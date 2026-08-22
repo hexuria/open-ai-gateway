@@ -1,0 +1,431 @@
+{
+  "title": "open-ai-gateway",
+  "uid": "oag-main",
+  "tags": [
+    "oag"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "DS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "Prometheus",
+          "value": "Prometheus"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Saved (last 24h)",
+      "type": "stat",
+      "description": "Spend avoided against sending everything to each route's top tier.",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(oag_counterfactual_microusd_total[24h])) / 1e6 - sum(increase(oag_cost_microusd_total[24h])) / 1e6",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Saved %",
+      "type": "stat",
+      "description": "If this falls, traffic is drifting onto expensive tiers.",
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "100 * (1 - sum(increase(oag_cost_microusd_total[24h])) / clamp_min(sum(increase(oag_counterfactual_microusd_total[24h])), 1))",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Prompt cache hit rate",
+      "type": "stat",
+      "description": "Collapses when session affinity stops working \u2014 and the bill follows.",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "100 * sum(rate(oag_tokens_total{kind=\"cache_read\"}[15m])) / clamp_min(sum(rate(oag_tokens_total{kind=~\"input|cache_read\"}[15m])), 1)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Replicas draining",
+      "type": "stat",
+      "description": "Non-zero during a deploy. Persistently non-zero means a drain is stuck.",
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 5
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(oag_draining)",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value"
+      }
+    },
+    {
+      "id": 10,
+      "title": "Spend rate, actual vs frontier-for-everything",
+      "type": "timeseries",
+      "description": "The gap between these two lines is the gateway paying for itself.",
+      "gridPos": {
+        "x": 0,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(oag_cost_microusd_total[5m])) * 60 / 1e6",
+          "legendFormat": "actual $/min",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(oag_counterfactual_microusd_total[5m])) * 60 / 1e6",
+          "legendFormat": "frontier-for-everything $/min",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "title": "Requests by tier",
+      "type": "timeseries",
+      "description": "The routing mix. A cheap tier that never gets used is a mis-set ladder.",
+      "gridPos": {
+        "x": 12,
+        "y": 5,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (tier) (rate(oag_cost_microusd_total[5m]) > bool 0)",
+          "legendFormat": "{{tier}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 20,
+      "title": "Time to first token",
+      "type": "timeseries",
+      "description": "The latency users actually feel. Measured to the first content token, not the first byte.",
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(oag_time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(oag_time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(oag_time_to_first_token_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 21,
+      "title": "Request duration",
+      "type": "timeseries",
+      "description": "",
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(oag_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(oag_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(oag_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 30,
+      "title": "Escalations",
+      "type": "timeseries",
+      "description": "A rung that escalates most of the time is the wrong rung for this workload. Suppressed means a principal was near their cap.",
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 8,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "sum by (gate) (rate(oag_escalations_total[5m]) * 60)",
+          "legendFormat": "escalated: {{gate}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(oag_escalations_suppressed_total[5m]) * 60)",
+          "legendFormat": "suppressed (budget)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 31,
+      "title": "Credential health",
+      "type": "timeseries",
+      "description": "If every selection is decided at SoonestReset, the pool is saturated.",
+      "gridPos": {
+        "x": 8,
+        "y": 21,
+        "w": 8,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(oag_failovers_total[5m]) * 60)",
+          "legendFormat": "failovers/min",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (stage) (rate(oag_selection_total[5m]) * 60)",
+          "legendFormat": "selected by {{stage}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (outcome) (rate(oag_token_refreshes_total[5m]) * 60)",
+          "legendFormat": "refresh {{outcome}}",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 32,
+      "title": "Faults",
+      "type": "timeseries",
+      "description": "Unbilled spend should always be zero: it is money the provider charged us that never reached the ledger.",
+      "gridPos": {
+        "x": 16,
+        "y": 21,
+        "w": 8,
+        "h": 7
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(oag_requests_total{outcome=\"error\"}[5m]) * 60)",
+          "legendFormat": "errors/min",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(oag_client_disconnects_total[5m]) * 60)",
+          "legendFormat": "client disconnects/min",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(oag_usage_write_failures_total[5m]) * 60)",
+          "legendFormat": "UNBILLED SPEND/min",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    }
+  ]
+}

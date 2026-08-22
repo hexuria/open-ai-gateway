@@ -117,7 +117,32 @@ services:
       retries: 20
     volumes: [redisdata:/data]
 
+  # ── observability ───────────────────────────────────────────────────────────
+  # Behind a profile, so the default stack stays small. Bring it up with:
+  #   docker compose -f deploy/compose/stack.yml --profile observability up -d
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: ["observability"]
+    volumes:
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    profiles: ["observability"]
+    depends_on: [prometheus]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:3000:3000"]
+
 volumes:
   pgdata:
   redisdata:
   caddy_data:
+  promdata:

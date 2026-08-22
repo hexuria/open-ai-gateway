@@ -9,7 +9,14 @@
 
 admin:
   address:
-    socket_address: { address: 127.0.0.1, port_value: 9901 }
+    # 0.0.0.0 so Prometheus can scrape /stats/prometheus from another container.
+    #
+    # Worth knowing what this opens: Envoy's admin interface is not read-only —
+    # it can drain listeners, change log levels, and shut the proxy down. It is
+    # reachable by anything on this compose network and is deliberately NOT
+    # published to the host. In a real deployment, put it on a separate
+    # interface or in front of a network policy rather than leaving it flat.
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
 
 static_resources:
   listeners:

@@ -1,0 +1,26 @@
+# Scrapes the gateway replicas' admin listeners.
+#
+# The admin listener, not the public one: /metrics is an operational surface and
+# has no business being reachable by clients.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: oag
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["oag-1:8081", "oag-2:8081", "oag-3:8081"]
+    relabel_configs:
+      # Keep the replica identity, so a metric can be attributed to the process
+      # that produced it — which is what makes "one replica is misbehaving"
+      # visible instead of averaged away.
+      - source_labels: [__address__]
+        regex: "([^:]+):.*"
+        target_label: replica
+        replacement: "$1"
+
+  - job_name: envoy
+    metrics_path: /stats/prometheus
+    static_configs:
+      - targets: ["envoy:9901"]
