@@ -71,7 +71,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-    volumes: [pgdata:/var/lib/postgresql/data]
+    # Single mount at /var/lib/postgresql, not .../data — Postgres 18 places
+    # the cluster in a version subdirectory beneath it so pg_upgrade --link can
+    # work without crossing a mount boundary.
+    volumes: [pgdata:/var/lib/postgresql]
 
   redis:
     image: redis:8-alpine

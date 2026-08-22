@@ -15,7 +15,11 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
-    tmpfs: ["/var/lib/postgresql/data"]
+    # Postgres 18 moved its data directory: the image wants a single mount at
+    # /var/lib/postgresql and places the cluster in a version subdirectory.
+    # Mounting /var/lib/postgresql/data (correct for 17 and earlier) makes the
+    # container refuse to start.
+    tmpfs: ["/var/lib/postgresql"]
 
   redis:
     image: redis:8-alpine
