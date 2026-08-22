@@ -13,9 +13,6 @@ data:
   OAG_GATEWAY__BEDROCK_REGION: {{ .Values.gateway.bedrockRegion | quote }}
   OAG_TELEMETRY__LOG_FILTER: {{ .Values.telemetry.logFilter | quote }}
   OAG_TELEMETRY__LOG_JSON: {{ .Values.telemetry.logJson | quote }}
-  {{- with .Values.telemetry.otlpEndpoint }}
-  OAG_TELEMETRY__OTLP_ENDPOINT: {{ . | quote }}
-  {{- end }}
   {{- range $provider, $url := .Values.gateway.providerBaseUrls }}
   OAG_GATEWAY__PROVIDER_BASE_URLS__{{ $provider | upper }}: {{ $url | quote }}
   {{- end }}

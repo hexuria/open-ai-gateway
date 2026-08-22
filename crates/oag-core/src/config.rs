@@ -208,7 +208,12 @@ pub struct TelemetryConfig {
     pub log_filter: String,
     /// JSON lines rather than human-readable. On in production.
     pub log_json: bool,
-    /// OTLP endpoint. Tracing is off entirely when this is unset.
+    /// OTLP endpoint for distributed tracing.
+    ///
+    /// **Not implemented in this build.** No OTLP exporter is linked, so
+    /// setting this is rejected at startup rather than silently ignored — a
+    /// config option that quietly does nothing is worse than one that does not
+    /// exist, because you only find out when you go looking for the traces.
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
 }
@@ -234,6 +239,12 @@ impl Config {
 
     pub fn validate(&self) -> crate::Result<()> {
         self.security.validate()?;
+        if self.telemetry.otlp_endpoint.is_some() {
+            return Err(crate::Error::Config(
+                "telemetry.otlp_endpoint is set, but this build has no OTLP exporter linked.                  Unset it; metrics are on /metrics and logs are structured."
+                    .to_owned(),
+            ));
+        }
         if self.gateway.max_stream_duration <= self.gateway.stream_idle_timeout {
             return Err(crate::Error::Config(
                 "gateway.max_stream_duration must exceed gateway.stream_idle_timeout".to_owned(),
@@ -366,5 +377,18 @@ security:
             "{MINIMAL}\ngateway:\n  stream_idle_timeout: 600\n  stream_keepalive_interval: 10\n  max_stream_duration: 300\n  same_account_retries: 2\n  max_account_switches: 3\n"
         );
         assert!(Config::from_yaml(&src).is_err());
+    }
+
+    #[test]
+    fn an_otlp_endpoint_is_refused_rather_than_ignored() {
+        // Setting a config option that this build cannot honour must fail at
+        // startup. Silently ignoring it means discovering the gap later, while
+        // looking for traces that were never going to exist.
+        let src = format!("{MINIMAL}\ntelemetry:\n  otlp_endpoint: \"http://collector:4317\"\n");
+        let err = Config::from_yaml(&src).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("no OTLP exporter"),
+            "the error should say why, got: {err}"
+        );
     }
 }

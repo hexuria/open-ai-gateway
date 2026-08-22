@@ -81,7 +81,9 @@ gateway:
 telemetry:
   logFilter: info
   logJson: true
-  otlpEndpoint: ""
+  # No otlpEndpoint: this build links no OTLP exporter, and the gateway now
+  # refuses to boot if one is configured rather than pretending to export.
+  # Metrics are on /metrics; logs are structured JSON.
 
 # ── listeners ─────────────────────────────────────────────────────────────────
 # Two by default: 8080 inference, 8081 admin. On Kubernetes there is no reason
