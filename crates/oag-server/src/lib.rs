@@ -14,6 +14,7 @@
 //! expose the admin API" a deployment fact rather than a routing rule someone
 //! has to remember to write.
 
+pub mod gateway;
 pub mod health;
 pub mod metrics;
 pub mod shutdown;
@@ -34,6 +35,10 @@ pub fn public_router(state: Arc<AppState>) -> Router {
         // operational detail, and because answering it does not require being
         // reachable from the internet.
         .route("/health/live", get(health::live))
+        .route("/v1/messages", axum::routing::post(gateway::messages))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            state.config.server.max_body_bytes,
+        ))
         .with_state(state)
 }
 

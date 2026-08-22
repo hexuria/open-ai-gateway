@@ -50,12 +50,24 @@ pub fn describe() {
         "Tokens by kind: input, output, cache read, cache write."
     );
     describe_counter!(
-        "oag_cost_usd_total",
-        "Actual spend. Pair with oag_counterfactual_usd_total for the saving."
+        "oag_cost_microusd_total",
+        "Actual spend in micro-USD; divide by 1e6. Pair with the counterfactual for the saving."
     );
     describe_counter!(
-        "oag_counterfactual_usd_total",
-        "What the same traffic would have cost on each route's top tier."
+        "oag_counterfactual_microusd_total",
+        "What the same traffic would have cost on each route's top tier, in micro-USD."
+    );
+    describe_counter!(
+        "oag_selection_total",
+        "Credential selections, by which cascade stage decided."
+    );
+    describe_counter!(
+        "oag_client_disconnects_total",
+        "Requests where the client hung up before the upstream finished."
+    );
+    describe_counter!(
+        "oag_usage_write_failures_total",
+        "Spend that could not be written to the ledger. Should always be zero."
     );
     describe_histogram!(
         "oag_request_duration_seconds",

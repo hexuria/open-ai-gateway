@@ -2,6 +2,8 @@
 
 //! `oag` — the gateway binary.
 
+mod admin;
+mod catalog;
 mod settings;
 
 use clap::{Parser, Subcommand};
@@ -35,6 +37,9 @@ enum Command {
     /// The fastest way to answer "is this replica actually reading the
     /// environment variable I think it is".
     Config,
+    /// Operator commands: principals, keys, credentials, catalog.
+    #[command(subcommand)]
+    Admin(admin::AdminCommand),
 }
 
 #[tokio::main]
@@ -69,6 +74,11 @@ async fn run() -> Result<()> {
             tracing::info!("migrations applied");
             Ok(())
         }
+        Command::Admin(cmd) => {
+            let db = Db::connect(&config.database.url, config.database.max_connections)?;
+            let kek = oag_core::Kek::from_base64(&config.security.credential_kek)?;
+            admin::run(cmd, &db, &kek).await
+        }
         Command::Serve => {
             let handle = oag_server::metrics::install()?;
             oag_server::metrics::describe();
@@ -76,8 +86,17 @@ async fn run() -> Result<()> {
             let db = Db::connect(&config.database.url, config.database.max_connections)?;
             let cache = Cache::connect(&config.redis.url)?;
 
-            let state = Arc::new(AppState::new(config, db, cache));
+            let state = Arc::new(AppState::new(config, db, cache)?);
             state.lifecycle.set_metrics(handle);
+
+            match state.reload_catalog().await {
+                Ok(0) => tracing::warn!(
+                    "model catalog is empty; every request will fail to route. \
+                     Run `oag admin seed-catalog`."
+                ),
+                Ok(n) => tracing::info!(models = n, "catalog loaded"),
+                Err(e) => tracing::warn!(error = %e, "could not load catalog"),
+            }
 
             // Report dependency health once at boot rather than waiting for the
             // first readiness probe: an operator watching the logs of a replica

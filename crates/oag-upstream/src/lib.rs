@@ -3,7 +3,9 @@
 //! Talking to providers.
 
 pub mod adapter;
+pub mod anthropic;
 pub mod transport;
 
 pub use adapter::{ProviderAdapter, UpstreamRequest};
+pub use anthropic::AnthropicAdapter;
 pub use transport::{HttpTransport, Transport, TransportKey, TransportPool};

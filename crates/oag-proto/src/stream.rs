@@ -136,6 +136,17 @@ impl StreamAccumulator {
         !self.committed
     }
 
+    /// The id of the tool call currently being streamed, if any.
+    ///
+    /// Anthropic identifies a tool block once, at `content_block_start`, and
+    /// then addresses its deltas by block index. Canonical events carry the id
+    /// on every delta, so the mapping has to live somewhere — here, because it
+    /// is per-response state and this is where per-response state goes.
+    #[must_use]
+    pub fn current_tool_id(&self) -> Option<String> {
+        self.tool_buffers.last().map(|(id, _)| id.clone())
+    }
+
     #[must_use]
     pub const fn usage(&self) -> &Usage {
         &self.usage

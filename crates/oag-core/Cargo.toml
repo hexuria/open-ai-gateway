@@ -14,6 +14,10 @@ uuid.workspace = true
 time.workspace = true
 rust_decimal.workspace = true
 zeroize.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
+base64.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

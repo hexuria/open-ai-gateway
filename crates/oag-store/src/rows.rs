@@ -1,0 +1,198 @@
+//! Row types.
+//!
+//! Plain `FromRow` structs rather than `sqlx::query!` macros: the macros need a
+//! live database at *compile* time, which makes `cargo build` fail on a machine
+//! that has never run Postgres and makes CI depend on a service to typecheck.
+//! The trade is that column mistakes surface as a runtime error on first query
+//! instead of a compile error, which the integration tests catch.
+
+use oag_core::{AccountId, ApiKeyId, PrincipalId, RouteId};
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
+use time::OffsetDateTime;
+use uuid::Uuid;
+
+/// An upstream credential, as stored.
+#[derive(Debug, Clone, FromRow)]
+pub struct AccountRow {
+    pub id: Uuid,
+    pub name: String,
+    pub provider: String,
+    pub kind: String,
+    pub credentials_sealed: Vec<u8>,
+    pub credentials_nonce: Vec<u8>,
+    pub token_version: i64,
+    pub token_expires_at: Option<OffsetDateTime>,
+    pub owner_principal_id: Option<Uuid>,
+    pub proxy_url: Option<String>,
+    pub priority: i16,
+    pub max_concurrency: i32,
+    pub weight: i16,
+    pub schedulable: bool,
+    pub cooldown_until: Option<OffsetDateTime>,
+    pub rate_limited_until: Option<OffsetDateTime>,
+    pub window_resets_at: Option<OffsetDateTime>,
+    pub last_used_at: OffsetDateTime,
+}
+
+impl AccountRow {
+    #[must_use]
+    pub fn account_id(&self) -> AccountId {
+        AccountId::from_uuid(self.id)
+    }
+
+    #[must_use]
+    pub fn sealed(&self) -> oag_core::Sealed {
+        oag_core::Sealed {
+            ciphertext: self.credentials_sealed.clone(),
+            nonce: self.credentials_nonce.clone(),
+        }
+    }
+
+    /// Convert into what the scheduler consumes.
+    ///
+    /// `in_flight` is not a column: it lives in Redis, because it changes many
+    /// times a second and every replica has to agree on it. Passing it in keeps
+    /// the scheduler a pure function of a snapshot.
+    #[must_use]
+    pub fn to_candidate(&self, in_flight: u32, waiting: u32) -> Option<oag_pool::Candidate> {
+        Some(oag_pool::Candidate {
+            account: self.account_id(),
+            provider: self.provider.parse().ok()?,
+            priority: u8::try_from(self.priority).unwrap_or(u8::MAX),
+            max_concurrency: u32::try_from(self.max_concurrency).unwrap_or(0),
+            in_flight,
+            waiting,
+            schedulable: self.schedulable,
+            cooldown_until: self.cooldown_until.map(OffsetDateTime::unix_timestamp),
+            rate_limited_until: self.rate_limited_until.map(OffsetDateTime::unix_timestamp),
+            window_resets_at: self.window_resets_at.map(OffsetDateTime::unix_timestamp),
+            last_used_at: self.last_used_at.unix_timestamp(),
+        })
+    }
+}
+
+/// A route's ladder and entitlements.
+#[derive(Debug, Clone, FromRow)]
+pub struct RouteRow {
+    pub id: Uuid,
+    pub name: String,
+    pub tiers: serde_json::Value,
+    pub default_mode: String,
+    pub floor_tier: Option<String>,
+    pub rpm_limit: Option<i32>,
+    pub monthly_budget_usd: Option<Decimal>,
+    pub active: bool,
+}
+
+impl RouteRow {
+    #[must_use]
+    pub fn route_id(&self) -> RouteId {
+        RouteId::from_uuid(self.id)
+    }
+}
+
+/// The result of authenticating an inbound key.
+///
+/// Deliberately a flat, owned, cheaply-cloned struct: it is what goes into the
+/// auth cache, and a cache entry that borrows from a connection would pin one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthContext {
+    pub api_key_id: Uuid,
+    pub principal_id: Uuid,
+    pub route_id: Uuid,
+    pub key_floor_tier: Option<String>,
+    pub quota_usd: Option<Decimal>,
+    pub spent_usd: Decimal,
+    pub principal_budget_usd: Option<Decimal>,
+    pub principal_hard_stop_multiple: Decimal,
+    pub principal_spent_usd: Decimal,
+}
+
+impl AuthContext {
+    #[must_use]
+    pub fn key(&self) -> ApiKeyId {
+        ApiKeyId::from_uuid(self.api_key_id)
+    }
+
+    #[must_use]
+    pub fn principal(&self) -> PrincipalId {
+        PrincipalId::from_uuid(self.principal_id)
+    }
+
+    #[must_use]
+    pub fn route(&self) -> RouteId {
+        RouteId::from_uuid(self.route_id)
+    }
+}
+
+/// One catalog entry.
+// The capability flags mirror the catalog columns one-for-one; folding them
+// into an enum here would just mean unfolding them again on every query.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, FromRow)]
+pub struct ModelRow {
+    pub id: String,
+    pub provider: String,
+    pub upstream_name: String,
+    pub input_per_mtok: Decimal,
+    pub output_per_mtok: Decimal,
+    pub cache_read_per_mtok: Option<Decimal>,
+    pub cache_write_per_mtok: Option<Decimal>,
+    pub context_window: i32,
+    pub max_output_tokens: i32,
+    pub supports_vision: bool,
+    pub supports_tools: bool,
+    pub supports_reasoning: bool,
+    pub supports_prompt_cache: bool,
+}
+
+impl ModelRow {
+    /// Convert into what the router consumes.
+    #[must_use]
+    pub fn to_spec(&self) -> Option<oag_router::ModelSpec> {
+        Some(oag_router::ModelSpec {
+            id: oag_router::ModelId::new(&self.id),
+            provider: self.provider.parse().ok()?,
+            upstream_name: self.upstream_name.clone(),
+            pricing: oag_router::Pricing {
+                input_per_mtok: self.input_per_mtok,
+                output_per_mtok: self.output_per_mtok,
+                cache_read_per_mtok: self.cache_read_per_mtok,
+                cache_write_per_mtok: self.cache_write_per_mtok,
+            },
+            context_window: u32::try_from(self.context_window).unwrap_or(0),
+            max_output_tokens: u32::try_from(self.max_output_tokens).unwrap_or(0),
+            capabilities: oag_router::Capabilities {
+                vision: self.supports_vision,
+                tools: self.supports_tools,
+                reasoning: self.supports_reasoning,
+                prompt_cache: self.supports_prompt_cache,
+            },
+        })
+    }
+}
+
+/// A row to append to the ledger.
+#[derive(Debug, Clone)]
+pub struct UsageWrite {
+    pub request_id: Uuid,
+    pub principal_id: Option<Uuid>,
+    pub api_key_id: Option<Uuid>,
+    pub route_id: Option<Uuid>,
+    pub account_id: Option<Uuid>,
+    pub model_id: String,
+    pub tier: String,
+    pub selection_reason: String,
+    pub escalated_from_tier: Option<String>,
+    pub escalation_gate: Option<String>,
+    pub usage: oag_router::Usage,
+    pub cost_usd: Decimal,
+    pub counterfactual_usd: Decimal,
+    pub counterfactual_model_id: Option<String>,
+    pub status: i16,
+    pub latency_ms: Option<i32>,
+    pub ttft_ms: Option<i32>,
+    pub streamed: bool,
+}

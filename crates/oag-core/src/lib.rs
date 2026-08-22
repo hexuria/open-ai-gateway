@@ -11,9 +11,11 @@ pub mod credential;
 pub mod error;
 pub mod id;
 pub mod provider;
+pub mod seal;
 pub mod tier;
 
-pub use error::{Error, Result};
+pub use error::{Disposition, Error, Result};
 pub use id::{AccountId, ApiKeyId, PrincipalId, RequestId, RouteId};
 pub use provider::Provider;
+pub use seal::{Kek, Sealed};
 pub use tier::{Tier, TierName};

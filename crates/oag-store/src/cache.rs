@@ -166,6 +166,44 @@ impl Cache {
     }
 }
 
+// ── auth cache (L2) ───────────────────────────────────────────────────────────
+
+impl Cache {
+    /// Read a cached auth context.
+    ///
+    /// Returns `None` on any failure, including Redis being down. A cache is an
+    /// optimisation: if it cannot answer, the caller falls through to Postgres.
+    /// Propagating an error here would turn a Redis blip into an outage.
+    pub async fn auth_get(&self, hash: &str) -> Option<crate::rows::AuthContext> {
+        let mut conn = self.conn().await.ok()?;
+        let raw: Option<String> = conn.get(auth_key(hash)).await.ok()?;
+        serde_json::from_str(&raw?).ok()
+    }
+
+    /// Cache an auth context. Best-effort for the same reason.
+    pub async fn auth_set(&self, hash: &str, ctx: &crate::rows::AuthContext, ttl: Duration) {
+        let Ok(mut conn) = self.conn().await else {
+            return;
+        };
+        let Ok(json) = serde_json::to_string(ctx) else {
+            return;
+        };
+        let _: std::result::Result<(), _> = conn.set_ex(auth_key(hash), json, ttl.as_secs()).await;
+    }
+
+    /// Evict a cached auth context, fleet-wide.
+    pub async fn auth_invalidate(&self, hash: &str) {
+        let Ok(mut conn) = self.conn().await else {
+            return;
+        };
+        let _: std::result::Result<i64, _> = conn.del(auth_key(hash)).await;
+    }
+}
+
+fn auth_key(hash: &str) -> String {
+    format!("oag:auth:{hash}")
+}
+
 fn slot_key(account: AccountId) -> String {
     format!("oag:slots:{account}")
 }

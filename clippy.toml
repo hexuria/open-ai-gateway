@@ -8,6 +8,8 @@ doc-valid-idents = [
     "PostgreSQL",
     "GitHub",
     "SigV4",
+    "XChaCha",
+    "LiteLLM",
     "BoringSSL",
     "JSON",
     "..",

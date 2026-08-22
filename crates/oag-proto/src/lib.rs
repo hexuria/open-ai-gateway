@@ -19,13 +19,14 @@
 //! recorded-fixture test corpus possible, and translation is precisely the
 //! thing you want that many tests on.
 
+pub mod anthropic;
 pub mod canonical;
 pub mod stream;
 
 pub use canonical::{
     CacheControl, CanonicalRequest, ContentBlock, Message, Role, Tool, extract_cache_blocks,
 };
-pub use stream::{StreamAccumulator, StreamEvent};
+pub use stream::{StopReason, StreamAccumulator, StreamEvent};
 
 use oag_core::provider::Dialect;
 
