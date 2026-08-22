@@ -140,8 +140,9 @@ variable "run_migrations" {
   description = <<-EOT
     Run `oag migrate` as part of the deployment. Leave this true.
 
-    Set it false for exactly one apply when ROLLING BACK to an older image:
-    sqlx runs with ignore_missing = false, so an older binary's migrate fails
-    with VersionMissing once a newer migration has been applied.
+    Set it false to deploy while running a long migration out of band, or to
+    skip the step during an incident. Rolling back does NOT require it: the
+    migrator runs with ignore_missing(true), so an older binary migrates
+    happily against a schema a newer release already applied.
   EOT
 }

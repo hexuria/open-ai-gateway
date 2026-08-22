@@ -187,10 +187,16 @@ reporting `ready: false` and being routed around. Gating replica start on migrat
 scale-out replica during a failover crash-loops instead — and `init_container` has no retry
 limit. `run_migrations = false` is the lever.
 
-**Rolling back needs that lever.** sqlx runs with `ignore_missing = false`, so once a newer
-migration is applied, an older binary's `oag migrate` fails with `VersionMissing`. On AWS and
-Azure the gateway container depends on the migrate step, so that revision could never launch
-again. Roll the image back and set `run_migrations = false` in the same apply.
+**Rolling back works without a lever**, deliberately. The migrator runs with
+`ignore_missing(true)`, so an older binary migrates happily against a schema a newer release
+already applied. sqlx defaults that to `false`, which sounds safer and is not: during any
+rolling deploy the migration lands while the previous release is still serving — on ECS for
+up to the 1800s deregistration delay — so old-binary-against-new-schema is the normal steady
+state for tens of minutes anyway. The default would forbid at rollback time precisely what
+every release does for half an hour, and on AWS and Azure, where the gateway container
+depends on the migrate step, it would leave the rolled-back revision unable to start at all.
+
+`run_migrations = false` remains for deploying while a long migration runs out of band.
 
 **Migrations must be expand/contract.** In all three the migration lands while the previous
 release is still serving — on AWS for up to the deregistration delay, which defaults to the
