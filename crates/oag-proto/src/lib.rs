@@ -23,6 +23,7 @@ pub mod anthropic;
 pub mod canonical;
 pub mod gemini;
 pub mod openai;
+pub mod responses;
 pub mod stream;
 
 pub use canonical::{

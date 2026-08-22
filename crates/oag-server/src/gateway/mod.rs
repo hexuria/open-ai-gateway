@@ -43,6 +43,16 @@ pub async fn chat_completions(
     dispatch(state, headers, body, Dialect::OpenAIChatCompletions).await
 }
 
+/// `POST /v1/responses` — OpenAI's newer surface, and the one their current
+/// SDKs default to.
+pub async fn responses(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    dispatch(state, headers, body, Dialect::OpenAIResponses).await
+}
+
 /// `POST /v1beta/models/{model}:generateContent` — the Gemini surface.
 ///
 /// The model and the streaming mode are in the path in this dialect, so they
@@ -124,6 +134,7 @@ async fn handle(
     let wire: serde_json::Value = serde_json::from_slice(body)?;
     let mut canonical = match ingress {
         Dialect::OpenAIChatCompletions => oag_proto::openai::parse_request(&wire)?,
+        Dialect::OpenAIResponses => oag_proto::responses::parse_request(&wire)?,
         Dialect::GeminiGenerateContent => {
             let mut c = oag_proto::gemini::parse_request(&wire)?;
             // Recovered from the path by `gemini_generate`.
@@ -448,6 +459,7 @@ fn egress_for(
         Dialect::OpenAIChatCompletions => sse::Egress::ChatCompletions { request_id, model },
         Dialect::AnthropicMessages => sse::Egress::AnthropicMessages { request_id, model },
         Dialect::GeminiGenerateContent => sse::Egress::Gemini,
+        Dialect::OpenAIResponses => sse::Egress::Responses { request_id, model },
         // Falling back to passthrough here would send the upstream's dialect to
         // a client expecting a different one — bytes that parse as nothing and
         // fail somewhere far from the cause. An error names the problem.
@@ -493,10 +505,23 @@ fn json_response(
                 Dialect::GeminiGenerateContent => {
                     bytes::Bytes::from(oag_proto::gemini::render_message_response(&v).to_string())
                 }
-                // No converter: hand back the upstream's own body rather than
-                // something half-translated. The streaming path errors instead,
-                // because a stream cannot be partly right.
-                _ => body.clone(),
+                Dialect::OpenAIResponses => {
+                    bytes::Bytes::from(oag_proto::responses::render_response(&v, &id).to_string())
+                }
+                // No converter for this dialect. Hand back the upstream's own
+                // body rather than something half-translated — but say so:
+                // a silent wildcard here is exactly how a missing arm went
+                // unnoticed once already, returning the wrong shape with
+                // nothing to show for it.
+                other => {
+                    tracing::warn!(
+                        ingress = ?other,
+                        upstream = ?upstream_dialect,
+                        "no non-streaming converter for this dialect pair; \
+                         returning the upstream body unchanged"
+                    );
+                    body.clone()
+                }
             },
         )
     };

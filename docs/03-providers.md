@@ -44,13 +44,6 @@ gateway:
     kimi: "https://your-proxy.internal/v1"
 ```
 
-## Not implemented
-
-`Dialect::OpenAIResponses` (`POST /v1/responses`) is declared and has no codec.
-Nothing maps to it, so it is unreachable — and `egress_for` errors on any
-dialect it cannot render, so wiring a provider to it before writing the codec
-fails at the first request instead of emitting bytes in the wrong shape.
-
 ## Which dialect reaches which upstream
 
 Any inbound dialect can reach any upstream one; translation goes through the
@@ -58,12 +51,19 @@ canonical form. When the two agree, bytes pass through **verbatim** — the
 upstream's own bytes are the most faithful answer available, and re-serialising
 can only differ from them.
 
-| Client speaks | Upstream speaks | What happens |
+All four dialects parse inbound and render outbound, so any client shape
+reaches any upstream shape:
+
+| Dialect | Inbound route | Renders outbound |
 |---|---|---|
-| Anthropic | Anthropic | verbatim |
-| Chat Completions | Chat Completions | verbatim |
-| Chat Completions | Anthropic | rendered as `chat.completion.chunk` frames, terminated with `[DONE]` |
-| Anthropic | Chat Completions | rendered as `message_start` / `content_block_*` / `message_stop` |
+| Anthropic Messages | `/v1/messages` | yes |
+| OpenAI Chat Completions | `/v1/chat/completions` | yes |
+| OpenAI Responses | `/v1/responses` | yes |
+| Gemini | `/v1beta/models/{model}:generateContent` | yes |
+
+No provider declares Responses as its *native* dialect — the adapter registered
+for OpenAI speaks Chat Completions — so reaching an upstream over Responses
+would be a separate adapter, not a change to the hub.
 
 The Anthropic direction is the harder one: it uses indexed content blocks that
 must be explicitly opened and closed, so the renderer tracks the open block and

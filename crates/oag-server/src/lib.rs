@@ -48,6 +48,8 @@ pub fn public_router(state: Arc<AppState>) -> Router {
             "/chat/completions",
             axum::routing::post(gateway::chat_completions),
         )
+        .route("/v1/responses", axum::routing::post(gateway::responses))
+        .route("/responses", axum::routing::post(gateway::responses))
         // Gemini puts the model and the mode in the path, separated by a colon.
         .route(
             "/v1beta/models/{*model_action}",

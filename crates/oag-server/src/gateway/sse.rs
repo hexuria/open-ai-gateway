@@ -53,6 +53,7 @@ enum Renderer {
     ChatCompletions(oag_proto::openai::RenderState),
     Anthropic(oag_proto::anthropic::RenderState),
     Gemini(oag_proto::gemini::RenderState),
+    Responses(oag_proto::responses::RenderState),
 }
 
 impl Renderer {
@@ -66,6 +67,9 @@ impl Renderer {
                 Self::Anthropic(oag_proto::anthropic::RenderState::new(request_id, model))
             }
             Egress::Gemini => Self::Gemini(oag_proto::gemini::RenderState::new()),
+            Egress::Responses { request_id, model } => {
+                Self::Responses(oag_proto::responses::RenderState::new(request_id, model))
+            }
         }
     }
 
@@ -75,6 +79,7 @@ impl Renderer {
             Self::ChatCompletions(st) => oag_proto::openai::render_event(event, st),
             Self::Anthropic(st) => oag_proto::anthropic::render_event(event, st),
             Self::Gemini(st) => oag_proto::gemini::render_event(event, st),
+            Self::Responses(st) => oag_proto::responses::render_event(event, st),
         }
     }
 }
@@ -96,6 +101,8 @@ pub enum Egress {
     AnthropicMessages { request_id: String, model: String },
     /// A Gemini-shaped client over some other upstream.
     Gemini,
+    /// A Responses-shaped client over some other upstream.
+    Responses { request_id: String, model: String },
 }
 
 /// Read `response`, forward it to `tx`, and account for usage.

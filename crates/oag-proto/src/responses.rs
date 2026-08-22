@@ -1,0 +1,1209 @@
+//! The OpenAI Responses dialect (`POST /v1/responses`).
+//!
+//! OpenAI's newer surface, and the one their current SDKs default to — so a
+//! gateway that does not speak it is unusable by a growing share of clients
+//! however well it speaks Chat Completions.
+//!
+//! Where it differs from Chat Completions, which is nearly everywhere:
+//!
+//! - The system prompt is `instructions`, a top-level string, not a message.
+//! - Messages are `input`, and the array is heterogeneous: message items sit
+//!   alongside `function_call` and `function_call_output` items as siblings,
+//!   rather than tool results being a message role.
+//! - Content parts are typed by direction — `input_text` going up,
+//!   `output_text` coming back — so a round trip has to flip them.
+//! - Tools are flat (`{"type":"function","name":...}`), not nested under a
+//!   `function` key.
+//! - It is `max_output_tokens`, not `max_tokens`.
+//! - Streaming events are *named* (`response.output_text.delta`) and carry a
+//!   bare string delta, rather than a chunk with a choices array.
+//! - Usage is `input_tokens`/`output_tokens`, and the input count includes the
+//!   cached prefix.
+
+use crate::canonical::{CanonicalRequest, ContentBlock, Message, Role, Tool};
+use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
+use oag_core::Result;
+use oag_router::Usage;
+use serde_json::{Value, json};
+
+/// Canonical → Responses wire JSON.
+pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Value> {
+    let mut input = Vec::new();
+    for m in &req.messages {
+        render_message_into(m, &mut input);
+    }
+
+    let mut body = json!({
+        "model": upstream_model,
+        "input": input,
+        "max_output_tokens": req.max_tokens,
+        "stream": req.stream,
+    });
+
+    if !req.system.is_empty() {
+        body["instructions"] = json!(
+            req.system
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        );
+    }
+
+    if !req.tools.is_empty() {
+        // Flat, not nested under a `function` key.
+        body["tools"] = Value::Array(
+            req.tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "function",
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.input_schema,
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    if let Some(t) = req.temperature {
+        body["temperature"] = json!(t);
+    }
+    if req.thinking_budget.is_some() {
+        // No token budget in this dialect; effort is the closest thing it has.
+        body["reasoning"] = json!({ "effort": "medium" });
+    }
+    Ok(body)
+}
+
+/// One canonical message becomes one or more `input` items.
+fn render_message_into(m: &Message, out: &mut Vec<Value>) {
+    // Tool results are their own top-level items, not part of a message.
+    for block in &m.content {
+        if let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+            ..
+        } = block
+        {
+            out.push(json!({
+                "type": "function_call_output",
+                "call_id": tool_use_id,
+                "output": content,
+            }));
+        }
+    }
+
+    let assistant = m.role == Role::Assistant;
+    let mut parts = Vec::new();
+    for block in &m.content {
+        match block {
+            ContentBlock::Text { text, .. } => parts.push(json!({
+                // Typed by direction: what we send up is input, what came back
+                // was output. Getting this backwards is rejected.
+                "type": if assistant { "output_text" } else { "input_text" },
+                "text": text,
+            })),
+            ContentBlock::Image { media_type, data } => parts.push(json!({
+                "type": "input_image",
+                "image_url": format!("data:{media_type};base64,{data}"),
+            })),
+            _ => {}
+        }
+    }
+
+    if !parts.is_empty() {
+        out.push(json!({
+            "type": "message",
+            "role": if assistant { "assistant" } else { "user" },
+            "content": parts,
+        }));
+    }
+
+    // Tool calls, likewise their own items.
+    for block in &m.content {
+        if let ContentBlock::ToolUse { id, name, input } = block {
+            out.push(json!({
+                "type": "function_call",
+                "call_id": id,
+                "name": name,
+                // A JSON string here, as in Chat Completions.
+                "arguments": input.to_string(),
+            }));
+        }
+    }
+}
+
+/// Responses wire JSON → canonical.
+pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
+    let mut system = Vec::new();
+    if let Some(text) = body["instructions"].as_str().filter(|s| !s.is_empty()) {
+        system.push(ContentBlock::Text {
+            text: text.to_owned(),
+            cache_control: None,
+        });
+    }
+
+    let mut messages: Vec<Message> = Vec::new();
+    match &body["input"] {
+        // The shorthand: a bare string is one user turn.
+        Value::String(s) => messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: s.clone(),
+                cache_control: None,
+            }],
+        }),
+        Value::Array(items) => {
+            for item in items {
+                parse_input_item(item, &mut messages);
+            }
+        }
+        _ => {}
+    }
+
+    let tools = body["tools"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    Some(Tool {
+                        name: t["name"].as_str()?.to_owned(),
+                        description: t["description"].as_str().unwrap_or_default().to_owned(),
+                        input_schema: t["parameters"].clone(),
+                        cache_control: None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(CanonicalRequest {
+        model: body["model"].as_str().unwrap_or_default().to_owned(),
+        system,
+        messages,
+        tools,
+        max_tokens: body["max_output_tokens"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(4096),
+        stream: body["stream"].as_bool().unwrap_or(false),
+        #[allow(clippy::cast_possible_truncation)]
+        temperature: body["temperature"].as_f64().map(|t| t as f32),
+        // Effort rather than a token budget; map any effort to a nominal one so
+        // the classifier sees that reasoning was asked for.
+        thinking_budget: body["reasoning"]["effort"].as_str().map(|_| 4096),
+        client_session: body["user"].as_str().map(std::borrow::ToOwned::to_owned),
+    })
+}
+
+/// Fold one `input` item into the canonical message list.
+fn parse_input_item(item: &Value, messages: &mut Vec<Message>) {
+    match item["type"].as_str().unwrap_or("message") {
+        "function_call" => {
+            let block = ContentBlock::ToolUse {
+                id: item["call_id"].as_str().unwrap_or_default().to_owned(),
+                name: item["name"].as_str().unwrap_or_default().to_owned(),
+                input: item["arguments"]
+                    .as_str()
+                    .and_then(|a| serde_json::from_str(a).ok())
+                    .unwrap_or_else(|| json!({})),
+            };
+            // Joins the assistant turn it belongs to, if there is one.
+            match messages.last_mut() {
+                Some(last) if last.role == Role::Assistant => last.content.push(block),
+                _ => messages.push(Message {
+                    role: Role::Assistant,
+                    content: vec![block],
+                }),
+            }
+        }
+
+        "function_call_output" => {
+            let block = ContentBlock::ToolResult {
+                tool_use_id: item["call_id"].as_str().unwrap_or_default().to_owned(),
+                content: match &item["output"] {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                },
+                is_error: false,
+            };
+            match messages.last_mut() {
+                Some(last) if last.role == Role::User => last.content.push(block),
+                _ => messages.push(Message {
+                    role: Role::User,
+                    content: vec![block],
+                }),
+            }
+        }
+
+        // Reasoning items are opaque and cannot be replayed; dropping is the
+        // honest lossy choice.
+        "reasoning" => {}
+
+        _ => {
+            let assistant = item["role"].as_str() == Some("assistant");
+            let mut content = Vec::new();
+            match &item["content"] {
+                Value::String(s) if !s.is_empty() => content.push(ContentBlock::Text {
+                    text: s.clone(),
+                    cache_control: None,
+                }),
+                Value::Array(parts) => {
+                    for p in parts {
+                        match p["type"].as_str().unwrap_or_default() {
+                            // Both directions, because a conversation replayed
+                            // to us contains items we previously sent back.
+                            "input_text" | "output_text" | "text" => {
+                                content.push(ContentBlock::Text {
+                                    text: p["text"].as_str().unwrap_or_default().to_owned(),
+                                    cache_control: None,
+                                });
+                            }
+                            "input_image" => {
+                                if let Some((media_type, data)) =
+                                    split_data_url(p["image_url"].as_str().unwrap_or_default())
+                                {
+                                    content.push(ContentBlock::Image { media_type, data });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if !content.is_empty() {
+                messages.push(Message {
+                    role: if assistant {
+                        Role::Assistant
+                    } else {
+                        Role::User
+                    },
+                    content,
+                });
+            }
+        }
+    }
+}
+
+fn split_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (media_type, data) = rest.split_once(";base64,")?;
+    Some((media_type.to_owned(), data.to_owned()))
+}
+
+/// One SSE `data:` payload → canonical events.
+pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
+    let v: Value = serde_json::from_str(payload)?;
+    let kind = v["type"].as_str().unwrap_or_default();
+
+    Ok(match kind {
+        "response.created" => vec![StreamEvent::Start {
+            model: v["response"]["model"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            usage: parse_usage(&v["response"]["usage"]),
+        }],
+
+        // The delta is a bare string here, not an object.
+        "response.output_text.delta" => vec![StreamEvent::TextDelta {
+            text: v["delta"].as_str().unwrap_or_default().to_owned(),
+        }],
+
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            vec![StreamEvent::ThinkingDelta {
+                text: v["delta"].as_str().unwrap_or_default().to_owned(),
+            }]
+        }
+
+        // A tool call announces itself when its output item is added.
+        "response.output_item.added" => {
+            let item = &v["item"];
+            if item["type"].as_str() == Some("function_call") {
+                vec![StreamEvent::ToolUseStart {
+                    id: item["call_id"].as_str().unwrap_or_default().to_owned(),
+                    name: item["name"].as_str().unwrap_or_default().to_owned(),
+                }]
+            } else {
+                vec![]
+            }
+        }
+
+        // Deltas are addressed by *item* id, but the call is identified by its
+        // `call_id` — and only the opening event carries both. Keying on the
+        // item id would leave every buffer empty, so the arguments never
+        // reassemble and every tool call looks malformed.
+        "response.function_call_arguments.delta" => vec![StreamEvent::ToolUseDelta {
+            id: acc.current_tool_id().unwrap_or_default(),
+            partial_json: v["delta"].as_str().unwrap_or_default().to_owned(),
+        }],
+
+        "response.output_item.done" => {
+            let item = &v["item"];
+            if item["type"].as_str() == Some("function_call") {
+                vec![StreamEvent::ToolUseEnd {
+                    // `call_id` when present, else whichever call is open —
+                    // the `done` event does not always echo it back.
+                    id: item["call_id"]
+                        .as_str()
+                        .map(std::borrow::ToOwned::to_owned)
+                        .or_else(|| acc.current_tool_id())
+                        .unwrap_or_default(),
+                }]
+            } else {
+                vec![]
+            }
+        }
+
+        "response.completed" | "response.incomplete" => {
+            let response = &v["response"];
+            let usage = parse_usage(&response["usage"]);
+            let reason = match response["incomplete_details"]["reason"].as_str() {
+                Some("max_output_tokens") => StopReason::MaxTokens,
+                Some("content_filter") => StopReason::Refusal,
+                _ => {
+                    // A response whose only output is a refusal part.
+                    if response["output"]
+                        .as_array()
+                        .is_some_and(|items| items.iter().any(has_refusal))
+                    {
+                        StopReason::Refusal
+                    } else {
+                        StopReason::EndTurn
+                    }
+                }
+            };
+            vec![
+                StreamEvent::UsageUpdate { usage },
+                StreamEvent::Stop { reason, usage },
+            ]
+        }
+
+        "response.failed" | "error" => vec![StreamEvent::Error {
+            message: v["response"]["error"]["message"]
+                .as_str()
+                .or_else(|| v["message"].as_str())
+                .unwrap_or("upstream error")
+                .to_owned(),
+        }],
+
+        // Every other lifecycle event carries nothing the canonical form needs.
+        _ => vec![],
+    })
+}
+
+fn has_refusal(item: &Value) -> bool {
+    item["content"]
+        .as_array()
+        .is_some_and(|parts| parts.iter().any(|p| p["type"].as_str() == Some("refusal")))
+}
+
+fn parse_usage(v: &Value) -> Usage {
+    let cached = v["input_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+    Usage {
+        // `input_tokens` includes the cached prefix, as in Chat Completions.
+        input_tokens: v["input_tokens"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(cached),
+        output_tokens: v["output_tokens"].as_u64().unwrap_or(0),
+        cache_read_tokens: cached,
+        cache_write_tokens: 0,
+    }
+}
+
+// ── rendering canonical events back into this dialect ─────────────────────────
+
+/// State carried while rendering canonical events as Responses SSE.
+///
+/// The most bookkeeping of the four dialects. Output is a list of *items*, each
+/// with its own index, and a message item contains *content parts* with their
+/// own indices — and both have explicit `added`/`done` events. A client that
+/// receives a delta for an item it was never told about drops it, so the
+/// lifecycle has to be emitted in order and closed before the next item opens.
+#[derive(Debug, Clone, Default)]
+pub struct RenderState {
+    id: String,
+    model: String,
+    created: bool,
+    /// The next free output-item index.
+    next_index: usize,
+    /// The open message item, if any: its index and id.
+    message: Option<(usize, String)>,
+    /// Text accumulated in the open message, needed for its `done` events.
+    text: String,
+    /// Open tool calls: call id → (item index, item id, accumulated arguments).
+    tools: Vec<(String, usize, String, String)>,
+    usage: Usage,
+    finished: bool,
+}
+
+impl RenderState {
+    #[must_use]
+    pub fn new(request_id: &str, model: &str) -> Self {
+        Self {
+            id: format!("resp_{request_id}"),
+            model: model.to_owned(),
+            ..Self::default()
+        }
+    }
+
+    fn frame(name: &str, body: &Value) -> String {
+        // Named events: this dialect's clients dispatch on the `event:` line.
+        format!("event: {name}\ndata: {body}\n\n")
+    }
+
+    fn ensure_created(&mut self, out: &mut String) {
+        if self.created {
+            return;
+        }
+        self.created = true;
+        out.push_str(&Self::frame(
+            "response.created",
+            &json!({
+                "type": "response.created",
+                "response": {
+                    "id": self.id,
+                    "object": "response",
+                    "created_at": 0,
+                    "status": "in_progress",
+                    "model": self.model,
+                    "output": [],
+                }
+            }),
+        ));
+    }
+
+    /// Open a message item and its first content part.
+    fn open_message(&mut self, out: &mut String) -> (usize, String) {
+        if let Some(open) = self.message.clone() {
+            return open;
+        }
+        let index = self.next_index;
+        self.next_index += 1;
+        let item_id = format!("msg_{index}");
+
+        out.push_str(&Self::frame(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": {
+                    "id": item_id, "type": "message", "status": "in_progress",
+                    "role": "assistant", "content": [],
+                }
+            }),
+        ));
+        out.push_str(&Self::frame(
+            "response.content_part.added",
+            &json!({
+                "type": "response.content_part.added",
+                "item_id": item_id, "output_index": index, "content_index": 0,
+                "part": { "type": "output_text", "text": "", "annotations": [] }
+            }),
+        ));
+
+        self.message = Some((index, item_id.clone()));
+        (index, item_id)
+    }
+
+    /// Close the open message item, if there is one.
+    fn close_message(&mut self, out: &mut String) {
+        let Some((index, item_id)) = self.message.take() else {
+            return;
+        };
+        let text = std::mem::take(&mut self.text);
+
+        out.push_str(&Self::frame(
+            "response.output_text.done",
+            &json!({
+                "type": "response.output_text.done",
+                "item_id": item_id, "output_index": index,
+                "content_index": 0, "text": text,
+            }),
+        ));
+        out.push_str(&Self::frame(
+            "response.content_part.done",
+            &json!({
+                "type": "response.content_part.done",
+                "item_id": item_id, "output_index": index, "content_index": 0,
+                "part": { "type": "output_text", "text": text, "annotations": [] }
+            }),
+        ));
+        out.push_str(&Self::frame(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": {
+                    "id": item_id, "type": "message", "status": "completed",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": text, "annotations": [] }],
+                }
+            }),
+        ));
+    }
+}
+
+/// One canonical event → Responses SSE frames, if it produces any.
+pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String> {
+    let mut out = String::new();
+
+    match event {
+        StreamEvent::Start { model, usage } => {
+            if !model.is_empty() {
+                st.model.clone_from(model);
+            }
+            st.usage.merge(usage);
+            st.ensure_created(&mut out);
+        }
+
+        StreamEvent::TextDelta { text } => {
+            st.ensure_created(&mut out);
+            let (index, item_id) = st.open_message(&mut out);
+            st.text.push_str(text);
+            out.push_str(&RenderState::frame(
+                "response.output_text.delta",
+                &json!({
+                    "type": "response.output_text.delta",
+                    "item_id": item_id, "output_index": index,
+                    "content_index": 0, "delta": text,
+                }),
+            ));
+        }
+
+        StreamEvent::ThinkingDelta { text } => {
+            st.ensure_created(&mut out);
+            out.push_str(&RenderState::frame(
+                "response.reasoning_summary_text.delta",
+                &json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": "rs_0", "output_index": 0,
+                    "summary_index": 0, "delta": text,
+                }),
+            ));
+        }
+
+        StreamEvent::ToolUseStart { id, name } => render_tool_start(st, &mut out, id, name),
+        StreamEvent::ToolUseDelta { id, partial_json } => {
+            render_tool_delta(st, &mut out, id, partial_json)?;
+        }
+        StreamEvent::ToolUseEnd { id } => render_tool_end(st, &mut out, id)?,
+
+        StreamEvent::UsageUpdate { usage } => {
+            st.usage.merge(usage);
+            return None;
+        }
+
+        StreamEvent::Stop { reason, usage } => {
+            if st.finished {
+                return None;
+            }
+            st.finished = true;
+            st.usage.merge(usage);
+            st.ensure_created(&mut out);
+            st.close_message(&mut out);
+
+            let incomplete = matches!(reason, StopReason::MaxTokens | StopReason::Refusal);
+            let name = if incomplete {
+                "response.incomplete"
+            } else {
+                "response.completed"
+            };
+            let mut response = json!({
+                "id": st.id,
+                "object": "response",
+                "created_at": 0,
+                "status": if incomplete { "incomplete" } else { "completed" },
+                "model": st.model,
+                "usage": usage_json(&st.usage),
+            });
+            if incomplete {
+                response["incomplete_details"] = json!({
+                    "reason": match reason {
+                        StopReason::MaxTokens => "max_output_tokens",
+                        _ => "content_filter",
+                    }
+                });
+            }
+            out.push_str(&RenderState::frame(
+                name,
+                &json!({ "type": name, "response": response }),
+            ));
+        }
+
+        StreamEvent::Error { message } => {
+            out.push_str(&RenderState::frame(
+                "error",
+                &json!({ "type": "error", "message": message }),
+            ));
+        }
+    }
+
+    (!out.is_empty()).then_some(out)
+}
+
+/// Open a `function_call` item, closing any open message item first.
+fn render_tool_start(st: &mut RenderState, out: &mut String, id: &str, name: &str) {
+    st.ensure_created(out);
+    // One item at a time: a message item must close before the next opens.
+    st.close_message(out);
+
+    let index = st.next_index;
+    st.next_index += 1;
+    let item_id = format!("fc_{index}");
+    st.tools
+        .push((id.to_owned(), index, item_id.clone(), String::new()));
+
+    out.push_str(&RenderState::frame(
+        "response.output_item.added",
+        &json!({
+            "type": "response.output_item.added",
+            "output_index": index,
+            "item": {
+                "id": item_id, "type": "function_call", "status": "in_progress",
+                "call_id": id, "name": name, "arguments": "",
+            }
+        }),
+    ));
+}
+
+/// Emit an argument fragment for an open tool call.
+fn render_tool_delta(
+    st: &mut RenderState,
+    out: &mut String,
+    id: &str,
+    partial_json: &str,
+) -> Option<()> {
+    let (_, index, item_id, args) = st.tools.iter_mut().find(|(call, ..)| call == id)?;
+    args.push_str(partial_json);
+    let (index, item_id) = (*index, item_id.clone());
+    out.push_str(&RenderState::frame(
+        "response.function_call_arguments.delta",
+        &json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": item_id, "output_index": index, "delta": partial_json,
+        }),
+    ));
+    Some(())
+}
+
+/// Close a tool call, emitting its assembled arguments.
+fn render_tool_end(st: &mut RenderState, out: &mut String, id: &str) -> Option<()> {
+    let (call_id, index, item_id, args) = st.tools.iter().find(|(call, ..)| call == id)?.clone();
+    out.push_str(&RenderState::frame(
+        "response.function_call_arguments.done",
+        &json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": item_id, "output_index": index, "arguments": args,
+        }),
+    ));
+    out.push_str(&RenderState::frame(
+        "response.output_item.done",
+        &json!({
+            "type": "response.output_item.done",
+            "output_index": index,
+            "item": {
+                "id": item_id, "type": "function_call", "status": "completed",
+                "call_id": call_id, "name": "", "arguments": args,
+            }
+        }),
+    ));
+    Some(())
+}
+
+/// An Anthropic Messages response → a Responses response.
+#[must_use]
+pub fn render_response(anthropic: &Value, request_id: &str) -> Value {
+    let mut output = Vec::new();
+    let mut text = String::new();
+
+    for block in anthropic["content"].as_array().unwrap_or(&Vec::new()) {
+        match block["type"].as_str().unwrap_or_default() {
+            "text" => text.push_str(block["text"].as_str().unwrap_or_default()),
+            "tool_use" => output.push(json!({
+                "id": format!("fc_{}", output.len()),
+                "type": "function_call",
+                "status": "completed",
+                "call_id": block["id"],
+                "name": block["name"],
+                "arguments": block["input"].to_string(),
+            })),
+            _ => {}
+        }
+    }
+
+    // The message item comes first when there is text, matching the order a
+    // streamed response would have produced.
+    if !text.is_empty() {
+        output.insert(
+            0,
+            json!({
+                "id": "msg_0",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": text, "annotations": [] }],
+            }),
+        );
+    }
+
+    let u = &anthropic["usage"];
+    let cached = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    let written = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    let input = u["input_tokens"].as_u64().unwrap_or(0) + cached + written;
+    let out_tokens = u["output_tokens"].as_u64().unwrap_or(0);
+
+    let stop = anthropic["stop_reason"].as_str().unwrap_or("end_turn");
+    let incomplete = matches!(stop, "max_tokens" | "refusal");
+
+    let mut response = json!({
+        "id": format!("resp_{request_id}"),
+        "object": "response",
+        "created_at": 0,
+        "status": if incomplete { "incomplete" } else { "completed" },
+        "model": anthropic["model"],
+        "output": output,
+        "usage": {
+            "input_tokens": input,
+            "input_tokens_details": { "cached_tokens": cached },
+            "output_tokens": out_tokens,
+            "output_tokens_details": { "reasoning_tokens": 0 },
+            "total_tokens": input + out_tokens,
+        }
+    });
+    if incomplete {
+        response["incomplete_details"] = json!({
+            "reason": if stop == "max_tokens" { "max_output_tokens" } else { "content_filter" }
+        });
+    }
+    response
+}
+
+fn usage_json(u: &Usage) -> Value {
+    // Every prompt-side token in `input_tokens`, so the totals add up the way
+    // clients in this dialect check them.
+    let input = u.input_tokens + u.cache_read_tokens + u.cache_write_tokens;
+    json!({
+        "input_tokens": input,
+        "input_tokens_details": { "cached_tokens": u.cache_read_tokens },
+        "output_tokens": u.output_tokens,
+        "output_tokens_details": { "reasoning_tokens": 0 },
+        "total_tokens": input + u.output_tokens,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A realistic streamed response, with the full item and content-part
+    /// lifecycle this dialect requires.
+    const STREAM: &[&str] = &[
+        r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":19200,"input_tokens_details":{"cached_tokens":18000}}}}"#,
+        r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant"}}"#,
+        r#"{"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"Let me "}"#,
+        r#"{"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"check."}"#,
+        r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file","arguments":""}}"#,
+        r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":"{\"path\""}"#,
+        r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":": \"a.rs\"}"}"#,
+        r#"{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file"}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":19200,"input_tokens_details":{"cached_tokens":18000},"output_tokens":142}}}"#,
+    ];
+
+    fn drive(lines: &[&str]) -> (Vec<StreamEvent>, StreamAccumulator) {
+        let mut acc = StreamAccumulator::new();
+        let mut out = Vec::new();
+        for line in lines {
+            let events = parse_event(line, &mut acc).expect("parses");
+            for e in &events {
+                acc.observe(e);
+            }
+            out.extend(events);
+        }
+        (out, acc)
+    }
+
+    #[test]
+    fn text_reassembles_across_deltas() {
+        let (events, _) = drive(STREAM);
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Let me check.");
+    }
+
+    #[test]
+    fn the_cached_prefix_is_not_counted_twice() {
+        // `input_tokens` includes the cached prefix here, as in Chat
+        // Completions. Adding them would bill 37200 for a 19200-token prompt.
+        let (_, acc) = drive(STREAM);
+        let u = acc.usage();
+        assert_eq!(u.cache_read_tokens, 18_000);
+        assert_eq!(u.input_tokens, 1_200);
+        assert_eq!(u.output_tokens, 142);
+    }
+
+    #[test]
+    fn tool_arguments_reassemble_despite_the_id_switch() {
+        // The trap: the opening event carries `call_id`, every delta after it
+        // carries only `item_id`. Keying deltas on the item id leaves the
+        // buffer empty, so the arguments never reassemble and every tool call
+        // looks malformed.
+        let (events, acc) = drive(STREAM);
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseDelta { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            vec!["call_1", "call_1"],
+            "deltas must carry the call id"
+        );
+        assert_eq!(
+            acc.quality_gate(),
+            None,
+            "and the arguments must be valid JSON"
+        );
+    }
+
+    #[test]
+    fn lifecycle_events_that_carry_nothing_produce_nothing() {
+        // This dialect emits many; treating an unknown one as fatal would break
+        // every request the day OpenAI adds another.
+        let mut acc = StreamAccumulator::new();
+        for noise in [
+            r#"{"type":"response.in_progress"}"#,
+            r#"{"type":"response.content_part.added","part":{"type":"output_text"}}"#,
+            r#"{"type":"response.output_text.done","text":"x"}"#,
+            r#"{"type":"something.new.in.2027"}"#,
+        ] {
+            assert!(
+                parse_event(noise, &mut acc)
+                    .expect("must not error")
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_is_reported_as_a_distinct_stop_reason() {
+        // It drives escalation, so it must not collapse into end-of-turn.
+        let (events, _) = drive(&[
+            r#"{"type":"response.incomplete","response":{"usage":{},"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        ]);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::Stop {
+                reason: StopReason::MaxTokens,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_request_round_trips_through_the_canonical_form() {
+        let wire = json!({
+            "model": "gpt-5",
+            "instructions": "You are helpful.",
+            "max_output_tokens": 2048,
+            "stream": true,
+            "input": [
+                { "type": "message", "role": "user",
+                  "content": [{ "type": "input_text", "text": "read a.rs" }] },
+                { "type": "function_call", "call_id": "call_1",
+                  "name": "read_file", "arguments": "{\"path\":\"a.rs\"}" },
+                { "type": "function_call_output", "call_id": "call_1",
+                  "output": "fn main() {}" }
+            ],
+            "tools": [{ "type": "function", "name": "read_file",
+                        "description": "reads", "parameters": { "type": "object" } }]
+        });
+
+        let c = parse_request(&wire).expect("parses");
+        assert_eq!(c.max_tokens, 2048, "max_output_tokens, not max_tokens");
+        assert_eq!(c.system.len(), 1, "instructions becomes the system prompt");
+        assert_eq!(c.tools.len(), 1, "tools are flat in this dialect");
+        assert!(c.stream);
+
+        let call = c
+            .messages
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                ContentBlock::ToolUse { input, .. } => Some(input.clone()),
+                _ => None,
+            });
+        assert_eq!(call.expect("tool call")["path"], "a.rs");
+        assert!(
+            c.messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|b| matches!(b, ContentBlock::ToolResult { .. }))
+        );
+
+        let back = render_request(&c, "gpt-5").expect("renders");
+        assert_eq!(back["instructions"], "You are helpful.");
+        assert_eq!(back["max_output_tokens"], 2048);
+        assert!(back.get("max_tokens").is_none());
+        assert_eq!(back["tools"][0]["name"], "read_file", "flat, not nested");
+    }
+
+    #[test]
+    fn content_parts_are_typed_by_direction() {
+        // input_text going up, output_text coming back. Getting this backwards
+        // is rejected by the API.
+        let c = CanonicalRequest {
+            model: "m".to_owned(),
+            system: vec![],
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "q".into(),
+                        cache_control: None,
+                    }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "a".into(),
+                        cache_control: None,
+                    }],
+                },
+            ],
+            tools: vec![],
+            max_tokens: 100,
+            stream: false,
+            temperature: None,
+            thinking_budget: None,
+            client_session: None,
+        };
+        let back = render_request(&c, "m").expect("renders");
+        assert_eq!(back["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(back["input"][1]["content"][0]["type"], "output_text");
+    }
+
+    #[test]
+    fn a_bare_string_input_is_accepted() {
+        let c = parse_request(&json!({ "model": "m", "input": "hello" })).expect("parses");
+        assert_eq!(c.messages.len(), 1);
+        assert!(matches!(
+            c.messages[0].content.first(),
+            Some(ContentBlock::Text { text, .. }) if text == "hello"
+        ));
+    }
+
+    // ── rendering ────────────────────────────────────────────────────────────
+
+    fn render_all(events: &[StreamEvent]) -> (Vec<String>, String) {
+        let mut st = RenderState::new("req1", "claude-opus-5");
+        let mut raw = String::new();
+        for e in events {
+            if let Some(f) = render_event(e, &mut st) {
+                raw.push_str(&f);
+            }
+        }
+        let mut names = Vec::new();
+        let mut text = String::new();
+        for frame in raw.split("\n\n").filter(|f| !f.trim().is_empty()) {
+            for line in frame.lines() {
+                if let Some(n) = line.strip_prefix("event: ") {
+                    names.push(n.to_owned());
+                }
+                if let Some(d) = line.strip_prefix("data: ") {
+                    let v: Value = serde_json::from_str(d).expect("valid json");
+                    if v["type"] == "response.output_text.delta" {
+                        text.push_str(v["delta"].as_str().unwrap_or_default());
+                    }
+                }
+            }
+        }
+        (names, text)
+    }
+
+    #[test]
+    fn rendering_emits_the_full_item_lifecycle_in_order() {
+        // A client here drops a delta for an item it was never told about, so
+        // added/done must bracket every item and part.
+        let (names, text) = render_all(&[
+            StreamEvent::Start {
+                model: "m".to_owned(),
+                usage: Usage {
+                    input_tokens: 900,
+                    ..Usage::default()
+                },
+            },
+            StreamEvent::TextDelta {
+                text: "Hello".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                usage: Usage {
+                    output_tokens: 30,
+                    ..Usage::default()
+                },
+            },
+        ]);
+        assert_eq!(
+            names,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn a_tool_call_closes_the_message_item_before_opening_its_own() {
+        let (names, _) = render_all(&[
+            StreamEvent::TextDelta {
+                text: "thinking".to_owned(),
+            },
+            StreamEvent::ToolUseStart {
+                id: "call_1".into(),
+                name: "f".into(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_1".into(),
+                partial_json: "{}".into(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_1".into(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ]);
+        let first_done = names.iter().position(|n| n == "response.output_item.done");
+        let second_added = names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| *n == "response.output_item.added")
+            .nth(1)
+            .map(|(i, _)| i);
+        assert!(
+            first_done < second_added,
+            "the message item must close before the tool item opens: {names:?}"
+        );
+    }
+
+    #[test]
+    fn rendering_round_trips_through_our_own_parser() {
+        let mut st = RenderState::new("r", "m");
+        let raw: String = [
+            StreamEvent::Start {
+                model: "m".to_owned(),
+                usage: Usage {
+                    input_tokens: 1200,
+                    cache_read_tokens: 18_000,
+                    ..Usage::default()
+                },
+            },
+            StreamEvent::TextDelta {
+                text: "Hi".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                usage: Usage {
+                    output_tokens: 142,
+                    ..Usage::default()
+                },
+            },
+        ]
+        .iter()
+        .filter_map(|e| render_event(e, &mut st))
+        .collect();
+
+        let mut acc = StreamAccumulator::new();
+        let mut text = String::new();
+        for frame in raw.split("\n\n").filter(|f| !f.trim().is_empty()) {
+            let payload = frame
+                .lines()
+                .find_map(|l| l.strip_prefix("data: "))
+                .expect("data line");
+            for e in parse_event(payload, &mut acc).expect("parses") {
+                acc.observe(&e);
+                if let StreamEvent::TextDelta { text: t } = &e {
+                    text.push_str(t);
+                }
+            }
+        }
+        assert_eq!(text, "Hi");
+        assert_eq!(acc.usage().input_tokens, 1_200);
+        assert_eq!(acc.usage().cache_read_tokens, 18_000);
+        assert_eq!(acc.usage().output_tokens, 142);
+    }
+
+    #[test]
+    fn a_duplicate_stop_does_not_terminate_twice() {
+        let mut st = RenderState::new("r", "m");
+        let stop = StreamEvent::Stop {
+            reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        };
+        assert!(render_event(&stop, &mut st).is_some());
+        assert!(render_event(&stop, &mut st).is_none());
+    }
+
+    #[test]
+    fn an_anthropic_response_renders_into_this_dialect() {
+        let anthropic = json!({
+            "model": "claude-opus-5",
+            "content": [{"type": "text", "text": "An answer."}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1200, "output_tokens": 42,
+                      "cache_read_input_tokens": 18000}
+        });
+        let out = render_response(&anthropic, "req1");
+        assert_eq!(out["object"], "response");
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["output"][0]["content"][0]["text"], "An answer.");
+        assert_eq!(out["usage"]["input_tokens"], 19_200);
+        assert_eq!(
+            out["usage"]["input_tokens_details"]["cached_tokens"],
+            18_000
+        );
+        assert_eq!(
+            out["usage"]["total_tokens"].as_u64(),
+            Some(19_200 + 42),
+            "total must equal input + output"
+        );
+    }
+
+    #[test]
+    fn truncation_renders_as_incomplete_with_a_reason() {
+        let anthropic = json!({
+            "model": "m",
+            "content": [{"type": "text", "text": "partial"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+        let out = render_response(&anthropic, "r");
+        assert_eq!(out["status"], "incomplete");
+        assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
+    }
+}
