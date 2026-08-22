@@ -6,6 +6,26 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Which spend cap stopped a request.
+///
+/// Both caps apply to every request. Naming the binding one is the difference
+/// between "raise this key's quota" and "raise this person's budget", which is
+/// the first question an operator asks when a request comes back 402.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetScope {
+    ApiKey,
+    Principal,
+}
+
+impl std::fmt::Display for BudgetScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ApiKey => "the quota on this API key",
+            Self::Principal => "the monthly budget for this principal",
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -36,8 +56,8 @@ pub enum Error {
     #[error("authentication failed")]
     Unauthenticated,
 
-    #[error("budget exhausted for this principal")]
-    BudgetExhausted,
+    #[error("{scope} exhausted")]
+    BudgetExhausted { scope: BudgetScope },
 
     #[error("upstream {provider} returned {status}")]
     Upstream {

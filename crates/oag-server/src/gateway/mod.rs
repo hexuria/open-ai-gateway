@@ -15,7 +15,7 @@ use oag_core::tier::RoutingMode;
 use oag_core::{AccountId, Disposition, Error, RequestId, Result, TierName};
 use oag_pool::SessionKey;
 use oag_proto::{anthropic, extract_cache_blocks};
-use oag_router::{BudgetState, RoutingDecision, RoutingPolicy, TierLadder};
+use oag_router::{BudgetState, Budgets, RoutingDecision, RoutingPolicy, TierLadder};
 use oag_upstream::Transport as _;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -366,10 +366,21 @@ async fn plan_request(
         RoutingMode::Passthrough
     };
 
-    let budget = BudgetState {
-        spent_usd: auth.principal_spent_usd,
-        limit_usd: auth.principal_budget_usd,
-        hard_stop_multiple: auth.principal_hard_stop_multiple,
+    let budget = Budgets {
+        // A per-key quota is a wall at the number written on it: it still
+        // degrades through the constrained band first, but it does not get the
+        // principal's overshoot grace. An operator who writes `quota_usd = 50`
+        // means fifty.
+        key: BudgetState {
+            spent_usd: auth.spent_usd,
+            limit_usd: auth.quota_usd,
+            hard_stop_multiple: rust_decimal::Decimal::ONE,
+        },
+        principal: BudgetState {
+            spent_usd: auth.principal_spent_usd,
+            limit_usd: auth.principal_budget_usd,
+            hard_stop_multiple: auth.principal_hard_stop_multiple,
+        },
     };
 
     // Logged at debug because "why did this route the way it did" is the
@@ -378,8 +389,11 @@ async fn plan_request(
     tracing::debug!(
         mode = ?mode,
         pressure = ?budget.pressure(),
-        spent = %budget.spent_usd,
-        limit = ?budget.limit_usd,
+        binding = %budget.binding(),
+        key_spent = %budget.key.spent_usd,
+        key_quota = ?budget.key.limit_usd,
+        spent = %budget.principal.spent_usd,
+        limit = ?budget.principal.limit_usd,
         floor = ?policy.floor_name(),
         "budget and mode"
     );
@@ -888,10 +902,10 @@ fn error_response(e: &Error) -> Response {
             "authentication_error",
             e.to_string(),
         ),
-        Error::BudgetExhausted => (
+        Error::BudgetExhausted { scope } => (
             StatusCode::PAYMENT_REQUIRED,
             "budget_exhausted",
-            "monthly budget exhausted for this principal".to_owned(),
+            format!("{scope} is exhausted"),
         ),
         Error::NoCredential { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1085,7 +1099,10 @@ mod tests {
         // The client needs to tell "you are out of money" from "your key is
         // wrong": one is fixed by waiting, the other never is.
         assert_eq!(
-            error_response(&Error::BudgetExhausted).status(),
+            error_response(&Error::BudgetExhausted {
+                scope: oag_core::BudgetScope::Principal,
+            })
+            .status(),
             StatusCode::PAYMENT_REQUIRED
         );
         assert_eq!(

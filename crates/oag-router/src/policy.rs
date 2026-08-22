@@ -4,12 +4,14 @@
 use crate::catalog::{Catalog, ModelSpec, Requirements};
 use crate::classify::{Classifier, RequestSignal};
 use crate::ladder::TierLadder;
-use oag_core::{Error, Result, Tier, TierName, tier::RoutingMode};
+use oag_core::{BudgetScope, Error, Result, Tier, TierName, tier::RoutingMode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 /// How close a principal is to their cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Variant order is load-bearing: it ascends from most to least headroom, so
+/// `max()` over several caps yields the tightest one. Do not reorder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum BudgetPressure {
     /// Plenty of headroom. Route on merit.
     Normal,
@@ -62,6 +64,47 @@ impl BudgetState {
             return BudgetPressure::Constrained;
         }
         BudgetPressure::Normal
+    }
+}
+
+/// Every spend cap that applies to one request.
+///
+/// Spend is capped per-key *and* per-principal, and the two are independent:
+/// a generous principal budget must never buy past a small per-key quota, and
+/// a fresh key must never buy past a principal who has spent their month. The
+/// tighter cap governs, which is what `pressure` computes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Budgets {
+    pub key: BudgetState,
+    pub principal: BudgetState,
+}
+
+impl Budgets {
+    /// Only a principal-level cap applies; the key is uncapped.
+    #[must_use]
+    pub fn principal_only(principal: BudgetState) -> Self {
+        Self {
+            key: BudgetState::unlimited(Decimal::ZERO),
+            principal,
+        }
+    }
+
+    /// The tighter of the two caps.
+    #[must_use]
+    pub fn pressure(&self) -> BudgetPressure {
+        self.key.pressure().max(self.principal.pressure())
+    }
+
+    /// Which cap is binding. Ties go to the key: it is the narrower object and
+    /// the one an operator can raise without widening spend for everything
+    /// else the principal owns.
+    #[must_use]
+    pub fn binding(&self) -> BudgetScope {
+        if self.key.pressure() >= self.principal.pressure() {
+            BudgetScope::ApiKey
+        } else {
+            BudgetScope::Principal
+        }
     }
 }
 
@@ -200,7 +243,7 @@ impl RoutingPolicy {
         mode: &RoutingMode,
         requested_model: Option<&str>,
         signal: &RequestSignal,
-        budget: &BudgetState,
+        budget: &Budgets,
         catalog: &Catalog,
         max_output_tokens: u32,
     ) -> Result<RoutingDecision> {
@@ -211,7 +254,9 @@ impl RoutingPolicy {
             .cloned();
 
         if budget.pressure() == BudgetPressure::Exhausted {
-            return Err(Error::BudgetExhausted);
+            return Err(Error::BudgetExhausted {
+                scope: budget.binding(),
+            });
         }
 
         if *mode == RoutingMode::Passthrough
@@ -417,8 +462,8 @@ mod tests {
         RoutingPolicy::new(ladder, Box::new(HeuristicClassifier::default()))
     }
 
-    fn rich() -> BudgetState {
-        BudgetState::unlimited(dec!(0))
+    fn rich() -> Budgets {
+        Budgets::principal_only(BudgetState::unlimited(dec!(0)))
     }
 
     #[test]
@@ -503,7 +548,7 @@ mod tests {
                     prompt_tokens: 150_000,
                     ..RequestSignal::default()
                 },
-                &constrained,
+                &Budgets::principal_only(constrained.clone()),
                 &catalog(),
                 1024,
             )
@@ -529,11 +574,11 @@ mod tests {
             &RoutingMode::Managed,
             None,
             &RequestSignal::default(),
-            &blown,
+            &Budgets::principal_only(blown.clone()),
             &catalog(),
             1024,
         );
-        assert!(matches!(err, Err(Error::BudgetExhausted)));
+        assert!(matches!(err, Err(Error::BudgetExhausted { .. })));
     }
 
     #[test]
@@ -566,7 +611,7 @@ mod tests {
                     prompt_tokens: 10,
                     ..RequestSignal::default()
                 },
-                &constrained,
+                &Budgets::principal_only(constrained.clone()),
                 &catalog(),
                 1024,
             )
@@ -688,5 +733,102 @@ mod tests {
             BudgetState::unlimited(dec!(1_000_000)).pressure(),
             BudgetPressure::Normal
         );
+    }
+
+    #[test]
+    fn a_key_quota_binds_even_when_the_principal_has_room() {
+        // The regression this guards: `quota_usd` was read from the database,
+        // carried through auth, and then never consulted, so a per-key cap was
+        // decorative and spend was governed only per-principal.
+        let budgets = Budgets {
+            key: BudgetState {
+                spent_usd: dec!(45),
+                limit_usd: Some(dec!(50)),
+                hard_stop_multiple: Decimal::ONE,
+            },
+            principal: BudgetState::unlimited(dec!(45)),
+        };
+        assert_eq!(budgets.pressure(), BudgetPressure::Constrained);
+        assert_eq!(budgets.binding(), BudgetScope::ApiKey);
+
+        let d = policy()
+            .decide(
+                &RoutingMode::Managed,
+                None,
+                &RequestSignal {
+                    prompt_tokens: 150_000,
+                    ..RequestSignal::default()
+                },
+                &budgets,
+                &catalog(),
+                1024,
+            )
+            .expect("a constrained key still gets served, just cheaply");
+        assert_eq!(d.reason, SelectionReason::BudgetDowngraded);
+    }
+
+    #[test]
+    fn an_exhausted_key_quota_names_the_key_not_the_principal() {
+        let budgets = Budgets {
+            key: BudgetState {
+                spent_usd: dec!(50),
+                limit_usd: Some(dec!(50)),
+                hard_stop_multiple: Decimal::ONE,
+            },
+            principal: BudgetState::unlimited(dec!(50)),
+        };
+        let err = policy().decide(
+            &RoutingMode::Managed,
+            None,
+            &RequestSignal::default(),
+            &budgets,
+            &catalog(),
+            1024,
+        );
+        assert!(matches!(
+            err,
+            Err(Error::BudgetExhausted {
+                scope: BudgetScope::ApiKey
+            })
+        ));
+    }
+
+    #[test]
+    fn an_exhausted_principal_is_not_rescued_by_a_fresh_key() {
+        let budgets = Budgets {
+            key: BudgetState {
+                spent_usd: dec!(5),
+                limit_usd: Some(dec!(1000)),
+                hard_stop_multiple: Decimal::ONE,
+            },
+            principal: BudgetState {
+                spent_usd: dec!(121),
+                limit_usd: Some(dec!(100)),
+                hard_stop_multiple: dec!(1.2),
+            },
+        };
+        assert_eq!(budgets.binding(), BudgetScope::Principal);
+        let err = policy().decide(
+            &RoutingMode::Managed,
+            None,
+            &RequestSignal::default(),
+            &budgets,
+            &catalog(),
+            1024,
+        );
+        assert!(matches!(
+            err,
+            Err(Error::BudgetExhausted {
+                scope: BudgetScope::Principal
+            })
+        ));
+    }
+
+    #[test]
+    fn pressure_ascends_so_the_tighter_cap_always_wins() {
+        // `Budgets::pressure` is a `max()`, which is only correct while the
+        // variants stay ordered from most headroom to least.
+        assert!(BudgetPressure::Normal < BudgetPressure::Constrained);
+        assert!(BudgetPressure::Constrained < BudgetPressure::Exhausted);
     }
 }
