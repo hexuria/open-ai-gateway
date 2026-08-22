@@ -44,6 +44,13 @@ gateway:
     kimi: "https://your-proxy.internal/v1"
 ```
 
+## Not implemented
+
+`Dialect::OpenAIResponses` (`POST /v1/responses`) is declared and has no codec.
+Nothing maps to it, so it is unreachable — and `egress_for` errors on any
+dialect it cannot render, so wiring a provider to it before writing the codec
+fails at the first request instead of emitting bytes in the wrong shape.
+
 ## Which dialect reaches which upstream
 
 Any inbound dialect can reach any upstream one; translation goes through the
