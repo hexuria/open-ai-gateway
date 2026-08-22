@@ -12,7 +12,7 @@
 //! Credentials are either long-lived IAM keys or temporary STS ones; the
 //! session token, when present, is signed rather than merely attached.
 
-use crate::adapter::{ProviderAdapter, UpstreamRequest};
+use crate::adapter::{Framing, ProviderAdapter, UpstreamRequest};
 use crate::sigv4::{self, Credentials};
 use async_trait::async_trait;
 use oag_core::{Provider, Result};
@@ -25,6 +25,12 @@ const BEDROCK_ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
 #[derive(Debug, Clone)]
 pub struct BedrockAdapter {
     region: String,
+    /// Overrides the derived AWS endpoint — a VPC endpoint, a proxy, or a mock.
+    ///
+    /// The signed `host` follows it, because SigV4 signs the host header and a
+    /// signature over the wrong host is rejected with an error that names
+    /// neither.
+    endpoint: Option<String>,
 }
 
 impl Default for BedrockAdapter {
@@ -38,11 +44,32 @@ impl BedrockAdapter {
     pub fn new(region: impl Into<String>) -> Self {
         Self {
             region: region.into(),
+            endpoint: None,
         }
     }
 
+    /// Point at a specific endpoint instead of the regional AWS one.
+    #[must_use]
+    pub fn with_endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.endpoint = endpoint.filter(|e| !e.is_empty());
+        self
+    }
+
+    /// The scheme and authority requests go to.
+    fn origin(&self) -> String {
+        self.endpoint
+            .clone()
+            .unwrap_or_else(|| format!("https://bedrock-runtime.{}.amazonaws.com", self.region))
+    }
+
+    /// The value of the `host` header, which is also what gets signed.
     fn host(&self) -> String {
-        format!("bedrock-runtime.{}.amazonaws.com", self.region)
+        self.origin()
+            .split("://")
+            .nth(1)
+            .unwrap_or_default()
+            .trim_end_matches('/')
+            .to_owned()
     }
 
     /// Split the stored credential into its SigV4 parts.
@@ -81,6 +108,10 @@ impl ProviderAdapter for BedrockAdapter {
         Provider::Bedrock
     }
 
+    fn framing(&self) -> Framing {
+        Framing::AwsEventStream
+    }
+
     fn build(&self, req: &UpstreamRequest<'_>) -> Result<reqwest::Request> {
         let creds = Self::credentials(&req.credential.access_token)?;
 
@@ -105,6 +136,7 @@ impl ProviderAdapter for BedrockAdapter {
         // path (`anthropic.claude-sonnet-4-v1:0`), including the colon.
         let path = format!("/model/{}/{action}", req.model.upstream_name);
         let host = self.host();
+        let origin = self.origin();
 
         let signed = sigv4::sign(
             &creds,
@@ -120,7 +152,7 @@ impl ProviderAdapter for BedrockAdapter {
         );
 
         let mut builder = reqwest::Client::new()
-            .post(format!("https://{host}{path}"))
+            .post(format!("{origin}{path}"))
             .header("content-type", "application/json")
             .header("host", &host)
             .header("x-amz-date", &signed.amz_date)
@@ -138,11 +170,8 @@ impl ProviderAdapter for BedrockAdapter {
     }
 
     fn parse_event(&self, raw: &str, acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
-        // The events inside the stream are Anthropic's own.
-        //
-        // Bedrock wraps them in its event-stream framing, which the transport
-        // would have to decode first — noted rather than pretended away; with
-        // plain SSE framing this is already correct.
+        // By this point the transport has already stripped Bedrock's binary
+        // envelope (see `framing`), so `raw` is Anthropic's own event JSON.
         anthropic::parse_event(raw, acc)
     }
 }
@@ -301,6 +330,58 @@ mod tests {
             })
             .expect("builds");
         assert_eq!(req.headers()["x-amz-security-token"], "SESSIONTOKEN");
+    }
+
+    #[test]
+    fn an_endpoint_override_moves_the_signed_host_with_it() {
+        // SigV4 signs the host header; signing the AWS hostname while sending
+        // to another one is rejected with an error that names neither.
+        let a = BedrockAdapter::new("us-east-1")
+            .with_endpoint(Some("http://127.0.0.1:9012".to_owned()));
+        let c = request(false);
+        let m = model();
+        let cr = cred("AKIDEXAMPLE:secret");
+        let req = a
+            .build(&UpstreamRequest {
+                canonical: &c,
+                model: &m,
+                credential: &cr,
+            })
+            .expect("builds");
+
+        assert!(
+            req.url()
+                .as_str()
+                .starts_with("http://127.0.0.1:9012/model/"),
+            "{}",
+            req.url()
+        );
+        assert_eq!(req.headers()["host"], "127.0.0.1:9012");
+        let auth = req.headers()["authorization"].to_str().expect("header");
+        assert!(
+            auth.contains("SignedHeaders=host;"),
+            "host must still be signed"
+        );
+    }
+
+    #[test]
+    fn without_an_override_it_derives_the_regional_endpoint() {
+        let a = BedrockAdapter::new("ap-southeast-2");
+        assert_eq!(a.host(), "bedrock-runtime.ap-southeast-2.amazonaws.com");
+        assert!(a.origin().starts_with("https://"));
+    }
+
+    #[test]
+    fn an_empty_override_is_treated_as_no_override() {
+        let a = BedrockAdapter::new("us-east-1").with_endpoint(Some(String::new()));
+        assert_eq!(a.host(), "bedrock-runtime.us-east-1.amazonaws.com");
+    }
+
+    #[test]
+    fn it_declares_binary_framing() {
+        // The default is SSE; getting this wrong yields an empty stream and
+        // zero usage rather than an error.
+        assert_eq!(BedrockAdapter::default().framing(), Framing::AwsEventStream);
     }
 
     #[test]

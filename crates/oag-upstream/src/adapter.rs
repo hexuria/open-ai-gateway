@@ -20,9 +20,32 @@ pub struct UpstreamRequest<'a> {
     pub credential: &'a SecretMaterial,
 }
 
+/// How an upstream delimits the events in a streamed response.
+///
+/// Not every provider streams server-sent events. Assuming they do is how a
+/// Bedrock stream produces zero frames: its framing is binary, a reader
+/// splitting on blank lines finds nothing, and the failure is silent — an empty
+/// response and zero recorded usage rather than an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Framing {
+    /// `data:` lines separated by a blank line. Everything except Bedrock.
+    Sse,
+    /// AWS `vnd.amazon.eventstream`: length-prefixed binary messages whose
+    /// payload carries the provider's own event, base64-encoded.
+    AwsEventStream,
+}
+
 #[async_trait]
 pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
     fn provider(&self) -> Provider;
+
+    /// How this provider delimits streamed events.
+    ///
+    /// Defaults to SSE because all but one do; the one that does not overrides
+    /// it, and the compiler is no help there — hence the loud note above.
+    fn framing(&self) -> Framing {
+        Framing::Sse
+    }
 
     /// Build the HTTP request. Sets the URL, auth header, and body.
     fn build(&self, req: &UpstreamRequest<'_>) -> Result<reqwest::Request>;

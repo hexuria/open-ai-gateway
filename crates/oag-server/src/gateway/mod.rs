@@ -431,9 +431,15 @@ fn egress_for(
     ingress: Dialect,
     decision: &RoutingDecision,
     request_id: RequestId,
+    framing: oag_upstream::Framing,
 ) -> Result<sse::Egress> {
     let upstream = decision.model.provider.native_dialect();
-    if ingress == upstream {
+
+    // Matching dialects are not sufficient: passthrough forwards the upstream's
+    // *bytes*, so it also requires that those bytes are already SSE. Bedrock's
+    // dialect is Anthropic and its framing is binary — passing that through
+    // would hand a client expecting `data:` lines a length-prefixed envelope.
+    if ingress == upstream && framing == oag_upstream::Framing::Sse {
         return Ok(sse::Egress::Passthrough);
     }
     let model = decision.model.id.as_str().to_owned();
@@ -446,8 +452,9 @@ fn egress_for(
         // a client expecting a different one — bytes that parse as nothing and
         // fail somewhere far from the cause. An error names the problem.
         // `Dialect` is non-exhaustive, so this arm also catches anything added
-        // later — which is the safe direction: a new dialect fails loudly here
-        // until someone writes its renderer.
+        // later — the safe direction: a new dialect fails loudly here until
+        // someone writes its renderer, rather than silently passing bytes
+        // through in the wrong shape.
         _ => {
             return Err(Error::Internal(format!(
                 "no renderer from {upstream:?} to {ingress:?}; \
@@ -465,6 +472,9 @@ fn json_response(
 ) -> Response {
     let upstream_dialect = decision.model.provider.native_dialect();
 
+    // Framing does not come into it here: a non-streamed response is a single
+    // JSON body whatever the provider streams, so dialect alone decides.
+    //
     // Verbatim when the dialects agree — the upstream's own bytes are the most
     // faithful answer we can give, and re-serialising can only differ from it.
     let out = if ingress == upstream_dialect {
@@ -726,7 +736,7 @@ fn stream_response(
     let max = state.config.gateway.max_stream_duration;
     let account = lease.account.account_id();
 
-    let egress = match egress_for(ingress, decision, request_id) {
+    let egress = match egress_for(ingress, decision, request_id, adapter.framing()) {
         Ok(e) => e,
         Err(e) => return error_response(&e),
     };
@@ -941,6 +951,78 @@ mod tests {
     #[test]
     fn short_bodies_are_not_truncated() {
         assert_eq!(truncate("brief", 512), "brief");
+    }
+
+    fn decision_for(provider: oag_core::Provider) -> RoutingDecision {
+        use oag_router::{Capabilities, ModelId, ModelSpec, Pricing};
+        RoutingDecision {
+            model: ModelSpec {
+                id: ModelId::new("p/m"),
+                provider,
+                upstream_name: "m".to_owned(),
+                pricing: Pricing {
+                    input_per_mtok: rust_decimal::Decimal::ONE,
+                    output_per_mtok: rust_decimal::Decimal::ONE,
+                    cache_read_per_mtok: None,
+                    cache_write_per_mtok: None,
+                },
+                context_window: 1000,
+                max_output_tokens: 100,
+                capabilities: Capabilities::default(),
+            },
+            tier: oag_core::Tier::new("cheap", 0),
+            reason: oag_router::SelectionReason::Classified,
+            capability_escalated_from: None,
+            ceiling_model: None,
+        }
+    }
+
+    #[test]
+    fn a_client_reaches_a_same_dialect_upstream_without_re_serialising() {
+        // The bug this pins: OpenAI declared its dialect as Responses while the
+        // adapter serving it spoke Chat Completions, so this case never took
+        // the passthrough path and round-tripped every frame for nothing.
+        let d = decision_for(oag_core::Provider::OpenAI);
+        let e = egress_for(
+            Dialect::OpenAIChatCompletions,
+            &d,
+            RequestId::new(),
+            oag_upstream::Framing::Sse,
+        )
+        .expect("supported");
+        assert!(matches!(e, sse::Egress::Passthrough));
+    }
+
+    #[test]
+    fn a_binary_framed_upstream_is_never_passed_through() {
+        // Bedrock's dialect *is* Anthropic, so dialect alone would say
+        // passthrough — and hand a client expecting `data:` lines a
+        // length-prefixed binary envelope.
+        let d = decision_for(oag_core::Provider::Bedrock);
+        let e = egress_for(
+            Dialect::AnthropicMessages,
+            &d,
+            RequestId::new(),
+            oag_upstream::Framing::AwsEventStream,
+        )
+        .expect("supported");
+        assert!(
+            matches!(e, sse::Egress::AnthropicMessages { .. }),
+            "must be rendered, not forwarded"
+        );
+    }
+
+    #[test]
+    fn a_cross_dialect_pair_selects_the_client_s_renderer() {
+        let d = decision_for(oag_core::Provider::Anthropic);
+        let e = egress_for(
+            Dialect::OpenAIChatCompletions,
+            &d,
+            RequestId::new(),
+            oag_upstream::Framing::Sse,
+        )
+        .expect("supported");
+        assert!(matches!(e, sse::Egress::ChatCompletions { .. }));
     }
 
     #[test]

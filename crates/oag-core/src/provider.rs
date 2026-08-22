@@ -33,8 +33,15 @@ impl Provider {
     pub const fn native_dialect(self) -> Dialect {
         match self {
             Self::Anthropic | Self::Bedrock => Dialect::AnthropicMessages,
-            Self::OpenAI => Dialect::OpenAIResponses,
-            Self::Kimi | Self::DeepSeek | Self::Zhipu | Self::XAI => Dialect::OpenAIChatCompletions,
+            // Chat Completions, not Responses. OpenAI serves both, but the
+            // adapter registered for it speaks Chat Completions — and if this
+            // said otherwise, an OpenAI client hitting an OpenAI upstream would
+            // never take the passthrough path and would round-trip every frame
+            // through the canonical form for no reason. Declaring Responses
+            // here is a promise only a Responses codec can keep.
+            Self::OpenAI | Self::Kimi | Self::DeepSeek | Self::Zhipu | Self::XAI => {
+                Dialect::OpenAIChatCompletions
+            }
             Self::Gemini | Self::Vertex => Dialect::GeminiGenerateContent,
         }
     }

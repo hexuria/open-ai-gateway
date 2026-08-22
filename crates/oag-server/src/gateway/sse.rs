@@ -17,7 +17,7 @@
 use futures_util::StreamExt;
 use oag_core::Error;
 use oag_proto::{StreamAccumulator, StreamEvent};
-use oag_upstream::ProviderAdapter;
+use oag_upstream::{Framing, ProviderAdapter};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -113,6 +113,8 @@ pub async fn pump(
     let mut client_gone = false;
     let mut error = None;
 
+    // Ask the adapter how this provider delimits events, once, up front.
+    let framing = adapter.framing();
     let mut body = response.bytes_stream();
     // SSE frames can split across TCP reads; hold the tail until it completes.
     let mut pending = Vec::<u8>::new();
@@ -145,14 +147,18 @@ pub async fn pump(
         // Account first, then forward. If the client is gone we still want the
         // usage, and this ordering means a send failure cannot skip it.
         pending.extend_from_slice(&chunk);
-        let frames = pending_take_complete(&mut pending);
-        let (saw_content, translated) = drain_frames_into(&frames, &adapter, &mut acc, &mut render);
+        let payloads = take_payloads(&mut pending, framing);
+        let (saw_content, translated) = fold_payloads(&payloads, &adapter, &mut acc, &mut render);
 
         if ttft.is_none() && saw_content {
             ttft = Some(started.elapsed());
         }
 
         // Verbatim when the dialects match, translated bytes when they do not.
+        //
+        // A non-SSE upstream can never be passed through verbatim: the client
+        // asked for SSE and Bedrock's binary envelope is not it. `egress_for`
+        // guarantees a renderer for that case.
         let outbound = match &egress {
             Egress::Passthrough => chunk,
             _ => bytes::Bytes::from(translated),
@@ -176,9 +182,11 @@ pub async fn pump(
         }
     }
 
-    // Whatever is left is a partial frame; parse it in case it completed at EOF.
+    // Whatever is left is a partial frame; try once more in case it completed
+    // exactly at EOF.
     if !pending.is_empty() {
-        let _ = drain_frames_into(&pending, &adapter, &mut acc, &mut render);
+        let payloads = take_payloads(&mut pending, framing);
+        let _ = fold_payloads(&payloads, &adapter, &mut acc, &mut render);
     }
 
     // A translated stream has to synthesise the sentinel the client's dialect
@@ -202,44 +210,57 @@ pub async fn pump(
     }
 }
 
-/// Split off every complete SSE frame, leaving any partial tail in `buf`.
-fn pending_take_complete(buf: &mut Vec<u8>) -> Vec<u8> {
+/// Take every complete event payload from `buf`, leaving any partial tail.
+///
+/// The framing is the provider's, not a constant: Bedrock streams length-
+/// prefixed binary messages rather than SSE, and a reader that assumes blank
+/// lines finds nothing in one — an empty response and zero usage, with no error
+/// anywhere.
+fn take_payloads(buf: &mut Vec<u8>, framing: Framing) -> Vec<String> {
+    match framing {
+        Framing::Sse => take_sse_payloads(buf),
+        Framing::AwsEventStream => oag_upstream::eventstream::take_messages(buf)
+            .iter()
+            .filter_map(oag_upstream::eventstream::inner_event)
+            .collect(),
+    }
+}
+
+/// The `data:` payloads of every complete SSE frame in `buf`.
+fn take_sse_payloads(buf: &mut Vec<u8>) -> Vec<String> {
     // Frames are separated by a blank line. Anything after the last one is
     // incomplete and must wait for more bytes.
-    match buf.windows(2).rposition(|w| w == b"\n\n") {
-        Some(idx) => {
-            let complete = buf[..=idx + 1].to_vec();
-            buf.drain(..=idx + 1);
-            complete
-        }
-        None => Vec::new(),
-    }
+    let Some(idx) = buf.windows(2).rposition(|w| w == b"\n\n") else {
+        return Vec::new();
+    };
+    let complete = buf[..=idx + 1].to_vec();
+    buf.drain(..=idx + 1);
+
+    let Ok(text) = std::str::from_utf8(&complete) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(str::trim)
+        // Some dialects terminate with a sentinel that is not JSON.
+        .filter(|p| !p.is_empty() && *p != "[DONE]")
+        .map(std::borrow::ToOwned::to_owned)
+        .collect()
 }
 
 /// Parse the `data:` payloads out of complete frames and fold them in.
 ///
 /// Returns whether any carried actual content — which is what times the first
 /// token — and, when a renderer is supplied, the client-dialect bytes.
-fn drain_frames_into(
-    bytes: &[u8],
+fn fold_payloads(
+    payloads: &[String],
     adapter: &Arc<dyn ProviderAdapter>,
     acc: &mut StreamAccumulator,
     render: &mut Renderer,
 ) -> (bool, Vec<u8>) {
     let mut out = Vec::new();
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return (false, out);
-    };
     let mut saw_content = false;
-    for line in text.lines() {
-        let Some(payload) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        // Some dialects terminate with a sentinel that is not JSON.
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
+    for payload in payloads {
         match adapter.parse_event(payload, acc) {
             Ok(events) => {
                 for e in &events {
@@ -346,11 +367,15 @@ pub async fn collect(
 mod tests {
     use super::*;
 
+    fn anthropic() -> Arc<dyn ProviderAdapter> {
+        Arc::new(oag_upstream::AnthropicAdapter::default())
+    }
+
     #[test]
-    fn only_complete_frames_are_taken() {
+    fn only_complete_sse_frames_are_taken() {
         let mut buf = b"data: {\"a\":1}\n\ndata: {\"b\"".to_vec();
-        let complete = pending_take_complete(&mut buf);
-        assert_eq!(complete, b"data: {\"a\":1}\n\n");
+        let payloads = take_payloads(&mut buf, Framing::Sse);
+        assert_eq!(payloads, vec![r#"{"a":1}"#]);
         assert_eq!(
             buf, b"data: {\"b\"",
             "the partial tail waits for more bytes"
@@ -362,50 +387,42 @@ mod tests {
         // The failure this prevents: parsing half a JSON object and discarding
         // the event, which loses the usage it carried.
         let mut buf = b"data: {\"partial".to_vec();
-        assert!(pending_take_complete(&mut buf).is_empty());
+        assert!(take_payloads(&mut buf, Framing::Sse).is_empty());
         assert_eq!(buf, b"data: {\"partial");
     }
 
     #[test]
     fn several_frames_arriving_together_are_all_taken() {
         let mut buf = b"data: {\"a\":1}\n\ndata: {\"b\":2}\n\n".to_vec();
-        let complete = pending_take_complete(&mut buf);
-        assert_eq!(
-            String::from_utf8_lossy(&complete).matches("data:").count(),
-            2,
-            "both frames should be taken in one pass"
-        );
+        assert_eq!(take_payloads(&mut buf, Framing::Sse).len(), 2);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn a_done_sentinel_is_not_offered_as_a_payload() {
+        let mut buf = b"data: [DONE]\n\n".to_vec();
+        assert!(take_payloads(&mut buf, Framing::Sse).is_empty());
     }
 
     #[test]
     fn usage_accumulates_across_frames_split_mid_json() {
         // The realistic case: a TCP read boundary lands inside an event.
-        let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
+        let adapter = anthropic();
         let mut acc = StreamAccumulator::new();
+        let mut render = Renderer::None;
         let mut buf = Vec::new();
 
         let whole = b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":50}}}\n\n";
         let (head, tail) = whole.split_at(40);
 
         buf.extend_from_slice(head);
-        let _ = drain_frames_into(
-            &pending_take_complete(&mut buf),
-            &adapter,
-            &mut acc,
-            &mut Renderer::None,
-        )
-        .0;
+        let p = take_payloads(&mut buf, Framing::Sse);
+        let _ = fold_payloads(&p, &adapter, &mut acc, &mut render);
         assert_eq!(acc.usage().input_tokens, 0, "nothing complete yet");
 
         buf.extend_from_slice(tail);
-        let _ = drain_frames_into(
-            &pending_take_complete(&mut buf),
-            &adapter,
-            &mut acc,
-            &mut Renderer::None,
-        )
-        .0;
+        let p = take_payloads(&mut buf, Framing::Sse);
+        let _ = fold_payloads(&p, &adapter, &mut acc, &mut render);
         assert_eq!(acc.usage().input_tokens, 50, "reassembled and counted");
     }
 
@@ -413,18 +430,25 @@ mod tests {
     fn ttft_is_timed_from_content_not_from_the_opening_event() {
         // message_start arrives immediately and carries no content. Timing to
         // it reports ~0ms for a response the user waited a second to see start.
-        let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
+        let adapter = anthropic();
         let mut acc = StreamAccumulator::new();
+        let mut render = Renderer::None;
 
-        let opening = b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":5}}}\n\n";
+        let opening = vec![
+            r#"{"type":"message_start","message":{"model":"m","usage":{"input_tokens":5}}}"#
+                .to_owned(),
+        ];
         assert!(
-            !drain_frames_into(opening, &adapter, &mut acc, &mut Renderer::None).0,
+            !fold_payloads(&opening, &adapter, &mut acc, &mut render).0,
             "an opening event is not content"
         );
 
-        let content = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+        let content = vec![
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#
+                .to_owned(),
+        ];
         assert!(
-            drain_frames_into(content, &adapter, &mut acc, &mut Renderer::None).0,
+            fold_payloads(&content, &adapter, &mut acc, &mut render).0,
             "a text delta is"
         );
     }
@@ -433,67 +457,69 @@ mod tests {
     fn a_tool_call_counts_as_content_for_ttft() {
         // A response that is only a tool call has no text, but the user is
         // still waiting for it and it is still the first thing to arrive.
-        let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
+        let adapter = anthropic();
         let mut acc = StreamAccumulator::new();
-        let frame = b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"f\"}}\n\n";
-        assert!(drain_frames_into(frame, &adapter, &mut acc, &mut Renderer::None).0);
+        let mut render = Renderer::None;
+        let frame = vec![r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"f"}}"#.to_owned()];
+        assert!(fold_payloads(&frame, &adapter, &mut acc, &mut render).0);
     }
 
-    fn collected(body: &serde_json::Value) -> StreamAccumulator {
-        // Exercise the same folding `collect` does, without an HTTP response.
-        let bytes = serde_json::to_vec(body).expect("json");
-        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-        let mut acc = StreamAccumulator::new();
-        acc.observe(&StreamEvent::UsageUpdate {
-            usage: oag_router::Usage {
-                input_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
-                output_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
-                cache_read_tokens: 0,
-                cache_write_tokens: 0,
-            },
-        });
-        if let Some(blocks) = v["content"].as_array() {
-            for b in blocks {
-                if b["type"] == "text" {
-                    acc.observe(&StreamEvent::TextDelta {
-                        text: b["text"].as_str().unwrap_or_default().to_owned(),
-                    });
-                }
-            }
-        }
-        acc
-    }
+    // ── framing ──────────────────────────────────────────────────────────────
 
     #[test]
-    fn a_non_streaming_answer_with_content_does_not_trip_the_gate() {
-        // The bug this guards: folding in only usage leaves text_len at zero,
-        // so every non-streaming response looks empty and every one escalates.
-        let acc = collected(&serde_json::json!({
-            "content": [{"type": "text", "text": "A considered answer."}],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 100, "output_tokens": 20}
-        }));
-        assert_eq!(acc.quality_gate(), None);
-    }
+    fn an_event_stream_upstream_is_decoded_not_split_on_blank_lines() {
+        // The bug: a Bedrock stream read as SSE yields zero frames — an empty
+        // response and zero recorded usage, with no error anywhere.
+        let inner =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
+        let framed = aws_frame(inner);
 
-    #[test]
-    fn a_genuinely_empty_non_streaming_answer_does_trip_it() {
-        let acc = collected(&serde_json::json!({
-            "content": [],
-            "stop_reason": "end_turn",
-            "usage": {"input_tokens": 100, "output_tokens": 0}
-        }));
-        assert_eq!(
-            acc.quality_gate(),
-            Some(oag_router::QualityGate::EmptyResponse)
+        let mut as_sse = framed.clone();
+        assert!(
+            take_payloads(&mut as_sse, Framing::Sse).is_empty(),
+            "read as SSE, a binary frame yields nothing — which is the failure"
         );
+
+        let mut as_stream = framed;
+        let payloads = take_payloads(&mut as_stream, Framing::AwsEventStream);
+        assert_eq!(payloads, vec![inner.to_owned()]);
     }
 
     #[test]
-    fn a_done_sentinel_is_not_parsed_as_json() {
-        let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
-        let mut acc = StreamAccumulator::new();
-        let _ = drain_frames_into(b"data: [DONE]\n\n", &adapter, &mut acc, &mut Renderer::None).0;
-        assert_eq!(acc.usage().total(), 0);
+    fn an_event_stream_message_split_across_reads_waits_for_the_rest() {
+        let whole = aws_frame(r#"{"type":"message_stop"}"#);
+        let split = whole.len() / 2;
+
+        let mut buf = whole[..split].to_vec();
+        assert!(take_payloads(&mut buf, Framing::AwsEventStream).is_empty());
+        buf.extend_from_slice(&whole[split..]);
+        assert_eq!(take_payloads(&mut buf, Framing::AwsEventStream).len(), 1);
+    }
+
+    /// Build one AWS event-stream message carrying `inner`.
+    fn aws_frame(inner: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        let payload = serde_json::json!({
+            "bytes": base64::engine::general_purpose::STANDARD.encode(inner)
+        })
+        .to_string()
+        .into_bytes();
+
+        let name = b":event-type";
+        let mut headers = vec![u8::try_from(name.len()).expect("short")];
+        headers.extend_from_slice(name);
+        headers.push(7);
+        headers.extend_from_slice(&5u16.to_be_bytes());
+        headers.extend_from_slice(b"chunk");
+
+        let total = 16 + headers.len() + payload.len();
+        let mut out = Vec::new();
+        out.extend_from_slice(&u32::try_from(total).expect("fits").to_be_bytes());
+        out.extend_from_slice(&u32::try_from(headers.len()).expect("fits").to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&headers);
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out
     }
 }

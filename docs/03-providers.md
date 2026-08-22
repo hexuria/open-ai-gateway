@@ -63,6 +63,26 @@ must be explicitly opened and closed, so the renderer tracks the open block and
 closes it before opening another. A client that receives a delta for a block it
 was never told about drops it silently.
 
+## Framing
+
+Not every provider streams server-sent events. `ProviderAdapter::framing()`
+says which one it speaks, and the default is SSE because all but one do:
+
+| Framing | Providers |
+|---|---|
+| `Sse` | Anthropic, OpenAI, Gemini, Kimi, DeepSeek, Zhipu, xAI |
+| `AwsEventStream` | Bedrock |
+
+Bedrock streams length-prefixed binary messages whose payload carries the
+provider's own event, base64-encoded. A reader that splits on blank lines finds
+nothing in one — and the failure is silent: an empty response and zero recorded
+usage, with no error anywhere. `eventstream.rs` decodes it.
+
+This also means **a binary-framed upstream can never be passed through**, even
+when the dialects match. Bedrock's dialect *is* Anthropic, so dialect alone
+would say passthrough and hand an SSE client a binary envelope; `egress_for`
+requires SSE framing as well.
+
 ## Transport
 
 `Transport` is a trait with exactly one implementation: `reqwest` over rustls.

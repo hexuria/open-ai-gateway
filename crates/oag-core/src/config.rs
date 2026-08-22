@@ -69,6 +69,10 @@ const fn default_db_pool() -> u32 {
     16
 }
 
+fn default_bedrock_region() -> String {
+    "us-east-1".to_owned()
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedisConfig {
@@ -156,6 +160,10 @@ pub struct GatewayConfig {
     /// takes effect — and the replicas give no sign that they are stale.
     #[serde(with = "humantime_secs")]
     pub catalog_refresh_interval: Duration,
+    /// AWS region for Bedrock. Also part of the SigV4 signing scope, so it has
+    /// to be right even when `provider_base_urls` points somewhere else.
+    #[serde(default = "default_bedrock_region")]
+    pub bedrock_region: String,
     /// Override a provider's base URL, keyed by provider name.
     ///
     /// For self-hosted or proxied endpoints, a regional deployment, or a mock
@@ -173,6 +181,7 @@ impl Default for GatewayConfig {
             same_account_retries: 2,
             max_account_switches: 3,
             catalog_refresh_interval: Duration::from_mins(1),
+            bedrock_region: default_bedrock_region(),
             provider_base_urls: std::collections::BTreeMap::new(),
         }
     }

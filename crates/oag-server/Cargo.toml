@@ -34,6 +34,7 @@ tokio-stream = "0.1"
 async-trait.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 http-body-util.workspace = true
 
 [lints]

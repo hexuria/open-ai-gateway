@@ -62,17 +62,15 @@ impl AppState {
             ))),
         );
 
-        // Region rather than a URL: Bedrock's host is derived from it, and it
-        // is also part of the SigV4 scope.
-        let bedrock_region = config
-            .gateway
-            .provider_base_urls
-            .get("bedrock")
-            .cloned()
-            .unwrap_or_else(|| "us-east-1".to_owned());
+        // Region and endpoint are separate for Bedrock: the region is part of
+        // the SigV4 signing scope and stays correct even when the endpoint is
+        // overridden to a VPC endpoint, a proxy, or a mock.
         adapters.insert(
             Provider::Bedrock,
-            Arc::new(oag_upstream::BedrockAdapter::new(bedrock_region)),
+            Arc::new(
+                oag_upstream::BedrockAdapter::new(config.gateway.bedrock_region.clone())
+                    .with_endpoint(config.gateway.provider_base_urls.get("bedrock").cloned()),
+            ),
         );
 
         adapters.insert(
