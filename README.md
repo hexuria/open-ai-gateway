@@ -13,6 +13,9 @@ three-tier topology that streaming AI traffic actually needs.
 > [docs/compliance.md](docs/compliance.md) for which credential kinds each
 > provider sanctions, and why that distinction is one nullable column.
 
+Picking this up on another machine? Start with [HANDOVER.md](HANDOVER.md) — what is
+proven, what is not, and where to continue.
+
 ## Why
 
 Most requests do not need a frontier model. A routine edit costs roughly
