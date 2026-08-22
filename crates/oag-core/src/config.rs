@@ -149,6 +149,12 @@ impl SecurityConfig {
                     .to_owned(),
             ));
         }
+        // Parsed here, not just checked for emptiness, so every subcommand fails
+        // the same way at config load. Previously only the paths that build a
+        // `Kek` — `serve` and `admin` — noticed a malformed one, so `migrate`
+        // succeeded and the gateway then crash-looped on boot with the real
+        // reason buried in a restarting container's logs. Found exactly that way.
+        crate::Kek::from_base64(&self.credential_kek)?;
         Ok(())
     }
 }
@@ -395,5 +401,30 @@ security:
             err.to_string().contains("no OTLP exporter"),
             "the error should say why, got: {err}"
         );
+    }
+
+    #[test]
+    fn a_wrong_length_kek_is_caught_at_config_load_not_at_boot() {
+        // 34 bytes rather than 32. Before this check, `migrate` accepted it —
+        // it never builds a Kek — and only `serve` failed, as a crash loop with
+        // the reason inside a restarting container. That is how it was found.
+        let src = MINIMAL.replace(
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+            "dmVyaWZ5LW9ubHkta2VrLTMyLWJ5dGVzLTAxMjM0NTY3OA==",
+        );
+        let err = Config::from_yaml(&src).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("32 bytes"),
+            "the error should say what is wrong, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_kek_that_is_not_base64_is_caught_too() {
+        let src = MINIMAL.replace(
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+            "not-base64-at-all!!!",
+        );
+        assert!(Config::from_yaml(&src).is_err());
     }
 }

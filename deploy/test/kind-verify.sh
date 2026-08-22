@@ -129,15 +129,24 @@ helm --kube-context "kind-$CLUSTER" upgrade --install oag "$REPO_ROOT/deploy/hel
   --set replicaCount=3 \
   --set data.mode=inCluster \
   --set security.signingSecret="verify-only-signing-secret-0123456789abcdef" \
-  --set security.credentialKek="dmVyaWZ5LW9ubHkta2VrLTMyLWJ5dGVzLTAxMjM0NTY3OA==" \
+  --set security.credentialKek="dmVyaWZ5LW9ubHkta2VrLTMyLWJ5dGVzLTAxMjM0NTY=" \
   --set gateway.providerBaseUrls.anthropic="http://mock-upstream:8088" >/dev/null || {
     echo
     echo "helm install failed — pod state and logs follow:"
-    $KC get pods
-    $KC describe pod -l app.kubernetes.io/name=open-ai-gateway 2>/dev/null | sed -n '/Events:/,$p' | head -30
-    $KC logs -l app.kubernetes.io/name=open-ai-gateway --tail=40 --all-containers 2>/dev/null
+    # Every line below is `|| true` and none pipes into `head`. The first version
+    # of this block took a SIGPIPE under `set -o pipefail` partway through and
+    # died before printing the gateway logs, which were the only thing that
+    # actually mattered. Diagnostics must not be able to fail.
+    $KC get pods -o wide || true
+    $KC get events --sort-by=.lastTimestamp 2>/dev/null | tail -30 || true
+    echo "--- gateway logs (current) ---"
+    $KC logs -l app.kubernetes.io/name=open-ai-gateway -c gateway --tail=40 || true
+    echo "--- gateway logs (previous container, where a crash loop leaves its reason) ---"
+    for pod in $($KC get pod -l app.kubernetes.io/name=open-ai-gateway -o name 2>/dev/null); do
+      $KC logs "$pod" -c gateway --previous --tail=40 || true
+    done
     for j in $($KC get job -o name 2>/dev/null); do
-      echo "--- $j ---"; $KC logs "$j" --tail=30 2>/dev/null
+      echo "--- $j ---"; $KC logs "$j" --tail=30 || true
     done
     fail "the chart never became ready"
   }
