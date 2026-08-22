@@ -39,10 +39,22 @@ impl AppState {
     pub fn new(config: Config, db: Db, cache: Cache) -> Result<Self> {
         let kek = Kek::from_base64(&config.security.credential_kek)?;
 
+        let base = |p: Provider, default: &str| -> String {
+            config
+                .gateway
+                .provider_base_urls
+                .get(p.as_str())
+                .cloned()
+                .unwrap_or_else(|| default.to_owned())
+        };
+
         let mut adapters: HashMap<Provider, Arc<dyn ProviderAdapter>> = HashMap::new();
         adapters.insert(
             Provider::Anthropic,
-            Arc::new(oag_upstream::AnthropicAdapter::default()),
+            Arc::new(oag_upstream::AnthropicAdapter::new(base(
+                Provider::Anthropic,
+                "https://api.anthropic.com",
+            ))),
         );
 
         Ok(Self {

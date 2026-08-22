@@ -134,7 +134,10 @@ mod tests {
     fn round_trips() {
         let k = kek();
         let sealed = k.seal(b"FAKE-CREDENTIAL-FOR-TESTS").expect("seals");
-        assert_eq!(k.open(&sealed).expect("opens"), b"FAKE-CREDENTIAL-FOR-TESTS");
+        assert_eq!(
+            k.open(&sealed).expect("opens"),
+            b"FAKE-CREDENTIAL-FOR-TESTS"
+        );
     }
 
     #[test]

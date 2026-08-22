@@ -84,4 +84,4 @@ _dev-secret:
     @echo "dev-only-signing-secret-do-not-use-in-production-0001"
 
 _dev-kek:
-    @echo "ZGV2LW9ubHkta2VrLTMyLWJ5dGVzLTAxMjM0NTY3OA=="
+    @echo "b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA="

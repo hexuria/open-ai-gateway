@@ -26,7 +26,12 @@ use tokio::sync::mpsc;
 #[derive(Debug)]
 pub struct StreamOutcome {
     pub accumulator: StreamAccumulator,
-    /// Time to the first byte of content. The latency users actually feel.
+    /// Time to the first token of *content*.
+    ///
+    /// Measured from the first text or reasoning delta, not the first byte.
+    /// `message_start` arrives immediately and carries no content, so timing to
+    /// it reports ~0ms for a response the user waited a second to see begin —
+    /// which makes the one latency number users actually feel useless.
     pub ttft: Option<Duration>,
     pub total: Duration,
     /// True when the client hung up before the upstream finished.
@@ -84,14 +89,15 @@ pub async fn pump(
             Ok(Some(Ok(bytes))) => bytes,
         };
 
-        if ttft.is_none() && !chunk.is_empty() {
-            ttft = Some(started.elapsed());
-        }
-
         // Account first, then forward. If the client is gone we still want the
         // usage, and this ordering means a send failure cannot skip it.
         pending.extend_from_slice(&chunk);
-        drain_frames(&pending_take_complete(&mut pending), &adapter, &mut acc);
+        let frames = pending_take_complete(&mut pending);
+        let saw_content = drain_frames(&frames, &adapter, &mut acc);
+
+        if ttft.is_none() && saw_content {
+            ttft = Some(started.elapsed());
+        }
 
         if !client_gone {
             if tx.send(Ok(chunk)).await.is_ok() {
@@ -109,7 +115,7 @@ pub async fn pump(
 
     // Whatever is left is a partial frame; parse it in case it completed at EOF.
     if !pending.is_empty() {
-        drain_frames(&pending, &adapter, &mut acc);
+        let _ = drain_frames(&pending, &adapter, &mut acc);
     }
 
     StreamOutcome {
@@ -136,10 +142,18 @@ fn pending_take_complete(buf: &mut Vec<u8>) -> Vec<u8> {
 }
 
 /// Parse the `data:` payloads out of complete frames and fold them in.
-fn drain_frames(bytes: &[u8], adapter: &Arc<dyn ProviderAdapter>, acc: &mut StreamAccumulator) {
+///
+/// Returns whether any of them carried actual content, which is what times
+/// the first token.
+fn drain_frames(
+    bytes: &[u8],
+    adapter: &Arc<dyn ProviderAdapter>,
+    acc: &mut StreamAccumulator,
+) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
-        return;
+        return false;
     };
+    let mut saw_content = false;
     for line in text.lines() {
         let Some(payload) = line.strip_prefix("data:") else {
             continue;
@@ -152,6 +166,14 @@ fn drain_frames(bytes: &[u8], adapter: &Arc<dyn ProviderAdapter>, acc: &mut Stre
         match adapter.parse_event(payload, acc) {
             Ok(events) => {
                 for e in &events {
+                    if matches!(
+                        e,
+                        StreamEvent::TextDelta { .. }
+                            | StreamEvent::ThinkingDelta { .. }
+                            | StreamEvent::ToolUseStart { .. }
+                    ) {
+                        saw_content = true;
+                    }
                     acc.observe(e);
                 }
             }
@@ -161,6 +183,7 @@ fn drain_frames(bytes: &[u8], adapter: &Arc<dyn ProviderAdapter>, acc: &mut Stre
             Err(e) => tracing::debug!(error = %e, "skipping unparseable stream frame"),
         }
     }
+    saw_content
 }
 
 /// Read a non-streaming response, accounting for usage.
@@ -234,19 +257,46 @@ mod tests {
         let (head, tail) = whole.split_at(40);
 
         buf.extend_from_slice(head);
-        drain_frames(&pending_take_complete(&mut buf), &adapter, &mut acc);
+        let _ = drain_frames(&pending_take_complete(&mut buf), &adapter, &mut acc);
         assert_eq!(acc.usage().input_tokens, 0, "nothing complete yet");
 
         buf.extend_from_slice(tail);
-        drain_frames(&pending_take_complete(&mut buf), &adapter, &mut acc);
+        let _ = drain_frames(&pending_take_complete(&mut buf), &adapter, &mut acc);
         assert_eq!(acc.usage().input_tokens, 50, "reassembled and counted");
+    }
+
+    #[test]
+    fn ttft_is_timed_from_content_not_from_the_opening_event() {
+        // message_start arrives immediately and carries no content. Timing to
+        // it reports ~0ms for a response the user waited a second to see start.
+        let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
+        let mut acc = StreamAccumulator::new();
+
+        let opening = b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":5}}}\n\n";
+        assert!(
+            !drain_frames(opening, &adapter, &mut acc),
+            "an opening event is not content"
+        );
+
+        let content = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
+        assert!(drain_frames(content, &adapter, &mut acc), "a text delta is");
+    }
+
+    #[test]
+    fn a_tool_call_counts_as_content_for_ttft() {
+        // A response that is only a tool call has no text, but the user is
+        // still waiting for it and it is still the first thing to arrive.
+        let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
+        let mut acc = StreamAccumulator::new();
+        let frame = b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"f\"}}\n\n";
+        assert!(drain_frames(frame, &adapter, &mut acc));
     }
 
     #[test]
     fn a_done_sentinel_is_not_parsed_as_json() {
         let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
         let mut acc = StreamAccumulator::new();
-        drain_frames(b"data: [DONE]\n\n", &adapter, &mut acc);
+        let _ = drain_frames(b"data: [DONE]\n\n", &adapter, &mut acc);
         assert_eq!(acc.usage().total(), 0);
     }
 }

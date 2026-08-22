@@ -149,6 +149,12 @@ pub struct GatewayConfig {
     pub same_account_retries: u8,
     /// Credentials to try before giving up on the request.
     pub max_account_switches: u8,
+    /// Override a provider's base URL, keyed by provider name.
+    ///
+    /// For self-hosted or proxied endpoints, a regional deployment, or a mock
+    /// during testing. Omitted providers use their public API.
+    #[serde(default)]
+    pub provider_base_urls: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for GatewayConfig {
@@ -159,6 +165,7 @@ impl Default for GatewayConfig {
             max_stream_duration: Duration::from_mins(30),
             same_account_retries: 2,
             max_account_switches: 3,
+            provider_base_urls: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -277,6 +284,24 @@ security:
             "sibling kept its default"
         );
         assert_eq!(cfg.server.max_body_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn provider_base_urls_are_optional_and_overridable() {
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(cfg.gateway.provider_base_urls.is_empty());
+
+        let src = format!(
+            "{MINIMAL}\ngateway:\n  provider_base_urls:\n    anthropic: \"http://127.0.0.1:9\"\n"
+        );
+        let cfg = Config::from_yaml(&src).expect("parses");
+        assert_eq!(
+            cfg.gateway
+                .provider_base_urls
+                .get("anthropic")
+                .map(String::as_str),
+            Some("http://127.0.0.1:9")
+        );
     }
 
     #[test]
