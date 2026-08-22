@@ -73,3 +73,23 @@ variable "log_retention_days" {
   type    = number
   default = 30
 }
+
+variable "run_migrations" {
+  type        = bool
+  default     = true
+  description = <<-EOT
+    Run `oag migrate` as a container the gateway container depends on. Leave true.
+
+    Set it false for exactly one apply when ROLLING BACK to an older image:
+    sqlx runs with ignore_missing = false, so an older binary's migrate fails
+    with VersionMissing once a newer migration has been applied — and because
+    the gateway container depends on it, that revision could never launch a
+    task again.
+  EOT
+}
+
+variable "wait_for_steady_state" {
+  type        = bool
+  default     = true
+  description = "Block the apply until the deployment is stable. Turning this off means a failed migration produces a green apply."
+}

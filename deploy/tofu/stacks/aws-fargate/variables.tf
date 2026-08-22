@@ -133,3 +133,15 @@ variable "tags" {
   type    = map(string)
   default = {}
 }
+
+variable "run_migrations" {
+  type        = bool
+  default     = true
+  description = <<-EOT
+    Run `oag migrate` as part of the deployment. Leave this true.
+
+    Set it false for exactly one apply when ROLLING BACK to an older image:
+    sqlx runs with ignore_missing = false, so an older binary's migrate fails
+    with VersionMissing once a newer migration has been applied.
+  EOT
+}

@@ -57,3 +57,21 @@ variable "ingress" {
   default     = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
   description = "INGRESS_TRAFFIC_ALL only if clients reach it directly. Behind Cloudflare, keep it restricted and front it with a load balancer."
 }
+
+variable "service_account_email" {
+  type        = string
+  description = "Runtime identity for both the service and the migrate job. Created by the stack, not here, so the Secret Manager grants can be ordered BEFORE this module — otherwise the job executes without permission to read them."
+}
+
+variable "run_migrations" {
+  type        = bool
+  default     = true
+  description = <<-EOT
+    Run `oag migrate` as part of the apply. Leave this true.
+
+    Set it false for exactly one apply when ROLLING BACK to an older image:
+    sqlx runs with ignore_missing = false, so an older binary's migrate fails
+    with VersionMissing once a newer migration has been applied. Roll the image
+    back and set this false in the same apply.
+  EOT
+}

@@ -11,7 +11,10 @@
 
 terraform {
   required_providers {
-    azurerm = { source = "hashicorp/azurerm", version = ">= 3.80" }
+    # Floor raised to 5.0: `init_container` — which is how migrations run here —
+    # is not present in 3.x, and a loose floor would let an older provider
+    # silently drop the migration rather than fail.
+    azurerm = { source = "hashicorp/azurerm", version = ">= 5.0" }
   }
 }
 
@@ -44,6 +47,68 @@ resource "azurerm_container_app" "this" {
   template {
     min_replicas = var.min_replicas
     max_replicas = var.max_replicas
+
+    # Migrations run as an init container, not as an azurerm_container_app_job:
+    # azurerm has no way to *start* a job execution — no execution resource, no
+    # execution data source, and `manual_trigger_config` carries only
+    # parallelism and replica_completion_count. A job here would be defined and
+    # never run, which is exactly the Cloud Run defect this change fixes.
+    #
+    # Container Apps runs init containers to completion before any app
+    # container in the replica, and `oag migrate` exits non-zero on failure, so
+    # a gateway serving in front of an unmigrated database is structurally
+    # impossible.
+    #
+    # The cost, accepted deliberately: this inverts a property the gateway was
+    # built for. `Db::connect` is lazy and `/health/live` ignores the database
+    # precisely so a replica survives a Postgres failover by reporting
+    # `ready: false` and being routed around. Gating replica start on migrate
+    # means a scale-out replica during a failover crash-loops instead — and
+    # `init_container` has no retry limit and no probe knobs, unlike the Helm
+    # Job's backoffLimit. `run_migrations = false` is the lever if that bites.
+    dynamic "init_container" {
+      for_each = var.run_migrations ? [1] : []
+      content {
+        name   = "migrate"
+        image  = var.image
+        args   = ["migrate"]
+        cpu    = var.migrate_cpu
+        memory = var.migrate_memory
+
+        # The SAME environment as the gateway container, literals included.
+        # `Config::validate` runs before the subcommand match, so a migrate
+        # container given only the database URL exits 1 on config validation
+        # and every replica crash-loops with an error that looks nothing like
+        # a migration failure.
+        env {
+          name  = "OAG_SERVER__PUBLIC_ADDR"
+          value = "0.0.0.0:8080"
+        }
+        env {
+          name  = "OAG_SERVER__SINGLE_LISTENER"
+          value = "true"
+        }
+        env {
+          name  = "OAG_GATEWAY__MAX_STREAM_DURATION"
+          value = tostring(var.max_stream_duration_seconds)
+        }
+
+        dynamic "env" {
+          for_each = var.env
+          content {
+            name  = env.key
+            value = env.value
+          }
+        }
+        dynamic "env" {
+          for_each = var.secret_env
+          content {
+            name        = env.key
+            secret_name = env.value
+          }
+        }
+      }
+    }
 
     container {
       name   = "gateway"
@@ -118,6 +183,11 @@ resource "azurerm_container_app" "this" {
       name  = secret.value
       value = var.secrets[secret.value]
     }
+  }
+
+  timeouts {
+    create = "40m"
+    update = "40m"
   }
 
   lifecycle {

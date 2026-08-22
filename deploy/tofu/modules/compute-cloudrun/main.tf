@@ -14,9 +14,9 @@ terraform {
   }
 }
 
-resource "google_service_account" "this" {
-  account_id   = "${var.name}-sa"
-  display_name = "open-ai-gateway"
+locals {
+  # Unique per apply, deliberately. See run_execution_token on the job below.
+  migrate_token = substr(sha256(timestamp()), 0, 16)
 }
 
 resource "google_cloud_run_v2_service" "this" {
@@ -24,8 +24,13 @@ resource "google_cloud_run_v2_service" "this" {
   location = var.region
   ingress  = var.ingress
 
+  # No revision, and therefore no traffic, until the migration has finished.
+  # `depends_on` orders updates as well as creates, so this holds on every
+  # upgrade rather than only on the first apply.
+  depends_on = [google_cloud_run_v2_job.migrate]
+
   template {
-    service_account = google_service_account.this.email
+    service_account = var.service_account_email
 
     # Up to 3600. Must exceed max_stream_duration, or Cloud Run cuts a stream
     # the gateway still considers live.
@@ -161,16 +166,48 @@ resource "google_cloud_run_v2_service" "this" {
   }
 }
 
-# Migrations as a Cloud Run Job. `oag migrate` is advisory-locked, so running
-# it twice or alongside a deploy is safe.
+# Migrations as a Cloud Run Job. `oag migrate` is advisory-locked and
+# checksum-guarded, so running it twice or alongside a deploy is safe.
 resource "google_cloud_run_v2_job" "migrate" {
+  count    = var.run_migrations ? 1 : 0
   name     = "${var.name}-migrate"
   location = var.region
 
+  # This is what EXECUTES the job — defining it never did. Setting the token
+  # creates an execution on create and on update, and unlike
+  # `start_execution_token` the job is only ready once that execution has
+  # COMPLETED, so the provider's wait covers the migration itself rather than
+  # returning at dispatch.
+  #
+  # The value is unique per apply on purpose. The Cloud Run API never returns
+  # this field, so Read blanks it and the resource carries a permanent diff
+  # whatever value is used — a content hash cannot suppress anything. A
+  # *repeated* value is actively harmful: the token becomes the execution name
+  # suffix, so re-sending the token of a failed execution risks a name
+  # collision that reports ready without running anything.
+  #
+  # Do NOT add `lifecycle { ignore_changes = [run_execution_token] }`. It kills
+  # the diff, the PATCH and the execution, and restores the original bug with
+  # no signal at all.
+  run_execution_token = local.migrate_token
+
+  # The job holds no state, and the default of `true` makes `terraform destroy`
+  # fail. It also lets a failed create self-heal: the resource is left tainted
+  # and the next apply replaces it.
+  deletion_protection = false
+
   template {
     template {
-      service_account = google_service_account.this.email
-      max_retries     = 3
+      service_account = var.service_account_email
+
+      # Absorbs the two transient failures that are actually likely here:
+      # Secret Manager IAM propagation on a first apply, and a Cloud SQL cold
+      # connect. A deterministically bad migration fails identically every
+      # time, so retries only cost time when the failure was never transient.
+      max_retries = 2
+
+      # Per ATTEMPT, not per execution.
+      timeout = "600s"
 
       dynamic "vpc_access" {
         for_each = var.vpc_subnet == "" ? [] : [1]
@@ -204,6 +241,22 @@ resource "google_cloud_run_v2_job" "migrate" {
           }
         }
       }
+    }
+  }
+
+  timeouts {
+    # INVARIANT: must exceed (max_retries + 1) x template.template.timeout, plus
+    # image pull and Direct VPC attach. 3 x 600s = 30m, plus headroom. If you
+    # change max_retries or that timeout, change these too.
+    create = "40m"
+    update = "40m"
+    delete = "20m"
+  }
+
+  lifecycle {
+    precondition {
+      condition     = length("${var.name}-migrate") + 17 < 63
+      error_message = "Cloud Run needs job name plus execution token under 63 characters; shorten `name`."
     }
   }
 }

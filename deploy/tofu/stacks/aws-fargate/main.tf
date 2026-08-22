@@ -199,7 +199,11 @@ module "gateway" {
   max_count                   = var.max_count
   internal                    = var.internal
   certificate_arn             = var.certificate_arn
+  run_migrations              = var.run_migrations
 
+  # The secret VERSIONS, not just the secrets: the migrate container resolves
+  # `valueFrom` at task start, and a secret with no version yet fails the task
+  # rather than the apply.
   depends_on = [aws_secretsmanager_secret_version.this]
 }
 

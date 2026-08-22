@@ -171,6 +171,7 @@ module "gateway" {
 
   max_stream_duration_seconds = var.max_stream_duration_seconds
   premium_ingress             = var.premium_ingress
+  run_migrations              = var.run_migrations
   min_replicas                = var.min_replicas
   max_replicas                = var.max_replicas
   external                    = var.external

@@ -94,6 +94,92 @@ resource "aws_lb_listener" "this" {
   }
 }
 
+locals {
+  container_env = [for k, v in var.env : { name = k, value = v }]
+  # Never plain environment: these come from Secrets Manager or SSM, so they are
+  # absent from the task definition and from state.
+  container_secrets = [for k, v in var.secret_env : { name = k, valueFrom = v }]
+
+  # Migrations run as a container in the same task, not as a separate one-off.
+  # The AWS provider has no run-task *resource*; the `aws_ecs_task_execution`
+  # DATA SOURCE looks like one but is read at PLAN time — a read-only plan on a
+  # pull request would fire RunTask at the production database — and it never
+  # calls DescribeTasks, so a failed migration is never noticed at all.
+  migrate_container = {
+    name    = "migrate"
+    image   = var.image
+    command = ["migrate"]
+
+    # MUST be false. An essential container that exits — even successfully —
+    # stops the whole task, so an essential migrate container would kill the
+    # task at the exact moment it succeeded.
+    essential = false
+
+    # The full set, not just the database URL. `settings::load` runs
+    # Config::validate before the subcommand match, so a migrate container
+    # missing the signing secret or the KEK exits 1 on config validation and
+    # never reaches Postgres — with an error that looks nothing like a
+    # migration failure.
+    environment = local.container_env
+    secrets     = local.container_secrets
+
+    # No startTimeout on purpose. It is set on the depended-ON container and
+    # Fargate caps it at 120 seconds, which would cap every migration at two
+    # minutes. The service's own timeout bounds the wait instead.
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        "awslogs-group"  = aws_cloudwatch_log_group.this.name
+        "awslogs-region" = var.region
+        # Its own stream: when an apply fails on a migration, this is where the
+        # SQL error is.
+        "awslogs-stream-prefix" = "migrate"
+      }
+    }
+  }
+
+  gateway_container = merge(
+    {
+      name      = "gateway"
+      image     = var.image
+      command   = ["serve"]
+      essential = true
+
+      portMappings = [
+        { containerPort = 8080, protocol = "tcp" },
+        { containerPort = 8081, protocol = "tcp" },
+      ]
+
+      environment = local.container_env
+      secrets     = local.container_secrets
+
+      healthCheck = {
+        command     = ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/health/ready || exit 1"]
+        interval    = 15
+        timeout     = 5
+        retries     = 3
+        startPeriod = 30
+      }
+
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.this.name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "gateway"
+        }
+      }
+    },
+    # merge() rather than a ternary yielding null: jsonencode would emit
+    # "dependsOn": null, which ECS never returns, giving the task definition a
+    # perpetual diff and forcing a redeploy on every apply.
+    var.run_migrations ? {
+      dependsOn = [{ containerName = "migrate", condition = "SUCCESS" }]
+    } : {},
+  )
+}
+
 resource "aws_ecs_task_definition" "this" {
   family                   = var.name
   requires_compatibilities = ["FARGATE"]
@@ -103,39 +189,10 @@ resource "aws_ecs_task_definition" "this" {
   execution_role_arn       = var.execution_role_arn
   task_role_arn            = var.task_role_arn
 
-  container_definitions = jsonencode([{
-    name      = "gateway"
-    image     = var.image
-    command   = ["serve"]
-    essential = true
-
-    portMappings = [
-      { containerPort = 8080, protocol = "tcp" },
-      { containerPort = 8081, protocol = "tcp" },
-    ]
-
-    environment = [for k, v in var.env : { name = k, value = v }]
-    # Never plain environment: these come from Secrets Manager or SSM, so they
-    # are absent from the task definition and from state.
-    secrets = [for k, v in var.secret_env : { name = k, valueFrom = v }]
-
-    healthCheck = {
-      command     = ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/health/ready || exit 1"]
-      interval    = 15
-      timeout     = 5
-      retries     = 3
-      startPeriod = 30
-    }
-
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        "awslogs-group"         = aws_cloudwatch_log_group.this.name
-        "awslogs-region"        = var.region
-        "awslogs-stream-prefix" = "gateway"
-      }
-    }
-  }])
+  container_definitions = jsonencode(concat(
+    var.run_migrations ? [local.migrate_container] : [],
+    [local.gateway_container],
+  ))
 }
 
 resource "aws_ecs_service" "this" {
@@ -154,6 +211,32 @@ resource "aws_ecs_service" "this" {
   # ECS caps this at 120s for Fargate, so the gateway's drain budget should be
   # set to match rather than the other way round on this platform.
   health_check_grace_period_seconds = var.health_check_grace_period_seconds
+
+  # Without this the apply returns the moment ECS accepts the deployment, which
+  # is exactly the green-apply-over-an-unmigrated-database failure the migrate
+  # container exists to prevent.
+  wait_for_steady_state = var.wait_for_steady_state
+
+  # The wait is now tens of minutes of real wall clock, so Ctrl-C and CI job
+  # timeouts are routine. Roll the deployment back rather than abandoning it
+  # half-applied.
+  sigint_rollback = true
+
+  deployment_circuit_breaker {
+    enable = true
+    # TRUE. The provider's stability waiter reads the deployment status and
+    # errors on ROLLBACK_SUCCESSFUL / ROLLBACK_FAILED / STOPPED, surfacing
+    # ECS's own statusReason as the diagnostic — so a failed migration fails
+    # the apply loudly *and* restores the last good revision. With `false` the
+    # service parks on a FAILED deployment that launches no tasks.
+    rollback = true
+  }
+
+  timeouts {
+    # Must outlast a real migration plus the rolling replacement of every task.
+    create = "45m"
+    update = "45m"
+  }
 
   network_configuration {
     subnets          = var.private_subnet_ids

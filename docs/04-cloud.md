@@ -147,6 +147,61 @@ blocks for the mistakes that do not fail loudly:
 - **Container Apps**: premium ingress, or streams die at 240s. On Azure,
   supporting long streams is a billing decision.
 
+## Migrations
+
+`oag serve` does not migrate on boot — only `oag migrate` does. So every deployment path
+needs a step that runs it, ordered after the database and the secrets exist and before the
+service takes traffic. Helm has always had one (a pre-install/pre-upgrade hook) and so has
+compose; the cloud stacks did not, which meant a successful `apply` could leave a running
+gateway pointed at an empty schema.
+
+The mechanism differs per cloud because what the providers expose differs, not by taste:
+
+| | Mechanism | Failed migration fails the apply? |
+|---|---|---|
+| Cloud Run | The existing job, executed via `run_execution_token`; the service `depends_on` it | Yes — the job is ready only once the execution *completes* |
+| Fargate | A `migrate` container in the same task, `dependsOn { condition = "SUCCESS" }` | Yes — via `wait_for_steady_state` and the deployment circuit breaker |
+| Container Apps | An `init_container` before the gateway container | **No.** Fail-closed but silent — see below |
+
+Two rejected alternatives are worth recording, because both look right:
+
+- **`aws_ecs_task_execution`** looks like the native way to run a one-off ECS task. It is a
+  *data source*, so it is read at **plan** time — a read-only plan on a pull request would
+  fire `RunTask` against the production database — and it never calls `DescribeTasks`, so a
+  non-zero exit code is never read at all.
+- **`azurerm_container_app_job`** creates a job *definition*. azurerm has no way to start an
+  execution: no execution resource, no data source, and `manual_trigger_config` carries only
+  parallelism and completion count. A job there would be defined and never run — exactly the
+  Cloud Run defect being fixed.
+
+**Azure cannot fail the apply, and the docs should not pretend otherwise.** azurerm exposes
+no revision health, no `runningState`, and no revision data source, so nothing in the
+Terraform graph can read whether the init container succeeded. What Azure does get is
+fail-*closed*: the gateway process never starts in a replica whose migration failed, so
+serving in front of an unmigrated database is structurally impossible. The stack outputs
+`migrate_check` with the command to run after every apply.
+
+That choice costs something real, and it is deliberate. `Db::connect` is lazy and
+`/health/live` ignores the database precisely so a replica survives a Postgres failover by
+reporting `ready: false` and being routed around. Gating replica start on migrate means a
+scale-out replica during a failover crash-loops instead — and `init_container` has no retry
+limit. `run_migrations = false` is the lever.
+
+**Rolling back needs that lever.** sqlx runs with `ignore_missing = false`, so once a newer
+migration is applied, an older binary's `oag migrate` fails with `VersionMissing`. On AWS and
+Azure the gateway container depends on the migrate step, so that revision could never launch
+again. Roll the image back and set `run_migrations = false` in the same apply.
+
+**Migrations must be expand/contract.** In all three the migration lands while the previous
+release is still serving — on AWS for up to the deregistration delay, which defaults to the
+full 1800s stream budget. Every migration has to be readable by the previous binary for at
+least that long.
+
+One consequence to expect: the Cloud Run stack's plan is **never clean**. The Cloud Run API
+does not return `run_execution_token`, so it re-appears as a diff on every plan. That is what
+makes the job execute; do not silence it with `ignore_changes`, and do not use
+`terraform plan -detailed-exitcode` as a drift gate on that stack.
+
 ## Verified
 
 | | |
@@ -157,6 +212,15 @@ blocks for the mistakes that do not fail loudly:
 | Rolling update | 12 of 12 long streams survived a `rollout restart` mid-flight |
 | OpenTofu | all modules and all three stacks pass `terraform validate` |
 | Container image | builds; `oag --version` runs; ELF `e_machine` matches the image architecture |
+
+Also unverified, and specific to the migration step: that the Cloud Run provider surfaces a
+FAILED execution as an apply error rather than a ready-but-failed resource (the whole GCP
+guarantee rests on it); whether the Azure LRO reports Failed when an init container
+crash-loops, and whether `revision_mode = "Single"` holds traffic on the previous revision
+until the new one is healthy — if it shifts on provisioning instead, a failed migration on
+upgrade is an outage on a green apply; and whether Fargate applies any default
+dependency-resolution timeout when `startTimeout` is omitted. Each is one throwaway apply to
+settle.
 
 Not verified: no `terraform apply` was run against a real cloud account. The
 configurations are validated and the reasoning behind each constraint is cited

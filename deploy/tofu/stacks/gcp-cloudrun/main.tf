@@ -19,6 +19,7 @@ terraform {
     # Pinned to v4: v5 turned `rules` from a block into an attribute, so the
     # ruleset resources below do not parse against it.
     cloudflare = { source = "cloudflare/cloudflare", version = "~> 4.0" }
+    time       = { source = "hashicorp/time", version = "~> 0.11" }
   }
 }
 
@@ -76,6 +77,28 @@ resource "google_secret_manager_secret_version" "this" {
   secret_data = each.value
 }
 
+resource "google_service_account" "gateway" {
+  account_id   = "${var.name}-sa"
+  display_name = "open-ai-gateway"
+}
+
+# Hoisted out of the module so the IAM grants below can be ordered BEFORE it.
+# Without this, applying the change destroys and recreates the account, which
+# briefly revokes the running service's access to its own secrets.
+moved {
+  from = module.gateway.google_service_account.this
+  to   = google_service_account.gateway
+}
+
+# `depends_on` orders the SetIamPolicy *call*, not the propagation behind it.
+# Secret Manager bindings are eventually consistent and the migrate execution
+# fires seconds later, so a fresh stack can fail PERMISSION_DENIED on its very
+# first apply. This plus the job's own retries covers it.
+resource "time_sleep" "iam_propagation" {
+  depends_on      = [google_secret_manager_secret_iam_member.read]
+  create_duration = "30s"
+}
+
 module "gateway" {
   source = "../../modules/compute-cloudrun"
 
@@ -98,13 +121,25 @@ module "gateway" {
   min_instances               = var.min_instances
   max_instances               = var.max_instances
   ingress                     = var.ingress
+
+  service_account_email = google_service_account.gateway.email
+  run_migrations        = var.run_migrations
+
+  # Both are load-bearing for migration ordering; neither is redundant. The
+  # module only ever depended on the secret *containers* via `.secret_id`, never
+  # on their versions — and the job's `secret_key_ref { version = "latest" }`
+  # resolves to nothing when no version exists yet.
+  depends_on = [
+    google_secret_manager_secret_version.this,
+    time_sleep.iam_propagation,
+  ]
 }
 
 resource "google_secret_manager_secret_iam_member" "read" {
   for_each  = google_secret_manager_secret.this
   secret_id = each.value.id
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${module.gateway.service_account}"
+  member    = "serviceAccount:${google_service_account.gateway.email}"
 }
 
 module "edge" {
