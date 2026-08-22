@@ -574,7 +574,15 @@ async fn forward_with_failover(
         {
             Ok(l) => l,
             Err(e) => {
-                last_error = e;
+                // Running out of candidates is only the real cause on the first
+                // pass. After a failover, the interesting error is why the
+                // credential we already tried failed — "no credential
+                // available" would bury it and send whoever is debugging to
+                // look at the pool, which is fine.
+                if matches!(last_error, Error::NoCredential { .. }) {
+                    last_error = e;
+                }
+                tracing::debug!(%request_id, switch, error = %last_error, "no further candidates");
                 break;
             }
         };
@@ -593,6 +601,7 @@ async fn forward_with_failover(
                 return Err(e);
             }
             Outcome::Switch(e) => {
+                tracing::warn!(%request_id, %account, error = %e, "switching credential");
                 last_error = e;
                 select::release(state, account, &lease.request_id).await;
                 excluded.insert(account);
@@ -887,6 +896,11 @@ fn error_response(e: &Error) -> Response {
         Error::NoCredential { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "no_credential",
+            e.to_string(),
+        ),
+        Error::AtCapacity { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "at_capacity",
             e.to_string(),
         ),
         Error::NoViableModel => (StatusCode::BAD_REQUEST, "no_viable_model", e.to_string()),

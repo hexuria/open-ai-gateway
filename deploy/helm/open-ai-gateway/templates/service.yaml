@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "oag.fullname" . }}
+  labels: {{- include "oag.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector: {{- include "oag.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: public
+      port: {{ .Values.service.publicPort }}
+      targetPort: public
+    # Exposed on the Service so Prometheus and an operator can reach it from
+    # inside the cluster. Never routed from an Ingress.
+    - name: admin
+      port: {{ .Values.service.adminPort }}
+      targetPort: admin

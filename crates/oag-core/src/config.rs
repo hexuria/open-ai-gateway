@@ -43,6 +43,19 @@ pub struct ServerConfig {
     pub idle_timeout: Duration,
     /// Maximum inbound body. Large because image and document payloads are.
     pub max_body_bytes: usize,
+    /// Serve admin routes on the public listener instead of their own.
+    ///
+    /// Off by default, because two listeners is the safer shape: it makes "do
+    /// not expose the admin API" a deployment fact rather than a routing rule
+    /// someone has to remember.
+    ///
+    /// Some platforms route to exactly **one** container port — Cloud Run and
+    /// Azure Container Apps both do — and on those the admin listener is simply
+    /// unreachable, which takes `/health/ready` and `/metrics` with it. This
+    /// exists for them. The admin routes still require an admin-role API key;
+    /// what is lost is the second layer, not the first.
+    #[serde(default)]
+    pub single_listener: bool,
 }
 
 impl Default for ServerConfig {
@@ -53,6 +66,7 @@ impl Default for ServerConfig {
             header_read_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_mins(2),
             max_body_bytes: 256 * 1024 * 1024,
+            single_listener: false,
         }
     }
 }
@@ -301,6 +315,13 @@ security:
             "sibling kept its default"
         );
         assert_eq!(cfg.server.max_body_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn two_listeners_is_the_default() {
+        // Single-port mode is for platforms that force it, not a convenience.
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(!cfg.server.single_listener);
     }
 
     #[test]

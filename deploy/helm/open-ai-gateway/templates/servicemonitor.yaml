@@ -1,0 +1,18 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "oag.fullname" . }}
+  labels:
+    {{- include "oag.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}{{- toYaml . | nindent 4 }}{{- end }}
+spec:
+  selector:
+    matchLabels: {{- include "oag.selectorLabels" . | nindent 6 }}
+  endpoints:
+    # The admin port. /metrics is an operational surface and has no business
+    # being reachable by clients.
+    - port: admin
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+{{- end }}

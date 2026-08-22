@@ -66,6 +66,11 @@ pub fn describe() {
         "Requests where the client hung up before the upstream finished."
     );
     describe_counter!(
+        "oag_at_capacity_total",
+        "Requests refused because every healthy credential was at its concurrency limit. \
+         A sizing signal, not a fault."
+    );
+    describe_counter!(
         "oag_escalations_suppressed_total",
         "Unusable answers left unescalated because the principal was near their budget."
     );

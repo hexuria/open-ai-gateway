@@ -1,0 +1,9 @@
+apiVersion: v2
+name: open-ai-gateway
+description: An internal AI gateway — cost-optimised model routing over pooled credentials.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/hexuria/open-ai-gateway
+sources:
+  - https://github.com/hexuria/open-ai-gateway

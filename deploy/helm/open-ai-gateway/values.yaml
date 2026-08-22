@@ -1,0 +1,185 @@
+# open-ai-gateway
+#
+# Runs on any conformant Kubernetes: GKE, EKS, AKS, or your own. Nothing here is
+# cloud-specific except the ingress annotations, which you set per platform.
+
+image:
+  repository: ghcr.io/hexuria/open-ai-gateway
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+replicaCount: 3
+
+# ── data tier ─────────────────────────────────────────────────────────────────
+# Three shapes, one interface. `external` covers both cloud-managed services
+# (Cloud SQL, RDS, Azure Database) and cloud-neutral ones (Neon, Upstash) —
+# from the gateway's point of view they are the same thing: a URL.
+data:
+  mode: external          # external | inCluster
+
+  external:
+    # Supply these through existingSecret in anything real. The inline values
+    # exist so `helm install` works for a first look, and only for that.
+    databaseUrl: ""
+    redisUrl: ""
+    # A secret with keys: OAG_DATABASE__URL, OAG_REDIS__URL
+    existingSecret: ""
+
+  # Postgres and Redis as StatefulSets in the same cluster.
+  #
+  # Honest about what this is: fine for a dev cluster or a small internal
+  # deployment, and NOT a substitute for an operator in production. This chart
+  # gives you a single instance with a PVC — no failover, no point-in-time
+  # recovery, no connection pooling. For production self-hosting, run
+  # CloudNativePG for Postgres and set data.mode=external to point at it.
+  inCluster:
+    postgres:
+      image: postgres:18-alpine
+      storage: 20Gi
+      storageClass: ""
+      resources:
+        requests: { cpu: 250m, memory: 512Mi }
+        limits:   { memory: 2Gi }
+    redis:
+      image: redis:8-alpine
+      storage: 8Gi
+      storageClass: ""
+      resources:
+        requests: { cpu: 100m, memory: 256Mi }
+        limits:   { memory: 1Gi }
+
+# ── secrets ───────────────────────────────────────────────────────────────────
+# Both are REQUIRED and must be byte-identical across every replica. The gateway
+# refuses to start without them, and refuses anything that looks like a
+# placeholder. Generate with:
+#   openssl rand -base64 48   # signingSecret
+#   openssl rand -base64 32   # credentialKek
+security:
+  signingSecret: ""
+  credentialKek: ""
+  # A secret with keys: OAG_SECURITY__SIGNING_SECRET, OAG_SECURITY__CREDENTIAL_KEK
+  # Prefer this, wired to External Secrets / Secrets Store CSI.
+  existingSecret: ""
+
+# ── gateway behaviour ─────────────────────────────────────────────────────────
+gateway:
+  # Ceiling on one stream, and the shutdown drain budget.
+  # terminationGracePeriodSeconds MUST exceed this — the chart refuses to render
+  # otherwise, because a shorter grace period severs live streams on every
+  # rolling update and the failure looks like a random upstream error.
+  maxStreamDurationSeconds: 1800
+  streamIdleTimeoutSeconds: 180
+  streamKeepaliveIntervalSeconds: 10
+  sameAccountRetries: 2
+  maxAccountSwitches: 3
+  catalogRefreshIntervalSeconds: 60
+  bedrockRegion: us-east-1
+  # provider -> base URL. Leave empty to use each provider's public API.
+  providerBaseUrls: {}
+
+telemetry:
+  logFilter: info
+  logJson: true
+  otlpEndpoint: ""
+
+# ── listeners ─────────────────────────────────────────────────────────────────
+# Two by default: 8080 inference, 8081 admin. On Kubernetes there is no reason
+# to collapse them — a Service can expose both, and keeping the admin API off
+# the internet-facing one is free.
+service:
+  type: ClusterIP
+  publicPort: 8080
+  adminPort: 8081
+  annotations: {}
+
+# ── scheduling ────────────────────────────────────────────────────────────────
+terminationGracePeriodSeconds: 1845
+
+# Seconds to wait after Kubernetes decides to stop a pod, before the process is
+# told to shut down.
+#
+# This closes a race that is invisible until you look for it. On SIGTERM the
+# gateway stops accepting new connections immediately — correct behaviour. But
+# removing a pod from a Service is not instantaneous: every kube-proxy has to
+# observe the endpoint change and rewrite its rules, which takes seconds. In
+# that window the pod is refusing connections that the cluster is still sending
+# it, and every one of them is a failed request during an ordinary deploy.
+#
+# Sleeping here delays SIGTERM so the endpoint is gone everywhere first. The pod
+# keeps serving normally throughout.
+preStopDelaySeconds: 15
+
+resources:
+  requests: { cpu: 200m, memory: 256Mi }
+  limits:   { memory: 1Gi }
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+  # Scale-down is deliberately slow: every terminating pod holds live streams
+  # for up to the drain budget, so thrashing costs far more than a spare pod.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 300
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+podAnnotations: {}
+podLabels: {}
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# ── migrations ────────────────────────────────────────────────────────────────
+# A pre-install/pre-upgrade hook. `oag migrate` takes a Postgres advisory lock,
+# so running it twice, or from two releases at once, is safe.
+migrations:
+  enabled: true
+  backoffLimit: 3
+
+# ── ingress ───────────────────────────────────────────────────────────────────
+# Only the inference port. The admin port is never routed from an ingress.
+#
+# The annotations below are the ones that matter for streaming, per controller.
+# Getting them wrong does not fail loudly — it buffers, and the client sees
+# nothing for two minutes and then everything at once.
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  tls: []
+  annotations: {}
+    # nginx:
+    #   nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    #   nginx.ingress.kubernetes.io/proxy-read-timeout: "1800"
+    #   nginx.ingress.kubernetes.io/proxy-send-timeout: "1800"
+    # GKE ingress: use a BackendConfig with timeoutSec: 1800
+    # AWS ALB:  alb.ingress.kubernetes.io/load-balancer-attributes:
+    #             idle_timeout.timeout_seconds=1800
+    #           alb.ingress.kubernetes.io/target-group-attributes:
+    #             load_balancing.algorithm.type=least_outstanding_requests
+
+# Prometheus Operator ServiceMonitor. Scrapes the admin port.
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  labels: {}

@@ -1,0 +1,54 @@
+{{- if .Values.migrations.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "oag.fullname" . }}-migrate-{{ .Release.Revision }}
+  labels: {{- include "oag.labels" . | nindent 4 }}
+  annotations:
+    # Before the pods, on install and on upgrade. `oag migrate` takes a Postgres
+    # advisory lock, so a second runner waits rather than half-applying.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: {{ .Values.migrations.backoffLimit }}
+  template:
+    metadata:
+      labels: {{- include "oag.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+      initContainers:
+        # `oag migrate` fails fast on an unreachable database, which is correct
+        # for a one-shot command and wrong for the first install: the Postgres
+        # StatefulSet is still starting. Wait here instead of burning the Job's
+        # backoff budget on it.
+        - name: wait-for-postgres
+          image: {{ include "oag.image" . }}
+          command:
+            - sh
+            - -c
+            - |
+              for i in $(seq 1 120); do
+                if oag migrate --help >/dev/null 2>&1; then :; fi
+                nc -z "$PGHOST" 5432 2>/dev/null && exit 0
+                echo "waiting for $PGHOST:5432 ($i)"; sleep 2
+              done
+              echo "postgres never became reachable"; exit 1
+          env:
+            - name: PGHOST
+              value: {{ if eq .Values.data.mode "inCluster" }}{{ include "oag.fullname" . }}-postgres{{ else }}""{{ end }}
+      containers:
+        - name: migrate
+          image: {{ include "oag.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["migrate"]
+          env: {{- include "oag.env" . | nindent 12 }}
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+{{- end }}

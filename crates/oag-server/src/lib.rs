@@ -30,20 +30,16 @@ use axum::routing::get;
 use oag_core::Result;
 use std::sync::Arc;
 
-/// Inference. Fronted by the load balancer.
-pub fn public_router(state: Arc<AppState>) -> Router {
+/// The inference routes, without the shared health endpoint.
+fn inference_routes() -> Router<Arc<AppState>> {
     Router::new()
-        // Liveness only. Readiness lives on the admin listener because it is an
-        // operational detail, and because answering it does not require being
-        // reachable from the internet.
-        .route("/health/live", get(health::live))
         .route("/v1/messages", axum::routing::post(gateway::messages))
         .route(
             "/v1/chat/completions",
             axum::routing::post(gateway::chat_completions),
         )
-        // The same surface without the version prefix; several SDKs default
-        // to it when given a custom base URL.
+        // The same surface without the version prefix; several SDKs default to
+        // it when given a custom base URL.
         .route(
             "/chat/completions",
             axum::routing::post(gateway::chat_completions),
@@ -55,19 +51,14 @@ pub fn public_router(state: Arc<AppState>) -> Router {
             "/v1beta/models/{*model_action}",
             axum::routing::post(gateway::gemini_generate),
         )
-        .layer(axum::extract::DefaultBodyLimit::max(
-            state.config.server.max_body_bytes,
-        ))
-        .with_state(state)
 }
 
-/// Admin API, metrics, readiness. Internal network only.
-pub fn admin_router(state: Arc<AppState>) -> Router {
+/// The admin routes, without the shared health endpoint.
+fn admin_routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/health/live", get(health::live))
+        .route("/", get(admin::dashboard))
         .route("/health/ready", get(health::ready))
         .route("/metrics", get(metrics::render))
-        .route("/", get(admin::dashboard))
         .route("/admin/api/summary", get(admin::summary))
         .route("/admin/api/accounts", get(admin::accounts))
         .route("/admin/api/routes", get(admin::routes))
@@ -76,6 +67,33 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
             "/admin/api/catalog/reload",
             axum::routing::post(admin::reload_catalog),
         )
+}
+
+/// Inference. Fronted by the load balancer.
+///
+/// Carries `/health/live` but not `/health/ready`: readiness is an operational
+/// detail, and answering it does not require being reachable from outside.
+pub fn public_router(state: Arc<AppState>) -> Router {
+    let limit = state.config.server.max_body_bytes;
+    let routes = inference_routes().route("/health/live", get(health::live));
+
+    // On a single-port platform there is nowhere else for the admin routes to
+    // live, so they join this listener rather than vanishing entirely.
+    let routes = if state.config.server.single_listener {
+        routes.merge(admin_routes())
+    } else {
+        routes
+    };
+
+    routes
+        .layer(axum::extract::DefaultBodyLimit::max(limit))
+        .with_state(state)
+}
+
+/// Admin API, metrics, readiness. Internal network only.
+pub fn admin_router(state: Arc<AppState>) -> Router {
+    admin_routes()
+        .route("/health/live", get(health::live))
         .with_state(state)
 }
 
@@ -104,24 +122,37 @@ fn spawn_catalog_refresh(state: Arc<AppState>) {
     });
 }
 
-/// Bind both listeners and serve until shutdown.
+/// Bind the listeners and serve until shutdown.
 pub async fn serve(state: Arc<AppState>) -> Result<()> {
     let public_addr = state.config.server.public_addr.clone();
-    let admin_addr = state.config.server.admin_addr.clone();
+    let lifecycle = Arc::clone(&state.lifecycle);
+    let drain = state.config.gateway.max_stream_duration;
 
     let public = tokio::net::TcpListener::bind(&public_addr)
         .await
         .map_err(|e| oag_core::Error::Internal(format!("binding {public_addr}: {e}")))?;
+
+    if state.config.server.single_listener {
+        tracing::warn!(
+            %public_addr,
+            "single-listener mode: the admin API, /metrics and /health/ready are on \
+             the public listener. They still require an admin key, but the second \
+             layer of separation is gone — restrict this port at the edge."
+        );
+        spawn_catalog_refresh(Arc::clone(&state));
+        return axum::serve(public, public_router(state))
+            .with_graceful_shutdown(shutdown::signal(lifecycle, drain))
+            .await
+            .map_err(|e| oag_core::Error::Internal(format!("listener: {e}")));
+    }
+
+    let admin_addr = state.config.server.admin_addr.clone();
     let admin = tokio::net::TcpListener::bind(&admin_addr)
         .await
         .map_err(|e| oag_core::Error::Internal(format!("binding {admin_addr}: {e}")))?;
 
-    spawn_catalog_refresh(Arc::clone(&state));
-
     tracing::info!(%public_addr, %admin_addr, "listening");
-
-    let lifecycle = Arc::clone(&state.lifecycle);
-    let drain = state.config.gateway.max_stream_duration;
+    spawn_catalog_refresh(Arc::clone(&state));
 
     let public_srv = axum::serve(public, public_router(Arc::clone(&state)))
         .with_graceful_shutdown(shutdown::signal(Arc::clone(&lifecycle), drain));

@@ -70,6 +70,7 @@ pub async fn lease(
 
     // 2. The cascade. Try in order, because the winner may have filled its last
     // slot between the snapshot and the acquire.
+    let mut exhausted = 0usize;
     let mut remaining: Vec<&AccountRow> = rows
         .iter()
         .filter(|r| !excluded.contains(&r.account_id()))
@@ -130,8 +131,19 @@ pub async fn lease(
         // Lost the race for the last slot. Drop it and re-run rather than
         // failing: another credential is very likely free.
         remaining.retain(|r| r.account_id() != selection.account);
+        exhausted += 1;
     }
 
+    // Distinguish "nothing to pick from" from "everything is busy". The first
+    // means somebody has to add a credential; the second means waiting, or
+    // raising max_concurrency, and resolves without anyone doing anything.
+    if exhausted > 0 {
+        metrics::counter!("oag_at_capacity_total", "provider" => provider.as_str()).increment(1);
+        return Err(Error::AtCapacity {
+            provider,
+            candidates: exhausted,
+        });
+    }
     Err(Error::NoCredential { provider })
 }
 

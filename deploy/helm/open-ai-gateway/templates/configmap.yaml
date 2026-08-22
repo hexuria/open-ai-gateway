@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "oag.fullname" . }}
+  labels: {{- include "oag.labels" . | nindent 4 }}
+data:
+  OAG_GATEWAY__MAX_STREAM_DURATION: {{ .Values.gateway.maxStreamDurationSeconds | quote }}
+  OAG_GATEWAY__STREAM_IDLE_TIMEOUT: {{ .Values.gateway.streamIdleTimeoutSeconds | quote }}
+  OAG_GATEWAY__STREAM_KEEPALIVE_INTERVAL: {{ .Values.gateway.streamKeepaliveIntervalSeconds | quote }}
+  OAG_GATEWAY__SAME_ACCOUNT_RETRIES: {{ .Values.gateway.sameAccountRetries | quote }}
+  OAG_GATEWAY__MAX_ACCOUNT_SWITCHES: {{ .Values.gateway.maxAccountSwitches | quote }}
+  OAG_GATEWAY__CATALOG_REFRESH_INTERVAL: {{ .Values.gateway.catalogRefreshIntervalSeconds | quote }}
+  OAG_GATEWAY__BEDROCK_REGION: {{ .Values.gateway.bedrockRegion | quote }}
+  OAG_TELEMETRY__LOG_FILTER: {{ .Values.telemetry.logFilter | quote }}
+  OAG_TELEMETRY__LOG_JSON: {{ .Values.telemetry.logJson | quote }}
+  {{- with .Values.telemetry.otlpEndpoint }}
+  OAG_TELEMETRY__OTLP_ENDPOINT: {{ . | quote }}
+  {{- end }}
+  {{- range $provider, $url := .Values.gateway.providerBaseUrls }}
+  OAG_GATEWAY__PROVIDER_BASE_URLS__{{ $provider | upper }}: {{ $url | quote }}
+  {{- end }}

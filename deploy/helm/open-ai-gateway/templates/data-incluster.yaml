@@ -1,0 +1,138 @@
+{{- if eq .Values.data.mode "inCluster" }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "oag.fullname" . }}-postgres
+  labels: {{- include "oag.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: {{ include "oag.name" . }}-postgres
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports: [{ name: postgres, port: 5432, targetPort: 5432 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "oag.fullname" . }}-postgres
+  labels: {{- include "oag.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+spec:
+  serviceName: {{ include "oag.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "oag.name" . }}-postgres
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "oag.name" . }}-postgres
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.data.inCluster.postgres.image }}
+          env:
+            - name: POSTGRES_USER
+              value: oag
+            - name: POSTGRES_DB
+              value: oag
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "oag.fullname" . }}-data
+                  key: POSTGRES_PASSWORD
+            # Postgres 18 places the cluster in a version subdirectory beneath
+            # the mount, so the volume goes at /var/lib/postgresql and not
+            # .../data — which is correct for 17 and earlier and makes 18
+            # refuse to start.
+            - name: PGDATA
+              value: /var/lib/postgresql/pgdata
+          ports: [{ name: postgres, containerPort: 5432 }]
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "oag", "-d", "oag"] }
+            periodSeconds: 5
+          resources: {{- toYaml .Values.data.inCluster.postgres.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.data.inCluster.postgres.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.data.inCluster.postgres.storage }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "oag.fullname" . }}-redis
+  labels: {{- include "oag.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: {{ include "oag.name" . }}-redis
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports: [{ name: redis, port: 6379, targetPort: 6379 }]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "oag.fullname" . }}-redis
+  labels: {{- include "oag.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+spec:
+  serviceName: {{ include "oag.fullname" . }}-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "oag.name" . }}-redis
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "oag.name" . }}-redis
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: redis
+          image: {{ .Values.data.inCluster.redis.image }}
+          # Everything the gateway keeps in Redis is expendable — slots, session
+          # pins, the auth cache — so an appendonly file buys little. It is on
+          # anyway so a restart does not dump every conversation off its pinned
+          # credential at once.
+          args: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+          ports: [{ name: redis, containerPort: 6379 }]
+          readinessProbe:
+            exec: { command: ["redis-cli", "ping"] }
+            periodSeconds: 5
+          resources: {{- toYaml .Values.data.inCluster.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.data.inCluster.redis.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.data.inCluster.redis.storage }}
+{{- end }}

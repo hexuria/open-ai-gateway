@@ -18,6 +18,18 @@ pub enum Error {
     #[error("no credential available for provider {provider} on this route")]
     NoCredential { provider: Provider },
 
+    /// Credentials exist and are healthy — every one of them is simply busy.
+    ///
+    /// Distinct from `NoCredential` because the two need opposite responses. No
+    /// credential is a configuration problem: someone must add one. At capacity
+    /// is a sizing problem that resolves on its own, and the caller should
+    /// retry rather than page anyone.
+    #[error("all {candidates} credentials for {provider} are at their concurrency limit")]
+    AtCapacity {
+        provider: Provider,
+        candidates: usize,
+    },
+
     #[error("no model on the ladder satisfies the request")]
     NoViableModel,
 
@@ -100,6 +112,8 @@ impl Error {
                 cooldown: Duration::from_mins(1),
             },
             Self::NoCredential { .. } | Self::NoViableModel => Disposition::EscalateTier,
+            // Waiting helps; a bigger model does not.
+            Self::AtCapacity { .. } => Disposition::RetrySameAccount,
             _ => Disposition::Fatal,
         }
     }
@@ -142,6 +156,19 @@ mod tests {
     #[test]
     fn context_overflow_escalates_instead_of_failing() {
         assert_eq!(upstream(413).disposition(), Disposition::EscalateTier);
+    }
+
+    #[test]
+    fn being_at_capacity_is_not_treated_as_a_missing_credential() {
+        // One is a config problem and one is a sizing problem. Collapsing them
+        // sends whoever is on call to look at the credential pool when what
+        // they needed was more concurrency.
+        let busy = Error::AtCapacity {
+            provider: Provider::Anthropic,
+            candidates: 3,
+        };
+        assert_eq!(busy.disposition(), Disposition::RetrySameAccount);
+        assert!(busy.to_string().contains("concurrency limit"));
     }
 
     #[test]

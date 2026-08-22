@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "oag.fullname" . }}
+  labels: {{- include "oag.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels: {{- include "oag.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One at a time, with a spare. Each terminating pod holds live streams for
+      # up to the drain budget, so a fast rollout means many pods draining at
+      # once and a long window at reduced capacity.
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "oag.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        # Roll the pods when configuration changes, not only when the image does.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Must exceed gateway.maxStreamDurationSeconds; _helpers.tpl refuses to
+      # render otherwise.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+        runAsUser: {{ .Values.securityContext.runAsUser }}
+      containers:
+        - name: gateway
+          image: {{ include "oag.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve"]
+          securityContext:
+            allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
+            readOnlyRootFilesystem: {{ .Values.securityContext.readOnlyRootFilesystem }}
+            capabilities: {{- toYaml .Values.securityContext.capabilities | nindent 14 }}
+          ports:
+            - name: public
+              containerPort: {{ .Values.service.publicPort }}
+            - name: admin
+              containerPort: {{ .Values.service.adminPort }}
+          env:
+            {{- include "oag.env" . | nindent 12 }}
+            - name: OAG_SERVER__PUBLIC_ADDR
+              value: "0.0.0.0:{{ .Values.service.publicPort }}"
+            - name: OAG_SERVER__ADMIN_ADDR
+              value: "0.0.0.0:{{ .Values.service.adminPort }}"
+          envFrom:
+            - configMapRef:
+                name: {{ include "oag.fullname" . }}
+          # Liveness never checks dependencies. A liveness probe that fails
+          # during a database outage makes Kubernetes restart every pod, turning
+          # a recoverable incident into a crash loop.
+          livenessProbe:
+            httpGet: { path: /health/live, port: public }
+            periodSeconds: 10
+            failureThreshold: 3
+          # Readiness does, so a pod with a dead pool leaves the Service.
+          readinessProbe:
+            httpGet: { path: /health/ready, port: admin }
+            periodSeconds: 5
+            failureThreshold: 2
+          # Startup is separate so a slow first connection does not trip
+          # liveness and restart the pod before it has ever been ready.
+          startupProbe:
+            httpGet: { path: /health/live, port: public }
+            periodSeconds: 2
+            failureThreshold: 30
+          lifecycle:
+            preStop:
+              # Not a workaround for slow shutdown — the gateway shuts down
+              # promptly. It is there so the Service stops sending traffic
+              # before the process stops accepting it. See preStopDelaySeconds.
+              exec:
+                command: ["sleep", "{{ .Values.preStopDelaySeconds }}"]
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # readOnlyRootFilesystem is on, and the process still needs somewhere
+        # writable.
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints: {{- toYaml . | nindent 8 }}
+      {{- end }}
