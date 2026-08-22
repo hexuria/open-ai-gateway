@@ -17,8 +17,14 @@ x-gateway: &gateway
     # signing secret per instance when the environment does not supply one, so
     # replica A mints admin tokens replica B rejects. We refuse to boot without
     # it rather than generating one. See crates/oag-core/src/config.rs.
-    OAG_SECURITY__SIGNING_SECRET: ${OAG_SIGNING_SECRET:?set OAG_SIGNING_SECRET, e.g. openssl rand -base64 48}
-    OAG_SECURITY__CREDENTIAL_KEK: ${OAG_CREDENTIAL_KEK:?set OAG_CREDENTIAL_KEK, e.g. openssl rand -base64 32}
+    #
+    # Not `:?` — compose interpolates on every command, so a required variable
+    # makes `docker compose down` fail too, which is a poor way to learn you
+    # forgot to export something. The gateway itself refuses to start on an
+    # empty or placeholder secret, with a message that says what to run, so the
+    # check belongs there and not here.
+    OAG_SECURITY__SIGNING_SECRET: ${OAG_SIGNING_SECRET:-}
+    OAG_SECURITY__CREDENTIAL_KEK: ${OAG_CREDENTIAL_KEK:-}
     OAG_SERVER__ADMIN_ADDR: 0.0.0.0:8081
     OAG_TELEMETRY__LOG_JSON: "true"
     # Override a provider's endpoint. Set here so the stack can be driven
@@ -51,8 +57,8 @@ services:
     environment:
       OAG_DATABASE__URL: postgres://oag:oag@postgres:5432/oag
       OAG_REDIS__URL: redis://redis:6379
-      OAG_SECURITY__SIGNING_SECRET: ${OAG_SIGNING_SECRET:?set OAG_SIGNING_SECRET, e.g. openssl rand -base64 48}
-      OAG_SECURITY__CREDENTIAL_KEK: ${OAG_CREDENTIAL_KEK:?set OAG_CREDENTIAL_KEK, e.g. openssl rand -base64 32}
+      OAG_SECURITY__SIGNING_SECRET: ${OAG_SIGNING_SECRET:-}
+      OAG_SECURITY__CREDENTIAL_KEK: ${OAG_CREDENTIAL_KEK:-}
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
