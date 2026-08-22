@@ -150,6 +150,41 @@ stack-observe:
 stack-roll:
     {{stack}} restart oag-2
 
+# ── verification ───────────────────────────────────────────────────────────────
+# Needs no credentials and no cluster, and guards the savings figure itself.
+# The request path end to end against a mock upstream, in about a minute.
+verify:
+    @./deploy/test/local-verify.sh
+
+# Needs kind, takes several minutes, and DOES NOT PASS YET — see the status note
+# at the top of deploy/test/kind-verify.sh before relying on it.
+# A rolling restart severing no live stream, and every drained stream metered.
+verify-k8s:
+    @./deploy/test/kind-verify.sh
+
+# Used by local-verify.sh. Kept here so there is one definition of the dev
+# environment rather than a second copy inside a shell script.
+_verify-env:
+    @echo 'export OAG_DATABASE__URL="{{dev_db}}"'
+    @echo 'export OAG_REDIS__URL="{{dev_rd}}"'
+    @echo 'export OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)"'
+    @echo 'export OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)"'
+
+_verify-bootstrap:
+    @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
+      OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
+      OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
+      sh -c 'cargo run --quiet -p oag -- admin init --email verify@localhost --route default && \
+             cargo run --quiet -p oag -- admin seed-catalog >/dev/null && \
+             cargo run --quiet -p oag -- admin add-account --name mock --provider anthropic \
+               --secret FAKE-CREDENTIAL-FOR-TESTS --route default >/dev/null'
+
+# The newest row, pipe-separated, for the assertions in local-verify.sh.
+_verify-ledger:
+    @psql "{{dev_db}}" -At -F'|' -c "SELECT model_id, tier, input_tokens, output_tokens, \
+        cost_usd, counterfactual_usd, coalesce(ttft_ms, 0) \
+        FROM usage_event WHERE model_id LIKE 'anthropic%' ORDER BY occurred_at DESC LIMIT 1"
+
 # ── helpers ────────────────────────────────────────────────────────────────────
 # Deterministic dev-only secrets. Never use these anywhere real.
 _dev-secret:
