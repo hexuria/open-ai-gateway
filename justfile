@@ -32,8 +32,7 @@ dev-up:
 dev-down:
     {{compose}} down
 
-# Stop and delete the data. The one destructive target, named so nobody types
-# it by accident.
+# Stop and delete the data. The one destructive target.
 dev-reset:
     {{compose}} down -v
 
@@ -55,8 +54,7 @@ serve:
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
       cargo run -p oag -- serve
 
-# Show the resolved config with secrets redacted. The fastest way to answer
-# "is this replica reading the environment variable I think it is".
+# Show the resolved config, secrets redacted.
 config:
     @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
@@ -64,8 +62,7 @@ config:
       cargo run --quiet -p oag -- config
 
 # ── the full topology ──────────────────────────────────────────────────────────
-# Caddy -> Envoy -> 3 replicas -> Postgres + Redis. This is what the streaming
-# and rolling-restart tests drive.
+# Caddy -> Envoy -> 3 replicas -> Postgres + Redis. The full topology.
 stack-up:
     OAG_SIGNING_SECRET="$(just _dev-secret)" \
     OAG_CREDENTIAL_KEK="$(just _dev-kek)" \
@@ -77,14 +74,12 @@ stack-down:
 stack-logs:
     {{stack}} logs -f
 
-# Restart one replica while traffic is flowing. In-flight streams on the other
-# two must survive, and their Redis concurrency slots must be untouched.
+# Restart one replica under load; the other two must not drop a stream.
 stack-roll:
     {{stack}} restart oag-2
 
 # ── helpers ────────────────────────────────────────────────────────────────────
-# Deterministic dev-only secrets. Never use these anywhere real: the config
-# validator rejects anything containing "example", which is the point.
+# Deterministic dev-only secrets. Never use these anywhere real.
 _dev-secret:
     @echo "dev-only-signing-secret-do-not-use-in-production-0001"
 
