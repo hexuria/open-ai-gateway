@@ -76,6 +76,17 @@ impl Breakers {
     }
 }
 
+impl Breakers {
+    /// Put a credential back in rotation after an operator cleared its cooldown.
+    ///
+    /// Replica-local, consistent with the rest of this module: other replicas
+    /// heal on their own half-open probe. Expressed as a success rather than a
+    /// separate reset path so there is one definition of "healthy".
+    pub fn clear(&self, account: AccountId) {
+        self.record_success(account);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,5 +125,22 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         assert!(!b.allows(broken, now));
         assert!(b.allows(healthy, now));
+    }
+
+    #[test]
+    fn clearing_a_breaker_puts_the_credential_back_in_rotation() {
+        // What the admin clear-cooldown button reaches. The database cooldown
+        // is fleet-wide; this is the replica-local half of the same action.
+        let breakers = Breakers::new();
+        let account = AccountId::new();
+        for _ in 0..TRIP_THRESHOLD {
+            breakers.record_failure(account);
+        }
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert!(!breakers.allows(account, now), "a run of failures trips it");
+
+        breakers.clear(account);
+        assert!(breakers.allows(account, now));
+        assert_eq!(breakers.open_count(now), 0);
     }
 }

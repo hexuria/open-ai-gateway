@@ -40,7 +40,20 @@ curl -N localhost:8080/v1/messages -H "x-api-key: $OAG_KEY" \
        "messages":[{"role":"user","content":"hello"}]}'
 ```
 
-`oag/auto` lets policy choose the model. Name a real one and it is honoured.
+`oag/auto` lets policy choose the model; `oag/cheap` and `oag/frontier` pin a
+rung. Name a real model and it is honoured.
+
+Clients that expect the usual discovery and preflight endpoints get them:
+
+```bash
+curl localhost:8080/v1/models -H "x-api-key: $OAG_KEY"
+```
+
+`/v1/models` lists what *this* key may actually ask for — the route's ladder,
+clamped to the key's floor, filtered to providers you hold credentials for —
+with the `oag/*` names first. `/v1/messages/count_tokens` returns a prompt-size
+estimate without spending anything upstream; it is marked `"oag_estimate": true`
+because no tokeniser is linked.
 
 The full three-tier topology — Caddy, Envoy, three replicas, Postgres, Redis —
 is one command, and Prometheus and Grafana are one flag more:

@@ -1,6 +1,8 @@
 //! The inference request path.
 
+pub mod count_tokens;
 pub mod meter;
+pub mod models;
 pub mod refresh;
 pub mod select;
 pub mod sse;
@@ -66,6 +68,20 @@ pub async fn gemini_generate(
     let (model, action) = model_action
         .rsplit_once(':')
         .unwrap_or((model_action.as_str(), "generateContent"));
+
+    // Every action used to fall through to a billed completion. `:countTokens`
+    // in particular leased a credential, ran a full request, metered the spend,
+    // and returned a body with no `totalTokens` in it — a preflight call that
+    // silently cost money and answered nothing.
+    match action {
+        "generateContent" | "streamGenerateContent" => {}
+        "countTokens" => return count_tokens::gemini_count(&state, &headers, &body).await,
+        other => {
+            return error_response(&Error::UnsupportedAction {
+                action: other.to_owned(),
+            });
+        }
+    }
     let stream = action.starts_with("stream");
 
     // Re-express the path's model and mode as body fields, so the rest of the
@@ -123,12 +139,7 @@ async fn handle(
     let started = Instant::now();
 
     // ── authenticate ──────────────────────────────────────────────────────────
-    let raw_key = extract_key(headers).ok_or(Error::Unauthenticated)?;
-    let auth = state
-        .auth
-        .authenticate(raw_key)
-        .await?
-        .ok_or(Error::Unauthenticated)?;
+    let auth = authenticate(state, headers).await?;
 
     // ── parse ─────────────────────────────────────────────────────────────────
     let wire: serde_json::Value = serde_json::from_slice(body)?;
@@ -323,6 +334,70 @@ struct Plan {
     pressure: oag_router::BudgetPressure,
 }
 
+/// Authenticate an inbound key.
+///
+/// Shared by every client-facing handler rather than inlined per handler: a
+/// second copy is how one endpoint ends up accepting a key the others reject.
+pub(crate) async fn authenticate(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<Arc<oag_store::AuthContext>> {
+    let raw_key = extract_key(headers).ok_or(Error::Unauthenticated)?;
+    state
+        .auth
+        .authenticate(raw_key)
+        .await?
+        .ok_or(Error::Unauthenticated)
+}
+
+/// Load the caller's route and build the policy it implies.
+///
+/// Split out of `plan_request` because `/v1/models` needs exactly this much and
+/// none of what follows it — no rate token, no budgets, no decision.
+pub(crate) async fn policy_for(
+    state: &Arc<AppState>,
+    auth: &oag_store::AuthContext,
+) -> Result<(oag_store::RouteRow, RoutingPolicy)> {
+    let route = oag_store::repo::route_by_id(&state.db, auth.route_id)
+        .await?
+        .ok_or_else(|| Error::Internal("route vanished between auth and routing".to_owned()))?;
+
+    let ladder = parse_ladder(&route.tiers)?;
+
+    // A key's floor beats the route's: it is the narrower grant, and the point
+    // of pinning one key to `frontier` is that it applies to that key alone.
+    let named = auth
+        .key_floor_tier
+        .as_deref()
+        .or(route.floor_tier.as_deref())
+        .map(TierName::from);
+    let floor = named.as_ref().and_then(|n| ladder.tier(n));
+    if let Some(name) = &named
+        && floor.is_none()
+    {
+        // Written by the CLI or by psql, neither of which validates against the
+        // ladder. Silently ignoring it means a key pinned to `frontier` quietly
+        // serving from `cheap`, with nothing anywhere saying why.
+        tracing::warn!(
+            route = %route.name,
+            floor = %name.as_str(),
+            "floor tier names no rung in this ladder; ignoring it"
+        );
+    }
+
+    let policy = RoutingPolicy::new(ladder, Box::new(oag_router::HeuristicClassifier::default()))
+        .with_floor(floor);
+    Ok((route, policy))
+}
+
+/// The rung an `oag/...` model name pins, if any. `oag/auto` pins nothing.
+pub(crate) fn virtual_tier(model: &str) -> Option<TierName> {
+    model
+        .strip_prefix("oag/")
+        .filter(|s| *s != "auto")
+        .map(TierName::from)
+}
+
 /// Resolve the route, build its policy, and choose a model.
 ///
 /// Separated from `handle` because it is the part with no I/O side effects
@@ -333,9 +408,7 @@ async fn plan_request(
     canonical: &oag_proto::CanonicalRequest,
     headers: &HeaderMap,
 ) -> Result<Plan> {
-    let route = oag_store::repo::route_by_id(&state.db, auth.route_id)
-        .await?
-        .ok_or_else(|| Error::Internal("route vanished between auth and routing".to_owned()))?;
+    let (route, policy) = policy_for(state, auth).await?;
 
     // Throttle before doing any of the expensive work below — classification,
     // catalog lookup, credential selection. A request that is going to be
@@ -347,30 +420,39 @@ async fn plan_request(
         return Err(Error::RateLimited { retry_after });
     }
 
-    let ladder = parse_ladder(&route.tiers)?;
     let catalog = state.catalog().await;
 
     let mut signal = canonical.signal();
-    // A header hint is an explicit instruction, so it outranks classification.
-    signal.explicit_tier = headers
+
+    // `x-oag-tier` outranks the body's model name: the header is what a caller
+    // adds deliberately, often when the body is generated by a tool they do not
+    // control. Both resolve through the ladder, and an unrecognised rung stays
+    // `None` on purpose — `decide` maps an unknown tier to `ladder.floor()`, so
+    // a typo that reached it would silently pin the *cheapest* rung.
+    let requested_tier = headers
         .get("x-oag-tier")
         .and_then(|v| v.to_str().ok())
-        .map(TierName::from);
-
-    // A key's floor beats the route's: it is the narrower grant, and the point
-    // of pinning one key to `frontier` is that it applies to that key alone.
-    let floor = auth
-        .key_floor_tier
-        .as_deref()
-        .or(route.floor_tier.as_deref())
         .map(TierName::from)
-        .and_then(|n| ladder.tier(&n));
+        .or_else(|| virtual_tier(&canonical.model));
+    if let Some(name) = &requested_tier
+        && policy.rung(name).is_none()
+    {
+        tracing::warn!(
+            tier = %name.as_str(),
+            route = %route.name,
+            "requested tier names no rung in this ladder; falling back to classification"
+        );
+    }
+    signal.explicit_tier = requested_tier.filter(|n| policy.rung(n).is_some());
 
-    let policy = RoutingPolicy::new(ladder, Box::new(oag_router::HeuristicClassifier::default()))
-        .with_floor(floor);
-
-    // `oag/` names are virtual and always managed; otherwise the route decides.
-    let mode = if canonical.model.starts_with("oag/") || route.default_mode == "managed" {
+    // An explicit tier is only ever consulted by the classifier, and `decide`
+    // only classifies outside its passthrough branch. Without the third arm,
+    // `x-oag-tier` and `oag/<rung>` are both no-ops on a stock route, whose
+    // `default_mode` is `passthrough`.
+    let mode = if canonical.model.starts_with("oag/")
+        || route.default_mode == "managed"
+        || signal.explicit_tier.is_some()
+    {
         RoutingMode::Managed
     } else {
         RoutingMode::Passthrough
@@ -932,6 +1014,7 @@ fn error_response(e: &Error) -> Response {
             "rate_limit_error",
             e.to_string(),
         ),
+        Error::UnsupportedAction { .. } => (StatusCode::NOT_FOUND, "not_found", e.to_string()),
         Error::NoCredential { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "no_credential",
@@ -1182,5 +1265,20 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("1")
         );
+    }
+
+    #[test]
+    fn a_virtual_model_name_pins_its_rung_and_auto_pins_nothing() {
+        // `oag/cheap` and `oag/frontier` used to be indistinguishable from
+        // `oag/auto`: the prefix forced managed mode and the rung after it was
+        // never read, so every virtual name meant "classify for me".
+        assert_eq!(virtual_tier("oag/cheap"), Some(TierName::from("cheap")));
+        assert_eq!(
+            virtual_tier("oag/frontier"),
+            Some(TierName::from("frontier"))
+        );
+        assert_eq!(virtual_tier("oag/auto"), None, "auto is the unpinned one");
+        assert_eq!(virtual_tier("claude-opus-5"), None);
+        assert_eq!(virtual_tier("anthropic/claude-opus-5"), None);
     }
 }

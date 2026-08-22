@@ -1,10 +1,15 @@
 //! Typed configuration.
 //!
-//! Static configuration is a file plus environment overrides. Runtime-tunable
-//! settings live in the `setting` table. sub2api put nearly everything in a
-//! generic key-value table and grew a 2466-line handler parsing it; the split
-//! here is "does changing this require a restart" — if no, it is a setting; if
-//! yes, it belongs in the file where it can be reviewed in a pull request.
+//! Configuration is a file plus environment overrides. All of it. Anything that
+//! must change without a restart gets a **typed column on the entity it belongs
+//! to** — `route.default_mode`, `account.schedulable` — never a generic
+//! key-value row.
+//!
+//! There is no `setting` table. A tunable needs a reader and a write path
+//! either way, so a generic row is not cheaper than a typed column; it is only
+//! less checkable. sub2api put nearly everything in one and grew a 2466-line
+//! handler parsing it. `state.reload_catalog()` shows restart-free mutation
+//! without any of that.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;

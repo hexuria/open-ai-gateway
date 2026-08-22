@@ -28,7 +28,6 @@ pub struct AccountRow {
     pub proxy_url: Option<String>,
     pub priority: i16,
     pub max_concurrency: i32,
-    pub weight: i16,
     pub schedulable: bool,
     pub cooldown_until: Option<OffsetDateTime>,
     pub rate_limited_until: Option<OffsetDateTime>,
@@ -106,6 +105,13 @@ pub struct AuthContext {
     pub principal_id: Uuid,
     pub route_id: Uuid,
     pub key_floor_tier: Option<String>,
+    /// Admin authority, carried on the key rather than the principal.
+    ///
+    /// `#[serde(default)]` is load-bearing: this struct is the Redis L2 cache
+    /// value, and an entry written by an older binary must still deserialise
+    /// rather than poisoning every request that hits it.
+    #[serde(default)]
+    pub admin: bool,
     pub quota_usd: Option<Decimal>,
     pub spent_usd: Decimal,
     pub principal_budget_usd: Option<Decimal>,

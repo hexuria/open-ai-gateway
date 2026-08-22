@@ -44,6 +44,13 @@
   button { background:var(--accent); border:0; color:#08131a; padding:7px 14px;
            border-radius:7px; font:inherit; font-weight:600; cursor:pointer; }
   .err { color:var(--bad); margin-top:10px; }
+  .btn-quiet, .btn-danger { padding:3px 9px; font-size:12px; font-weight:600;
+          border-radius:6px; border:1px solid var(--line); cursor:pointer; }
+  .btn-quiet  { background:transparent; color:var(--fg); }
+  .btn-danger { background:transparent; color:var(--bad); border-color:var(--bad); }
+  .btn-quiet:hover  { background:var(--line); }
+  .btn-danger:hover { background:var(--bad); color:var(--panel); }
+  .reason { color:var(--dim); font-size:12px; margin-left:6px; }
   code { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--dim); }
 </style>
 </head>
@@ -73,6 +80,9 @@
     <h2>Credentials</h2>
     <div class="scroll"><table id="accounts"></table></div>
 
+    <h2>Keys</h2>
+    <div class="scroll"><table id="keys"></table></div>
+
     <h2>Routes</h2>
     <div class="scroll"><table id="routes"></table></div>
 
@@ -91,6 +101,20 @@ async function get(path) {
   return r.json();
 }
 
+// Auth is a header, not a cookie, so a cross-origin page cannot forge one of
+// these: it would need to set x-api-key, which requires a preflight the browser
+// refuses. That is what makes bodyless POST actions safe here.
+async function post(path) {
+  const r = await fetch(path, { method: 'POST', headers: { 'x-api-key': $('key').value } });
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    // Must be an Error: the single catch in load() reads e.message, and a bare
+    // string throw renders as an empty error bar.
+    throw new Error(body.error ?? `${path} → HTTP ${r.status}`);
+  }
+  return r.json();
+}
+
 function table(el, cols, rows) {
   const head = `<tr>${cols.map(c => `<th>${esc(c.h)}</th>`).join('')}</tr>`;
   const body = rows.map(r =>
@@ -106,8 +130,8 @@ const state = s => `<span class="pill ${s === 'ready' ? 'good' : s === 'disabled
 async function load() {
   $('err').textContent = '';
   try {
-    const [s, accounts, routes, usage] = await Promise.all([
-      get('/admin/api/summary'), get('/admin/api/accounts'),
+    const [s, accounts, keys, routes, usage] = await Promise.all([
+      get('/admin/api/summary'), get('/admin/api/accounts'), get('/admin/api/keys'),
       get('/admin/api/routes'), get('/admin/api/usage?limit=25'),
     ]);
     localStorage.setItem('oag_key', $('key').value);
@@ -131,18 +155,40 @@ async function load() {
       { h:'Name',     f:a => esc(a.name) },
       { h:'Provider', f:a => esc(a.provider) },
       { h:'Kind',     f:a => esc(a.kind) },
-      { h:'State',    f:a => state(a.state) },
+      { h:'State',    f:a => state(a.state) +
+          (a.reason ? `<span class="reason">${esc(a.reason)}</span>` : '') },
       { h:'Scope',    f:a => a.personal ? 'personal' : 'shared pool' },
       { h:'Priority', f:a => a.priority, num:true },
       { h:'Max conc.',f:a => a.max_concurrency, num:true },
+      { h:'', f:a => [
+          a.state === 'disabled'
+            ? btn('enable', a.id, 'Enable', 'btn-quiet')
+            : btn('disable', a.id, 'Disable', 'btn-danger'),
+          a.state === 'cooling down' ? btn('clear-cooldown', a.id, 'Clear cooldown', 'btn-quiet') : '',
+        ].join(' ') },
     ], accounts);
+
+    table($('keys'), [
+      { h:'Name',   f:k => esc(k.name) },
+      { h:'Prefix', f:k => `<code>${esc(k.key_prefix)}</code>` },
+      { h:'Who',    f:k => esc(k.principal) },
+      { h:'Route',  f:k => esc(k.route) },
+      { h:'Kind',   f:k => k.admin ? '<span class="pill warn">admin</span>' : '<span class="pill">client</span>' },
+      { h:'State',  f:k => k.active ? state('ready') : state('disabled') },
+      { h:'Last used', f:k => esc((k.last_used_at || '—').slice(0, 19)) },
+      { h:'', f:k => k.active ? btn('revoke', k.id, 'Revoke', 'btn-danger') : '' },
+    ], keys);
 
     table($('routes'), [
       { h:'Route', f:r => esc(r.name) },
       { h:'Mode',  f:r => `<span class="pill">${esc(r.mode)}</span>` },
       { h:'Floor', f:r => esc(r.floor_tier || '—') },
-      { h:'Ladder',f:r => (r.tiers || []).map(t =>
-          `<span class="pill">${esc(t.name)}</span>`).join(' ') },
+      // Defensive: `tiers` is raw JSONB straight from the row, so a route
+      // written by psql with the wrong shape reaches here unvalidated. One
+      // malformed row must not throw and blank every table on the page.
+      { h:'Ladder',f:r => (Array.isArray(r.tiers) ? r.tiers : [])
+          .map(t => `<span class="pill">${esc(t && t.name)}</span>`).join(' ')
+          || '<span class="reason">malformed</span>' },
       { h:'Credentials', f:r => r.credentials, num:true },
     ], routes);
 
@@ -165,6 +211,35 @@ async function load() {
     $('content').hidden = true;
   }
 }
+
+// One delegated listener rather than inline onclick handlers: no id is ever
+// interpolated into an executable attribute, so a hostile value cannot become
+// code. Attribute values are double-quoted because esc() does not escape "'".
+function btn(act, id, label, cls) {
+  return `<button class="${cls}" data-act="${esc(act)}" data-id="${esc(id)}">${esc(label)}</button>`;
+}
+
+const ACTIONS = {
+  'disable':        id => [`/admin/api/accounts/${id}/disable`, 'Disable this credential?'],
+  'enable':         id => [`/admin/api/accounts/${id}/enable`, null],
+  'clear-cooldown': id => [`/admin/api/accounts/${id}/clear-cooldown`, null],
+  'revoke':         id => [`/admin/api/keys/${id}/revoke`, 'Revoke this key? It cannot be undone.'],
+};
+
+document.querySelector('main').addEventListener('click', async e => {
+  const act = e.target.dataset?.act;
+  if (!act || !ACTIONS[act]) return;
+  const [path, confirmation] = ACTIONS[act](encodeURIComponent(e.target.dataset.id));
+  if (confirmation && !confirm(confirmation)) return;
+  e.target.disabled = true;
+  try {
+    await post(path);
+    await load();
+  } catch (err) {
+    $('err').textContent = err.message;
+    e.target.disabled = false;
+  }
+});
 
 $('go').addEventListener('click', load);
 $('key').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });

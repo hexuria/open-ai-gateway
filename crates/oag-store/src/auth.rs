@@ -95,9 +95,18 @@ impl AuthCache {
     /// Called when a key is revoked or edited. Other replicas' L1 entries still
     /// expire on their own within [`L1_TTL`], which bounds the window.
     pub async fn invalidate(&self, raw_key: &str) {
-        let hash = repo::hash_key(raw_key);
-        self.l1.invalidate(&hash).await;
-        self.cache.auth_invalidate(&hash).await;
+        self.invalidate_hash(&repo::hash_key(raw_key)).await;
+    }
+
+    /// Same, for a caller that holds the hash and not the plaintext.
+    ///
+    /// The revoke path is exactly that: `api_key` stores only the hash, so a
+    /// revocation can never reconstruct the key it is revoking. Callers use
+    /// this *instead of* `invalidate` and the cache call, not as well as —
+    /// doing both would issue two DELs for one key.
+    pub async fn invalidate_hash(&self, hash: &str) {
+        self.l1.invalidate(hash).await;
+        self.cache.auth_invalidate(hash).await;
     }
 
     /// Drop every L1 entry on this replica.

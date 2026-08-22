@@ -35,6 +35,21 @@ pub enum AdminCommand {
         /// Never route below this tier, whatever the classifier says.
         #[arg(long)]
         floor_tier: Option<String>,
+        /// Mint an admin key: one that can reach the admin API and perform
+        /// writes. Deliberately opt-in — an inference key must not be able to
+        /// disable credentials just because its owner happens to be an admin.
+        #[arg(long)]
+        admin: bool,
+    },
+    /// Revoke an inbound key by its displayed prefix.
+    ///
+    /// The one write that genuinely needs a CLI: during an incident the prefix
+    /// is what an operator can actually see (in a log, in the dashboard), and
+    /// psql alone cannot evict the shared auth cache, so a row update there
+    /// leaves the key working on every replica for up to its cache TTL.
+    RevokeKey {
+        #[arg(long)]
+        prefix: String,
     },
     /// Register an upstream credential.
     AddAccount {
@@ -104,8 +119,9 @@ pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Resu
             route,
             name,
             floor_tier,
+            admin,
         } => {
-            let key = mint_key(db, &email, &route, &name, floor_tier.as_deref()).await?;
+            let key = mint_key(db, &email, &route, &name, floor_tier.as_deref(), admin).await?;
             print_key(&key);
             Ok(())
         }
@@ -134,6 +150,7 @@ pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Resu
         AdminCommand::SeedCatalog { from } => seed_catalog(db, from.as_deref()).await,
         AdminCommand::SetMode { route, mode } => set_mode(db, &route, &mode).await,
         AdminCommand::SetTiers { route, tiers } => set_tiers(db, &route, &tiers).await,
+        AdminCommand::RevokeKey { prefix } => revoke_key(db, redis_url, &prefix).await,
         AdminCommand::FlushCache => flush_cache(redis_url).await,
         AdminCommand::Status => status(db).await,
     }
@@ -144,9 +161,13 @@ async fn init(db: &Db, email: &str, route: &str, budget: Option<Decimal>) -> Res
     let route_id = upsert_route(db, route).await?;
     println!("principal {email} -> {principal_id}");
     println!("route     {route} -> {route_id}");
-    let key = mint_key(db, email, route, "initial", None).await?;
+    let key = mint_key(db, email, route, "initial", None, true).await?;
     print_key(&key);
     println!("\nNext:");
+    println!("  This is an ADMIN key: it can disable credentials and revoke keys.");
+    println!("  Do not paste it into a client. Mint a separate one for SDKs:");
+    println!("      oag admin key --email {email} --route {route} --name codex");
+    println!();
     println!("  oag admin seed-catalog");
     println!("  oag admin add-account --name <n> --provider anthropic --secret <key>");
     println!();
@@ -221,6 +242,7 @@ async fn mint_key(
     route: &str,
     name: &str,
     floor_tier: Option<&str>,
+    admin: bool,
 ) -> Result<String> {
     use std::fmt::Write as _;
 
@@ -241,8 +263,9 @@ async fn mint_key(
 
     sqlx::query(
         r"
-        INSERT INTO api_key (id, key_hash, key_prefix, name, principal_id, route_id, floor_tier)
-        SELECT $1, $2, $3, $4, p.id, r.id, $7
+        INSERT INTO api_key
+            (id, key_hash, key_prefix, name, principal_id, route_id, floor_tier, admin)
+        SELECT $1, $2, $3, $4, p.id, r.id, $7, $8
         FROM principal p, route r
         WHERE p.email = $5 AND r.name = $6
         ",
@@ -254,6 +277,7 @@ async fn mint_key(
     .bind(email)
     .bind(route)
     .bind(floor_tier)
+    .bind(admin)
     .execute(db.pool())
     .await
     .map_err(|e| oag_core::Error::Internal(format!("minting key: {e}")))?;
@@ -410,6 +434,33 @@ async fn seed_catalog(db: &Db, from: Option<&str>) -> Result<()> {
         repo::upsert_model(db, m, false).await?;
     }
     println!("catalog: {n} models");
+    Ok(())
+}
+
+async fn revoke_key(db: &Db, redis_url: &str, prefix: &str) -> Result<()> {
+    let Some((hash, name, prefix)) = repo::revoke_key_by_prefix(db, prefix).await? else {
+        println!("no active key with prefix {prefix}");
+        return Ok(());
+    };
+
+    // The row update alone is not a revocation: every replica caches auth by
+    // hash, so without this the key keeps working until those entries expire.
+    oag_store::Cache::connect(redis_url)?
+        .auth_invalidate(&hash)
+        .await;
+
+    // Same target and shape as the server's audit line, so the CLI is not a
+    // hole in the trail.
+    tracing::warn!(
+        target: "oag::audit",
+        actor = "cli",
+        action = "key.revoke",
+        subject = %prefix,
+        name,
+        "admin write"
+    );
+    println!("revoked {name} ({prefix})");
+    println!("  shared cache evicted; each replica's in-process cache expires within 15s");
     Ok(())
 }
 

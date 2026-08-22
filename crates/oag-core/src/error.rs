@@ -67,6 +67,12 @@ pub enum Error {
     #[error("route rate limit exceeded")]
     RateLimited { retry_after: Duration },
 
+    /// A dialect path named an operation this gateway does not implement.
+    /// Distinct from a bad request: the path parsed, the verb just is not one
+    /// of ours, and answering 400 would send the caller looking at their body.
+    #[error("unsupported action: {action}")]
+    UnsupportedAction { action: String },
+
     #[error("upstream {provider} returned {status}")]
     Upstream {
         provider: Provider,

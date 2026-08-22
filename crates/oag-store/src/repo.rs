@@ -44,6 +44,7 @@ pub async fn authenticate(db: &Db, raw_key: &str) -> Result<Option<AuthContext>>
             Option<Decimal>,
             Decimal,
             Decimal,
+            bool,
         ),
     >(
         r"
@@ -54,7 +55,8 @@ pub async fn authenticate(db: &Db, raw_key: &str) -> Result<Option<AuthContext>>
                    SELECT SUM(u.cost_usd) FROM usage_event u
                    WHERE u.principal_id = p.id
                      AND u.occurred_at >= date_trunc('month', now())
-               ), 0)
+               ), 0),
+               k.admin
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
         JOIN route    r ON r.id = k.route_id
@@ -79,6 +81,7 @@ pub async fn authenticate(db: &Db, raw_key: &str) -> Result<Option<AuthContext>>
         principal_budget_usd: r.6,
         principal_hard_stop_multiple: r.7,
         principal_spent_usd: r.8,
+        admin: r.9,
     }))
 }
 
@@ -118,7 +121,7 @@ pub async fn candidates(
         r"
         SELECT a.id, a.name, a.provider, a.kind,
                a.credentials_sealed, a.credentials_nonce, a.token_version, a.token_expires_at,
-               a.owner_principal_id, a.proxy_url, a.priority, a.max_concurrency, a.weight,
+               a.owner_principal_id, a.proxy_url, a.priority, a.max_concurrency,
                a.schedulable, a.cooldown_until, a.rate_limited_until, a.window_resets_at,
                a.last_used_at
         FROM account a
@@ -141,7 +144,7 @@ pub async fn account_by_id(db: &Db, id: AccountId) -> Result<Option<AccountRow>>
         r"
         SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
                token_version, token_expires_at, owner_principal_id, proxy_url,
-               priority, max_concurrency, weight, schedulable, cooldown_until,
+               priority, max_concurrency, schedulable, cooldown_until,
                rate_limited_until, window_resets_at, last_used_at
         FROM account WHERE id = $1
         ",
@@ -150,6 +153,92 @@ pub async fn account_by_id(db: &Db, id: AccountId) -> Result<Option<AccountRow>>
     .fetch_optional(db.pool())
     .await
     .map_err(|e| Error::Internal(format!("loading account: {e}")))
+}
+
+/// Providers this route holds usable credentials for, for one principal.
+///
+/// Mirrors the personal-credential predicate in `candidates`: a credential
+/// bound to another principal must never appear in this principal's view. Adds
+/// `a.schedulable`, which `candidates` leaves to the scheduler — correct here
+/// because a disabled credential is an operator decision, not a transient
+/// state, and advertising a model nobody can reach is worse than omitting it.
+pub async fn route_providers(db: &Db, route_id: Uuid, principal_id: Uuid) -> Result<Vec<String>> {
+    sqlx::query_scalar::<_, String>(
+        r"
+        SELECT DISTINCT a.provider
+        FROM account a
+        JOIN account_route ar ON ar.account_id = a.id
+        WHERE ar.route_id = $1
+          AND a.schedulable
+          AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $2)
+        ",
+    )
+    .bind(route_id)
+    .bind(principal_id)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("loading route providers: {e}")))
+}
+
+/// Take a credential out of rotation, or put it back. Returns its name, or
+/// `None` if no such credential — which is the caller's 404.
+pub async fn set_schedulable(db: &Db, id: AccountId, value: bool) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "UPDATE account SET schedulable = $2, updated_at = now() WHERE id = $1 RETURNING name",
+    )
+    .bind(id.as_uuid())
+    .bind(value)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("setting schedulable: {e}")))
+}
+
+/// Clear an operator-visible cooldown.
+///
+/// Deliberately not `rate_limited_until`: that one is the provider's own
+/// `Retry-After`, and discarding it fleet-wide turns a throttle into an
+/// account action. Deliberately not `window_resets_at` either — eligibility
+/// gates on `schedulable`, `cooldown_until` and `rate_limited_until` only.
+pub async fn clear_cooldown(db: &Db, id: AccountId) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        r"UPDATE account
+             SET cooldown_until = NULL, cooldown_reason = NULL, updated_at = now()
+           WHERE id = $1 RETURNING name",
+    )
+    .bind(id.as_uuid())
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("clearing cooldown: {e}")))
+}
+
+/// Revoke an inbound key. Returns `(key_hash, name, key_prefix)`.
+///
+/// The hash comes back because the caller must evict the auth cache and never
+/// holds the plaintext. It must not be put in a response body.
+pub async fn revoke_key(db: &Db, id: Uuid) -> Result<Option<(String, String, String)>> {
+    sqlx::query_as::<_, (String, String, String)>(
+        "UPDATE api_key SET active = false WHERE id = $1 RETURNING key_hash, name, key_prefix",
+    )
+    .bind(id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("revoking key: {e}")))
+}
+
+/// Revoke by the displayed prefix, for the CLI — during an incident the prefix
+/// is what an operator can actually see.
+pub async fn revoke_key_by_prefix(
+    db: &Db,
+    prefix: &str,
+) -> Result<Option<(String, String, String)>> {
+    sqlx::query_as::<_, (String, String, String)>(
+        "UPDATE api_key SET active = false WHERE key_prefix = $1 AND active
+         RETURNING key_hash, name, key_prefix",
+    )
+    .bind(prefix)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("revoking key by prefix: {e}")))
 }
 
 pub async fn touch_account(db: &Db, id: AccountId) -> Result<()> {
@@ -381,7 +470,7 @@ mod tests {
 
         let capped: Uuid = sqlx::query_scalar(
             "INSERT INTO route (id, name, tiers, default_mode, monthly_budget_usd)
-             VALUES (gen_random_uuid(), $1, '{\"cheap\":[\"kimi-k2\"]}'::jsonb, 'managed', 500)
+             VALUES (gen_random_uuid(), $1, '[{\"name\":\"cheap\",\"models\":[\"kimi-k2\"]}]'::jsonb, 'managed', 500)
              RETURNING id",
         )
         .bind(format!("capped-{}", Uuid::new_v4()))
@@ -391,7 +480,7 @@ mod tests {
 
         let other: Uuid = sqlx::query_scalar(
             "INSERT INTO route (id, name, tiers, default_mode)
-             VALUES (gen_random_uuid(), $1, '{\"cheap\":[\"kimi-k2\"]}'::jsonb, 'managed')
+             VALUES (gen_random_uuid(), $1, '[{\"name\":\"cheap\",\"models\":[\"kimi-k2\"]}]'::jsonb, 'managed')
              RETURNING id",
         )
         .bind(format!("uncapped-{}", Uuid::new_v4()))
@@ -439,5 +528,225 @@ mod tests {
             .expect("exists");
         assert_eq!(row.monthly_budget_usd, None);
         assert!(row.spent_usd.is_zero(), "uncapped routes skip the sum");
+    }
+
+    /// Fixture: one principal, one route, one shared credential joined to it.
+    async fn seed(db: &Db) -> (Uuid, Uuid, AccountId) {
+        let tag = Uuid::new_v4();
+        let principal: Uuid = sqlx::query_scalar(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')
+             RETURNING id",
+        )
+        .bind(format!("{tag}@example.invalid"))
+        .fetch_one(db.pool())
+        .await
+        .expect("principal");
+
+        let route: Uuid = sqlx::query_scalar(
+            "INSERT INTO route (id, name, tiers, default_mode)
+             VALUES (gen_random_uuid(), $1, '[{\"name\":\"cheap\",\"models\":[\"kimi-k2\"]}]'::jsonb, 'managed')
+             RETURNING id",
+        )
+        .bind(format!("route-{tag}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("route");
+
+        let account: Uuid = sqlx::query_scalar(
+            "INSERT INTO account
+                 (id, name, provider, kind, credentials_sealed, credentials_nonce)
+             VALUES (gen_random_uuid(), $1, 'anthropic', 'api_key', '\\x00', '\\x00')
+             RETURNING id",
+        )
+        .bind(format!("acct-{tag}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("account");
+
+        sqlx::query("INSERT INTO account_route (account_id, route_id) VALUES ($1, $2)")
+            .bind(account)
+            .bind(route)
+            .execute(db.pool())
+            .await
+            .expect("join");
+
+        (principal, route, AccountId::from_uuid(account))
+    }
+
+    fn test_db() -> Option<Db> {
+        let url = std::env::var("OAG_TEST_DATABASE_URL").ok()?;
+        Some(Db::connect(&url, 2).expect("connect"))
+    }
+
+    /// The queries whose SELECT lists name every column by hand.
+    ///
+    /// `rows.rs` justifies hand-written `FromRow` structs on the grounds that a
+    /// column mistake "surfaces as a runtime error on first query, which the
+    /// integration tests catch" — but nothing exercised either query, so that
+    /// claim was unbacked until now. Both SELECT lists were edited in this
+    /// change, which is exactly when it needed to be true.
+    #[tokio::test]
+    async fn the_hand_written_account_selects_match_the_schema() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+
+        let found = candidates(&db, route, "anthropic", principal)
+            .await
+            .expect("candidates must not fail on a column name");
+        assert_eq!(
+            found.len(),
+            1,
+            "the seeded credential should be a candidate"
+        );
+
+        let row = account_by_id(&db, account)
+            .await
+            .expect("account_by_id must not fail on a column name")
+            .expect("exists");
+        assert_eq!(row.provider, "anthropic");
+        assert_eq!(row.max_concurrency, 8);
+    }
+
+    #[tokio::test]
+    async fn route_providers_hides_what_the_caller_cannot_use() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+
+        assert_eq!(
+            route_providers(&db, route, principal).await.expect("list"),
+            vec!["anthropic".to_owned()]
+        );
+
+        // Disabled is an operator decision, not a transient state: advertising
+        // a model nobody can reach moves the failure away from its cause.
+        set_schedulable(&db, account, false).await.expect("disable");
+        assert!(
+            route_providers(&db, route, principal)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        set_schedulable(&db, account, true).await.expect("enable");
+
+        // A credential bound to someone else must not show up here either.
+        let other: Uuid = sqlx::query_scalar(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')
+             RETURNING id",
+        )
+        .bind(format!("other-{}@example.invalid", Uuid::new_v4()))
+        .fetch_one(db.pool())
+        .await
+        .expect("other principal");
+        sqlx::query("UPDATE account SET owner_principal_id = $2 WHERE id = $1")
+            .bind(account.as_uuid())
+            .bind(other)
+            .execute(db.pool())
+            .await
+            .expect("bind");
+        assert!(
+            route_providers(&db, route, principal)
+                .await
+                .expect("list")
+                .is_empty(),
+            "another principal's personal credential is not this caller's to see"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_cooldown_leaves_the_providers_own_backoff_alone() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (_, _, account) = seed(&db).await;
+
+        sqlx::query(
+            "UPDATE account
+                SET cooldown_until = now() + interval '1 hour',
+                    cooldown_reason = 'test',
+                    rate_limited_until = now() + interval '1 hour',
+                    window_resets_at = now() + interval '1 hour'
+              WHERE id = $1",
+        )
+        .bind(account.as_uuid())
+        .execute(db.pool())
+        .await
+        .expect("cool down");
+
+        clear_cooldown(&db, account).await.expect("clear");
+
+        let row = account_by_id(&db, account)
+            .await
+            .expect("load")
+            .expect("row");
+        assert!(row.cooldown_until.is_none());
+        assert!(
+            row.rate_limited_until.is_some(),
+            "rate_limited_until is the provider's own Retry-After; discarding it \
+             fleet-wide turns a throttle into an account action"
+        );
+        assert!(row.window_resets_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn admin_authority_is_carried_by_the_key_not_the_principal() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, _) = seed(&db).await;
+
+        let mint = |key: &'static str, admin: bool| {
+            let db = &db;
+            async move {
+                sqlx::query(
+                    "INSERT INTO api_key
+                         (id, key_hash, key_prefix, name, principal_id, route_id, admin)
+                     VALUES (gen_random_uuid(), $1, 'oag_live_test', $2, $3, $4, $5)",
+                )
+                .bind(hash_key(key))
+                .bind(key)
+                .bind(principal)
+                .bind(route)
+                .bind(admin)
+                .execute(db.pool())
+                .await
+                .expect("mint");
+            }
+        };
+
+        let plain = format!("plain-{}", Uuid::new_v4());
+        let elevated = format!("admin-{}", Uuid::new_v4());
+        let plain: &'static str = Box::leak(plain.into_boxed_str());
+        let elevated: &'static str = Box::leak(elevated.into_boxed_str());
+        mint(plain, false).await;
+        mint(elevated, true).await;
+
+        assert!(
+            !authenticate(&db, plain)
+                .await
+                .expect("auth")
+                .expect("found")
+                .admin,
+            "an inference key must not carry admin authority just because its \
+             principal is an admin"
+        );
+        assert!(
+            authenticate(&db, elevated)
+                .await
+                .expect("auth")
+                .expect("found")
+                .admin
+        );
     }
 }

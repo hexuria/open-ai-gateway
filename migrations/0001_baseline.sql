@@ -93,7 +93,10 @@ CREATE TABLE account (
     proxy_url           text,
     priority            smallint    NOT NULL DEFAULT 0,
     max_concurrency     integer     NOT NULL DEFAULT 8 CHECK (max_concurrency >= 0),
-    weight              smallint    NOT NULL DEFAULT 1,
+    -- No `weight`. The scheduler is a cascade of independently justified
+    -- filters rather than a weighted score, precisely so "why did this request
+    -- go there" has an answer at 3am. A weight column with nothing reading it
+    -- is an invitation to reintroduce the scoring it exists to avoid.
 
     -- Scheduling state. All expiry-based: there is no sweeper and no state
     -- machine, so nothing can leave a credential stuck out of the pool.
@@ -115,14 +118,16 @@ CREATE INDEX account_schedulable_idx
 CREATE INDEX account_owner_idx ON account (owner_principal_id)
     WHERE owner_principal_id IS NOT NULL;
 
--- Which credentials a route may draw on, and in what preference order.
+-- Which credentials a route may draw on. Membership only: preference is
+-- `account.priority`, applied by the scheduler's cascade. This table carried a
+-- `priority` column that no query ever ordered by, which read as a promise the
+-- code did not keep.
 CREATE TABLE account_route (
     account_id  uuid     NOT NULL REFERENCES account(id) ON DELETE CASCADE,
     route_id    uuid     NOT NULL REFERENCES route(id)   ON DELETE CASCADE,
-    priority    smallint NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, route_id)
 );
-CREATE INDEX account_route_by_route_idx ON account_route (route_id, priority);
+CREATE INDEX account_route_by_route_idx ON account_route (route_id);
 
 -- ── inbound keys ──────────────────────────────────────────────────────────────
 CREATE TABLE api_key (
@@ -142,6 +147,11 @@ CREATE TABLE api_key (
     -- Pin this key to a minimum rung: the CI agent gets `cheap`, the
     -- architecture-review key gets `frontier`.
     floor_tier      text,
+    -- Admin authority is a property of the KEY, not of the principal that owns
+    -- it. An operator's ordinary inference key is pasted into SDK configs and
+    -- CI; it must not also be able to disable credentials or revoke keys.
+    -- `oag admin init` mints exactly one key with this set.
+    admin           boolean     NOT NULL DEFAULT false,
     quota_usd       numeric(14,6),
     spent_usd       numeric(14,6) NOT NULL DEFAULT 0,
     expires_at      timestamptz,
@@ -220,11 +230,8 @@ CREATE INDEX usage_event_principal_idx ON usage_event (principal_id, occurred_at
 CREATE INDEX usage_event_route_idx     ON usage_event (route_id, occurred_at DESC);
 CREATE INDEX usage_event_account_idx   ON usage_event (account_id, occurred_at DESC);
 
--- ── runtime settings ──────────────────────────────────────────────────────────
--- Small on purpose. Anything that needs a restart to take effect belongs in the
--- config file, where it can be reviewed in a pull request.
-CREATE TABLE setting (
-    key         text PRIMARY KEY,
-    value       jsonb       NOT NULL,
-    updated_at  timestamptz NOT NULL DEFAULT now()
-);
+-- No `setting` table. Configuration lives in the config file, where a change is
+-- reviewable in a pull request; anything that must change without a restart
+-- gets a typed column on the entity it belongs to (`route.default_mode`,
+-- `account.schedulable`), which is no more expensive than a generic key/value
+-- row and cannot drift into an untyped grab bag.

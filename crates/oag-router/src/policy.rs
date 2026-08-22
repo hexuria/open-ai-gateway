@@ -4,9 +4,11 @@
 use crate::catalog::{Catalog, ModelSpec, Requirements};
 use crate::classify::{Classifier, RequestSignal};
 use crate::ladder::TierLadder;
+use oag_core::Provider;
 use oag_core::{BudgetScope, Error, Result, Tier, TierName, tier::RoutingMode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// How close a principal is to their cap.
 /// Variant order is load-bearing: it ascends from most to least headroom, so
@@ -65,6 +67,17 @@ impl BudgetState {
         }
         BudgetPressure::Normal
     }
+}
+
+/// One model a caller is entitled to name, as reported by `/v1/models`.
+#[derive(Debug, Clone)]
+pub struct Entitlement<'c> {
+    pub spec: &'c ModelSpec,
+    /// The rung it sits on, or `None` for a catalog model that is on no rung.
+    pub tier: Option<TierName>,
+    /// Whether naming it will be honoured. False in managed mode, and false for
+    /// an off-ladder name under a floor above the cheapest rung.
+    pub honoured: bool,
 }
 
 /// Every spend cap that applies to one request.
@@ -234,6 +247,12 @@ impl RoutingPolicy {
         &self.ladder
     }
 
+    /// The rung this name refers to, if the route's ladder has one.
+    #[must_use]
+    pub fn rung(&self, name: &TierName) -> Option<Tier> {
+        self.ladder.tier(name)
+    }
+
     /// The floor rung's name, for logging.
     #[must_use]
     pub fn floor_name(&self) -> Option<&str> {
@@ -395,6 +414,85 @@ impl RoutingPolicy {
             };
             current = next;
         }
+    }
+
+    /// The ladder rungs this route advertises as `oag/<rung>` names.
+    ///
+    /// Rung names come from the route's own ladder rather than a hardcoded
+    /// cheap/balanced/frontier trio, because `TierName` is operator-defined and
+    /// a route with a `[budget, standard, premium]` ladder must advertise those.
+    /// `oag/auto` is universal and is not returned here — it is not a rung.
+    #[must_use]
+    pub fn virtual_names(&self) -> Vec<TierName> {
+        let floor_rank = self.floor.as_ref().map_or(0, |t| t.rank);
+        self.ladder
+            .rungs()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rung)| {
+                let rank = u8::try_from(i).ok()?;
+                (rank >= floor_rank).then(|| rung.name.clone())
+            })
+            .collect()
+    }
+
+    /// Models this caller may actually name, and whether naming one is honoured.
+    ///
+    /// `providers` is the set the route holds usable credentials for: a model
+    /// nobody can reach is worse listed than omitted, because the failure
+    /// arrives later and further from the cause.
+    #[must_use]
+    pub fn entitled<'c>(
+        &self,
+        mode: &RoutingMode,
+        catalog: &'c Catalog,
+        providers: &BTreeSet<Provider>,
+    ) -> Vec<Entitlement<'c>> {
+        let floor_rank = self.floor.as_ref().map_or(0, |t| t.rank);
+        let managed = *mode == RoutingMode::Managed;
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        for (i, rung) in self.ladder.rungs().iter().enumerate() {
+            let Ok(rank) = u8::try_from(i) else { continue };
+            if rank < floor_rank {
+                continue;
+            }
+            for spec in rung.models.iter().filter_map(|id| catalog.get(id)) {
+                if !providers.contains(&spec.provider) || !seen.insert(spec.id.as_str().to_owned())
+                {
+                    continue;
+                }
+                out.push(Entitlement {
+                    spec,
+                    tier: Some(rung.name.clone()),
+                    // In managed mode the name is advisory: `decide` classifies
+                    // and picks for itself.
+                    honoured: !managed,
+                });
+            }
+        }
+
+        if !managed {
+            // An off-ladder name lands in `decide`'s passthrough branch, where
+            // `tier_of` returns `None` and it is treated as rank 0. With a floor
+            // above rank 0 the clamp then substitutes a *different* model
+            // entirely, silently — so under a floor these are advertised as not
+            // honoured rather than as free choices.
+            let honoured = floor_rank == 0;
+            for spec in catalog.iter() {
+                if !providers.contains(&spec.provider) || seen.contains(spec.id.as_str()) {
+                    continue;
+                }
+                out.push(Entitlement {
+                    spec,
+                    tier: None,
+                    honoured,
+                });
+            }
+        }
+
+        out
     }
 
     fn tier_of(&self, model: &crate::catalog::ModelId) -> Option<Tier> {
@@ -905,5 +1003,131 @@ mod tests {
             principal: exhausted(),
         };
         assert_eq!(wider.binding(), BudgetScope::Route);
+    }
+
+    /// The ladder's three models plus one the ladder never names.
+    fn catalog_with_off_ladder() -> Catalog {
+        Catalog::from_entries([
+            model("kimi/k2", Provider::Kimi, 128_000, dec!(0.6)),
+            model("anthropic/haiku", Provider::Anthropic, 200_000, dec!(1)),
+            model("anthropic/opus", Provider::Anthropic, 400_000, dec!(15)),
+            model("anthropic/sonnet", Provider::Anthropic, 200_000, dec!(3)),
+        ])
+    }
+
+    fn all_providers() -> BTreeSet<Provider> {
+        [Provider::Kimi, Provider::Anthropic].into_iter().collect()
+    }
+
+    fn ids(entries: &[Entitlement<'_>]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| e.spec.id.as_str().to_owned())
+            .collect()
+    }
+
+    fn names(rungs: &[TierName]) -> Vec<String> {
+        rungs.iter().map(|r| r.as_str().to_owned()).collect()
+    }
+
+    #[test]
+    fn entitled_excludes_rungs_below_the_floor() {
+        let floored = policy().with_floor(Some(Tier::new(TierName::new("frontier"), 2)));
+        let catalog = catalog();
+        let listed = floored.entitled(&RoutingMode::Managed, &catalog, &all_providers());
+        assert_eq!(ids(&listed), ["anthropic/opus"]);
+    }
+
+    #[test]
+    fn entitled_excludes_a_provider_with_no_credentials() {
+        // Listing a model nobody can reach moves the failure away from its
+        // cause: the caller picks it and finds out two layers later.
+        let only_kimi: BTreeSet<Provider> = [Provider::Kimi].into_iter().collect();
+        let catalog = catalog();
+        let listed = policy().entitled(&RoutingMode::Managed, &catalog, &only_kimi);
+        assert_eq!(ids(&listed), ["kimi/k2"]);
+    }
+
+    #[test]
+    fn passthrough_lists_off_ladder_models_and_managed_does_not() {
+        let catalog = catalog_with_off_ladder();
+
+        let managed = policy().entitled(&RoutingMode::Managed, &catalog, &all_providers());
+        assert!(
+            !ids(&managed).iter().any(|id| id == "anthropic/sonnet"),
+            "managed mode picks for itself, so an off-ladder name is not on offer"
+        );
+
+        let passthrough = policy().entitled(&RoutingMode::Passthrough, &catalog, &all_providers());
+        assert!(
+            ids(&passthrough).iter().any(|id| id == "anthropic/sonnet"),
+            "passthrough honours a named model, so the catalog is the menu"
+        );
+    }
+
+    #[test]
+    fn an_off_ladder_name_under_a_floor_is_advertised_as_not_honoured() {
+        // The subtle one. In passthrough, `decide` maps an off-ladder name to
+        // rank 0 and then clamps to the floor — which returns a *different*
+        // model, silently. The caller was explicit and gets something else, so
+        // the listing has to say so.
+        let catalog = catalog_with_off_ladder();
+        let floored = policy().with_floor(Some(Tier::new(TierName::new("balanced"), 1)));
+        let listed = floored.entitled(&RoutingMode::Passthrough, &catalog, &all_providers());
+
+        let off_ladder = listed
+            .iter()
+            .find(|e| e.spec.id.as_str() == "anthropic/sonnet")
+            .expect("off-ladder models are listed in passthrough");
+        assert!(off_ladder.tier.is_none());
+        assert!(
+            !off_ladder.honoured,
+            "a floor above the cheapest rung silently substitutes a different model"
+        );
+
+        // With no floor, the same name is honoured exactly as given.
+        let open = policy().entitled(&RoutingMode::Passthrough, &catalog, &all_providers());
+        let off_ladder = open
+            .iter()
+            .find(|e| e.spec.id.as_str() == "anthropic/sonnet")
+            .expect("listed");
+        assert!(off_ladder.honoured);
+    }
+
+    #[test]
+    fn managed_mode_honours_no_name() {
+        let catalog = catalog();
+        let listed = policy().entitled(&RoutingMode::Managed, &catalog, &all_providers());
+        assert!(
+            listed.iter().all(|e| !e.honoured),
+            "in managed mode the model name is advisory; the classifier decides"
+        );
+    }
+
+    #[test]
+    fn virtual_names_come_from_this_ladder_not_a_hardcoded_trio() {
+        let ladder = TierLadder::new(vec![
+            Rung {
+                name: TierName::new("budget"),
+                models: vec![ModelId::new("kimi/k2")],
+            },
+            Rung {
+                name: TierName::new("premium"),
+                models: vec![ModelId::new("anthropic/opus")],
+            },
+        ])
+        .expect("non-empty");
+        let policy = RoutingPolicy::new(ladder, Box::new(HeuristicClassifier::default()));
+        assert_eq!(names(&policy.virtual_names()), ["budget", "premium"]);
+    }
+
+    #[test]
+    fn virtual_names_stop_at_the_floor() {
+        let floored = policy().with_floor(Some(Tier::new(TierName::new("balanced"), 1)));
+        assert_eq!(
+            names(&floored.virtual_names()),
+            ["balanced", "frontier"],
+            "advertising oag/cheap to a key floored at balanced promises what it cannot deliver"
+        );
     }
 }

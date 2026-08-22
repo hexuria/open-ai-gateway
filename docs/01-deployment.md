@@ -173,6 +173,61 @@ behind for at most one TTL: bounded, and self-healing.
 Migrations are safe to run from every replica simultaneously; a Postgres
 advisory lock serialises them.
 
+## The admin API
+
+It performs writes: disable or enable a credential, clear a cooldown, revoke a
+key. Four operations, chosen because they are what you reach for during an
+incident. Everything you can do calmly at a prompt stays in `oag admin`.
+
+**Authority is on the key, not the principal.** `api_key.admin` is what the
+admin API checks. This matters because `oag admin init` prints a key the
+operator is meant to paste into an SDK config, and its principal is an admin —
+so under a principal-based check, every inference key that operator ever minted
+could disable credentials. Mint the admin one explicitly:
+
+```bash
+oag admin key --email you@example.com --route default --name ops --admin
+```
+
+Every `/admin/api` route is authenticated by a single layer applied where the
+routes are declared, not by a call inside each handler. A handler that forgets
+the call is silently public and looks exactly like the others; a route in the
+wrong function is visible in ten lines. `/`, `/metrics` and `/health/ready` sit
+outside it on purpose — the page must load before anyone can type a key, and
+the scraper and the orchestrator do not have one.
+
+Auth is an `x-api-key` header rather than a cookie, so a cross-origin page
+cannot forge a write: it would need to set a custom header, which requires a
+preflight the browser refuses. The dashboard keeps the key in `localStorage`,
+which is a real exposure and is why the page ships a restrictive CSP — that
+narrows the channel, it does not close it, since nothing in CSP constrains
+top-level navigation.
+
+**With `single_listener: true`** — which Cloud Run and Container Apps force —
+the admin routes are merged onto the public listener, so `disable` and `revoke`
+are internet-reachable and one key is the only thing in the way. Restrict the
+service with ingress rules or IAM; do not rely on the key alone.
+
+Every write emits one line at `warn` on the `oag::audit` target, naming the
+actor, the action and the subject. `warn` rather than `info` because the log
+filter is a free-form string and an operator quietening a noisy deployment to
+`warn` would otherwise erase the audit trail without noticing.
+
+## Migrations
+
+`oag migrate` runs them under a Postgres advisory lock; `oag serve` does not run
+them at all. There is one migration, and it is a baseline that gets edited in
+place rather than accumulating a chain — which is only safe while no database
+anyone cares about has applied it.
+
+sqlx checksums applied migrations. Against a database that ran an earlier
+version of `0001`, `oag migrate` fails closed with *migration 1 was previously
+applied but has been modified* and applies nothing — including any later
+migration. In development the fix is to recreate the database. In production it
+is a hand-patched `_sqlx_migrations.checksum`, so once this project has a real
+deployment the baseline stops being editable and changes become `0002`, `0003`,
+and so on.
+
 ## Verifying it
 
 ```bash

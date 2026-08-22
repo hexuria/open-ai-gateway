@@ -165,6 +165,55 @@ impl CanonicalRequest {
     }
 }
 
+/// Token estimate for a client that asked "how big is this prompt".
+///
+/// Deliberately separate from [`CanonicalRequest::estimated_prompt_tokens`],
+/// which feeds a routing threshold. That one is biased low in ways that do not
+/// matter there and do matter here: a client that under-counts never compacts
+/// and then takes a hard context-overflow error from the provider. Changing it
+/// would also silently re-route every deployment, because the classifier's
+/// thresholds are calibrated against its current behaviour.
+///
+/// Still an estimate. No tokeniser is linked, and the divisors below are
+/// reasoned rather than measured — which is why every response built on this
+/// is marked as an estimate rather than presented as a count.
+#[must_use]
+pub fn count_input_tokens(req: &CanonicalRequest) -> u64 {
+    let content: usize = req
+        .system
+        .iter()
+        .chain(req.messages.iter().flat_map(|m| m.content.iter()))
+        .map(count_block)
+        .sum();
+
+    // Tool schemas are JSON: punctuation-dense, so closer to three bytes per
+    // token than four. The name and prose description are ordinary English.
+    let tools: usize = req
+        .tools
+        .iter()
+        .map(|t| (t.name.len() + t.description.len()) / 4 + t.input_schema.to_string().len() / 3)
+        .sum();
+
+    // Per-message and per-tool framing the provider adds around the content
+    // itself — role markers, delimiters, the tool-definition envelope.
+    let framing = 4 * req.messages.len() + 8 * req.tools.len();
+
+    (content + tools + framing) as u64
+}
+
+fn count_block(b: &ContentBlock) -> usize {
+    match b {
+        ContentBlock::Text { text, .. } | ContentBlock::Thinking { text, .. } => text.len() / 4,
+        ContentBlock::ToolResult { content, .. } => content.len() / 4,
+        ContentBlock::ToolUse { name, input, .. } => (name.len() + input.to_string().len()) / 3,
+        // Anthropic bills an image at roughly (width x height) / 750, which puts
+        // a typical screenshot between 1,000 and 1,600 tokens. `block_len`'s
+        // 1,000 *bytes* becomes 250 tokens after its divisor — low by about 6x,
+        // and low is the direction that breaks a client's compaction trigger.
+        ContentBlock::Image { .. } => 1_500,
+    }
+}
+
 fn block_len(b: &ContentBlock) -> usize {
     match b {
         ContentBlock::Text { text, .. } | ContentBlock::Thinking { text, .. } => text.len(),
@@ -346,5 +395,98 @@ mod tests {
     #[test]
     fn an_empty_request_has_no_cache_blocks() {
         assert!(extract_cache_blocks(&request(vec![])).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod count_tests {
+    use super::*;
+
+    fn blank() -> CanonicalRequest {
+        CanonicalRequest {
+            model: "anthropic/opus".to_owned(),
+            system: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: 1024,
+            stream: false,
+            temperature: None,
+            thinking_budget: None,
+            client_session: None,
+        }
+    }
+
+    fn text(t: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: t.to_owned(),
+            cache_control: None,
+        }
+    }
+
+    fn user(blocks: Vec<ContentBlock>) -> CanonicalRequest {
+        CanonicalRequest {
+            messages: vec![Message {
+                role: Role::User,
+                content: blocks,
+            }],
+            ..blank()
+        }
+    }
+
+    #[test]
+    fn an_image_is_priced_near_what_a_provider_bills_not_at_a_quarter_of_it() {
+        // `estimated_prompt_tokens` values an image at 1_000 *bytes*, which its
+        // divisor turns into 250 tokens — roughly 6x low against a real
+        // screenshot. Low is the direction that breaks a compaction trigger,
+        // which is why this endpoint does not reuse it.
+        let req = user(vec![ContentBlock::Image {
+            media_type: "image/png".to_owned(),
+            data: "AAAA".to_owned(),
+        }]);
+        assert!(count_input_tokens(&req) > 1_000);
+        assert!(req.estimated_prompt_tokens() < 500);
+    }
+
+    #[test]
+    fn a_tool_schema_counts_denser_than_the_same_bytes_of_prose() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" }, "recursive": { "type": "boolean" } },
+        });
+        let with_tool = CanonicalRequest {
+            tools: vec![Tool {
+                name: "list_files".to_owned(),
+                description: String::new(),
+                input_schema: schema.clone(),
+                cache_control: None,
+            }],
+            ..blank()
+        };
+        let as_prose = user(vec![text(&schema.to_string())]);
+        assert!(count_input_tokens(&with_tool) > count_input_tokens(&as_prose));
+    }
+
+    #[test]
+    fn the_routing_estimate_is_pinned_so_classifier_thresholds_cannot_drift() {
+        // `estimated_prompt_tokens` feeds the classifier's 8000/100000 lines.
+        // Changing it silently re-routes every deployment, so it gets a
+        // regression guard rather than an opinion.
+        let req = user(vec![text(&"a".repeat(4_000))]);
+        assert_eq!(req.estimated_prompt_tokens(), 1_000);
+    }
+
+    #[test]
+    fn framing_is_charged_per_message_so_many_short_turns_are_not_free() {
+        let one = user(vec![text("hi")]);
+        let many = CanonicalRequest {
+            messages: (0..10)
+                .map(|_| Message {
+                    role: Role::User,
+                    content: vec![text("hi")],
+                })
+                .collect(),
+            ..blank()
+        };
+        assert!(count_input_tokens(&many) > count_input_tokens(&one) * 5);
     }
 }

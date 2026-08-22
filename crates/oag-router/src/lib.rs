@@ -22,6 +22,6 @@ pub use classify::{Classifier, HeuristicClassifier, RequestSignal};
 pub use cost::{Usage, counterfactual};
 pub use ladder::TierLadder;
 pub use policy::{
-    BudgetPressure, BudgetState, Budgets, QualityGate, RoutingDecision, RoutingPolicy,
+    BudgetPressure, BudgetState, Budgets, Entitlement, QualityGate, RoutingDecision, RoutingPolicy,
     SelectionReason, escalation_allowed,
 };

@@ -26,7 +26,7 @@ pub use shutdown::Lifecycle;
 pub use state::AppState;
 
 use axum::Router;
-use axum::routing::get;
+use axum::routing::{get, post};
 use oag_core::Result;
 use std::sync::Arc;
 
@@ -34,6 +34,20 @@ use std::sync::Arc;
 fn inference_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/messages", axum::routing::post(gateway::messages))
+        .route(
+            "/v1/messages/count_tokens",
+            axum::routing::post(gateway::count_tokens::count_tokens)
+                // The outer limit is `server.max_body_bytes`, 256 MiB by
+                // default. This endpoint does a full parse plus a `to_string`
+                // of every tool schema, and a real count_tokens body carries no
+                // payload worth megabytes. The inner limit wins for this route.
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
+        // Discovery. Both spellings, because SDKs given a custom base URL
+        // differ on whether they keep the version prefix.
+        .route("/v1/models", get(gateway::models::list))
+        .route("/models", get(gateway::models::list))
+        .route("/v1beta/models", get(gateway::models::list_gemini))
         .route(
             "/v1/chat/completions",
             axum::routing::post(gateway::chat_completions),
@@ -54,19 +68,38 @@ fn inference_routes() -> Router<Arc<AppState>> {
 }
 
 /// The admin routes, without the shared health endpoint.
-fn admin_routes() -> Router<Arc<AppState>> {
+fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
+    // The only place an `/admin/api` path may be declared. A route added here
+    // is authenticated whether or not its author thought about it; producing an
+    // unauthenticated admin handler requires declaring it in the wrong
+    // function, which is visible in the ten lines below.
+    let api = Router::new()
+        .route("/summary", get(admin::summary))
+        .route("/accounts", get(admin::accounts))
+        .route("/routes", get(admin::routes))
+        .route("/usage", get(admin::usage))
+        .route("/keys", get(admin::keys))
+        .route("/catalog/reload", post(admin::reload_catalog))
+        .route("/accounts/{id}/disable", post(admin::disable_account))
+        .route("/accounts/{id}/enable", post(admin::enable_account))
+        .route("/accounts/{id}/clear-cooldown", post(admin::clear_cooldown))
+        .route("/keys/{id}/revoke", post(admin::revoke_key))
+        // `route_layer` rather than `layer`: an unmatched path under
+        // /admin/api should 404 without a database round trip.
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(state),
+            admin::require_admin_layer,
+        ));
+
     Router::new()
+        // Deliberately outside the layer. The dashboard HTML has to load before
+        // the operator can type a key into it; /metrics is scraped without one;
+        // /health/ready is probed by the orchestrator without one. A blanket
+        // layer over this router breaks all three.
         .route("/", get(admin::dashboard))
         .route("/health/ready", get(health::ready))
         .route("/metrics", get(metrics::render))
-        .route("/admin/api/summary", get(admin::summary))
-        .route("/admin/api/accounts", get(admin::accounts))
-        .route("/admin/api/routes", get(admin::routes))
-        .route("/admin/api/usage", get(admin::usage))
-        .route(
-            "/admin/api/catalog/reload",
-            axum::routing::post(admin::reload_catalog),
-        )
+        .nest("/admin/api", api)
 }
 
 /// Inference. Fronted by the load balancer.
@@ -80,7 +113,7 @@ pub fn public_router(state: Arc<AppState>) -> Router {
     // On a single-port platform there is nowhere else for the admin routes to
     // live, so they join this listener rather than vanishing entirely.
     let routes = if state.config.server.single_listener {
-        routes.merge(admin_routes())
+        routes.merge(admin_routes(&state))
     } else {
         routes
     };
@@ -92,7 +125,7 @@ pub fn public_router(state: Arc<AppState>) -> Router {
 
 /// Admin API, metrics, readiness. Internal network only.
 pub fn admin_router(state: Arc<AppState>) -> Router {
-    admin_routes()
+    admin_routes(&state)
         .route("/health/live", get(health::live))
         .with_state(state)
 }
@@ -163,4 +196,138 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
     a.map_err(|e| oag_core::Error::Internal(format!("public listener: {e}")))?;
     b.map_err(|e| oag_core::Error::Internal(format!("admin listener: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    /// A state that dials nothing.
+    ///
+    /// `Db::connect` builds a lazy pool and `Cache::connect` only opens a redis
+    /// client, so neither touches the network here. Every assertion below is
+    /// about routing and the auth layer, which run before any backend does.
+    fn state(single_listener: bool) -> Arc<AppState> {
+        let src = format!(
+            r#"
+database:
+  url: "postgres://oag:oag@127.0.0.1:1/oag"
+redis:
+  url: "redis://127.0.0.1:1"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+server:
+  single_listener: {single_listener}
+"#
+        );
+        let config = oag_core::config::Config::from_yaml(&src).expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        Arc::new(AppState::new(config, db, cache).expect("state"))
+    }
+
+    /// Every mutating and reading path under /admin/api.
+    ///
+    /// Hardcoded rather than derived from the router: a list generated from the
+    /// thing under test would pass even if every route disappeared.
+    const ADMIN_API: &[(&str, &str)] = &[
+        ("GET", "/admin/api/summary"),
+        ("GET", "/admin/api/accounts"),
+        ("GET", "/admin/api/routes"),
+        ("GET", "/admin/api/usage"),
+        ("GET", "/admin/api/keys"),
+        ("POST", "/admin/api/catalog/reload"),
+        (
+            "POST",
+            "/admin/api/accounts/00000000-0000-0000-0000-000000000001/disable",
+        ),
+        (
+            "POST",
+            "/admin/api/accounts/00000000-0000-0000-0000-000000000001/enable",
+        ),
+        (
+            "POST",
+            "/admin/api/accounts/00000000-0000-0000-0000-000000000001/clear-cooldown",
+        ),
+        (
+            "POST",
+            "/admin/api/keys/00000000-0000-0000-0000-000000000001/revoke",
+        ),
+    ];
+
+    async fn status(router: Router, method: &str, path: &str) -> StatusCode {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        router.oneshot(request).await.expect("response").status()
+    }
+
+    #[tokio::test]
+    async fn every_admin_api_route_rejects_an_anonymous_request() {
+        // The point of the layer. With per-handler checks this test could only
+        // ever cover the handlers someone remembered to write a check into;
+        // here a new route is covered by construction, and adding one to the
+        // wrong function is what this catches.
+        for (method, path) in ADMIN_API {
+            let got = status(admin_router(state(false)), method, path).await;
+            assert_eq!(
+                got,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} answered {got} without a key"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_dashboard_and_metrics_stay_open() {
+        // Deliberately outside the layer: the page has to load before anyone
+        // can type a key into it, and /metrics is scraped without one.
+        //
+        // /health/ready is excluded on purpose — it pings Postgres, whose pool
+        // has a ten-second acquire timeout, so asserting on it here would cost
+        // a real stall and depend on whether a local Postgres happens to exist.
+        for path in ["/", "/metrics"] {
+            let got = status(admin_router(state(false)), "GET", path).await;
+            assert_ne!(got, StatusCode::UNAUTHORIZED, "{path} must not need a key");
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_writes_are_absent_from_the_public_listener_by_default() {
+        // 404, not 401: with two listeners the admin surface is not merely
+        // guarded on the inference port, it is not routed there at all.
+        let got = status(
+            public_router(state(false)),
+            "POST",
+            "/admin/api/accounts/00000000-0000-0000-0000-000000000001/disable",
+        )
+        .await;
+        assert_eq!(got, StatusCode::NOT_FOUND);
+
+        // With single_listener they share a port — Cloud Run and Container Apps
+        // route to one — and then the key is the only thing in the way.
+        let got = status(
+            public_router(state(true)),
+            "POST",
+            "/admin/api/accounts/00000000-0000-0000-0000-000000000001/disable",
+        )
+        .await;
+        assert_eq!(got, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn client_discovery_routes_require_a_key_too() {
+        // /v1/models reports the org's provider inventory and this route's
+        // entitlements. It is not public information.
+        for path in ["/v1/models", "/models", "/v1beta/models"] {
+            let got = status(public_router(state(false)), "GET", path).await;
+            assert_eq!(got, StatusCode::UNAUTHORIZED, "{path} leaked without a key");
+        }
+    }
 }
