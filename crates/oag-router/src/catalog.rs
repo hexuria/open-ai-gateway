@@ -1,0 +1,253 @@
+//! What models exist, what they cost, and what they can do.
+//!
+//! Seeded from `LiteLLM`'s `model_prices_and_context_window.json`, which is the
+//! most complete public pricing table and is what sub2api uses too. We vendor
+//! it as a build asset and refresh it with a command, rather than sub2api's
+//! background download-and-hash-check service — pricing changes a few times a
+//! year, and a gateway that cannot start because a GitHub fetch failed is a
+//! worse trade than a table that is occasionally a week stale.
+
+use oag_core::Provider;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fmt;
+
+/// A canonical model identifier, `provider/name`.
+///
+/// Distinct from the provider's own name for the model, which appears on the
+/// wire: Bedrock calls Sonnet `anthropic.claude-sonnet-4-v1:0`, and we should
+/// not make routing policy spell that.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ModelId(pub String);
+
+impl ModelId {
+    #[must_use]
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for ModelId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+/// Per-million-token prices, in USD.
+///
+/// `Decimal`, never `f64`. These values get multiplied by token counts and
+/// summed across millions of rows; binary floating point accumulates visible
+/// drift and there is no reason to accept it for a fixed-point quantity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pricing {
+    pub input_per_mtok: Decimal,
+    pub output_per_mtok: Decimal,
+    /// Reading a cached prefix. Typically ~10% of input. The single largest
+    /// lever on agentic workloads, where most of the prompt repeats every turn.
+    #[serde(default)]
+    pub cache_read_per_mtok: Option<Decimal>,
+    /// Writing a prefix into the cache. Typically ~125% of input.
+    #[serde(default)]
+    pub cache_write_per_mtok: Option<Decimal>,
+}
+
+/// What a model can be asked to do.
+///
+/// Used to reject a rung rather than discover the incapability as a 400 from
+/// upstream: routing a vision request to a text-only model is a decision we can
+/// make correctly for free.
+// Independent feature flags, not a state machine: a model can have any subset
+// of these and no combination is invalid.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Capabilities {
+    pub vision: bool,
+    pub tools: bool,
+    /// Extended thinking / reasoning budgets.
+    pub reasoning: bool,
+    pub prompt_cache: bool,
+}
+
+/// One model, as routing policy sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSpec {
+    pub id: ModelId,
+    pub provider: Provider,
+    /// What to actually put on the wire for this provider.
+    pub upstream_name: String,
+    pub pricing: Pricing,
+    pub context_window: u32,
+    pub max_output_tokens: u32,
+    #[serde(default)]
+    pub capabilities: Capabilities,
+}
+
+impl ModelSpec {
+    /// Whether this model can serve a request with these requirements.
+    #[must_use]
+    pub fn satisfies(&self, need: &Requirements) -> bool {
+        if need.vision && !self.capabilities.vision {
+            return false;
+        }
+        if need.tools && !self.capabilities.tools {
+            return false;
+        }
+        if need.reasoning && !self.capabilities.reasoning {
+            return false;
+        }
+        // Leave headroom for the response: a prompt that exactly fills the
+        // window leaves nowhere to answer.
+        let needed = need.prompt_tokens.saturating_add(u64::from(need.max_output_tokens));
+        needed <= u64::from(self.context_window)
+    }
+}
+
+/// What a specific request needs from whatever model serves it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Requirements {
+    pub prompt_tokens: u64,
+    pub max_output_tokens: u32,
+    pub vision: bool,
+    pub tools: bool,
+    pub reasoning: bool,
+}
+
+/// Every model the gateway knows about.
+#[derive(Debug, Clone, Default)]
+pub struct Catalog {
+    models: BTreeMap<ModelId, ModelSpec>,
+}
+
+impl Catalog {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&mut self, spec: ModelSpec) {
+        self.models.insert(spec.id.clone(), spec);
+    }
+
+    #[must_use]
+    pub fn get(&self, id: &ModelId) -> Option<&ModelSpec> {
+        self.models.get(id)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.models.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ModelSpec> {
+        self.models.values()
+    }
+
+    /// Resolve a name a client sent us.
+    ///
+    /// Accepts the canonical `provider/name` and, as a convenience, a bare
+    /// upstream name when it is unambiguous. Ambiguity resolves to `None`
+    /// rather than guessing: silently picking one of two providers for
+    /// `gpt-5` would route spend somewhere the operator did not choose.
+    #[must_use]
+    pub fn resolve(&self, name: &str) -> Option<&ModelSpec> {
+        if let Some(spec) = self.models.get(&ModelId::new(name)) {
+            return Some(spec);
+        }
+        let mut hits = self.models.values().filter(|m| m.upstream_name == name);
+        let first = hits.next()?;
+        if hits.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
+    /// Build from parsed `LiteLLM` pricing entries.
+    pub fn from_entries(entries: impl IntoIterator<Item = ModelSpec>) -> Self {
+        let mut catalog = Self::new();
+        for spec in entries {
+            catalog.insert(spec);
+        }
+        catalog
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::dec;
+
+    fn spec(id: &str, provider: Provider, upstream: &str, ctx: u32) -> ModelSpec {
+        ModelSpec {
+            id: ModelId::new(id),
+            provider,
+            upstream_name: upstream.to_owned(),
+            pricing: Pricing {
+                input_per_mtok: dec!(1),
+                output_per_mtok: dec!(5),
+                cache_read_per_mtok: Some(dec!(0.1)),
+                cache_write_per_mtok: Some(dec!(1.25)),
+            },
+            context_window: ctx,
+            max_output_tokens: 8192,
+            capabilities: Capabilities {
+                vision: true,
+                tools: true,
+                reasoning: false,
+                prompt_cache: true,
+            },
+        }
+    }
+
+    #[test]
+    fn ambiguous_bare_names_do_not_resolve() {
+        let catalog = Catalog::from_entries([
+            spec("openai/gpt-5", Provider::OpenAI, "gpt-5", 400_000),
+            spec("vertex/gpt-5", Provider::Vertex, "gpt-5", 400_000),
+        ]);
+        // Guessing here would route spend to a provider the operator did not pick.
+        assert!(catalog.resolve("gpt-5").is_none());
+        assert!(catalog.resolve("openai/gpt-5").is_some());
+    }
+
+    #[test]
+    fn context_check_leaves_room_for_the_answer() {
+        let model = spec("m/small", Provider::Kimi, "small", 8_000);
+        let need = Requirements {
+            prompt_tokens: 7_000,
+            max_output_tokens: 4_000,
+            ..Requirements::default()
+        };
+        // 7k prompt fits in 8k, but not alongside a 4k response.
+        assert!(!model.satisfies(&need));
+    }
+
+    #[test]
+    fn missing_capability_disqualifies() {
+        let mut model = spec("m/text", Provider::Kimi, "text", 100_000);
+        model.capabilities.vision = false;
+        let need = Requirements {
+            prompt_tokens: 10,
+            vision: true,
+            ..Requirements::default()
+        };
+        assert!(!model.satisfies(&need));
+    }
+}

@@ -75,13 +75,13 @@ impl Error {
     /// the pool until a human notices.
     #[must_use]
     pub fn disposition(&self) -> Disposition {
-        const COOLDOWN: Duration = Duration::from_secs(600);
+        const COOLDOWN: Duration = Duration::from_mins(10);
 
         match self {
             Self::Upstream { status, .. } => match status {
                 401 | 403 => Disposition::FailoverAccount { cooldown: COOLDOWN },
                 402 => Disposition::FailoverAccount {
-                    cooldown: Duration::from_secs(3600),
+                    cooldown: Duration::from_hours(1),
                 },
                 408 | 409 | 425 => Disposition::RetrySameAccount,
                 429 => Disposition::RateLimited { retry_after: None },
@@ -97,7 +97,7 @@ impl Error {
                 _ => Disposition::Fatal,
             },
             Self::StreamIdle(_) => Disposition::FailoverAccount {
-                cooldown: Duration::from_secs(60),
+                cooldown: Duration::from_mins(1),
             },
             Self::NoCredential { .. } | Self::NoViableModel => Disposition::EscalateTier,
             _ => Disposition::Fatal,
@@ -133,7 +133,7 @@ mod tests {
         let Disposition::FailoverAccount { cooldown } = upstream(529).disposition() else {
             panic!("529 should fail over");
         };
-        assert!(cooldown < Duration::from_secs(60), "overload cooldown should be short");
+        assert!(cooldown < Duration::from_mins(1), "overload cooldown should be short");
     }
 
     #[test]

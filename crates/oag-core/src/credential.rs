@@ -19,7 +19,7 @@ pub enum CredentialKind {
     /// A subscription OAuth token pair. Sanctioned for the seat holder's own
     /// use; see `docs/compliance.md` before pooling one across people.
     OAuth,
-    /// AWS SigV4 credentials for Bedrock.
+    /// AWS `SigV4` credentials for Bedrock.
     Bedrock,
     /// GCP service-account credentials for Vertex.
     Vertex,

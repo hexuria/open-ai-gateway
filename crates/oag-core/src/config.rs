@@ -51,7 +51,7 @@ impl Default for ServerConfig {
             public_addr: "0.0.0.0:8080".to_owned(),
             admin_addr: "127.0.0.1:8081".to_owned(),
             header_read_timeout: Duration::from_secs(10),
-            idle_timeout: Duration::from_secs(120),
+            idle_timeout: Duration::from_mins(2),
             max_body_bytes: 256 * 1024 * 1024,
         }
     }
@@ -154,9 +154,9 @@ pub struct GatewayConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            stream_idle_timeout: Duration::from_secs(180),
+            stream_idle_timeout: Duration::from_mins(3),
             stream_keepalive_interval: Duration::from_secs(10),
-            max_stream_duration: Duration::from_secs(1800),
+            max_stream_duration: Duration::from_mins(30),
             same_account_retries: 2,
             max_account_switches: 3,
         }

@@ -90,7 +90,7 @@ pub enum Dialect {
     AnthropicMessages,
     /// `POST /v1/chat/completions` — the lingua franca of everything else.
     OpenAIChatCompletions,
-    /// `POST /v1/responses` — OpenAI's newer stateful surface.
+    /// `POST /v1/responses` — `OpenAI`'s newer stateful surface.
     OpenAIResponses,
     /// `POST /v1beta/models/{model}:generateContent`
     GeminiGenerateContent,
