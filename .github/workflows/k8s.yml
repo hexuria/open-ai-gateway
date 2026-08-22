@@ -4,15 +4,19 @@ name: k8s
 # claim in the docs that was only ever checked by hand. This is where it stops
 # being an anecdote.
 #
-# Deliberately NOT on push yet: deploy/test/kind-verify.sh has never completed a
-# run, and a permanently red X on main teaches everyone to ignore CI. Run it with
-# workflow_dispatch until it is green, then add:
-#   push: { branches: [main] }
-#   pull_request: { paths: ['crates/**', 'deploy/**', 'migrations/**'] }
+# Green as of 2026-08-23 (8/8 streams, 8 ledger rows), so it now runs on the
+# changes that could break it rather than only on request. Path-filtered because
+# it takes ~10 minutes and a docs commit cannot affect it.
 on:
+  push:
+    branches: [main]
+    paths: ["crates/**", "deploy/**", "migrations/**", ".github/workflows/k8s.yml"]
+  pull_request:
+    paths: ["crates/**", "deploy/**", "migrations/**", ".github/workflows/k8s.yml"]
   workflow_dispatch:
   schedule:
-    # Nightly, so a regression surfaces within a day once this is stable.
+    # Nightly too: the drain budget interacts with image and chart defaults that
+    # can move underneath us without any file here changing.
     - cron: "17 3 * * *"
 
 jobs:

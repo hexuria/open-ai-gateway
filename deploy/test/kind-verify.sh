@@ -16,18 +16,16 @@
 #
 # Local only: kind, no cloud, no credentials. Takes a few minutes.
 #
-# STATUS: NOT YET PROVEN. This script has never completed a full run. It gets as
-# far as standing up the cluster, loading the image, starting the mock and
-# beginning the chart install; the one run that reached `helm install --wait`
-# timed out at 10 minutes with the gateway Deployment at 0/3, and the cause was
-# never diagnosed. The likely candidates, in order, are: the 10m timeout being
-# too short for image pulls plus two StatefulSets plus the migrate hook on a
-# cold machine; a readiness probe that cannot reach the in-cluster Postgres or
-# Redis; and the chart's terminationGracePeriodSeconds (which must exceed the
-# 1800s maxStreamDuration) interacting badly with `--wait`.
+# STATUS: passing as of 2026-08-23 — 8 of 8 streams completed across a full
+# rolling restart, and all 8 reached the ledger. It runs on push, on PRs that
+# touch crates/, deploy/ or migrations/, and nightly.
 #
-# Finish this before trusting anything it prints. Everything below the install
-# step — the drain assertion itself — has never executed.
+# Getting here took six CI runs and every failure was in this script rather than
+# in the gateway: a KEK that decoded to 34 bytes instead of 32, a hardcoded
+# deployment name, a bare `wait` that waited on the port-forward, a race against
+# the per-replica catalog refresh, and a ledger query routed through a pod the
+# rollout had just replaced. Each is commented where it was fixed. If you are
+# extending this, assume a new failure is yours before it is the gateway's.
 set -euo pipefail
 
 CLUSTER="${CLUSTER:-oag-verify}"

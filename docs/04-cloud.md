@@ -213,9 +213,9 @@ makes the job execute; do not silence it with `ignore_changes`, and do not use
 | | |
 |---|---|
 | Helm chart | linted; five preflight guards each confirmed to fire; four valid configurations render |
-| Kubernetes | deployed to `kind`: migration hook, in-cluster Postgres and Redis, two replicas ready, both listeners answering |
+| Kubernetes | deployed to `kind` in CI: migration hook confirmed to run before any pod serves, in-cluster Postgres and Redis, three replicas, both listeners answering |
 | Request path | streamed through the Service; ledger row exact — `in=1200 cached=18000 out=142`, `$0.004085` against `$0.061275` |
-| Rolling update | 12 of 12 long streams survived a `rollout restart` mid-flight |
+| Rolling update | 8 of 8 long streams survived a `rollout restart` mid-flight, and all 8 reached the ledger — in CI, on every push (`.github/workflows/k8s.yml`), not by hand |
 | OpenTofu | all modules and all three stacks pass `terraform validate` |
 | Container image | builds; `oag --version` runs; ELF `e_machine` matches the image architecture |
 

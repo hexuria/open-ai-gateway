@@ -25,9 +25,16 @@ pattern from the start, when the repo was published straight to `hexuria`.
 
 ```bash
 just verify        # request path end to end vs a mock upstream, ~1 min, no credentials
+just verify-k8s    # rolling restart severs no stream; needs kind, ~10 min
 just check         # fmt + clippy + tests
 just dev-serve     # local gateway; also what the editor run button launches
 ```
+
+`just verify-k8s` also runs in CI (`.github/workflows/k8s.yml`) on every push
+touching `crates/`, `deploy/` or `migrations/`, on PRs, and nightly. As of
+2026-08-23 it passes: 8 of 8 streams complete across a full `rollout restart`
+and all 8 reach the ledger. That claim used to be an anecdote from one manual
+check; it is now checked by a runner.
 
 `just verify` is the one to run first on a new machine. It passes today with:
 
@@ -38,69 +45,46 @@ $0.00019000 vs $0.00285000 frontier — 93% saved, ttft 998ms
 
 ## Pick up here
 
-In priority order. The first is a genuine blocker for trusting anything else.
+In priority order. Everything here is blocked on credentials or on a decision —
+the local and CI verification is done.
 
-### 1. `just verify-k8s` does not pass — finish it
+### 1. Point it at one real credential
 
-`deploy/test/kind-verify.sh` is scaffolding that has never completed a run. It
-stands up kind, builds and loads the image, starts the mock, begins the chart
-install — and the one run that reached `helm install --wait` timed out at ten
-minutes with the gateway Deployment at 0/3. **The drain assertion itself has
-never executed.**
-
-Candidates, in the order worth checking:
-
-- the 10m `--wait` timeout being too short for image pulls plus two StatefulSets
-  plus the migrate hook on a cold machine (raise it first, it is free)
-- a readiness probe that cannot reach the in-cluster Postgres or Redis
-- `terminationGracePeriodSeconds` — which the chart forces above the 1800s
-  `maxStreamDuration` — interacting badly with `--wait`
-
-The script keeps its cluster on failure and prints pod state, events and logs.
-Run it with `KEEP=1` and look.
-
-This matters because the claim it is meant to prove — that a rolling restart
-severs no live stream — is currently an anecdote. It was checked once by hand,
-early on, and written into `docs/04-cloud.md`. Nothing re-checks it.
-
-### 2. Point it at one real credential
-
-Nothing has ever talked to a real provider. The adapters, credential unsealing,
-and the SigV4 path have only ever run against the mock.
+Nothing has ever talked to a real provider. The adapters, credential unsealing
+and the SigV4 path have only ever run against the mock upstream.
 
 ```bash
 just dev-serve
 oag admin add-account --name anthropic-1 --provider anthropic --secret sk-...
 ```
 
-Then send a request through `oag/auto` and read the ledger row. This is also
-what unblocks:
+Then send a request through `oag/auto` and read the ledger row. This also
+unblocks three things that cannot move without it:
 
 - **Bedrock**: the event-stream decoder was verified against an encoder written
   in the same commit, which proves self-consistency and nothing about AWS's
   actual framing.
 - **OAuth**: the two-layer refresh (process mutex, fleet lock, version stamp,
-  `invalid_grant` recovery) is the most concurrency-sensitive code in the
-  repo and has only unit coverage.
+  `invalid_grant` recovery) is the most concurrency-sensitive code in the repo
+  and has only unit coverage.
 - **`count_tokens` calibration**: the divisors in `oag_proto::count_input_tokens`
   are reasoned, not measured. Run five real prompts through Anthropic's own
   `count_tokens` and adjust. Until then the `oag_estimate: true` flag is doing
   real work.
 
-### 3. Run `deploy/tofu/verify-migration-gate.sh` once per cloud
+### 2. Run `deploy/tofu/verify-migration-gate.sh` once per cloud
 
-Migrations now run on all three clouds, by three different mechanisms, because
-the providers expose three different things (`docs/04-cloud.md` has the table and
-the reasoning). Whether a *failed* migration actually fails the apply is checked
-only on GCP and AWS by argument, never by observation.
+Migrations run on all three clouds, by three different mechanisms, because the
+providers expose three different things — `docs/04-cloud.md` has the table and
+the reasoning. Whether a *failed* migration actually fails the apply is argued
+on GCP and AWS and never observed.
 
 The script applies cleanly, corrupts the migration ledger the way a broken
 migration would, forces a redeploy, and asserts the second apply fails. Use
-`data_mode = "neutral"` — cheaper, seconds to provision, and it leaves the
+`data_mode = "neutral"`: cheaper, seconds to provision, and it leaves the
 database reachable, which is what makes the corruption step possible.
 
-The specific unknowns are listed at the end of `docs/04-cloud.md`. The two that
-would change the design if they came out badly:
+The two unknowns that would change the design if they came out badly:
 
 - **GCP**: that the provider surfaces a FAILED Cloud Run execution as an apply
   error rather than a ready-but-failed resource. The whole GCP guarantee rests
@@ -111,22 +95,23 @@ would change the design if they came out badly:
   strictly worse than the bug the migrate step was added to fix.
 
 Azure cannot fail the apply at all; azurerm exposes no revision health and no
-revision data source. It is fail-*closed* (the gateway never starts in a replica
-whose migration failed) and the stack outputs `migrate_check` with the command to
-run after each apply. That is documented, not hidden.
+revision data source. It is fail-*closed* — the gateway never starts in a replica
+whose migration failed — and the stack outputs `migrate_check` with the command
+to run after each apply. Documented, not hidden.
 
-### 4. Smaller, all self-contained
+### 3. Smaller, all self-contained
 
 - **Circuit breakers** are wired and unit-tested but never exercised end to end.
-  The mock has `MOCK_FAIL_STATUS` and `MOCK_FAIL_FIRST` for exactly this.
+  The mock has `MOCK_FAIL_STATUS` and `MOCK_FAIL_FIRST` for exactly this, and
+  `deploy/test/kind-verify.sh` is now a working template for that kind of test.
 - **In-cluster Postgres** is a single StatefulSet with no operator, no PITR and
   no pooling. Fine for kind; wrong for the credential store. Use CloudNativePG
   with `data.mode=external`.
 - **`/v1/models` in passthrough** returns the ladder plus every off-ladder
   catalog model, rendered per request. The built-in catalog is small; the
   documented seeding path is LiteLLM's table, which is >1000 entries. Memoise
-  against the catalog `Arc` if that bites — do not cap the list, which would make
-  the answer wrong rather than large.
+  against the catalog `Arc` if that bites — do not cap the list, which would
+  make the answer wrong rather than large.
 - **`route_providers` alias asymmetry**: `Provider::from_str` accepts aliases but
   `select::lease` queries the canonical spelling, so an account row spelled
   `moonshot` is advertised by `/v1/models` and never actually selectable.
@@ -159,7 +144,7 @@ run after each apply. That is documented, not hidden.
 | Path | Migrations | Status |
 |---|---|---|
 | `deploy/compose/stack.yml` | service dependency | works |
-| `deploy/helm/` | pre-install/pre-upgrade hook | deployed to kind once, by hand |
+| `deploy/helm/` | pre-install/pre-upgrade hook | verified in CI on every relevant push |
 | `deploy/tofu/stacks/gcp-cloudrun` | job via `run_execution_token` | validates only |
 | `deploy/tofu/stacks/aws-fargate` | container `dependsOn` SUCCESS | validates only |
 | `deploy/tofu/stacks/azure-containerapps` | `init_container` | validates only |
