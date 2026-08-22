@@ -87,6 +87,15 @@ streaming usage accounting, two-stage failover — and is worth reading for it.
 This keeps the plumbing, drops the resale SaaS around it, and adds the cost
 engine that was the point.
 
+## On the name
+
+`open-ai-gateway` reads as "OpenAI gateway" and would be trademark-adjacent for
+a published package. That was considered and accepted: this is internal, and
+nothing here goes to crates.io or a public registry (`publish = false` across
+the workspace). If that ever changes, the name should change with it — the
+crates are prefixed `oag-` and the binary is `oag`, so a rename is a
+find-and-replace rather than a refactor.
+
 ## Licence
 
 MIT.
