@@ -196,6 +196,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_guard_moved_into_a_task_keeps_the_request_in_flight() {
+        // The bug this guards against: the handler returns as soon as the
+        // response *headers* are decided, but a streamed body runs for minutes
+        // afterwards. A guard dropped when the handler returns tells shutdown
+        // the request is over, and the next rolling deploy severs the stream.
+        let l = Arc::new(Lifecycle::new());
+        let guard = l.track();
+        assert_eq!(l.in_flight(), 1);
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            // Stands in for the stream pump: the guard is owned here.
+            let _guard = guard;
+            let _ = rx.await;
+        });
+
+        // The handler has "returned"; the stream has not finished.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            l.in_flight(),
+            1,
+            "the request must still count while its body is streaming"
+        );
+
+        let _ = tx.send(());
+        task.await.expect("task");
+        assert_eq!(
+            l.in_flight(),
+            0,
+            "and stop counting once it really finishes"
+        );
+    }
+
+    #[tokio::test]
     async fn draining_completes_once_in_flight_work_finishes() {
         let l = Arc::new(Lifecycle::new());
         let guard = l.track();

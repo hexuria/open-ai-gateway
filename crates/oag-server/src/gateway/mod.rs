@@ -49,17 +49,16 @@ async fn dispatch(
     body: axum::body::Bytes,
     ingress: Dialect,
 ) -> Response {
+    // The guard is *moved* down the call chain and, for a streamed response,
+    // into the task that pumps it. It must outlive the response body, not just
+    // the handler: a handler returns as soon as the headers are decided, and a
+    // guard dropped there tells shutdown the request is finished while its
+    // stream still has minutes to run — so a rolling deploy severs it.
     let guard = state.lifecycle.track();
     let request_id = RequestId::new();
 
-    match handle(&state, &headers, &body, request_id, ingress).await {
-        Ok(response) => {
-            // The guard must outlive the streaming body, not just the handler:
-            // dropping it here would let shutdown believe the request finished
-            // while its stream is still running.
-            let _ = guard;
-            response
-        }
+    match handle(&state, &headers, &body, request_id, ingress, guard).await {
+        Ok(response) => response,
         Err(e) => {
             metrics::counter!("oag_requests_total", "outcome" => "error").increment(1);
             error_response(&e)
@@ -73,6 +72,7 @@ async fn handle(
     body: &[u8],
     request_id: RequestId,
     ingress: Dialect,
+    guard: crate::shutdown::InFlightGuard,
 ) -> Result<Response> {
     let started = Instant::now();
 
@@ -124,6 +124,7 @@ async fn handle(
         request_id,
         started,
         ingress,
+        guard,
     )
     .await
 }
@@ -145,6 +146,7 @@ async fn run_with_escalation(
     request_id: RequestId,
     started: Instant,
     ingress: Dialect,
+    guard: crate::shutdown::InFlightGuard,
 ) -> Result<Response> {
     let Plan {
         policy,
@@ -182,6 +184,7 @@ async fn run_with_escalation(
                     request_id,
                     started,
                     ingress,
+                    guard,
                 ));
             }
             Attempt::Collected {
@@ -649,6 +652,7 @@ fn stream_response(
     request_id: RequestId,
     started: Instant,
     ingress: Dialect,
+    guard: crate::shutdown::InFlightGuard,
 ) -> Response {
     // Bounded: a slow client parks the reader instead of buffering the whole
     // response in memory.
@@ -675,6 +679,10 @@ fn stream_response(
     // If the client hangs up, this keeps draining and still records what the
     // provider is going to bill us for.
     tokio::spawn(async move {
+        // The guard rides along and is dropped here, when the stream is
+        // genuinely finished — which is what makes the shutdown drain wait for
+        // it rather than exiting out from under it.
+        let _guard = guard;
         let outcome = sse::pump(response, adapter, tx, idle, max, egress).await;
         select::release(&state2, account, &lease_id).await;
         meter::record(&state2, &ctx, &outcome).await;

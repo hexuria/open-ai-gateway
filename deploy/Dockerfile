@@ -6,9 +6,12 @@ FROM --platform=$BUILDPLATFORM rust:1.95-alpine AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 
-# Dependencies first, so a source-only change does not rebuild the world.
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml clippy.toml ./
 COPY crates ./crates
+# Migrations are needed at *compile* time, not just at run time: `sqlx::migrate!`
+# embeds them into the binary. Copying them only into the runtime stage makes
+# the build fail with a confusing "canonicalizing migration directory" error.
+COPY migrations ./migrations
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --bin oag && \
@@ -18,7 +21,8 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata curl && \
     adduser -D -u 1000 oag
 COPY --from=builder /oag /usr/local/bin/oag
-COPY migrations /app/migrations
+# No migrations copied here on purpose: they are compiled into the binary, so a
+# second copy on disk could only ever disagree with the one that runs.
 USER oag
 WORKDIR /app
 

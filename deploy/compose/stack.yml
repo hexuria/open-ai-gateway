@@ -21,9 +21,13 @@ x-gateway: &gateway
     OAG_SECURITY__CREDENTIAL_KEK: ${OAG_CREDENTIAL_KEK:?set OAG_CREDENTIAL_KEK, e.g. openssl rand -base64 32}
     OAG_SERVER__ADMIN_ADDR: 0.0.0.0:8081
     OAG_TELEMETRY__LOG_JSON: "true"
+    # Override a provider's endpoint. Set here so the stack can be driven
+    # against a mock; unset in a real deployment to use the public API.
+    OAG_GATEWAY__PROVIDER_BASE_URLS__ANTHROPIC: ${OAG_ANTHROPIC_BASE_URL:-https://api.anthropic.com}
   depends_on:
     postgres: { condition: service_healthy }
     redis: { condition: service_healthy }
+    migrate: { condition: service_completed_successfully }
   # Must exceed gateway.max_stream_duration, or a rolling restart severs
   # in-flight streams — which is exactly what sub2api's hardcoded 5-second
   # shutdown does on every deploy.
@@ -31,6 +35,29 @@ x-gateway: &gateway
   restart: unless-stopped
 
 services:
+  # Migrations run once, in their own container, before any replica starts.
+  #
+  # The alternative — having one replica migrate on boot — needs that replica
+  # to run two commands, which fights the image's entrypoint, and makes the
+  # ordering implicit. `service_completed_successfully` states it outright.
+  #
+  # The advisory lock inside `oag migrate` means this stays safe even if
+  # several stacks come up against one database at the same time.
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+    command: ["migrate"]
+    environment:
+      OAG_DATABASE__URL: postgres://oag:oag@postgres:5432/oag
+      OAG_REDIS__URL: redis://redis:6379
+      OAG_SECURITY__SIGNING_SECRET: ${OAG_SIGNING_SECRET:?set OAG_SIGNING_SECRET, e.g. openssl rand -base64 48}
+      OAG_SECURITY__CREDENTIAL_KEK: ${OAG_CREDENTIAL_KEK:?set OAG_CREDENTIAL_KEK, e.g. openssl rand -base64 32}
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: "no"
+
   caddy:
     image: caddy:2-alpine
     depends_on: [envoy]
@@ -46,19 +73,19 @@ services:
       - ../envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
     command: ["-c", "/etc/envoy/envoy.yaml", "--service-cluster", "oag-lb"]
 
+  # `command` here is arguments to the image's entrypoint (`oag`), not a
+  # replacement for it — so it is the subcommand alone.
   oag-1:
     <<: *gateway
-    # One replica owns migrations; the others wait on the advisory lock rather
-    # than racing. Any of them could do it — this just makes the logs legible.
-    command: ["sh", "-c", "oag migrate && exec oag serve"]
+    command: ["serve"]
 
   oag-2:
     <<: *gateway
-    command: ["oag", "serve"]
+    command: ["serve"]
 
   oag-3:
     <<: *gateway
-    command: ["oag", "serve"]
+    command: ["serve"]
 
   postgres:
     image: postgres:18-alpine
