@@ -8,9 +8,10 @@ actually spent against what frontier-for-everything would have cost.
 Written in Rust. Deployed behind a reverse proxy and a load balancer, in the
 three-tier topology that streaming AI traffic actually needs.
 
-> **Not a resale product.** This is built for a single organisation using its
-> own credentials for its own members. See [docs/compliance.md](docs/compliance.md)
-> for which credential kinds each provider sanctions.
+> **Not a resale product.** This is built for an organisation to use its own
+> credentials for its own members — not to intermediate anyone else's. See
+> [docs/compliance.md](docs/compliance.md) for which credential kinds each
+> provider sanctions, and why that distinction is one nullable column.
 
 ## Why
 
@@ -127,12 +128,14 @@ engine that was the point.
 
 ## On the name
 
-`open-ai-gateway` reads as "OpenAI gateway" and would be trademark-adjacent for
-a published package. That was considered and accepted: this is internal, and
-nothing here goes to crates.io or a public registry (`publish = false` across
-the workspace). If that ever changes, the name should change with it — the
-crates are prefixed `oag-` and the binary is `oag`, so a rename is a
-find-and-replace rather than a refactor.
+`open-ai-gateway` reads as "OpenAI gateway" and is trademark-adjacent. The
+repository is public; the crates are not published to crates.io (`publish =
+false` across the workspace), which is where a name collision would actually
+bite. Worth reconsidering before that changes — the crates are prefixed `oag-`
+and the binary is `oag`, so a rename is a find-and-replace rather than a
+refactor.
+
+This project is not affiliated with, endorsed by, or connected to OpenAI.
 
 ## Licence
 
