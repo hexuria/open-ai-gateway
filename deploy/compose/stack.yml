@@ -78,6 +78,10 @@ services:
   oag-1:
     <<: *gateway
     command: ["serve"]
+    # The admin listener, published to loopback only so an operator can reach
+    # the dashboard from the host. Never bind this to 0.0.0.0: the admin API
+    # authenticates, but it has no business being reachable off the machine.
+    ports: ["127.0.0.1:8081:8081"]
 
   oag-2:
     <<: *gateway

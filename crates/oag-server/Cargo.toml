@@ -25,6 +25,7 @@ metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 reqwest.workspace = true
 rust_decimal.workspace = true
+sqlx.workspace = true
 time.workspace = true
 uuid.workspace = true
 bytes = "1"

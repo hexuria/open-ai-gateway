@@ -12,6 +12,9 @@ COPY crates ./crates
 # embeds them into the binary. Copying them only into the runtime stage makes
 # the build fail with a confusing "canonicalizing migration directory" error.
 COPY migrations ./migrations
+# The dashboard is embedded with include_str!, so it is a build-time input for
+# the same reason the migrations are.
+COPY web ./web
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --bin oag && \

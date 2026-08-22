@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>open-ai-gateway</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36;
+    --fg: #e6e9ef; --dim: #8b93a7; --good: #4ade80; --warn: #fbbf24; --bad: #f87171;
+    --accent: #7dd3fc;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f7f8fa; --panel:#fff; --line:#e3e6ec; --fg:#171a21; --dim:#666e80;
+            --good:#15803d; --warn:#b45309; --bad:#b91c1c; --accent:#0369a1; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  header { padding:20px 24px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  h1 { margin:0; font-size:16px; font-weight:600; letter-spacing:.02em; }
+  .sub { color:var(--dim); font-size:13px; }
+  main { padding:24px; max-width:1200px; margin:0 auto; }
+  .grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+  .label { color:var(--dim); font-size:12px; text-transform:uppercase; letter-spacing:.06em; }
+  .big { font-size:28px; font-weight:650; margin-top:6px; font-variant-numeric:tabular-nums; }
+  .good { color:var(--good); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.06em;
+       color:var(--dim); margin:32px 0 10px; font-weight:600; }
+  table { width:100%; border-collapse:collapse; background:var(--panel);
+          border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  th,td { text-align:left; padding:9px 14px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:600; font-size:12px;
+       text-transform:uppercase; letter-spacing:.04em; }
+  tr:last-child td { border-bottom:none; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px;
+          font-size:12px; border:1px solid var(--line); }
+  .scroll { overflow-x:auto; }
+  input { background:var(--panel); border:1px solid var(--line); color:var(--fg);
+          padding:7px 10px; border-radius:7px; font:inherit; min-width:260px; }
+  button { background:var(--accent); border:0; color:#08131a; padding:7px 14px;
+           border-radius:7px; font:inherit; font-weight:600; cursor:pointer; }
+  .err { color:var(--bad); margin-top:10px; }
+  code { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>open-ai-gateway</h1>
+  <span class="sub">internal AI gateway &middot; cost routing</span>
+  <span style="flex:1"></span>
+  <input id="key" type="password" placeholder="admin API key" autocomplete="off">
+  <button id="go">Load</button>
+</header>
+<main>
+  <div id="err" class="err"></div>
+  <div id="content" hidden>
+    <div class="grid">
+      <div class="card"><div class="label">Spent</div><div class="big" id="spent">—</div></div>
+      <div class="card"><div class="label">Frontier for everything</div><div class="big" id="cf">—</div></div>
+      <div class="card"><div class="label">Saved</div><div class="big good" id="saved">—</div></div>
+      <div class="card"><div class="label">Saved vs frontier</div><div class="big good" id="pct">—</div></div>
+      <div class="card"><div class="label">Prompt cache hit</div><div class="big" id="cache">—</div></div>
+      <div class="card"><div class="label">Requests (30d)</div><div class="big" id="reqs">—</div></div>
+    </div>
+
+    <h2>By tier</h2>
+    <div class="scroll"><table id="tiers"></table></div>
+
+    <h2>Credentials</h2>
+    <div class="scroll"><table id="accounts"></table></div>
+
+    <h2>Routes</h2>
+    <div class="scroll"><table id="routes"></table></div>
+
+    <h2>Recent requests</h2>
+    <div class="scroll"><table id="usage"></table></div>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+async function get(path) {
+  const r = await fetch(path, { headers: { 'x-api-key': $('key').value } });
+  if (!r.ok) throw new Error(`${path} → HTTP ${r.status}`);
+  return r.json();
+}
+
+function table(el, cols, rows) {
+  const head = `<tr>${cols.map(c => `<th>${esc(c.h)}</th>`).join('')}</tr>`;
+  const body = rows.map(r =>
+    `<tr>${cols.map(c => {
+      const v = c.f(r);
+      return `<td class="${c.num ? 'num' : ''}">${v}</td>`;
+    }).join('')}</tr>`).join('');
+  el.innerHTML = head + body;
+}
+
+const state = s => `<span class="pill ${s === 'ready' ? 'good' : s === 'disabled' ? 'bad' : 'warn'}">${esc(s)}</span>`;
+
+async function load() {
+  $('err').textContent = '';
+  try {
+    const [s, accounts, routes, usage] = await Promise.all([
+      get('/admin/api/summary'), get('/admin/api/accounts'),
+      get('/admin/api/routes'), get('/admin/api/usage?limit=25'),
+    ]);
+    localStorage.setItem('oag_key', $('key').value);
+
+    $('spent').textContent = '$' + s.spent_usd;
+    $('cf').textContent    = '$' + s.counterfactual_usd;
+    $('saved').textContent = '$' + s.saved_usd;
+    $('pct').textContent   = s.saved_pct + '%';
+    $('cache').textContent = s.cache_hit_rate + '%';
+    $('reqs').textContent  = s.requests;
+
+    table($('tiers'), [
+      { h:'Tier',    f:r => esc(r.tier) },
+      { h:'Requests',f:r => r.requests, num:true },
+      { h:'Spent',   f:r => '$' + r.spent_usd, num:true },
+      { h:'If frontier', f:r => '$' + r.counterfactual_usd, num:true },
+      { h:'Saved',   f:r => `<span class="good">$${esc(r.saved_usd)}</span>`, num:true },
+    ], s.by_tier);
+
+    table($('accounts'), [
+      { h:'Name',     f:a => esc(a.name) },
+      { h:'Provider', f:a => esc(a.provider) },
+      { h:'Kind',     f:a => esc(a.kind) },
+      { h:'State',    f:a => state(a.state) },
+      { h:'Scope',    f:a => a.personal ? 'personal' : 'shared pool' },
+      { h:'Priority', f:a => a.priority, num:true },
+      { h:'Max conc.',f:a => a.max_concurrency, num:true },
+    ], accounts);
+
+    table($('routes'), [
+      { h:'Route', f:r => esc(r.name) },
+      { h:'Mode',  f:r => `<span class="pill">${esc(r.mode)}</span>` },
+      { h:'Floor', f:r => esc(r.floor_tier || '—') },
+      { h:'Ladder',f:r => (r.tiers || []).map(t =>
+          `<span class="pill">${esc(t.name)}</span>`).join(' ') },
+      { h:'Credentials', f:r => r.credentials, num:true },
+    ], routes);
+
+    table($('usage'), [
+      { h:'When',  f:u => esc((u.at || '').slice(11, 19)) },
+      { h:'Model', f:u => esc(u.model) },
+      { h:'Tier',  f:u => `<span class="pill">${esc(u.tier)}</span>` },
+      { h:'Why',   f:u => esc(u.escalated_from
+          ? `${u.reason} (from ${u.escalated_from}: ${u.gate})` : u.reason) },
+      { h:'In',    f:u => u.input_tokens, num:true },
+      { h:'Cached',f:u => u.cache_read_tokens, num:true },
+      { h:'Out',   f:u => u.output_tokens, num:true },
+      { h:'Cost',  f:u => '$' + (+u.cost_usd).toFixed(5), num:true },
+      { h:'TTFT',  f:u => u.ttft_ms == null ? '—' : u.ttft_ms + 'ms', num:true },
+    ], usage);
+
+    $('content').hidden = false;
+  } catch (e) {
+    $('err').textContent = e.message;
+    $('content').hidden = true;
+  }
+}
+
+$('go').addEventListener('click', load);
+$('key').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+// Convenience only: this page is served on the internal admin listener, and the
+// key is an admin credential either way.
+const saved = localStorage.getItem('oag_key');
+if (saved) { $('key').value = saved; load(); }
+</script>
+</body>
+</html>

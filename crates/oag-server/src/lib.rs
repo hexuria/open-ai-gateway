@@ -14,6 +14,7 @@
 //! expose the admin API" a deployment fact rather than a routing rule someone
 //! has to remember to write.
 
+pub mod admin;
 pub mod breakers;
 pub mod gateway;
 pub mod health;
@@ -59,6 +60,11 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/health/live", get(health::live))
         .route("/health/ready", get(health::ready))
         .route("/metrics", get(metrics::render))
+        .route("/", get(admin::dashboard))
+        .route("/admin/api/summary", get(admin::summary))
+        .route("/admin/api/accounts", get(admin::accounts))
+        .route("/admin/api/routes", get(admin::routes))
+        .route("/admin/api/usage", get(admin::usage))
         .with_state(state)
 }
 

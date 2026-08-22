@@ -732,7 +732,7 @@ fn backoff(attempt: u8) -> std::time::Duration {
 /// Three spellings because three ecosystems: `Authorization` for OpenAI-shaped
 /// clients, `x-api-key` for Anthropic's, `x-goog-api-key` for Gemini's. A
 /// gateway that accepts only one makes the others' SDKs unusable.
-fn extract_key(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn extract_key(headers: &HeaderMap) -> Option<&str> {
     if let Some(v) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
