@@ -1,0 +1,65 @@
+# open-ai-gateway configuration.
+#
+# Every field can be overridden by an environment variable named
+# OAG_<SECTION>__<FIELD> — double underscore for nesting. So:
+#
+#   OAG_DATABASE__URL=postgres://...
+#   OAG_SERVER__PUBLIC_ADDR=0.0.0.0:8080
+#
+# That is how a container image ships one config file and lets the orchestrator
+# inject secrets, which is the only way the signing secret can be identical
+# across replicas without being committed to the repo.
+
+server:
+  # Inference only. This is what the load balancer fronts.
+  public_addr: "0.0.0.0:8080"
+  # Admin API, the SPA, /metrics, /health/ready. Keep this on the internal
+  # network — the default binds to loopback so an accidental deployment does not
+  # expose it.
+  admin_addr: "127.0.0.1:8081"
+  header_read_timeout: 10
+  # Connection idle timeout. Deliberately NOT a response deadline: a streamed
+  # completion legitimately runs for many minutes.
+  idle_timeout: 120
+  max_body_bytes: 268435456
+
+database:
+  url: "postgres://oag:oag@localhost:5432/oag"
+  max_connections: 16
+
+redis:
+  url: "redis://localhost:6379"
+
+security:
+  # BOTH REQUIRED. The gateway refuses to start without them, and refuses
+  # anything that looks like a placeholder.
+  #
+  # They must be byte-identical across every replica. sub2api generates its
+  # equivalents per instance when the environment does not supply them, so
+  # replica A mints tokens replica B rejects — an intermittent auth failure
+  # that looks like anything but a config problem.
+  #
+  #   openssl rand -base64 48   # signing_secret
+  #   openssl rand -base64 32   # credential_kek
+  signing_secret: "REPLACE_ME"
+  credential_kek: "REPLACE_ME"
+
+gateway:
+  # How long an upstream may send nothing before we call the stream dead and
+  # fail over. Long enough to cover a model thinking, short enough to notice a
+  # hung connection.
+  stream_idle_timeout: 180
+  # No-op events downstream, so intermediaries with their own idle timeouts do
+  # not drop a legitimately quiet stream.
+  stream_keepalive_interval: 10
+  # Ceiling on one stream, and the shutdown drain budget. Your orchestrator's
+  # grace period must be at least this long or a rolling deploy severs streams:
+  # stop_grace_period in compose, terminationGracePeriodSeconds on Kubernetes.
+  max_stream_duration: 1800
+  same_account_retries: 2
+  max_account_switches: 3
+
+telemetry:
+  log_filter: "info"
+  log_json: false
+  # otlp_endpoint: "http://tempo:4318"

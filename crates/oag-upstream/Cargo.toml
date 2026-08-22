@@ -7,6 +7,16 @@ publish.workspace = true
 
 [dependencies]
 oag-core.workspace = true
+oag-proto.workspace = true
+oag-router.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+moka.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

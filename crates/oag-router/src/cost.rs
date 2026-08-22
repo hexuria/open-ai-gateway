@@ -149,7 +149,10 @@ mod tests {
             output_tokens: 250,
             ..Usage::default()
         });
-        assert_eq!(usage.input_tokens, 1000, "input must survive the delta event");
+        assert_eq!(
+            usage.input_tokens, 1000,
+            "input must survive the delta event"
+        );
         assert_eq!(usage.cache_read_tokens, 5000);
         assert_eq!(usage.output_tokens, 250);
     }

@@ -81,7 +81,9 @@ impl TierLadder {
     pub fn escalate(&self, from: &Tier) -> Option<Tier> {
         let next = usize::from(from.rank).checked_add(1)?;
         let rung = self.rungs.get(next)?;
-        u8::try_from(next).ok().map(|r| Tier::new(rung.name.clone(), r))
+        u8::try_from(next)
+            .ok()
+            .map(|r| Tier::new(rung.name.clone(), r))
     }
 
     /// The rung one step cheaper, or `None` at the floor.
@@ -89,7 +91,9 @@ impl TierLadder {
     pub fn downgrade(&self, from: &Tier) -> Option<Tier> {
         let prev = usize::from(from.rank).checked_sub(1)?;
         let rung = self.rungs.get(prev)?;
-        u8::try_from(prev).ok().map(|r| Tier::new(rung.name.clone(), r))
+        u8::try_from(prev)
+            .ok()
+            .map(|r| Tier::new(rung.name.clone(), r))
     }
 
     /// Clamp a tier to a floor, so a key pinned to `frontier` never routes below it.
@@ -182,6 +186,10 @@ mod tests {
         let l = ladder();
         let pin = l.floor();
         let got = l.clamp_to_floor(l.ceiling(), Some(&pin));
-        assert_eq!(got.name.as_str(), "frontier", "a floor is a minimum, not a target");
+        assert_eq!(
+            got.name.as_str(),
+            "frontier",
+            "a floor is a minimum, not a target"
+        );
     }
 }

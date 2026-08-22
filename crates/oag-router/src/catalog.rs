@@ -110,7 +110,9 @@ impl ModelSpec {
         }
         // Leave headroom for the response: a prompt that exactly fills the
         // window leaves nowhere to answer.
-        let needed = need.prompt_tokens.saturating_add(u64::from(need.max_output_tokens));
+        let needed = need
+            .prompt_tokens
+            .saturating_add(u64::from(need.max_output_tokens));
         needed <= u64::from(self.context_window)
     }
 }

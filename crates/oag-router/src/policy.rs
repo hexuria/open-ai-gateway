@@ -182,30 +182,44 @@ impl RoutingPolicy {
         max_output_tokens: u32,
     ) -> Result<RoutingDecision> {
         let need = signal.requirements(max_output_tokens);
-        let ceiling_model = self.ladder.pick(&self.ladder.ceiling(), catalog, &need).cloned();
+        let ceiling_model = self
+            .ladder
+            .pick(&self.ladder.ceiling(), catalog, &need)
+            .cloned();
 
         if budget.pressure() == BudgetPressure::Exhausted {
             return Err(Error::BudgetExhausted);
         }
 
         if *mode == RoutingMode::Passthrough
-            && let Some(name) = requested_model {
-                let spec = catalog.resolve(name).ok_or(Error::NoViableModel)?;
-                let tier = self.tier_of(&spec.id).unwrap_or_else(|| self.ladder.floor());
-                let clamped = self.ladder.clamp_to_floor(tier.clone(), self.floor.as_ref());
-                // A floor pin outranks the caller's choice: that is what makes
-                // it an entitlement rather than a default.
-                if clamped == tier {
-                    return Ok(RoutingDecision {
-                        model: spec.clone(),
-                        tier,
-                        reason: SelectionReason::Passthrough,
-                        capability_escalated_from: None,
-                        ceiling_model,
-                    });
-                }
-                return self.resolve_from(clamped, SelectionReason::FloorPinned, catalog, &need, ceiling_model);
+            && let Some(name) = requested_model
+        {
+            let spec = catalog.resolve(name).ok_or(Error::NoViableModel)?;
+            let tier = self
+                .tier_of(&spec.id)
+                .unwrap_or_else(|| self.ladder.floor());
+            let clamped = self
+                .ladder
+                .clamp_to_floor(tier.clone(), self.floor.as_ref());
+            // A floor pin outranks the caller's choice: that is what makes
+            // it an entitlement rather than a default.
+            if clamped == tier {
+                return Ok(RoutingDecision {
+                    model: spec.clone(),
+                    tier,
+                    reason: SelectionReason::Passthrough,
+                    capability_escalated_from: None,
+                    ceiling_model,
+                });
             }
+            return self.resolve_from(
+                clamped,
+                SelectionReason::FloorPinned,
+                catalog,
+                &need,
+                ceiling_model,
+            );
+        }
 
         let classified = self.classifier.classify(signal);
         let tier = self
@@ -213,7 +227,9 @@ impl RoutingPolicy {
             .tier(&classified)
             .unwrap_or_else(|| self.ladder.floor());
 
-        let floored = self.ladder.clamp_to_floor(tier.clone(), self.floor.as_ref());
+        let floored = self
+            .ladder
+            .clamp_to_floor(tier.clone(), self.floor.as_ref());
         let mut reason = if floored == tier {
             SelectionReason::Classified
         } else {
@@ -254,7 +270,10 @@ impl RoutingPolicy {
     ) -> Option<RoutingDecision> {
         let next = self.ladder.escalate(from)?;
         let need = signal.requirements(max_output_tokens);
-        let ceiling_model = self.ladder.pick(&self.ladder.ceiling(), catalog, &need).cloned();
+        let ceiling_model = self
+            .ladder
+            .pick(&self.ladder.ceiling(), catalog, &need)
+            .cloned();
         self.resolve_from(
             next,
             SelectionReason::Escalated {
@@ -304,9 +323,7 @@ impl RoutingPolicy {
             .iter()
             .position(|r| r.models.contains(model))
             .and_then(|i| u8::try_from(i).ok())
-            .map(|rank| {
-                Tier::new(self.ladder.rungs()[usize::from(rank)].name.clone(), rank)
-            })
+            .map(|rank| Tier::new(self.ladder.rungs()[usize::from(rank)].name.clone(), rank))
     }
 }
 
@@ -360,9 +377,18 @@ mod tests {
 
     fn policy() -> RoutingPolicy {
         let ladder = TierLadder::new(vec![
-            Rung { name: TierName::new("cheap"), models: vec![ModelId::new("kimi/k2")] },
-            Rung { name: TierName::new("balanced"), models: vec![ModelId::new("anthropic/haiku")] },
-            Rung { name: TierName::new("frontier"), models: vec![ModelId::new("anthropic/opus")] },
+            Rung {
+                name: TierName::new("cheap"),
+                models: vec![ModelId::new("kimi/k2")],
+            },
+            Rung {
+                name: TierName::new("balanced"),
+                models: vec![ModelId::new("anthropic/haiku")],
+            },
+            Rung {
+                name: TierName::new("frontier"),
+                models: vec![ModelId::new("anthropic/opus")],
+            },
         ])
         .expect("non-empty");
         RoutingPolicy::new(ladder, Box::new(HeuristicClassifier::default()))
@@ -378,7 +404,11 @@ mod tests {
             .decide(
                 &RoutingMode::Managed,
                 None,
-                &RequestSignal { prompt_tokens: 200, turn_count: 1, ..RequestSignal::default() },
+                &RequestSignal {
+                    prompt_tokens: 200,
+                    turn_count: 1,
+                    ..RequestSignal::default()
+                },
                 &rich(),
                 &catalog(),
                 1024,
@@ -396,7 +426,10 @@ mod tests {
             .decide(
                 &RoutingMode::Passthrough,
                 Some("anthropic/opus"),
-                &RequestSignal { prompt_tokens: 50, ..RequestSignal::default() },
+                &RequestSignal {
+                    prompt_tokens: 50,
+                    ..RequestSignal::default()
+                },
                 &rich(),
                 &catalog(),
                 1024,
@@ -409,7 +442,17 @@ mod tests {
     #[test]
     fn counterfactual_model_is_always_the_ceiling() {
         let d = policy()
-            .decide(&RoutingMode::Managed, None, &RequestSignal { prompt_tokens: 100, ..RequestSignal::default() }, &rich(), &catalog(), 1024)
+            .decide(
+                &RoutingMode::Managed,
+                None,
+                &RequestSignal {
+                    prompt_tokens: 100,
+                    ..RequestSignal::default()
+                },
+                &rich(),
+                &catalog(),
+                1024,
+            )
             .expect("routes");
         assert_eq!(
             d.ceiling_model.expect("ceiling exists").id.as_str(),
@@ -433,7 +476,10 @@ mod tests {
                 &RoutingMode::Managed,
                 None,
                 // Would classify frontier on merit.
-                &RequestSignal { prompt_tokens: 150_000, ..RequestSignal::default() },
+                &RequestSignal {
+                    prompt_tokens: 150_000,
+                    ..RequestSignal::default()
+                },
                 &constrained,
                 &catalog(),
                 1024,
@@ -456,19 +502,33 @@ mod tests {
             hard_stop_multiple: dec!(1.2),
         };
         assert_eq!(blown.pressure(), BudgetPressure::Exhausted);
-        let err = policy().decide(&RoutingMode::Managed, None, &RequestSignal::default(), &blown, &catalog(), 1024);
+        let err = policy().decide(
+            &RoutingMode::Managed,
+            None,
+            &RequestSignal::default(),
+            &blown,
+            &catalog(),
+            1024,
+        );
         assert!(matches!(err, Err(Error::BudgetExhausted)));
     }
 
     #[test]
     fn budget_pressure_does_not_override_an_explicit_floor() {
         let ladder = TierLadder::new(vec![
-            Rung { name: TierName::new("cheap"), models: vec![ModelId::new("kimi/k2")] },
-            Rung { name: TierName::new("frontier"), models: vec![ModelId::new("anthropic/opus")] },
+            Rung {
+                name: TierName::new("cheap"),
+                models: vec![ModelId::new("kimi/k2")],
+            },
+            Rung {
+                name: TierName::new("frontier"),
+                models: vec![ModelId::new("anthropic/opus")],
+            },
         ])
         .expect("non-empty");
         let floor = ladder.tier(&TierName::new("frontier"));
-        let p = RoutingPolicy::new(ladder, Box::new(HeuristicClassifier::default())).with_floor(floor);
+        let p =
+            RoutingPolicy::new(ladder, Box::new(HeuristicClassifier::default())).with_floor(floor);
 
         let constrained = BudgetState {
             spent_usd: dec!(90),
@@ -476,7 +536,17 @@ mod tests {
             hard_stop_multiple: dec!(1.2),
         };
         let d = p
-            .decide(&RoutingMode::Managed, None, &RequestSignal { prompt_tokens: 10, ..RequestSignal::default() }, &constrained, &catalog(), 1024)
+            .decide(
+                &RoutingMode::Managed,
+                None,
+                &RequestSignal {
+                    prompt_tokens: 10,
+                    ..RequestSignal::default()
+                },
+                &constrained,
+                &catalog(),
+                1024,
+            )
             .expect("routes");
         assert_eq!(
             d.model.id.as_str(),
@@ -490,8 +560,14 @@ mod tests {
         // 300k prompt: only opus can hold it, but this classifies frontier
         // anyway. Force the issue from the floor instead.
         let ladder = TierLadder::new(vec![
-            Rung { name: TierName::new("cheap"), models: vec![ModelId::new("kimi/k2")] },
-            Rung { name: TierName::new("frontier"), models: vec![ModelId::new("anthropic/opus")] },
+            Rung {
+                name: TierName::new("cheap"),
+                models: vec![ModelId::new("kimi/k2")],
+            },
+            Rung {
+                name: TierName::new("frontier"),
+                models: vec![ModelId::new("anthropic/opus")],
+            },
         ])
         .expect("non-empty");
         let p = RoutingPolicy::new(ladder, Box::new(AlwaysCheap));
@@ -499,14 +575,21 @@ mod tests {
             .decide(
                 &RoutingMode::Managed,
                 None,
-                &RequestSignal { prompt_tokens: 300_000, ..RequestSignal::default() },
+                &RequestSignal {
+                    prompt_tokens: 300_000,
+                    ..RequestSignal::default()
+                },
                 &rich(),
                 &catalog(),
                 1024,
             )
             .expect("escalates on capability");
         assert_eq!(d.model.id.as_str(), "anthropic/opus");
-        assert_eq!(d.reason, SelectionReason::Classified, "the classifier still picked cheap");
+        assert_eq!(
+            d.reason,
+            SelectionReason::Classified,
+            "the classifier still picked cheap"
+        );
         assert_eq!(d.capability_escalated_from, Some(TierName::new("cheap")));
     }
 
@@ -515,12 +598,25 @@ mod tests {
         let p = policy();
         let cheap = p.ladder().floor();
         let d = p
-            .escalate(&cheap, QualityGate::MalformedToolCall, &RequestSignal::default(), &catalog(), 1024)
+            .escalate(
+                &cheap,
+                QualityGate::MalformedToolCall,
+                &RequestSignal::default(),
+                &catalog(),
+                1024,
+            )
             .expect("escalates");
-        assert_eq!(d.model.id.as_str(), "anthropic/haiku", "one rung, not straight to the top");
+        assert_eq!(
+            d.model.id.as_str(),
+            "anthropic/haiku",
+            "one rung, not straight to the top"
+        );
         assert!(matches!(
             d.reason,
-            SelectionReason::Escalated { gate: QualityGate::MalformedToolCall, .. }
+            SelectionReason::Escalated {
+                gate: QualityGate::MalformedToolCall,
+                ..
+            }
         ));
     }
 
@@ -529,13 +625,23 @@ mod tests {
         let p = policy();
         let top = p.ladder().ceiling();
         assert!(
-            p.escalate(&top, QualityGate::Refusal, &RequestSignal::default(), &catalog(), 1024).is_none(),
+            p.escalate(
+                &top,
+                QualityGate::Refusal,
+                &RequestSignal::default(),
+                &catalog(),
+                1024
+            )
+            .is_none(),
             "unbounded escalation would turn one bad answer into unbounded spend"
         );
     }
 
     #[test]
     fn uncapped_budget_never_applies_pressure() {
-        assert_eq!(BudgetState::unlimited(dec!(1_000_000)).pressure(), BudgetPressure::Normal);
+        assert_eq!(
+            BudgetState::unlimited(dec!(1_000_000)).pressure(),
+            BudgetPressure::Normal
+        );
     }
 }

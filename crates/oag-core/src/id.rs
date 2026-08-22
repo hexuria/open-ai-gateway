@@ -11,7 +11,9 @@ use uuid::Uuid;
 macro_rules! typed_id {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+        )]
         #[serde(transparent)]
         pub struct $name(pub Uuid);
 
@@ -57,7 +59,10 @@ macro_rules! typed_id {
 }
 
 typed_id!(AccountId, "Identifies one upstream credential.");
-typed_id!(RouteId, "Identifies a tier ladder plus its entitlements and budget.");
+typed_id!(
+    RouteId,
+    "Identifies a tier ladder plus its entitlements and budget."
+);
 typed_id!(ApiKeyId, "Identifies an inbound client credential.");
 typed_id!(PrincipalId, "Identifies an organisation member.");
 

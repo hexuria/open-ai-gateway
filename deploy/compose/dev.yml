@@ -1,0 +1,28 @@
+# Infrastructure only. The gateway runs on the host via `just serve`, so the
+# edit-compile-run loop stays fast.
+name: oag-dev
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: oag
+      POSTGRES_PASSWORD: oag
+      POSTGRES_DB: oag
+    ports: ["127.0.0.1:5452:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oag -d oag"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    tmpfs: ["/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports: ["127.0.0.1:6399:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

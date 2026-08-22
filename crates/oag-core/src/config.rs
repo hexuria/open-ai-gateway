@@ -25,7 +25,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
     /// Inference traffic. This is the only listener the load balancer fronts.
     pub public_addr: String,
@@ -131,7 +131,7 @@ impl SecurityConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct GatewayConfig {
     /// How long an upstream stream may go without sending anything before we
     /// treat it as stalled and fail over.
@@ -164,7 +164,7 @@ impl Default for GatewayConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct TelemetryConfig {
     /// `tracing` filter, e.g. `info,oag_server=debug`.
     pub log_filter: String,
@@ -198,8 +198,7 @@ impl Config {
         self.security.validate()?;
         if self.gateway.max_stream_duration <= self.gateway.stream_idle_timeout {
             return Err(crate::Error::Config(
-                "gateway.max_stream_duration must exceed gateway.stream_idle_timeout"
-                    .to_owned(),
+                "gateway.max_stream_duration must exceed gateway.stream_idle_timeout".to_owned(),
             ));
         }
         Ok(())
@@ -265,8 +264,34 @@ security:
     }
 
     #[test]
+    fn a_partial_section_keeps_its_siblings_defaulted() {
+        // The container case: the orchestrator sets exactly one server field
+        // via OAG_SERVER__ADMIN_ADDR and expects the rest to default. Without
+        // struct-level `default`, serde demands every sibling and the override
+        // mechanism is useless.
+        let src = format!("{MINIMAL}\nserver:\n  admin_addr: \"0.0.0.0:9091\"\n");
+        let cfg = Config::from_yaml(&src).expect("a partial section should parse");
+        assert_eq!(cfg.server.admin_addr, "0.0.0.0:9091");
+        assert_eq!(
+            cfg.server.public_addr, "0.0.0.0:8080",
+            "sibling kept its default"
+        );
+        assert_eq!(cfg.server.max_body_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_partial_gateway_section_keeps_the_stream_invariant() {
+        let src = format!("{MINIMAL}\ngateway:\n  same_account_retries: 5\n");
+        let cfg = Config::from_yaml(&src).expect("parses");
+        assert_eq!(cfg.gateway.same_account_retries, 5);
+        assert!(cfg.gateway.max_stream_duration > cfg.gateway.stream_idle_timeout);
+    }
+
+    #[test]
     fn stream_ceiling_must_exceed_idle_timeout() {
-        let src = format!("{MINIMAL}\ngateway:\n  stream_idle_timeout: 600\n  stream_keepalive_interval: 10\n  max_stream_duration: 300\n  same_account_retries: 2\n  max_account_switches: 3\n");
+        let src = format!(
+            "{MINIMAL}\ngateway:\n  stream_idle_timeout: 600\n  stream_keepalive_interval: 10\n  max_stream_duration: 300\n  same_account_retries: 2\n  max_account_switches: 3\n"
+        );
         assert!(Config::from_yaml(&src).is_err());
     }
 }

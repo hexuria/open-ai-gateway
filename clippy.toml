@@ -1,0 +1,14 @@
+# Company and product names that read as camelCase identifiers. Without this,
+# `doc_markdown` demands backticks around every mention of OpenAI in prose,
+# which makes the docs worse to read in service of a lint that is aimed at
+# unbackticked *code* references.
+doc-valid-idents = [
+    "OpenAI",
+    "DeepSeek",
+    "PostgreSQL",
+    "GitHub",
+    "SigV4",
+    "BoringSSL",
+    "JSON",
+    "..",
+]

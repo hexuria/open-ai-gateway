@@ -133,7 +133,10 @@ mod tests {
         let Disposition::FailoverAccount { cooldown } = upstream(529).disposition() else {
             panic!("529 should fail over");
         };
-        assert!(cooldown < Duration::from_mins(1), "overload cooldown should be short");
+        assert!(
+            cooldown < Duration::from_mins(1),
+            "overload cooldown should be short"
+        );
     }
 
     #[test]

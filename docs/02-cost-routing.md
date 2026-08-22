@@ -1,0 +1,145 @@
+# Cost routing
+
+The reason this project exists. sub2api pools credentials and meters usage but
+always sends a request to whatever model the client named; this decides.
+
+## Ladders
+
+A route defines an ordered ladder, cheapest rung first:
+
+```yaml
+tiers:
+  cheap:    [kimi/k2, deepseek/v3, zhipu/glm-4.6]
+  balanced: [anthropic/claude-haiku-4.5, openai/gpt-5-mini]
+  frontier: [anthropic/claude-opus-5, openai/gpt-5.6]
+```
+
+Rung names are operator-defined — how many rungs and what they mean differs per
+organisation. What the types enforce is that rungs are *ordered*, so escalation
+and budget downgrade are index arithmetic rather than stringly-typed comparison.
+
+Within a rung, models are tried in preference order; the first that can serve
+the request and has a live credential wins.
+
+## Two entry modes
+
+**Passthrough** — the client named a concrete model. Honour it. Never surprise a
+caller who was explicit; silently downgrading a request someone deliberately
+routed to Opus is how you get a bug report you cannot reproduce.
+
+**Managed** — the client asked for a virtual model (`oag/auto`, `oag/cheap`,
+`oag/frontier`) and policy decides. This is where the savings come from.
+
+Both are first-class. A team can adopt the gateway in passthrough mode for
+visibility alone, then move workloads to managed once they trust the routing.
+
+## Classification
+
+Heuristics, deliberately. The obvious alternative — ask a cheap model to grade
+every request — costs a call and adds latency on *every* request to save money
+on *some*. That trade only makes sense once heuristics are demonstrably leaving
+money on the table, so `Classifier` is a trait and swapping in a model-based
+implementation later is contained.
+
+Rules, in order of how strong a signal each is:
+
+| Signal | Rung | Why |
+|---|---|---|
+| Caller sent `x-oag-tier` | as asked | An explicit ask is not an input to a heuristic, it is the answer. |
+| Extended thinking requested | frontier | The caller telling you it is hard. |
+| Prompt ≥ 100k tokens | frontier | Expensive to get wrong, and beyond most cheap models' *effective* context. |
+| ≥3 tools, or ≥8 turns | balanced | Agentic shape. Small models lose the thread. |
+| Prompt ≥ 8k tokens, images, or code | balanced | Substantial work. |
+| otherwise | cheap | |
+
+Every rule is a statement about the *task*, not about the wording. A rule keyed
+on phrasing would be gameable and would drift as prompt styles change.
+
+## Escalation
+
+Three paths to a better model, so "let people reach Claude for demanding tasks"
+does not mean "everything goes to Claude":
+
+- **Explicit** — the caller asks for a tier or a concrete model.
+- **Declared** — a route or an API key is pinned to a floor tier. The CI agent
+  gets `cheap`; the architecture-review key gets `frontier`. A floor is an
+  entitlement, not a preference: budget pressure does not override it.
+- **Reactive** — the response tripped a quality gate. Retry once, one rung up.
+
+### Quality gates
+
+Only shapes a stronger model would plausibly fix:
+
+| Gate | What it means |
+|---|---|
+| `EmptyResponse` | Nothing usable came back. |
+| `Refusal` | Declined a task within policy. |
+| `Truncated` | Hit the output limit mid-answer. |
+| `MalformedToolCall` | Tool arguments did not parse. The classic small-model failure on an agentic prompt, and the most valuable thing to escalate on. |
+| `ContextOverflow` | Rejected as too long or too complex. |
+
+Transport failures are **absent on purpose**. Escalating on a 500 would quietly
+migrate the whole fleet onto expensive models every time a provider had a bad
+afternoon. Those are credential problems and failover handles them.
+
+Escalation moves exactly one rung and stops at the ceiling. Unbounded escalation
+turns one bad answer into unbounded spend.
+
+## Budgets
+
+Per principal and per route, monthly, in USD.
+
+| Spend | Pressure | Behaviour |
+|---|---|---|
+| < 80% | Normal | Route on merit. |
+| 80%–120% | Constrained | Downgrade to the cheapest rung the floor allows. |
+| > 120% | Exhausted | Refuse. |
+
+The grace band between the budget and the hard stop is the important part.
+**Degrade, do not deny.** A developer who can get no answer at all routes around
+the gateway, and then you have neither the savings nor the visibility.
+
+Constrained pressure never overrides an explicit floor tier. A route pinned to
+frontier is pinned because cheaper answers are unacceptable there, and quietly
+downgrading it is the wrong kind of thrift.
+
+## Session affinity, which is also a cost feature
+
+Every major provider scopes its prompt cache to the credential. Rotate
+credentials between turns and every turn is a cache miss — on an agentic
+workload, where the same system prompt and tool definitions replay every turn,
+that is most of the bill.
+
+So the pool pins a conversation to a credential. The subtlety is *what to hash*:
+hashing the whole conversation gives a different key every turn and pins
+nothing, while looking exactly like affinity is configured. The key comes from
+the part of the prompt that is stable across turns — the blocks the client
+marked cacheable — in descending order of precision:
+
+1. A session id the client supplied (Claude Code embeds one).
+2. A hash of the cache-marked prompt prefix.
+3. A coarse hash of the API key and model, which at least keeps one caller's
+   traffic from fanning across every credential at once.
+
+## Measuring it
+
+Every `usage_event` records both the actual cost and the **counterfactual** —
+what that exact usage would have cost on the route's top rung, computed from
+real token counts.
+
+```sql
+SELECT sum(counterfactual_usd - cost_usd) AS saved
+FROM usage_event
+WHERE occurred_at > now() - interval '30 days';
+```
+
+Per request, from real counts, because estimating it afterwards from averages
+would make the headline number unfalsifiable — and a savings figure nobody can
+check is worth nothing.
+
+Worth watching alongside it:
+
+- **Escalation rate.** Escalations that never improve anything are pure cost.
+  If a rung escalates most of the time, it is the wrong rung for your workload.
+- **Cache hit rate.** If this collapses, session affinity has stopped working
+  and the bill will follow.

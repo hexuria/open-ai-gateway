@@ -115,7 +115,10 @@ pub fn select(candidates: &[Candidate], now: i64, tie_breaker: u64) -> Option<Se
     // occupancy is a far better signal than round-robin, for the same reason
     // the load balancer in front of us uses least-request.
     let min_load = tier.iter().map(|c| c.load_bp()).min()?;
-    let least_loaded: Vec<&Candidate> = tier.into_iter().filter(|c| c.load_bp() == min_load).collect();
+    let least_loaded: Vec<&Candidate> = tier
+        .into_iter()
+        .filter(|c| c.load_bp() == min_load)
+        .collect();
     if let [only] = least_loaded.as_slice() {
         return Some(Selection {
             account: only.account,
@@ -150,7 +153,10 @@ pub fn select(candidates: &[Candidate], now: i64, tie_breaker: u64) -> Option<Se
     // Stage 4 — least recently used, with a random tie-break so concurrent
     // requests reading an identical snapshot spread out instead of stampeding.
     let oldest = pool.iter().map(|c| c.last_used_at).min()?;
-    let coldest: Vec<&Candidate> = pool.into_iter().filter(|c| c.last_used_at == oldest).collect();
+    let coldest: Vec<&Candidate> = pool
+        .into_iter()
+        .filter(|c| c.last_used_at == oldest)
+        .collect();
     let idx = usize::try_from(tie_breaker % coldest.len() as u64).unwrap_or(0);
     coldest.get(idx).map(|c| Selection {
         account: c.account,

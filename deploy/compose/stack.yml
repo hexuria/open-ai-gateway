@@ -1,0 +1,89 @@
+# The full three-tier topology: edge -> load balancer -> N gateway replicas.
+#
+# This is the thing to run when you want to see how the tiers actually compose,
+# and the thing the streaming and rolling-restart tests drive.
+name: oag-stack
+
+x-gateway: &gateway
+  build:
+    context: ../..
+    dockerfile: deploy/Dockerfile
+  environment: &gateway-env
+    OAG_DATABASE__URL: postgres://oag:oag@postgres:5432/oag
+    OAG_REDIS__URL: redis://redis:6379
+    # Identical across every replica, and supplied from outside.
+    #
+    # This is the multi-replica correctness requirement: sub2api generates its
+    # signing secret per instance when the environment does not supply one, so
+    # replica A mints admin tokens replica B rejects. We refuse to boot without
+    # it rather than generating one. See crates/oag-core/src/config.rs.
+    OAG_SECURITY__SIGNING_SECRET: ${OAG_SIGNING_SECRET:?set OAG_SIGNING_SECRET, e.g. openssl rand -base64 48}
+    OAG_SECURITY__CREDENTIAL_KEK: ${OAG_CREDENTIAL_KEK:?set OAG_CREDENTIAL_KEK, e.g. openssl rand -base64 32}
+    OAG_SERVER__ADMIN_ADDR: 0.0.0.0:8081
+    OAG_TELEMETRY__LOG_JSON: "true"
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+  # Must exceed gateway.max_stream_duration, or a rolling restart severs
+  # in-flight streams — which is exactly what sub2api's hardcoded 5-second
+  # shutdown does on every deploy.
+  stop_grace_period: 1830s
+  restart: unless-stopped
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    depends_on: [envoy]
+    ports: ["443:443", "80:80"]
+    volumes:
+      - ../caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+
+  envoy:
+    image: envoyproxy/envoy:v1.34-latest
+    depends_on: [oag-1, oag-2, oag-3]
+    volumes:
+      - ../envoy/envoy.yaml:/etc/envoy/envoy.yaml:ro
+    command: ["-c", "/etc/envoy/envoy.yaml", "--service-cluster", "oag-lb"]
+
+  oag-1:
+    <<: *gateway
+    # One replica owns migrations; the others wait on the advisory lock rather
+    # than racing. Any of them could do it — this just makes the logs legible.
+    command: ["sh", "-c", "oag migrate && exec oag serve"]
+
+  oag-2:
+    <<: *gateway
+    command: ["oag", "serve"]
+
+  oag-3:
+    <<: *gateway
+    command: ["oag", "serve"]
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: oag
+      POSTGRES_PASSWORD: oag
+      POSTGRES_DB: oag
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U oag -d oag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes: [pgdata:/var/lib/postgresql/data]
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes: [redisdata:/data]
+
+volumes:
+  pgdata:
+  redisdata:
+  caddy_data:

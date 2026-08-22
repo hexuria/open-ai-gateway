@@ -1,0 +1,98 @@
+//! Prometheus metrics.
+//!
+//! sub2api ships no metrics endpoint at all — its observability is an admin
+//! dashboard backed by aggregate rows in its own Postgres. That works until you
+//! want to alert on something, or correlate a gateway symptom with anything
+//! else in the fleet.
+
+use crate::AppState;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::IntoResponse;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use std::sync::Arc;
+
+/// Install the global recorder.
+///
+/// Called once at boot. Returns the handle the `/metrics` route renders from.
+pub fn install() -> Result<PrometheusHandle, oag_core::Error> {
+    PrometheusBuilder::new()
+        // Latency buckets chosen for this traffic: an LLM call's interesting
+        // range is hundreds of milliseconds to tens of seconds, so the default
+        // buckets — which top out around ten seconds — put most of the
+        // distribution in +Inf and make p99 unreadable.
+        .set_buckets(&[
+            0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0,
+        ])
+        .map_err(|e| oag_core::Error::Internal(format!("metric buckets: {e}")))?
+        .install_recorder()
+        .map_err(|e| oag_core::Error::Internal(format!("installing recorder: {e}")))
+}
+
+/// Describe every metric once, so `/metrics` carries HELP and TYPE lines.
+pub fn describe() {
+    use metrics::{describe_counter, describe_gauge, describe_histogram};
+
+    describe_counter!(
+        "oag_requests_total",
+        "Inference requests, by route and outcome."
+    );
+    describe_counter!(
+        "oag_escalations_total",
+        "Requests retried one tier up after a quality gate tripped."
+    );
+    describe_counter!(
+        "oag_failovers_total",
+        "Requests moved to a different credential after an upstream failure."
+    );
+    describe_counter!(
+        "oag_tokens_total",
+        "Tokens by kind: input, output, cache read, cache write."
+    );
+    describe_counter!(
+        "oag_cost_usd_total",
+        "Actual spend. Pair with oag_counterfactual_usd_total for the saving."
+    );
+    describe_counter!(
+        "oag_counterfactual_usd_total",
+        "What the same traffic would have cost on each route's top tier."
+    );
+    describe_histogram!(
+        "oag_request_duration_seconds",
+        "End-to-end request latency."
+    );
+    describe_histogram!(
+        "oag_time_to_first_token_seconds",
+        "Latency to the first streamed token. The number users actually feel."
+    );
+    describe_gauge!(
+        "oag_credentials_schedulable",
+        "Credentials currently eligible, by provider."
+    );
+    describe_gauge!("oag_slots_in_use", "Concurrency slots held, by credential.");
+    describe_gauge!(
+        "oag_draining",
+        "1 while this replica is shutting down and refusing new work."
+    );
+
+    // Give the lifecycle gauge a value immediately. `describe!` alone emits
+    // nothing, so a freshly booted replica would serve an empty /metrics body —
+    // which is indistinguishable from a broken exporter to whoever is scraping
+    // it, and to the alert that fires when the scrape returns no series.
+    metrics::gauge!("oag_draining").set(0.0);
+}
+
+pub async fn render(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(handle) = state.lifecycle.metrics() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "metrics recorder not installed\n".to_owned(),
+        );
+    };
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        handle.render(),
+    )
+}

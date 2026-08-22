@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # Cheapest check first: a formatting failure should not wait on a build.
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # Everything above is pure and needs no services, which is the payoff for
+  # keeping oag-router, oag-pool, and oag-proto free of I/O. Only the store and
+  # server tiers need real infrastructure.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: oag
+          POSTGRES_PASSWORD: oag
+          POSTGRES_DB: oag
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U oag" --health-interval 2s
+          --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s
+          --health-timeout 3s --health-retries 20
+    env:
+      OAG_DATABASE__URL: postgres://oag:oag@127.0.0.1:5432/oag
+      OAG_REDIS__URL: redis://127.0.0.1:6379
+      OAG_SECURITY__SIGNING_SECRET: ci-only-signing-secret-0123456789abcdefghij
+      OAG_SECURITY__CREDENTIAL_KEK: Y2ktb25seS1rZWstMzItYnl0ZXMtMDEyMzQ1Njc4OQ==
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p oag -- migrate
+      # Migrations are idempotent and advisory-locked: running twice must be a
+      # no-op, which is what makes it safe for every replica to migrate on boot.
+      - run: cargo run -p oag -- migrate

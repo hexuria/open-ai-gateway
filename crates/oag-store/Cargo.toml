@@ -7,6 +7,16 @@ publish.workspace = true
 
 [dependencies]
 oag-core.workspace = true
+oag-pool.workspace = true
+oag-router.workspace = true
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

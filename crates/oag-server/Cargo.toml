@@ -7,6 +7,25 @@ publish.workspace = true
 
 [dependencies]
 oag-core.workspace = true
+oag-pool.workspace = true
+oag-proto.workspace = true
+oag-router.workspace = true
+oag-store.workspace = true
+oag-upstream.workspace = true
+axum.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
 
 [lints]
 workspace = true

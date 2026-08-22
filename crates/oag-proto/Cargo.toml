@@ -7,6 +7,10 @@ publish.workspace = true
 
 [dependencies]
 oag-core.workspace = true
+oag-router.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
