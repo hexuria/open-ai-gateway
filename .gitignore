@@ -6,3 +6,9 @@
 /web/node_modules
 /web/dist
 .DS_Store
+
+# OpenTofu / Terraform local state and provider downloads
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
