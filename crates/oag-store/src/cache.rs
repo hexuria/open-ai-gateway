@@ -240,6 +240,41 @@ impl Cache {
     }
 }
 
+// ── refresh locks ─────────────────────────────────────────────────────────────
+
+impl Cache {
+    /// Take the fleet-wide right to refresh one credential.
+    ///
+    /// `SET NX EX`: the first replica to ask wins, and the TTL means a replica
+    /// that dies mid-refresh releases the lock rather than wedging the
+    /// credential forever. Losing the race is not an error — the loser waits
+    /// and re-reads what the winner wrote.
+    pub async fn acquire_refresh_lock(&self, account: AccountId, ttl: Duration) -> Result<bool> {
+        let mut conn = self.conn().await?;
+        let acquired: Option<String> = redis::cmd("SET")
+            .arg(refresh_key(account))
+            .arg("1")
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl.as_secs())
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| Error::Internal(format!("acquiring refresh lock: {e}")))?;
+        Ok(acquired.is_some())
+    }
+
+    pub async fn release_refresh_lock(&self, account: AccountId) {
+        let Ok(mut conn) = self.conn().await else {
+            return;
+        };
+        let _: std::result::Result<i64, _> = conn.del(refresh_key(account)).await;
+    }
+}
+
+fn refresh_key(account: AccountId) -> String {
+    format!("oag:refresh-lock:{account}")
+}
+
 fn auth_key(hash: &str) -> String {
     format!("oag:auth:{hash}")
 }

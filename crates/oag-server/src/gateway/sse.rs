@@ -43,18 +43,27 @@ pub struct StreamOutcome {
 /// What the client's response body receives.
 pub type Chunk = std::result::Result<bytes::Bytes, std::io::Error>;
 
-/// Read `response`, forward bytes to `tx`, and account for usage.
-///
-/// Bytes go through **verbatim**. When the client and the upstream speak the
-/// same dialect there is nothing to translate, and re-serialising a stream we
-/// already have correct bytes for can only introduce differences. Events are
-/// parsed in parallel purely to accumulate usage.
+/// How the client's bytes are produced.
+#[derive(Debug, Clone)]
+pub enum Egress {
+    /// Client and upstream speak the same dialect: forward bytes verbatim.
+    ///
+    /// Always preferred when it applies. We already hold bytes the upstream
+    /// considered correct; re-serialising them can only introduce differences,
+    /// and every difference is a client bug waiting to be blamed on us.
+    Passthrough,
+    /// They differ: render each canonical event into the client's dialect.
+    ChatCompletions { request_id: String, model: String },
+}
+
+/// Read `response`, forward it to `tx`, and account for usage.
 pub async fn pump(
     response: reqwest::Response,
     adapter: Arc<dyn ProviderAdapter>,
     tx: mpsc::Sender<Chunk>,
     idle_timeout: Duration,
     max_duration: Duration,
+    egress: Egress,
 ) -> StreamOutcome {
     let started = Instant::now();
     let mut acc = StreamAccumulator::new();
@@ -65,6 +74,13 @@ pub async fn pump(
     let mut body = response.bytes_stream();
     // SSE frames can split across TCP reads; hold the tail until it completes.
     let mut pending = Vec::<u8>::new();
+
+    let mut render = match &egress {
+        Egress::Passthrough => None,
+        Egress::ChatCompletions { request_id, model } => {
+            Some(oag_proto::openai::RenderState::new(request_id, model))
+        }
+    };
 
     loop {
         if started.elapsed() >= max_duration {
@@ -93,14 +109,25 @@ pub async fn pump(
         // usage, and this ordering means a send failure cannot skip it.
         pending.extend_from_slice(&chunk);
         let frames = pending_take_complete(&mut pending);
-        let saw_content = drain_frames(&frames, &adapter, &mut acc);
+        let (saw_content, translated) =
+            drain_frames_into(&frames, &adapter, &mut acc, render.as_mut());
 
         if ttft.is_none() && saw_content {
             ttft = Some(started.elapsed());
         }
 
+        // Verbatim when the dialects match, translated bytes when they do not.
+        let outbound = match &egress {
+            Egress::Passthrough => chunk,
+            Egress::ChatCompletions { .. } => bytes::Bytes::from(translated),
+        };
+
+        if outbound.is_empty() {
+            continue;
+        }
+
         if !client_gone {
-            if tx.send(Ok(chunk)).await.is_ok() {
+            if tx.send(Ok(outbound)).await.is_ok() {
                 acc.mark_committed();
             } else {
                 // Receiver dropped: the client hung up. Keep going — the
@@ -115,7 +142,17 @@ pub async fn pump(
 
     // Whatever is left is a partial frame; parse it in case it completed at EOF.
     if !pending.is_empty() {
-        let _ = drain_frames(&pending, &adapter, &mut acc);
+        let _ = drain_frames_into(&pending, &adapter, &mut acc, render.as_mut());
+    }
+
+    // A translated stream has to synthesise the sentinel the client's dialect
+    // expects. Anthropic has no equivalent, so without this a Chat Completions
+    // client waits for a [DONE] that never arrives and hangs until its own
+    // timeout — which looks exactly like a slow model.
+    if !client_gone && matches!(egress, Egress::ChatCompletions { .. }) {
+        let _ = tx
+            .send(Ok(bytes::Bytes::from(oag_proto::openai::done_frame())))
+            .await;
     }
 
     StreamOutcome {
@@ -143,15 +180,17 @@ fn pending_take_complete(buf: &mut Vec<u8>) -> Vec<u8> {
 
 /// Parse the `data:` payloads out of complete frames and fold them in.
 ///
-/// Returns whether any of them carried actual content, which is what times
-/// the first token.
-fn drain_frames(
+/// Returns whether any carried actual content — which is what times the first
+/// token — and, when a renderer is supplied, the client-dialect bytes.
+fn drain_frames_into(
     bytes: &[u8],
     adapter: &Arc<dyn ProviderAdapter>,
     acc: &mut StreamAccumulator,
-) -> bool {
+    mut render: Option<&mut oag_proto::openai::RenderState>,
+) -> (bool, Vec<u8>) {
+    let mut out = Vec::new();
     let Ok(text) = std::str::from_utf8(bytes) else {
-        return false;
+        return (false, out);
     };
     let mut saw_content = false;
     for line in text.lines() {
@@ -175,6 +214,11 @@ fn drain_frames(
                         saw_content = true;
                     }
                     acc.observe(e);
+                    if let Some(st) = render.as_deref_mut()
+                        && let Some(frame) = oag_proto::openai::render_event(e, st)
+                    {
+                        out.extend_from_slice(frame.as_bytes());
+                    }
                 }
             }
             // A frame we cannot parse must not kill a stream that is otherwise
@@ -183,7 +227,7 @@ fn drain_frames(
             Err(e) => tracing::debug!(error = %e, "skipping unparseable stream frame"),
         }
     }
-    saw_content
+    (saw_content, out)
 }
 
 /// Read a non-streaming response and fold it into an accumulator.
@@ -309,11 +353,11 @@ mod tests {
         let (head, tail) = whole.split_at(40);
 
         buf.extend_from_slice(head);
-        let _ = drain_frames(&pending_take_complete(&mut buf), &adapter, &mut acc);
+        let _ = drain_frames_into(&pending_take_complete(&mut buf), &adapter, &mut acc, None).0;
         assert_eq!(acc.usage().input_tokens, 0, "nothing complete yet");
 
         buf.extend_from_slice(tail);
-        let _ = drain_frames(&pending_take_complete(&mut buf), &adapter, &mut acc);
+        let _ = drain_frames_into(&pending_take_complete(&mut buf), &adapter, &mut acc, None).0;
         assert_eq!(acc.usage().input_tokens, 50, "reassembled and counted");
     }
 
@@ -326,12 +370,15 @@ mod tests {
 
         let opening = b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":5}}}\n\n";
         assert!(
-            !drain_frames(opening, &adapter, &mut acc),
+            !drain_frames_into(opening, &adapter, &mut acc, None).0,
             "an opening event is not content"
         );
 
         let content = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
-        assert!(drain_frames(content, &adapter, &mut acc), "a text delta is");
+        assert!(
+            drain_frames_into(content, &adapter, &mut acc, None).0,
+            "a text delta is"
+        );
     }
 
     #[test]
@@ -341,7 +388,7 @@ mod tests {
         let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
         let mut acc = StreamAccumulator::new();
         let frame = b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"f\"}}\n\n";
-        assert!(drain_frames(frame, &adapter, &mut acc));
+        assert!(drain_frames_into(frame, &adapter, &mut acc, None).0);
     }
 
     fn collected(body: &serde_json::Value) -> StreamAccumulator {
@@ -398,7 +445,7 @@ mod tests {
     fn a_done_sentinel_is_not_parsed_as_json() {
         let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
         let mut acc = StreamAccumulator::new();
-        let _ = drain_frames(b"data: [DONE]\n\n", &adapter, &mut acc);
+        let _ = drain_frames_into(b"data: [DONE]\n\n", &adapter, &mut acc, None).0;
         assert_eq!(acc.usage().total(), 0);
     }
 }

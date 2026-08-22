@@ -22,6 +22,9 @@ pub struct AppState {
     pub transports: TransportPool,
     pub kek: Arc<Kek>,
     pub breakers: Arc<Breakers>,
+    /// One mutex per credential, so concurrent requests on this replica make at
+    /// most one attempt at the fleet-wide refresh lock between them.
+    refresh_gates: Arc<std::sync::Mutex<HashMap<oag_core::AccountId, Arc<tokio::sync::Mutex<()>>>>>,
     adapters: Arc<HashMap<Provider, Arc<dyn ProviderAdapter>>>,
     /// Swapped wholesale on refresh rather than mutated in place, so a request
     /// that started with one catalog finishes with it — a price changing
@@ -59,6 +62,19 @@ impl AppState {
             ))),
         );
 
+        // Five providers, one adapter: they all speak Chat Completions and
+        // differ only in base URL.
+        for p in [
+            Provider::OpenAI,
+            Provider::Kimi,
+            Provider::DeepSeek,
+            Provider::Zhipu,
+            Provider::XAI,
+        ] {
+            let url = base(p, oag_upstream::OpenAICompatAdapter::default_base_url(p));
+            adapters.insert(p, Arc::new(oag_upstream::OpenAICompatAdapter::new(p, url)));
+        }
+
         Ok(Self {
             auth: AuthCache::new(db.clone(), cache.clone(), 10_000),
             transports: TransportPool::new(2_048, Duration::from_mins(15), Duration::from_secs(10)),
@@ -68,6 +84,7 @@ impl AppState {
             lifecycle: Arc::new(Lifecycle::new()),
             kek: Arc::new(kek),
             breakers: Arc::new(Breakers::new()),
+            refresh_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             adapters: Arc::new(adapters),
             catalog: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
         })
@@ -84,6 +101,17 @@ impl AppState {
     #[must_use]
     pub fn providers(&self) -> Vec<Provider> {
         self.adapters.keys().copied().collect()
+    }
+
+    /// The per-credential refresh gate, creating it on first use.
+    pub fn refresh_gate(&self, account: oag_core::AccountId) -> Arc<tokio::sync::Mutex<()>> {
+        self.refresh_gates.lock().map_or_else(
+            // A poisoned lock hands back a private mutex rather than failing:
+            // the worst case is one extra attempt at the distributed lock,
+            // which that lock is there to arbitrate anyway.
+            |_| Arc::new(tokio::sync::Mutex::new(())),
+            |mut m| Arc::clone(m.entry(account).or_default()),
+        )
     }
 
     /// A snapshot of the catalog. Cheap: one `Arc` clone.

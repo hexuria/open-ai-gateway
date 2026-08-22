@@ -1,6 +1,7 @@
 //! The inference request path.
 
 pub mod meter;
+pub mod refresh;
 pub mod select;
 pub mod sse;
 
@@ -9,6 +10,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use oag_core::provider::Dialect;
 use oag_core::tier::RoutingMode;
 use oag_core::{AccountId, Disposition, Error, RequestId, Result, TierName};
 use oag_pool::SessionKey;
@@ -26,10 +28,31 @@ pub async fn messages(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    dispatch(state, headers, body, Dialect::AnthropicMessages).await
+}
+
+/// `POST /v1/chat/completions` — the OpenAI-shaped surface.
+///
+/// The same pipeline: only the codec at each end differs, which is the point of
+/// having a canonical form in the middle.
+pub async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    dispatch(state, headers, body, Dialect::OpenAIChatCompletions).await
+}
+
+async fn dispatch(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+    ingress: Dialect,
+) -> Response {
     let guard = state.lifecycle.track();
     let request_id = RequestId::new();
 
-    match handle(&state, &headers, &body, request_id).await {
+    match handle(&state, &headers, &body, request_id, ingress).await {
         Ok(response) => {
             // The guard must outlive the streaming body, not just the handler:
             // dropping it here would let shutdown believe the request finished
@@ -49,6 +72,7 @@ async fn handle(
     headers: &HeaderMap,
     body: &[u8],
     request_id: RequestId,
+    ingress: Dialect,
 ) -> Result<Response> {
     let started = Instant::now();
 
@@ -62,7 +86,12 @@ async fn handle(
 
     // ── parse ─────────────────────────────────────────────────────────────────
     let wire: serde_json::Value = serde_json::from_slice(body)?;
-    let mut canonical = anthropic::parse_request(&wire)?;
+    let mut canonical = match ingress {
+        Dialect::OpenAIChatCompletions => oag_proto::openai::parse_request(&wire)?,
+        // Everything else parses as Anthropic for now; the remaining dialects
+        // are a codec each, not a change to this path.
+        _ => anthropic::parse_request(&wire)?,
+    };
 
     let plan = plan_request(state, &auth, &canonical, headers).await?;
 
@@ -94,6 +123,7 @@ async fn handle(
         &session,
         request_id,
         started,
+        ingress,
     )
     .await
 }
@@ -114,6 +144,7 @@ async fn run_with_escalation(
     session: &SessionKey,
     request_id: RequestId,
     started: Instant,
+    ingress: Dialect,
 ) -> Result<Response> {
     let Plan {
         policy,
@@ -150,6 +181,7 @@ async fn run_with_escalation(
                     &decision,
                     request_id,
                     started,
+                    ingress,
                 ));
             }
             Attempt::Collected {
@@ -220,7 +252,7 @@ async fn run_with_escalation(
         // tripped — so the ledger always names the reason, never nothing.
         meter::record_collected(state, &ctx, &accumulator, triggering_gate.or(gate)).await;
 
-        return Ok(json_response(body, &decision, request_id));
+        return Ok(json_response(&body, &decision, request_id, ingress));
     }
 }
 
@@ -345,17 +377,35 @@ enum Attempt {
 
 /// A complete, non-streamed response.
 fn json_response(
-    body: bytes::Bytes,
+    body: &bytes::Bytes,
     decision: &RoutingDecision,
     request_id: RequestId,
+    ingress: Dialect,
 ) -> Response {
+    let upstream_dialect = decision.model.provider.native_dialect();
+
+    // Verbatim when the dialects agree — the upstream's own bytes are the most
+    // faithful answer we can give, and re-serialising can only differ from it.
+    let out = if ingress == upstream_dialect || ingress != Dialect::OpenAIChatCompletions {
+        body.clone()
+    } else {
+        serde_json::from_slice::<serde_json::Value>(body).map_or_else(
+            |_| body.clone(),
+            |v| {
+                bytes::Bytes::from(
+                    oag_proto::openai::render_completion(&v, &request_id.to_string()).to_string(),
+                )
+            },
+        )
+    };
+
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-oag-model", decision.model.id.as_str())
         .header("x-oag-tier", decision.tier.name.as_str())
         .header("x-oag-request-id", request_id.to_string())
-        .body(Body::from(body))
+        .body(Body::from(out))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
@@ -459,13 +509,14 @@ async fn try_credential(
         Ok(a) => a,
         Err(e) => return Outcome::Fatal(e),
     };
-    let credential: oag_core::credential::SecretMaterial =
-        match state.kek.open_json(&lease.account.sealed()) {
-            Ok(c) => c,
-            // A credential we cannot decrypt is broken for everyone, not just
-            // this request, but another credential may well work.
-            Err(e) => return Outcome::Switch(e),
-        };
+    // Refreshes first if the token is close to expiry. A credential that is
+    // merely expiring must not be treated as a credential that is broken.
+    let credential = match refresh::ensure_fresh(state, &lease.account).await {
+        Ok(c) => c,
+        // Broken for everyone, not just this request — but another credential
+        // may well work, so switch rather than fail the request outright.
+        Err(e) => return Outcome::Switch(e),
+    };
 
     let mut last = Error::NoCredential { provider };
 
@@ -572,6 +623,7 @@ fn stream_response(
     decision: &RoutingDecision,
     request_id: RequestId,
     started: Instant,
+    ingress: Dialect,
 ) -> Response {
     // Bounded: a slow client parks the reader instead of buffering the whole
     // response in memory.
@@ -580,6 +632,18 @@ fn stream_response(
     let idle = state.config.gateway.stream_idle_timeout;
     let max = state.config.gateway.max_stream_duration;
     let account = lease.account.account_id();
+
+    let upstream_dialect = decision.model.provider.native_dialect();
+    let egress = if ingress == upstream_dialect {
+        sse::Egress::Passthrough
+    } else if ingress == Dialect::OpenAIChatCompletions {
+        sse::Egress::ChatCompletions {
+            request_id: request_id.to_string(),
+            model: decision.model.id.as_str().to_owned(),
+        }
+    } else {
+        sse::Egress::Passthrough
+    };
 
     let ctx = meter::Context {
         request_id,
@@ -596,7 +660,7 @@ fn stream_response(
     // If the client hangs up, this keeps draining and still records what the
     // provider is going to bill us for.
     tokio::spawn(async move {
-        let outcome = sse::pump(response, adapter, tx, idle, max).await;
+        let outcome = sse::pump(response, adapter, tx, idle, max, egress).await;
         select::release(&state2, account, &lease_id).await;
         meter::record(&state2, &ctx, &outcome).await;
     });

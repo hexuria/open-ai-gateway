@@ -37,6 +37,16 @@ pub fn public_router(state: Arc<AppState>) -> Router {
         // reachable from the internet.
         .route("/health/live", get(health::live))
         .route("/v1/messages", axum::routing::post(gateway::messages))
+        .route(
+            "/v1/chat/completions",
+            axum::routing::post(gateway::chat_completions),
+        )
+        // The same surface without the version prefix; several SDKs default
+        // to it when given a custom base URL.
+        .route(
+            "/chat/completions",
+            axum::routing::post(gateway::chat_completions),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(
             state.config.server.max_body_bytes,
         ))
