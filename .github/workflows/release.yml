@@ -1,0 +1,109 @@
+name: release
+
+# Publishes ghcr.io/hexuria/open-ai-gateway. Until this existed the Helm chart
+# and every OpenTofu module referenced an image that had never been built, so
+# nothing in deploy/ could actually be deployed by anyone.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  # One native runner per architecture. Cross-compiling Rust to musl needs a
+  # toolchain the alpine image does not carry, and QEMU emulation of a Rust
+  # build is punishingly slow, so each arch builds on its own metal and the
+  # results are merged below. arm64 runners are free for public repositories.
+  build:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push by digest only. Tags are attached once, to the manifest list, so a
+      # tag never points at a single-arch image even briefly.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  merge:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+      - name: create manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE }}@sha256:%s ' *)
+      - name: verify both architectures are present
+        run: |
+          ref='${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.meta.outputs.version }}'
+          docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' > m.json
+          for a in amd64 arm64; do
+            jq -e --arg a "$a" \
+              '[.manifests[]?.platform | select(.os=="linux" and .architecture==$a)] | length > 0' \
+              m.json > /dev/null || { echo "::error::$a missing from $ref"; exit 1; }
+          done
+          echo "published $ref (linux/amd64, linux/arm64)"

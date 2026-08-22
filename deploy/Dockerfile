@@ -1,8 +1,13 @@
 # syntax=docker/dockerfile:1
 
-# Build on the build platform and cross-compile, rather than emulating the
-# target under QEMU — a Rust build under QEMU is punishing.
-FROM --platform=$BUILDPLATFORM rust:1.95-alpine AS builder
+# Deliberately *not* pinned to $BUILDPLATFORM. Pinning the builder to the build
+# platform without also passing --target to cargo produces a binary for the
+# build arch inside an image tagged for the target arch — an arm64 manifest
+# holding an amd64 binary, which fails at exec time with a bad-format error.
+# Each architecture is instead built natively on its own runner and the two are
+# merged into one manifest list (see .github/workflows/release.yml), so there is
+# no cross-compilation and no QEMU, both of which are painful for Rust.
+FROM rust:1.95-alpine AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 
