@@ -161,6 +161,11 @@ pass "migrate hook ran before any pod served"
 
 SVC="$($KC get svc -l app.kubernetes.io/name=open-ai-gateway -o jsonpath='{.items[0].metadata.name}')"
 [ -n "$SVC" ] || fail "could not find the gateway service"
+# Discovered, not assumed: the chart's fullname is release + chart name
+# ("oag-open-ai-gateway"), not the release name, and guessing it cost a CI run.
+DEPLOY="$($KC get deploy -l app.kubernetes.io/name=open-ai-gateway -o jsonpath='{.items[0].metadata.name}')"
+[ -n "$DEPLOY" ] || fail "could not find the gateway deployment"
+echo "  service=$SVC deployment=$DEPLOY"
 
 say "5/7  bootstrap a key and a credential"
 POD="$($KC get pod -l app.kubernetes.io/name=open-ai-gateway -o jsonpath='{.items[0].metadata.name}')"
@@ -173,6 +178,15 @@ $KC exec "$POD" -- oag admin add-account --name mock --provider anthropic \
 pass "bootstrapped"
 
 say "6/7  open $STREAMS streams, then restart every replica mid-flight"
+# Note what this does and does not prove: `port-forward` to a Service binds to
+# ONE pod and stays there, so all the streams below land on a single replica
+# rather than spreading across three. That is still the property under test —
+# the replica holding live streams must drain rather than be killed — but it is
+# one pod's drain, not the fleet's. Spreading them would need a real ingress.
+#
+# It also means the forward itself is part of the assertion: if the pod were
+# killed instead of drained, the forward would break and the streams would fail,
+# which is the outcome we want to catch.
 $KC port-forward "svc/$SVC" 18080:8080 18081:8081 >"$WORK/pf.log" 2>&1 &
 PF=$!
 for i in $(seq 1 60); do curl -fsS -o /dev/null "http://127.0.0.1:18080/health/live" 2>/dev/null && break; sleep 1; done
@@ -189,7 +203,7 @@ done
 
 # Land the restart squarely in the middle of every stream.
 sleep $((STREAM_SECONDS / 3))
-$KC rollout restart deployment/oag >/dev/null
+$KC rollout restart "deployment/$DEPLOY" >/dev/null
 echo "  restart issued with streams in flight; waiting for them to finish"
 wait
 
