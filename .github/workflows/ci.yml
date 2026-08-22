@@ -48,7 +48,10 @@ jobs:
       OAG_DATABASE__URL: postgres://oag:oag@127.0.0.1:5432/oag
       OAG_REDIS__URL: redis://127.0.0.1:6379
       OAG_SECURITY__SIGNING_SECRET: ci-only-signing-secret-0123456789abcdefghij
-      OAG_SECURITY__CREDENTIAL_KEK: Y2ktb25seS1rZWstMzItYnl0ZXMtMDEyMzQ1Njc4OQ==
+      # Must decode to EXACTLY 32 bytes. This one was 31 for the life of the
+      # file and nothing noticed, because `migrate` did not parse the KEK
+      # until validation moved into Config::validate.
+      OAG_SECURITY__CREDENTIAL_KEK: Y2ktb25seS1rZWstMzItYnl0ZXMtMDEyMzQ1Njc4OTA=
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
