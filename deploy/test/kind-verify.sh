@@ -191,6 +191,10 @@ $KC port-forward "svc/$SVC" 18080:8080 18081:8081 >"$WORK/pf.log" 2>&1 &
 PF=$!
 for i in $(seq 1 60); do curl -fsS -o /dev/null "http://127.0.0.1:18080/health/live" 2>/dev/null && break; sleep 1; done
 
+# Collect the stream PIDs. A bare `wait` would also wait on the port-forward,
+# which never exits — that hung a CI run until the 45-minute job timeout while
+# the streams themselves had long since finished.
+STREAM_PIDS=()
 for i in $(seq 1 "$STREAMS"); do
   (
     curl -sN --max-time $((STREAM_SECONDS + 120)) -X POST "http://127.0.0.1:18080/v1/messages" \
@@ -199,13 +203,17 @@ for i in $(seq 1 "$STREAMS"); do
            "messages":[{"role":"user","content":"drain test"}]}' \
       > "$WORK/stream-$i.txt" 2>/dev/null
   ) &
+  STREAM_PIDS+=($!)
 done
 
 # Land the restart squarely in the middle of every stream.
 sleep $((STREAM_SECONDS / 3))
 $KC rollout restart "deployment/$DEPLOY" >/dev/null
 echo "  restart issued with streams in flight; waiting for them to finish"
-wait
+# Only the streams. Each curl carries --max-time, so this is already bounded;
+# waiting on the wrong thing is what was unbounded.
+for pid in "${STREAM_PIDS[@]}"; do wait "$pid" || true; done
+kill "$PF" 2>/dev/null || true
 
 say "7/7  results"
 survived=0
