@@ -64,13 +64,185 @@ async fn handle(
     let wire: serde_json::Value = serde_json::from_slice(body)?;
     let mut canonical = anthropic::parse_request(&wire)?;
 
-    // A header hint is an explicit instruction, so it outranks classification.
-    let explicit_tier = headers
-        .get("x-oag-tier")
-        .and_then(|v| v.to_str().ok())
-        .map(TierName::from);
+    let plan = plan_request(state, &auth, &canonical, headers).await?;
 
-    // ── route ─────────────────────────────────────────────────────────────────
+    tracing::info!(
+        %request_id,
+        model = %plan.decision.model.id,
+        tier = %plan.decision.tier,
+        reason = ?plan.decision.reason,
+        "routed"
+    );
+
+    // The upstream must be told the model the router chose, not the virtual
+    // name the client asked for.
+    canonical.model = plan.decision.model.upstream_name.clone();
+
+    let cache_blocks = extract_cache_blocks(&canonical);
+    let session = SessionKey::resolve(
+        canonical.client_session.as_deref(),
+        &cache_blocks,
+        &auth.api_key_id.to_string(),
+        plan.decision.model.id.as_str(),
+    );
+
+    run_with_escalation(
+        state,
+        &auth,
+        plan,
+        &mut canonical,
+        &session,
+        request_id,
+        started,
+    )
+    .await
+}
+
+/// Forward, failing over between credentials, and escalate a rung if the
+/// answer comes back unusable.
+///
+/// Escalation sits *outside* failover, and the nesting is the point: failover
+/// asks "is this credential healthy", escalation asks "is this model good
+/// enough". Collapsing them would mean a provider outage silently migrated the
+/// fleet onto expensive models.
+#[allow(clippy::too_many_arguments)]
+async fn run_with_escalation(
+    state: &Arc<AppState>,
+    auth: &oag_store::AuthContext,
+    plan: Plan,
+    canonical: &mut oag_proto::CanonicalRequest,
+    session: &SessionKey,
+    request_id: RequestId,
+    started: Instant,
+) -> Result<Response> {
+    let Plan {
+        policy,
+        mut decision,
+        signal,
+        catalog,
+        pressure,
+    } = plan;
+    //
+    // Escalation sits *outside* failover, and the nesting is the point:
+    // failover asks "is this credential healthy", escalation asks "is this
+    // model good enough". Collapsing them would mean a provider outage silently
+    // migrated the fleet onto expensive models.
+    let mut escalations = 0u8;
+    // The gate that *caused* an escalation, not the last one observed. Recording
+    // the final attempt's gate would leave this empty on exactly the rows where
+    // it matters, because a successful escalation trips no gate.
+    let mut triggering_gate: Option<oag_router::QualityGate> = None;
+
+    loop {
+        let attempt =
+            forward_with_failover(state, auth, &decision, canonical, session, request_id).await?;
+
+        let (body, accumulator, lease) = match attempt {
+            // Streaming: the bytes are already on their way to the client, so
+            // there is nothing left to judge. See the note on MAX_ESCALATIONS.
+            Attempt::Streaming { response, lease } => {
+                return Ok(stream_response(
+                    state,
+                    response,
+                    state.adapter(decision.model.provider)?,
+                    &lease,
+                    auth,
+                    &decision,
+                    request_id,
+                    started,
+                ));
+            }
+            Attempt::Collected {
+                body,
+                accumulator,
+                lease,
+            } => (body, accumulator, lease),
+        };
+
+        let gate = accumulator.quality_gate();
+
+        // Retry one rung up when the answer was unusable and a rung is left.
+        //
+        // Not under budget pressure, though. A principal near their cap has
+        // already been downgraded on purpose; escalating them back up to the
+        // most expensive model would undo the very saving the downgrade exists
+        // to make. Accepting the worse answer *is* the policy at that point.
+        if let Some(gate) = gate
+            && oag_router::escalation_allowed(pressure, escalations, MAX_ESCALATIONS)
+            && let Some(next) = policy.escalate(
+                &decision.tier,
+                gate,
+                &signal,
+                &catalog,
+                canonical.max_tokens,
+            )
+        {
+            tracing::info!(
+                %request_id, from = %decision.tier, to = %next.tier, ?gate,
+                "escalating: the cheaper model produced an unusable answer"
+            );
+            metrics::counter!(
+                "oag_escalations_total",
+                "from" => decision.tier.name.to_string(),
+                "gate" => format!("{gate:?}"),
+            )
+            .increment(1);
+
+            select::release(state, lease.account.account_id(), &lease.request_id).await;
+            canonical.model.clone_from(&next.model.upstream_name);
+            decision = next;
+            escalations += 1;
+            triggering_gate = Some(gate);
+            continue;
+        }
+
+        if gate.is_some() && pressure != oag_router::BudgetPressure::Normal {
+            tracing::info!(
+                %request_id, ?gate,
+                "not escalating: this principal is near their budget, so a worse \
+                 answer is the intended outcome"
+            );
+            metrics::counter!("oag_escalations_suppressed_total").increment(1);
+        }
+
+        // Either it was fine, or nothing better exists. Record the gate either
+        // way: a gate we could not act on is exactly the signal that a rung is
+        // mis-set for this workload.
+        let ctx = meter::Context {
+            request_id,
+            auth: auth.clone(),
+            decision: decision.clone(),
+            account: lease.account.account_id(),
+            started,
+        };
+        select::release(state, lease.account.account_id(), &lease.request_id).await;
+        // `triggering_gate` when we escalated, otherwise whatever this attempt
+        // tripped — so the ledger always names the reason, never nothing.
+        meter::record_collected(state, &ctx, &accumulator, triggering_gate.or(gate)).await;
+
+        return Ok(json_response(body, &decision, request_id));
+    }
+}
+
+/// Everything routing decided, before a single byte goes upstream.
+struct Plan {
+    policy: RoutingPolicy,
+    decision: RoutingDecision,
+    signal: oag_router::RequestSignal,
+    catalog: Arc<oag_router::Catalog>,
+    pressure: oag_router::BudgetPressure,
+}
+
+/// Resolve the route, build its policy, and choose a model.
+///
+/// Separated from `handle` because it is the part with no I/O side effects
+/// beyond two reads — which makes it the part worth reasoning about on its own.
+async fn plan_request(
+    state: &Arc<AppState>,
+    auth: &oag_store::AuthContext,
+    canonical: &oag_proto::CanonicalRequest,
+    headers: &HeaderMap,
+) -> Result<Plan> {
     let route = oag_store::repo::route_by_id(&state.db, auth.route_id)
         .await?
         .ok_or_else(|| Error::Internal("route vanished between auth and routing".to_owned()))?;
@@ -79,8 +251,14 @@ async fn handle(
     let catalog = state.catalog().await;
 
     let mut signal = canonical.signal();
-    signal.explicit_tier = explicit_tier;
+    // A header hint is an explicit instruction, so it outranks classification.
+    signal.explicit_tier = headers
+        .get("x-oag-tier")
+        .and_then(|v| v.to_str().ok())
+        .map(TierName::from);
 
+    // A key's floor beats the route's: it is the narrower grant, and the point
+    // of pinning one key to `frontier` is that it applies to that key alone.
     let floor = auth
         .key_floor_tier
         .as_deref()
@@ -91,6 +269,7 @@ async fn handle(
     let policy = RoutingPolicy::new(ladder, Box::new(oag_router::HeuristicClassifier::default()))
         .with_floor(floor);
 
+    // `oag/` names are virtual and always managed; otherwise the route decides.
     let mode = if canonical.model.starts_with("oag/") || route.default_mode == "managed" {
         RoutingMode::Managed
     } else {
@@ -103,6 +282,18 @@ async fn handle(
         hard_stop_multiple: auth.principal_hard_stop_multiple,
     };
 
+    // Logged at debug because "why did this route the way it did" is the
+    // question every routing complaint turns into, and reconstructing it from
+    // the ledger afterwards is slower than reading one line.
+    tracing::debug!(
+        mode = ?mode,
+        pressure = ?budget.pressure(),
+        spent = %budget.spent_usd,
+        limit = ?budget.limit_usd,
+        floor = ?policy.floor_name(),
+        "budget and mode"
+    );
+
     let decision = policy.decide(
         &mode,
         Some(&canonical.model),
@@ -112,32 +303,60 @@ async fn handle(
         canonical.max_tokens,
     )?;
 
-    tracing::info!(
-        %request_id,
-        model = %decision.model.id,
-        tier = %decision.tier,
-        reason = ?decision.reason,
-        "routed"
-    );
+    Ok(Plan {
+        policy,
+        decision,
+        signal,
+        catalog,
+        pressure: budget.pressure(),
+    })
+}
 
-    // The upstream must be told the model the router chose, not the virtual
-    // name the client asked for.
-    canonical.model = decision.model.upstream_name.clone();
+/// How many rungs one request may climb.
+///
+/// One. A second escalation would mean the classifier was wrong by two rungs,
+/// which is a configuration problem to fix rather than a cost to keep paying at
+/// runtime.
+///
+/// **Reactive escalation applies only to non-streaming requests**, and that is
+/// a real limit rather than an oversight: a quality gate is knowable only once
+/// the answer is complete, and by then a streamed response has already been
+/// delivered. Retrying would mean the client saw two answers.
+///
+/// Streamed responses still have their gate recorded, so an operator can see
+/// how often a rung produces unusable answers and move the rung — which is the
+/// durable fix anyway.
+const MAX_ESCALATIONS: u8 = 1;
 
-    // ── session affinity ──────────────────────────────────────────────────────
-    let cache_blocks = extract_cache_blocks(&canonical);
-    let session = SessionKey::resolve(
-        canonical.client_session.as_deref(),
-        &cache_blocks,
-        &auth.api_key_id.to_string(),
-        decision.model.id.as_str(),
-    );
+/// What one forwarding attempt produced.
+enum Attempt {
+    /// Handed to the client as a stream. Nothing further can be decided.
+    Streaming {
+        response: reqwest::Response,
+        lease: select::Lease,
+    },
+    /// Read in full, so the answer can still be judged and retried.
+    Collected {
+        body: bytes::Bytes,
+        accumulator: oag_proto::StreamAccumulator,
+        lease: select::Lease,
+    },
+}
 
-    // ── forward, with failover ────────────────────────────────────────────────
-    forward_with_failover(
-        state, &auth, &decision, &canonical, &session, request_id, started,
-    )
-    .await
+/// A complete, non-streamed response.
+fn json_response(
+    body: bytes::Bytes,
+    decision: &RoutingDecision,
+    request_id: RequestId,
+) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-oag-model", decision.model.id.as_str())
+        .header("x-oag-tier", decision.tier.name.as_str())
+        .header("x-oag-request-id", request_id.to_string())
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// Try credentials until one works or the budget of attempts runs out.
@@ -159,10 +378,8 @@ async fn forward_with_failover(
     canonical: &oag_proto::CanonicalRequest,
     session: &SessionKey,
     request_id: RequestId,
-    started: Instant,
-) -> Result<Response> {
+) -> Result<Attempt> {
     let provider = decision.model.provider;
-    let adapter = state.adapter(provider)?;
     let mut excluded: HashSet<AccountId> = HashSet::new();
     let mut last_error = Error::NoCredential { provider };
 
@@ -184,92 +401,164 @@ async fn forward_with_failover(
                 break;
             }
         };
-
         let account = lease.account.account_id();
-        let credential: oag_core::credential::SecretMaterial =
-            state.kek.open_json(&lease.account.sealed())?;
 
-        for attempt in 0..=state.config.gateway.same_account_retries {
-            let request = adapter.build(&oag_upstream::UpstreamRequest {
-                canonical,
-                model: &decision.model,
-                credential: &credential,
-            })?;
-
-            let transport = state
-                .transports
-                .get(&oag_upstream::TransportKey {
-                    account,
-                    proxy: lease.account.proxy_url.clone(),
-                })
-                .await?;
-
-            match transport.execute(request).await {
-                Ok(response) if response.status().is_success() => {
-                    let _ = oag_store::repo::touch_account(&state.db, account).await;
-                    metrics::counter!(
-                        "oag_requests_total",
-                        "outcome" => "ok",
-                        "provider" => provider.as_str(),
-                    )
-                    .increment(1);
-                    if switch > 0 {
-                        metrics::counter!("oag_failovers_total").increment(1);
-                    }
-                    return Ok(stream_response(
-                        state, response, adapter, &lease, auth, decision, request_id, started,
-                    ));
+        match try_credential(state, decision, canonical, &lease, request_id).await {
+            Outcome::Ok(attempt) => {
+                if switch > 0 {
+                    metrics::counter!("oag_failovers_total").increment(1);
                 }
-
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let body = response.text().await.unwrap_or_default();
-                    let err = Error::Upstream {
-                        provider,
-                        account,
-                        status,
-                        body: truncate(&body, 512),
-                    };
-
-                    let disposition = err.disposition();
-                    tracing::warn!(%request_id, status, ?disposition, "upstream rejected");
-                    apply_disposition(state, account, disposition).await;
-                    last_error = err;
-
-                    match disposition {
-                        // Same credential, after a backoff. Only for failures
-                        // that are about the moment rather than the credential.
-                        Disposition::RetrySameAccount
-                            if attempt < state.config.gateway.same_account_retries =>
-                        {
-                            // Falls through to the next attempt against the
-                            // same credential.
-                            tokio::time::sleep(backoff(attempt)).await;
-                        }
-                        Disposition::Fatal | Disposition::EscalateTier => {
-                            select::release(state, account, &lease.request_id).await;
-                            return Err(last_error);
-                        }
-                        _ => break,
-                    }
-                }
-
-                Err(e) => {
-                    last_error = e;
-                    if attempt < state.config.gateway.same_account_retries {
-                        tokio::time::sleep(backoff(attempt)).await;
-                        continue;
-                    }
-                    break;
-                }
+                return Ok(*attempt);
+            }
+            // Nothing about another credential would help.
+            Outcome::Fatal(e) => {
+                select::release(state, account, &lease.request_id).await;
+                return Err(e);
+            }
+            Outcome::Switch(e) => {
+                last_error = e;
+                select::release(state, account, &lease.request_id).await;
+                excluded.insert(account);
             }
         }
-
-        select::release(state, account, &lease.request_id).await;
-        excluded.insert(account);
     }
 
     Err(last_error)
+}
+
+/// What one credential's attempts came to.
+///
+/// The success variant is boxed: it carries a whole `reqwest::Response` and a
+/// lease, which makes every `Outcome` — including the common error ones — as
+/// large as the largest variant otherwise.
+enum Outcome {
+    Ok(Box<Attempt>),
+    /// Try a different credential.
+    Switch(Error),
+    /// Stop: another credential cannot help.
+    Fatal(Error),
+}
+
+/// Try one credential, with bounded same-credential retries.
+///
+/// The retries here are for failures that are about *the moment* — a timeout, a
+/// conflict — rather than about the credential. Anything that says the
+/// credential itself is unhealthy returns `Switch` immediately rather than
+/// spending the retry budget on it.
+async fn try_credential(
+    state: &Arc<AppState>,
+    decision: &RoutingDecision,
+    canonical: &oag_proto::CanonicalRequest,
+    lease: &select::Lease,
+    request_id: RequestId,
+) -> Outcome {
+    let provider = decision.model.provider;
+    let account = lease.account.account_id();
+
+    let adapter = match state.adapter(provider) {
+        Ok(a) => a,
+        Err(e) => return Outcome::Fatal(e),
+    };
+    let credential: oag_core::credential::SecretMaterial =
+        match state.kek.open_json(&lease.account.sealed()) {
+            Ok(c) => c,
+            // A credential we cannot decrypt is broken for everyone, not just
+            // this request, but another credential may well work.
+            Err(e) => return Outcome::Switch(e),
+        };
+
+    let mut last = Error::NoCredential { provider };
+
+    for attempt in 0..=state.config.gateway.same_account_retries {
+        let request = match adapter.build(&oag_upstream::UpstreamRequest {
+            canonical,
+            model: &decision.model,
+            credential: &credential,
+        }) {
+            Ok(r) => r,
+            // We built a bad request; a different credential will build the
+            // same bad request.
+            Err(e) => return Outcome::Fatal(e),
+        };
+
+        let transport = match state
+            .transports
+            .get(&oag_upstream::TransportKey {
+                account,
+                proxy: lease.account.proxy_url.clone(),
+            })
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => return Outcome::Switch(e),
+        };
+
+        match transport.execute(request).await {
+            Ok(response) if response.status().is_success() => {
+                let _ = oag_store::repo::touch_account(&state.db, account).await;
+                state.breakers.record_success(account);
+                metrics::counter!(
+                    "oag_requests_total",
+                    "outcome" => "ok",
+                    "provider" => provider.as_str(),
+                )
+                .increment(1);
+
+                return if canonical.stream {
+                    Outcome::Ok(Box::new(Attempt::Streaming {
+                        response,
+                        lease: lease.clone(),
+                    }))
+                } else {
+                    match sse::collect(response).await {
+                        Ok((body, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
+                            body,
+                            accumulator,
+                            lease: lease.clone(),
+                        })),
+                        Err(e) => Outcome::Switch(e),
+                    }
+                };
+            }
+
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                let err = Error::Upstream {
+                    provider,
+                    account,
+                    status,
+                    body: truncate(&body, 512),
+                };
+                let disposition = err.disposition();
+                tracing::warn!(%request_id, status, ?disposition, "upstream rejected");
+                state.breakers.record_failure(account);
+                apply_disposition(state, account, disposition).await;
+                last = err;
+
+                match disposition {
+                    Disposition::RetrySameAccount
+                        if attempt < state.config.gateway.same_account_retries =>
+                    {
+                        tokio::time::sleep(backoff(attempt)).await;
+                    }
+                    Disposition::Fatal | Disposition::EscalateTier => return Outcome::Fatal(last),
+                    _ => return Outcome::Switch(last),
+                }
+            }
+
+            Err(e) => {
+                last = e;
+                if attempt < state.config.gateway.same_account_retries {
+                    tokio::time::sleep(backoff(attempt)).await;
+                } else {
+                    return Outcome::Switch(last);
+                }
+            }
+        }
+    }
+
+    Outcome::Switch(last)
 }
 
 /// Hand the upstream stream to the client.

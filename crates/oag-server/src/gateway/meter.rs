@@ -25,6 +25,17 @@ pub struct Context {
 /// than the request's — so a client that hung up early still gets billed for
 /// what the provider generated.
 pub async fn record(state: &AppState, ctx: &Context, outcome: &StreamOutcome) {
+    let gate = outcome.accumulator.quality_gate();
+    record_with_gate(state, ctx, outcome, gate, true).await;
+}
+
+async fn record_with_gate(
+    state: &AppState,
+    ctx: &Context,
+    outcome: &StreamOutcome,
+    gate: Option<oag_router::QualityGate>,
+    streamed: bool,
+) {
     let usage = *outcome.accumulator.usage();
     let cost = ctx.decision.model.pricing.cost(&usage);
 
@@ -36,12 +47,15 @@ pub async fn record(state: &AppState, ctx: &Context, outcome: &StreamOutcome) {
         .as_ref()
         .map_or(cost, |m| m.pricing.cost(&usage));
 
-    let (escalated_from, gate) = match &ctx.decision.reason {
-        SelectionReason::Escalated { from, gate } => {
-            (Some(from.to_string()), Some(format!("{gate:?}")))
-        }
-        _ => (None, None),
+    // `escalated_from_tier` is set only when we actually climbed a rung;
+    // `escalation_gate` is set whenever a gate tripped. Keeping them separate
+    // is what lets you count missed escalation opportunities — the streamed
+    // requests where the answer was unusable and it was too late to retry.
+    let escalated_from = match &ctx.decision.reason {
+        SelectionReason::Escalated { from, .. } => Some(from.to_string()),
+        _ => None,
     };
+    let gate_label = gate.map(|g| format!("{g:?}"));
 
     let status = if outcome.error.is_some() { 502 } else { 200 };
 
@@ -55,7 +69,7 @@ pub async fn record(state: &AppState, ctx: &Context, outcome: &StreamOutcome) {
         tier: ctx.decision.tier.name.to_string(),
         selection_reason: reason_label(&ctx.decision.reason).to_owned(),
         escalated_from_tier: escalated_from,
-        escalation_gate: gate,
+        escalation_gate: gate_label,
         usage,
         cost_usd: cost,
         counterfactual_usd: counterfactual,
@@ -67,7 +81,7 @@ pub async fn record(state: &AppState, ctx: &Context, outcome: &StreamOutcome) {
         status,
         latency_ms: i32::try_from(outcome.total.as_millis()).ok(),
         ttft_ms: outcome.ttft.and_then(|d| i32::try_from(d.as_millis()).ok()),
-        streamed: true,
+        streamed,
     };
 
     if let Err(e) = oag_store::repo::record_usage(&state.db, &write).await {
@@ -85,6 +99,30 @@ pub async fn record(state: &AppState, ctx: &Context, outcome: &StreamOutcome) {
     }
 
     emit_metrics(ctx, outcome, &usage, cost, counterfactual);
+}
+
+/// Record a non-streamed response.
+///
+/// Takes the quality gate whether or not we acted on it. A gate we could not
+/// act on still belongs in the ledger: it is the signal that a rung is
+/// mis-configured for this workload, and it is invisible everywhere else.
+pub async fn record_collected(
+    state: &AppState,
+    ctx: &Context,
+    accumulator: &oag_proto::StreamAccumulator,
+    gate: Option<oag_router::QualityGate>,
+) {
+    let outcome = StreamOutcome {
+        accumulator: accumulator.clone(),
+        // A non-streamed response has no meaningful first-token time: the whole
+        // body arrives at once. Reporting the total here would quietly corrupt
+        // the TTFT histogram with values that are not TTFT.
+        ttft: None,
+        total: ctx.started.elapsed(),
+        client_gone: false,
+        error: None,
+    };
+    record_with_gate(state, ctx, &outcome, gate, false).await;
 }
 
 fn emit_metrics(

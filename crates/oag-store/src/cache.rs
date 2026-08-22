@@ -200,6 +200,46 @@ impl Cache {
     }
 }
 
+impl Cache {
+    /// Drop every cached auth entry. Returns how many were removed.
+    ///
+    /// Scans rather than `FLUSHDB`: this key space shares Redis with
+    /// concurrency slots and session pins, and dropping those would void live
+    /// concurrency accounting and scatter every in-flight conversation off its
+    /// pinned credential.
+    pub async fn flush_auth_cache(&self) -> Result<usize> {
+        let mut conn = self.conn().await?;
+        let mut cursor: u64 = 0;
+        let mut removed = 0usize;
+
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg("oag:auth:*")
+                .arg("COUNT")
+                .arg(500)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| Error::Internal(format!("scanning auth cache: {e}")))?;
+
+            if !keys.is_empty() {
+                let n: usize = conn
+                    .del(&keys)
+                    .await
+                    .map_err(|e| Error::Internal(format!("dropping auth cache: {e}")))?;
+                removed += n;
+            }
+
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        Ok(removed)
+    }
+}
+
 fn auth_key(hash: &str) -> String {
     format!("oag:auth:{hash}")
 }

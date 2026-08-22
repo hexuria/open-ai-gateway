@@ -14,6 +14,7 @@
 //! expose the admin API" a deployment fact rather than a routing rule someone
 //! has to remember to write.
 
+pub mod breakers;
 pub mod gateway;
 pub mod health;
 pub mod metrics;

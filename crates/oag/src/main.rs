@@ -77,7 +77,7 @@ async fn run() -> Result<()> {
         Command::Admin(cmd) => {
             let db = Db::connect(&config.database.url, config.database.max_connections)?;
             let kek = oag_core::Kek::from_base64(&config.security.credential_kek)?;
-            admin::run(cmd, &db, &kek).await
+            admin::run(cmd, &db, &kek, &config.redis.url).await
         }
         Command::Serve => {
             let handle = oag_server::metrics::install()?;

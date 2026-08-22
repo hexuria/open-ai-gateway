@@ -64,6 +64,15 @@ pub enum AdminCommand {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Choose whether a concrete model name is honoured or overridden.
+    SetMode {
+        #[arg(long, default_value = "default")]
+        route: String,
+        /// `passthrough` honours a named model; `managed` applies policy to
+        /// every request. Virtual `oag/*` names are always managed.
+        #[arg(long)]
+        mode: String,
+    },
     /// Set a route's tier ladder from JSON.
     SetTiers {
         #[arg(long, default_value = "default")]
@@ -72,11 +81,18 @@ pub enum AdminCommand {
         #[arg(long)]
         tiers: String,
     },
+    /// Drop the shared auth cache.
+    ///
+    /// Budget, quota, and floor-tier changes are read through a cache, so they
+    /// take up to five minutes to reach every replica. This clears the shared
+    /// tier immediately; each replica's own short-lived cache expires within
+    /// fifteen seconds, which bounds the rest.
+    FlushCache,
     /// Show routes, credentials, and this month's spend.
     Status,
 }
 
-pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek) -> Result<()> {
+pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Result<()> {
     match cmd {
         AdminCommand::Init {
             email,
@@ -116,7 +132,9 @@ pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek) -> Result<()> {
             .await
         }
         AdminCommand::SeedCatalog { from } => seed_catalog(db, from.as_deref()).await,
+        AdminCommand::SetMode { route, mode } => set_mode(db, &route, &mode).await,
         AdminCommand::SetTiers { route, tiers } => set_tiers(db, &route, &tiers).await,
+        AdminCommand::FlushCache => flush_cache(redis_url).await,
         AdminCommand::Status => status(db).await,
     }
 }
@@ -130,7 +148,13 @@ async fn init(db: &Db, email: &str, route: &str, budget: Option<Decimal>) -> Res
     print_key(&key);
     println!("\nNext:");
     println!("  oag admin seed-catalog");
-    println!("  oag admin add-account --name <n> --provider anthropic --secret <sk-ant-...>");
+    println!("  oag admin add-account --name <n> --provider anthropic --secret <key>");
+    println!();
+    println!("  This route is in passthrough mode: a client that names a concrete");
+    println!("  model gets that model. Clients asking for oag/auto are routed by");
+    println!("  policy. To apply policy to every request, including ones that name");
+    println!("  a model:");
+    println!("      oag admin set-mode --route {route} --mode managed");
     Ok(())
 }
 
@@ -176,7 +200,7 @@ async fn upsert_route(db: &Db, name: &str) -> Result<Uuid> {
     let id: (Uuid,) = sqlx::query_as(
         r"
         INSERT INTO route (id, name, tiers, default_mode)
-        VALUES ($1, $2, $3, 'managed')
+        VALUES ($1, $2, $3, 'passthrough')
         ON CONFLICT (name) DO UPDATE SET updated_at = now()
         RETURNING id
         ",
@@ -323,6 +347,30 @@ async fn add_account(
     Ok(())
 }
 
+async fn set_mode(db: &Db, route: &str, mode: &str) -> Result<()> {
+    if !matches!(mode, "passthrough" | "managed") {
+        return Err(oag_core::Error::Config(format!(
+            "mode must be 'passthrough' or 'managed', not '{mode}'"
+        )));
+    }
+    let n = sqlx::query("UPDATE route SET default_mode = $2, updated_at = now() WHERE name = $1")
+        .bind(route)
+        .bind(mode)
+        .execute(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("setting mode: {e}")))?;
+    if n.rows_affected() == 0 {
+        return Err(oag_core::Error::Config(format!("no route named {route}")));
+    }
+    println!("route '{route}' mode: {mode}");
+    if mode == "managed" {
+        println!("  concrete model names will now be overridden by policy");
+    } else {
+        println!("  concrete model names will be honoured; oag/* stays managed");
+    }
+    Ok(())
+}
+
 async fn set_tiers(db: &Db, route: &str, tiers: &str) -> Result<()> {
     // Parse through the real type, so a malformed ladder is rejected here and
     // not on the first request that route serves.
@@ -362,6 +410,14 @@ async fn seed_catalog(db: &Db, from: Option<&str>) -> Result<()> {
         repo::upsert_model(db, m, false).await?;
     }
     println!("catalog: {n} models");
+    Ok(())
+}
+
+async fn flush_cache(redis_url: &str) -> Result<()> {
+    let cache = oag_store::Cache::connect(redis_url)?;
+    let n = cache.flush_auth_cache().await?;
+    println!("dropped {n} cached auth entries");
+    println!("  each replica's in-process cache expires within 15s");
     Ok(())
 }
 

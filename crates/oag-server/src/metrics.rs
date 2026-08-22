@@ -66,6 +66,10 @@ pub fn describe() {
         "Requests where the client hung up before the upstream finished."
     );
     describe_counter!(
+        "oag_escalations_suppressed_total",
+        "Unusable answers left unescalated because the principal was near their budget."
+    );
+    describe_counter!(
         "oag_usage_write_failures_total",
         "Spend that could not be written to the ledger. Should always be zero."
     );

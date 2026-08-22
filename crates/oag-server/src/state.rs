@@ -1,5 +1,6 @@
 //! Shared application state.
 
+use crate::breakers::Breakers;
 use crate::shutdown::Lifecycle;
 use oag_core::config::Config;
 use oag_core::{Error, Kek, Provider, Result};
@@ -20,6 +21,7 @@ pub struct AppState {
     pub lifecycle: Arc<Lifecycle>,
     pub transports: TransportPool,
     pub kek: Arc<Kek>,
+    pub breakers: Arc<Breakers>,
     adapters: Arc<HashMap<Provider, Arc<dyn ProviderAdapter>>>,
     /// Swapped wholesale on refresh rather than mutated in place, so a request
     /// that started with one catalog finishes with it — a price changing
@@ -65,6 +67,7 @@ impl AppState {
             cache,
             lifecycle: Arc::new(Lifecycle::new()),
             kek: Arc::new(kek),
+            breakers: Arc::new(Breakers::new()),
             adapters: Arc::new(adapters),
             catalog: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
         })

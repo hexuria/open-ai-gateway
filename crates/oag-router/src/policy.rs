@@ -124,6 +124,23 @@ pub struct RoutingDecision {
     pub ceiling_model: Option<ModelSpec>,
 }
 
+/// Whether an unusable answer should be retried one rung up.
+///
+/// A pure function because this is a policy question with a surprising answer,
+/// and the surprising part deserves a test rather than a comment in a handler:
+/// **a principal under budget pressure does not get escalated.** They were
+/// downgraded on purpose; spending more to fix the answer undoes exactly the
+/// saving the downgrade existed to make. Accepting the worse answer *is* the
+/// policy at that point.
+#[must_use]
+pub fn escalation_allowed(
+    pressure: BudgetPressure,
+    escalations_so_far: u8,
+    max_escalations: u8,
+) -> bool {
+    pressure == BudgetPressure::Normal && escalations_so_far < max_escalations
+}
+
 /// A route's routing rules.
 pub struct RoutingPolicy {
     ladder: TierLadder,
@@ -160,6 +177,12 @@ impl RoutingPolicy {
     #[must_use]
     pub fn ladder(&self) -> &TierLadder {
         &self.ladder
+    }
+
+    /// The floor rung's name, for logging.
+    #[must_use]
+    pub fn floor_name(&self) -> Option<&str> {
+        self.floor.as_ref().map(|t| t.name.as_str())
     }
 
     /// Choose a model for a request.
@@ -635,6 +658,28 @@ mod tests {
             .is_none(),
             "unbounded escalation would turn one bad answer into unbounded spend"
         );
+    }
+
+    #[test]
+    fn budget_pressure_suppresses_escalation() {
+        // The saving from a downgrade is undone entirely if the request then
+        // climbs back to the most expensive rung.
+        assert!(escalation_allowed(BudgetPressure::Normal, 0, 1));
+        assert!(!escalation_allowed(BudgetPressure::Constrained, 0, 1));
+        assert!(!escalation_allowed(BudgetPressure::Exhausted, 0, 1));
+    }
+
+    #[test]
+    fn escalation_is_bounded_even_with_headroom() {
+        // Unbounded escalation turns one bad answer into unbounded spend.
+        assert!(escalation_allowed(BudgetPressure::Normal, 0, 1));
+        assert!(!escalation_allowed(BudgetPressure::Normal, 1, 1));
+        assert!(!escalation_allowed(BudgetPressure::Normal, 9, 1));
+    }
+
+    #[test]
+    fn a_zero_budget_of_escalations_never_escalates() {
+        assert!(!escalation_allowed(BudgetPressure::Normal, 0, 0));
     }
 
     #[test]

@@ -42,7 +42,14 @@ CREATE TABLE route (
     -- Ordering is positional, which is what makes escalation and budget
     -- downgrade index arithmetic instead of stringly-typed comparisons.
     tiers               jsonb       NOT NULL,
-    default_mode        text        NOT NULL DEFAULT 'managed'
+    -- What to do when a client names a *concrete* model.
+    --   passthrough: honour it. The default, because silently redirecting a
+    --                request someone deliberately routed is the kind of
+    --                surprise that gets a gateway removed from the path.
+    --   managed:     override it with policy anyway. For an operator who wants
+    --                cost rules enforced over clients that hardcode a model.
+    -- Virtual `oag/*` names are always managed, whichever this says.
+    default_mode        text        NOT NULL DEFAULT 'passthrough'
                         CHECK (default_mode IN ('managed', 'passthrough')),
     -- Minimum rung this route will ever serve from. An entitlement, not a
     -- preference: budget pressure does not override it.

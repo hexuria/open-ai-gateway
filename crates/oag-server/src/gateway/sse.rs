@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// How the stream ended.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StreamOutcome {
     pub accumulator: StreamAccumulator,
     /// Time to the first token of *content*.
@@ -186,7 +186,12 @@ fn drain_frames(
     saw_content
 }
 
-/// Read a non-streaming response, accounting for usage.
+/// Read a non-streaming response and fold it into an accumulator.
+///
+/// The accumulator must end up in the *same state* a streamed response would
+/// have reached, because that is what `quality_gate` reads. Extracting only
+/// usage would leave `text_len` at zero, and every non-streaming response would
+/// then look like an empty one — so every single one would escalate.
 pub async fn collect(
     response: reqwest::Response,
 ) -> std::result::Result<(bytes::Bytes, StreamAccumulator), Error> {
@@ -196,17 +201,64 @@ pub async fn collect(
         .map_err(|e| Error::Internal(format!("reading upstream response: {e}")))?;
 
     let mut acc = StreamAccumulator::new();
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-        let usage = oag_router::Usage {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok((bytes, acc));
+    };
+
+    acc.observe(&StreamEvent::UsageUpdate {
+        usage: oag_router::Usage {
             input_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
             output_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
             cache_read_tokens: v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0),
             cache_write_tokens: v["usage"]["cache_creation_input_tokens"]
                 .as_u64()
                 .unwrap_or(0),
-        };
-        acc.observe(&StreamEvent::UsageUpdate { usage });
+        },
+    });
+
+    // Replay the content as the events a stream would have produced.
+    if let Some(blocks) = v["content"].as_array() {
+        for block in blocks {
+            match block["type"].as_str().unwrap_or_default() {
+                "text" => acc.observe(&StreamEvent::TextDelta {
+                    text: block["text"].as_str().unwrap_or_default().to_owned(),
+                }),
+                "thinking" => acc.observe(&StreamEvent::ThinkingDelta {
+                    text: block["thinking"].as_str().unwrap_or_default().to_owned(),
+                }),
+                "tool_use" => {
+                    let id = block["id"].as_str().unwrap_or_default().to_owned();
+                    acc.observe(&StreamEvent::ToolUseStart {
+                        id: id.clone(),
+                        name: block["name"].as_str().unwrap_or_default().to_owned(),
+                    });
+                    // Whole, not fragmented — a non-streamed tool call is
+                    // already complete JSON, so the malformed-arguments gate
+                    // should never fire on one.
+                    acc.observe(&StreamEvent::ToolUseDelta {
+                        partial_json: block["input"].to_string(),
+                        id: id.clone(),
+                    });
+                    acc.observe(&StreamEvent::ToolUseEnd { id });
+                }
+                _ => {}
+            }
+        }
     }
+
+    if let Some(reason) = v["stop_reason"].as_str() {
+        acc.observe(&StreamEvent::Stop {
+            reason: match reason {
+                "max_tokens" => oag_proto::StopReason::MaxTokens,
+                "stop_sequence" => oag_proto::StopReason::StopSequence,
+                "tool_use" => oag_proto::StopReason::ToolUse,
+                "refusal" => oag_proto::StopReason::Refusal,
+                _ => oag_proto::StopReason::EndTurn,
+            },
+            usage: *acc.usage(),
+        });
+    }
+
     Ok((bytes, acc))
 }
 
@@ -290,6 +342,56 @@ mod tests {
         let mut acc = StreamAccumulator::new();
         let frame = b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"f\"}}\n\n";
         assert!(drain_frames(frame, &adapter, &mut acc));
+    }
+
+    fn collected(body: &serde_json::Value) -> StreamAccumulator {
+        // Exercise the same folding `collect` does, without an HTTP response.
+        let bytes = serde_json::to_vec(body).expect("json");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        let mut acc = StreamAccumulator::new();
+        acc.observe(&StreamEvent::UsageUpdate {
+            usage: oag_router::Usage {
+                input_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
+                output_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        });
+        if let Some(blocks) = v["content"].as_array() {
+            for b in blocks {
+                if b["type"] == "text" {
+                    acc.observe(&StreamEvent::TextDelta {
+                        text: b["text"].as_str().unwrap_or_default().to_owned(),
+                    });
+                }
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn a_non_streaming_answer_with_content_does_not_trip_the_gate() {
+        // The bug this guards: folding in only usage leaves text_len at zero,
+        // so every non-streaming response looks empty and every one escalates.
+        let acc = collected(&serde_json::json!({
+            "content": [{"type": "text", "text": "A considered answer."}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 20}
+        }));
+        assert_eq!(acc.quality_gate(), None);
+    }
+
+    #[test]
+    fn a_genuinely_empty_non_streaming_answer_does_trip_it() {
+        let acc = collected(&serde_json::json!({
+            "content": [],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 100, "output_tokens": 0}
+        }));
+        assert_eq!(
+            acc.quality_gate(),
+            Some(oag_router::QualityGate::EmptyResponse)
+        );
     }
 
     #[test]

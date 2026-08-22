@@ -21,7 +21,7 @@ const STICKY_TTL: Duration = Duration::from_mins(30);
 const SLOT_TTL: Duration = Duration::from_mins(35);
 
 /// The chosen credential, plus the slot that has to be given back.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Lease {
     pub account: AccountRow,
     pub request_id: String,
@@ -78,6 +78,15 @@ pub async fn lease(
     while !remaining.is_empty() {
         let mut candidates = Vec::with_capacity(remaining.len());
         for row in &remaining {
+            // Skip credentials this replica has watched fail repeatedly.
+            //
+            // This has to happen *before* the cascade, not inside it: a broken
+            // credential fails fast, so it always has the lowest in-flight
+            // count, so the least-loaded stage actively prefers it. Filtering
+            // afterwards would be too late.
+            if !state.breakers.allows(row.account_id(), now) {
+                continue;
+            }
             if let Some(c) = candidate_for(state, row, now).await {
                 candidates.push(c);
             }
@@ -157,7 +166,7 @@ async fn try_pinned(
     let row = rows.iter().find(|r| r.account_id() == pinned)?;
     let candidate = candidate_for(state, row, now).await?;
 
-    if !is_eligible(&candidate, now) {
+    if !is_eligible(&candidate, now) || !state.breakers.allows(pinned, now) {
         return None;
     }
     let acquired = state
