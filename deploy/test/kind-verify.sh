@@ -191,6 +191,21 @@ $KC port-forward "svc/$SVC" 18080:8080 18081:8081 >"$WORK/pf.log" 2>&1 &
 PF=$!
 for i in $(seq 1 60); do curl -fsS -o /dev/null "http://127.0.0.1:18080/health/live" 2>/dev/null && break; sleep 1; done
 
+# The catalog is per-replica and in memory, seeded into Postgres *after* these
+# pods booted, and picked up on a refresh interval rather than immediately. Until
+# that lands every request fails to route — which looks exactly like a severed
+# stream in the results below, and cost a CI run to tell apart. Wait for the
+# replica this forward is pinned to to actually see a concrete model.
+echo "  waiting for the catalog to reach this replica"
+for i in $(seq 1 90); do
+  models="$(curl -fsS "http://127.0.0.1:18080/v1/models" -H "x-api-key: $KEY" 2>/dev/null \
+    | python3 -c 'import sys,json; d=json.load(sys.stdin); print(sum(1 for m in d["data"] if not m["oag"]["virtual"]))' 2>/dev/null || echo 0)"
+  [ "${models:-0}" -gt 0 ] && break
+  sleep 2
+done
+[ "${models:-0}" -gt 0 ] || fail "the catalog never reached this replica; every request would fail to route"
+pass "catalog visible ($models concrete models)"
+
 # Collect the stream PIDs. A bare `wait` would also wait on the port-forward,
 # which never exits — that hung a CI run until the 45-minute job timeout while
 # the streams themselves had long since finished.
@@ -223,7 +238,19 @@ for i in $(seq 1 "$STREAMS"); do
   grep -q 'message_stop' "$WORK/stream-$i.txt" 2>/dev/null && survived=$((survived + 1))
 done
 echo "  streams completed: $survived / $STREAMS"
-[ "$survived" -eq "$STREAMS" ] || fail "$((STREAMS - survived)) stream(s) were severed by the rollout"
+if [ "$survived" -ne "$STREAMS" ]; then
+  # Print what actually came back. A stream that never started looks identical
+  # to one that was severed if you only count message_stop, and telling those
+  # apart from CI logs alone is otherwise a guess.
+  echo
+  echo "  what the streams returned (first two):"
+  for i in 1 2; do
+    echo "  --- stream $i (first 300 bytes) ---"
+    head -c 300 "$WORK/stream-$i.txt" 2>/dev/null | sed 's/^/    /'
+    echo
+  done
+  fail "$((STREAMS - survived)) stream(s) did not complete"
+fi
 pass "every stream survived a full rolling restart"
 
 # A completed stream that never reached the ledger would mean the metering task
