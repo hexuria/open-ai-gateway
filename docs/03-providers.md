@@ -31,10 +31,37 @@ so only OAuth-style adapters implement it.
 
 ## Most providers need no adapter
 
-`Provider::native_dialect` maps a provider to the wire format it speaks. Kimi,
-DeepSeek, Zhipu, and xAI all speak OpenAI Chat Completions, so they share one
-adapter and differ only in base URL and catalog entries. Check the dialect
-before writing code.
+`Provider::native_dialect` maps a provider to the wire format it speaks. OpenAI,
+Kimi, DeepSeek, Zhipu, and xAI all speak Chat Completions, so **one adapter
+covers all five** — `OpenAICompatAdapter` — and they differ only in base URL and
+catalog entries. Check the dialect before writing code.
+
+Point any of them somewhere else without a rebuild:
+
+```yaml
+gateway:
+  provider_base_urls:
+    kimi: "https://your-proxy.internal/v1"
+```
+
+## Which dialect reaches which upstream
+
+Any inbound dialect can reach any upstream one; translation goes through the
+canonical form. When the two agree, bytes pass through **verbatim** — the
+upstream's own bytes are the most faithful answer available, and re-serialising
+can only differ from them.
+
+| Client speaks | Upstream speaks | What happens |
+|---|---|---|
+| Anthropic | Anthropic | verbatim |
+| Chat Completions | Chat Completions | verbatim |
+| Chat Completions | Anthropic | rendered as `chat.completion.chunk` frames, terminated with `[DONE]` |
+| Anthropic | Chat Completions | rendered as `message_start` / `content_block_*` / `message_stop` |
+
+The Anthropic direction is the harder one: it uses indexed content blocks that
+must be explicitly opened and closed, so the renderer tracks the open block and
+closes it before opening another. A client that receives a delta for a block it
+was never told about drops it silently.
 
 ## Transport
 

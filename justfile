@@ -45,6 +45,14 @@ migrate:
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
       cargo run --quiet -p oag -- migrate
 
+# A route, a principal, an API key, and the model catalog. Prints the key.
+bootstrap:
+    @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
+      OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
+      OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
+      sh -c 'cargo run --quiet -p oag -- admin init --email dev@localhost && \
+             cargo run --quiet -p oag -- admin seed-catalog'
+
 # Run the gateway against the dev infrastructure.
 serve:
     @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
@@ -73,6 +81,12 @@ stack-down:
 
 stack-logs:
     {{stack}} logs -f
+
+# The same stack plus Prometheus and Grafana (:9090, :3000).
+stack-observe:
+    OAG_SIGNING_SECRET="$(just _dev-secret)" \
+    OAG_CREDENTIAL_KEK="$(just _dev-kek)" \
+      {{stack}} --profile observability up -d --wait --build
 
 # Restart one replica under load; the other two must not drop a stream.
 stack-roll:

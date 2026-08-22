@@ -25,7 +25,17 @@ the request and has a live credential wins.
 
 **Passthrough** — the client named a concrete model. Honour it. Never surprise a
 caller who was explicit; silently downgrading a request someone deliberately
-routed to Opus is how you get a bug report you cannot reproduce.
+routed to Opus is how you get a bug report you cannot reproduce. **This is the
+default for a new route.**
+
+An operator who wants cost policy applied to clients that hardcode an expensive
+model opts in explicitly:
+
+```bash
+oag admin set-mode --route default --mode managed
+```
+
+Virtual `oag/*` names are always managed, whichever the route says.
 
 **Managed** — the client asked for a virtual model (`oag/auto`, `oag/cheap`,
 `oag/frontier`) and policy decides. This is where the savings come from.
@@ -85,6 +95,19 @@ afternoon. Those are credential problems and failover handles them.
 Escalation moves exactly one rung and stops at the ceiling. Unbounded escalation
 turns one bad answer into unbounded spend.
 
+**It is suppressed under budget pressure.** A principal near their cap has
+already been downgraded on purpose; escalating them back to the most expensive
+model would undo the exact saving the downgrade existed to make. Accepting the
+worse answer *is* the policy at that point, and `oag_escalations_suppressed_total`
+counts how often it happens.
+
+**It applies to non-streaming requests only**, and that is a real limit rather
+than an oversight: a quality gate is knowable only once the answer is complete,
+and by then a streamed response has already been delivered. Retrying would mean
+the client saw two answers. Streamed responses still have their gate recorded,
+so you can see how often a rung produces unusable answers and move the rung —
+which is the durable fix anyway.
+
 ## Budgets
 
 Per principal and per route, monthly, in USD.
@@ -143,3 +166,9 @@ Worth watching alongside it:
   If a rung escalates most of the time, it is the wrong rung for your workload.
 - **Cache hit rate.** If this collapses, session affinity has stopped working
   and the bill will follow.
+- **Suppressed escalations.** A high count means people are hitting their caps
+  and getting worse answers for it — which is the system working as designed,
+  but is also the signal to raise a budget or fix a ladder.
+
+Budget changes are read through the auth cache, so they take up to five minutes
+to reach every replica. `oag admin flush-cache` makes one immediate.

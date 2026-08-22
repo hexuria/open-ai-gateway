@@ -26,19 +26,30 @@ number you can point at rather than a claim.
 ## Quick start
 
 ```bash
-just dev      # Postgres + Redis, migrated
-just serve    # the gateway on :8080 (inference) and :8081 (admin)
+just dev        # Postgres + Redis, migrated
+just bootstrap  # a route, a principal, an API key, the model catalog
+just serve      # :8080 inference, :8081 admin + dashboard
 ```
+
+Then point any Anthropic- or OpenAI-shaped client at it:
 
 ```bash
-curl -s localhost:8081/health/ready | jq
+curl -N localhost:8080/v1/messages -H "x-api-key: $OAG_KEY" \
+  -d '{"model":"oag/auto","max_tokens":256,"stream":true,
+       "messages":[{"role":"user","content":"hello"}]}'
 ```
 
-The full three-tier topology — Caddy, Envoy, three replicas — is one command:
+`oag/auto` lets policy choose the model. Name a real one and it is honoured.
+
+The full three-tier topology — Caddy, Envoy, three replicas, Postgres, Redis —
+is one command, and Prometheus and Grafana are one flag more:
 
 ```bash
 just stack-up
 ```
+
+The dashboard is on the admin listener at `http://127.0.0.1:8081/`; Grafana, if
+you brought up the observability profile, at `:3000`.
 
 ## Shape
 
@@ -50,14 +61,21 @@ crates/
   oag-pool       scheduler, session affinity, breakers    — no I/O
   oag-upstream   provider adapters and HTTP transport
   oag-store      Postgres and Redis
-  oag-server     axum: two listeners, health, metrics, drain
+  oag-server     axum: two listeners, health, metrics, drain, admin API
   oag            the binary
+web/index.html   the dashboard, embedded in the binary
 ```
 
 Four of the eight crates do no I/O at all. That is deliberate and it is the
 main structural bet: routing policy, translation, and credential scheduling are
 the things most worth testing exhaustively and least worth spinning up a
-database for. The test suite runs in well under a second.
+database for. The suite is ~180 tests and runs in well under a second.
+
+The dashboard is a single self-contained HTML file compiled into the binary. A
+build toolchain and `node_modules` for a handful of read views is what "less is
+more" was defined against, and an operator debugging a gateway at 3am should not
+need `npm install` first. The admin API is ordinary REST, so a richer UI can be
+added later without the server changing.
 
 ## Two listeners
 
@@ -78,6 +96,26 @@ deployment fact rather than a routing rule someone has to remember.
 | [02-cost-routing.md](docs/02-cost-routing.md) | Tiers, classification, escalation, budgets |
 | [03-providers.md](docs/03-providers.md) | The adapter contract |
 | [compliance.md](docs/compliance.md) | Credential kinds and their standing |
+
+## What it does
+
+- **Routes by cost.** A route defines an ordered tier ladder. Requests are
+  classified from what is observable — prompt size, tool count, conversation
+  depth, whether extended thinking was asked for — and served from the cheapest
+  rung that can do the job.
+- **Escalates when the cheap answer is unusable.** Refusals, truncation,
+  malformed tool calls, and empty responses trip a quality gate and retry one
+  rung up. Bounded to one rung, and *suppressed* when the principal is near
+  their budget: escalating then would undo the saving the downgrade made.
+- **Pools credentials.** Priority tiers, least-loaded selection, use-it-or-lose-it
+  window preference, LRU, circuit breakers, and two-stage failover.
+- **Keeps prompt caches hitting.** Conversations pin to a credential, keyed on
+  the part of the prompt that is stable across turns. On agentic traffic the
+  cache is most of the bill.
+- **Speaks both dialects, in both directions.** Anthropic Messages and OpenAI
+  Chat Completions, inbound and upstream, translated through one canonical form.
+- **Measures itself.** Every request records what it cost *and* what it would
+  have cost on the route's top tier. The difference is the point.
 
 ## Prior art
 
