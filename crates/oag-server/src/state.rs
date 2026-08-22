@@ -62,6 +62,19 @@ impl AppState {
             ))),
         );
 
+        // Region rather than a URL: Bedrock's host is derived from it, and it
+        // is also part of the SigV4 scope.
+        let bedrock_region = config
+            .gateway
+            .provider_base_urls
+            .get("bedrock")
+            .cloned()
+            .unwrap_or_else(|| "us-east-1".to_owned());
+        adapters.insert(
+            Provider::Bedrock,
+            Arc::new(oag_upstream::BedrockAdapter::new(bedrock_region)),
+        );
+
         adapters.insert(
             Provider::Gemini,
             Arc::new(oag_upstream::GeminiAdapter::new(base(

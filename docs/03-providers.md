@@ -79,6 +79,20 @@ evicts by idle time; an evicted transport's in-flight requests are unaffected,
 because the `Arc` outlives the cache entry — a long-running stream is never cut
 short by eviction.
 
+## Providers with their own adapter
+
+| Provider | Why it needs one |
+|---|---|
+| Anthropic | The canonical dialect. |
+| Gemini | Model and mode in the URL path; its own auth header; a genuinely different body shape. |
+| Bedrock | Anthropic's body, but the model is in the path, `anthropic_version` replaces the version header, and every request is SigV4-signed. |
+
+`sigv4.rs` is hand-rolled — a few dozen lines against the AWS SDK's several
+hundred transitive crates and a second HTTP stack, none of which this gateway
+would use for anything else. Bedrock credentials are stored packed as
+`access_key:secret[:session_token]`, so Bedrock needs no separate credential
+shape from every other provider.
+
 ## Catalog entries
 
 ```rust
