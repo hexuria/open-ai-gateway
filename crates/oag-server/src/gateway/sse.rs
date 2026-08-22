@@ -43,6 +43,39 @@ pub struct StreamOutcome {
 /// What the client's response body receives.
 pub type Chunk = std::result::Result<bytes::Bytes, std::io::Error>;
 
+/// Renders canonical events into whichever dialect the client speaks.
+///
+/// One enum rather than a trait object: there are exactly as many variants as
+/// there are dialects, and a match keeps the compiler responsible for noticing
+/// when a new one is added.
+enum Renderer {
+    None,
+    ChatCompletions(oag_proto::openai::RenderState),
+    Anthropic(oag_proto::anthropic::RenderState),
+}
+
+impl Renderer {
+    fn new(egress: &Egress) -> Self {
+        match egress {
+            Egress::Passthrough => Self::None,
+            Egress::ChatCompletions { request_id, model } => {
+                Self::ChatCompletions(oag_proto::openai::RenderState::new(request_id, model))
+            }
+            Egress::AnthropicMessages { request_id, model } => {
+                Self::Anthropic(oag_proto::anthropic::RenderState::new(request_id, model))
+            }
+        }
+    }
+
+    fn render(&mut self, event: &oag_proto::StreamEvent) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::ChatCompletions(st) => oag_proto::openai::render_event(event, st),
+            Self::Anthropic(st) => oag_proto::anthropic::render_event(event, st),
+        }
+    }
+}
+
 /// How the client's bytes are produced.
 #[derive(Debug, Clone)]
 pub enum Egress {
@@ -54,6 +87,10 @@ pub enum Egress {
     Passthrough,
     /// They differ: render each canonical event into the client's dialect.
     ChatCompletions { request_id: String, model: String },
+    /// The other direction: an Anthropic-shaped client over a Chat Completions
+    /// upstream. The headline case, since it is what a Claude-shaped agent
+    /// routed to a cheap model looks like.
+    AnthropicMessages { request_id: String, model: String },
 }
 
 /// Read `response`, forward it to `tx`, and account for usage.
@@ -75,12 +112,7 @@ pub async fn pump(
     // SSE frames can split across TCP reads; hold the tail until it completes.
     let mut pending = Vec::<u8>::new();
 
-    let mut render = match &egress {
-        Egress::Passthrough => None,
-        Egress::ChatCompletions { request_id, model } => {
-            Some(oag_proto::openai::RenderState::new(request_id, model))
-        }
-    };
+    let mut render = Renderer::new(&egress);
 
     loop {
         if started.elapsed() >= max_duration {
@@ -109,8 +141,7 @@ pub async fn pump(
         // usage, and this ordering means a send failure cannot skip it.
         pending.extend_from_slice(&chunk);
         let frames = pending_take_complete(&mut pending);
-        let (saw_content, translated) =
-            drain_frames_into(&frames, &adapter, &mut acc, render.as_mut());
+        let (saw_content, translated) = drain_frames_into(&frames, &adapter, &mut acc, &mut render);
 
         if ttft.is_none() && saw_content {
             ttft = Some(started.elapsed());
@@ -119,7 +150,7 @@ pub async fn pump(
         // Verbatim when the dialects match, translated bytes when they do not.
         let outbound = match &egress {
             Egress::Passthrough => chunk,
-            Egress::ChatCompletions { .. } => bytes::Bytes::from(translated),
+            _ => bytes::Bytes::from(translated),
         };
 
         if outbound.is_empty() {
@@ -142,7 +173,7 @@ pub async fn pump(
 
     // Whatever is left is a partial frame; parse it in case it completed at EOF.
     if !pending.is_empty() {
-        let _ = drain_frames_into(&pending, &adapter, &mut acc, render.as_mut());
+        let _ = drain_frames_into(&pending, &adapter, &mut acc, &mut render);
     }
 
     // A translated stream has to synthesise the sentinel the client's dialect
@@ -154,6 +185,8 @@ pub async fn pump(
             .send(Ok(bytes::Bytes::from(oag_proto::openai::done_frame())))
             .await;
     }
+    // Anthropic needs no sentinel: its stream ends with message_stop, which the
+    // renderer already emitted.
 
     StreamOutcome {
         accumulator: acc,
@@ -186,7 +219,7 @@ fn drain_frames_into(
     bytes: &[u8],
     adapter: &Arc<dyn ProviderAdapter>,
     acc: &mut StreamAccumulator,
-    mut render: Option<&mut oag_proto::openai::RenderState>,
+    render: &mut Renderer,
 ) -> (bool, Vec<u8>) {
     let mut out = Vec::new();
     let Ok(text) = std::str::from_utf8(bytes) else {
@@ -214,9 +247,7 @@ fn drain_frames_into(
                         saw_content = true;
                     }
                     acc.observe(e);
-                    if let Some(st) = render.as_deref_mut()
-                        && let Some(frame) = oag_proto::openai::render_event(e, st)
-                    {
+                    if let Some(frame) = render.render(e) {
                         out.extend_from_slice(frame.as_bytes());
                     }
                 }
@@ -353,11 +384,23 @@ mod tests {
         let (head, tail) = whole.split_at(40);
 
         buf.extend_from_slice(head);
-        let _ = drain_frames_into(&pending_take_complete(&mut buf), &adapter, &mut acc, None).0;
+        let _ = drain_frames_into(
+            &pending_take_complete(&mut buf),
+            &adapter,
+            &mut acc,
+            &mut Renderer::None,
+        )
+        .0;
         assert_eq!(acc.usage().input_tokens, 0, "nothing complete yet");
 
         buf.extend_from_slice(tail);
-        let _ = drain_frames_into(&pending_take_complete(&mut buf), &adapter, &mut acc, None).0;
+        let _ = drain_frames_into(
+            &pending_take_complete(&mut buf),
+            &adapter,
+            &mut acc,
+            &mut Renderer::None,
+        )
+        .0;
         assert_eq!(acc.usage().input_tokens, 50, "reassembled and counted");
     }
 
@@ -370,13 +413,13 @@ mod tests {
 
         let opening = b"data: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":5}}}\n\n";
         assert!(
-            !drain_frames_into(opening, &adapter, &mut acc, None).0,
+            !drain_frames_into(opening, &adapter, &mut acc, &mut Renderer::None).0,
             "an opening event is not content"
         );
 
         let content = b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n";
         assert!(
-            drain_frames_into(content, &adapter, &mut acc, None).0,
+            drain_frames_into(content, &adapter, &mut acc, &mut Renderer::None).0,
             "a text delta is"
         );
     }
@@ -388,7 +431,7 @@ mod tests {
         let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
         let mut acc = StreamAccumulator::new();
         let frame = b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"f\"}}\n\n";
-        assert!(drain_frames_into(frame, &adapter, &mut acc, None).0);
+        assert!(drain_frames_into(frame, &adapter, &mut acc, &mut Renderer::None).0);
     }
 
     fn collected(body: &serde_json::Value) -> StreamAccumulator {
@@ -445,7 +488,7 @@ mod tests {
     fn a_done_sentinel_is_not_parsed_as_json() {
         let adapter: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::AnthropicAdapter::default());
         let mut acc = StreamAccumulator::new();
-        let _ = drain_frames_into(b"data: [DONE]\n\n", &adapter, &mut acc, None).0;
+        let _ = drain_frames_into(b"data: [DONE]\n\n", &adapter, &mut acc, &mut Renderer::None).0;
         assert_eq!(acc.usage().total(), 0);
     }
 }

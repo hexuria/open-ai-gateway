@@ -376,6 +376,26 @@ enum Attempt {
 }
 
 /// A complete, non-streamed response.
+/// Choose how to produce the client's bytes.
+///
+/// Passthrough whenever the dialects agree, which is both faster and more
+/// faithful — we hand back the bytes the upstream considered correct.
+fn egress_for(ingress: Dialect, decision: &RoutingDecision, request_id: RequestId) -> sse::Egress {
+    let upstream = decision.model.provider.native_dialect();
+    if ingress == upstream {
+        return sse::Egress::Passthrough;
+    }
+    let model = decision.model.id.as_str().to_owned();
+    let request_id = request_id.to_string();
+    match ingress {
+        Dialect::OpenAIChatCompletions => sse::Egress::ChatCompletions { request_id, model },
+        Dialect::AnthropicMessages => sse::Egress::AnthropicMessages { request_id, model },
+        // No renderer for this dialect yet. Forwarding the upstream's own bytes
+        // is wrong, but visibly wrong, which beats an empty stream.
+        _ => sse::Egress::Passthrough,
+    }
+}
+
 fn json_response(
     body: &bytes::Bytes,
     decision: &RoutingDecision,
@@ -386,15 +406,20 @@ fn json_response(
 
     // Verbatim when the dialects agree — the upstream's own bytes are the most
     // faithful answer we can give, and re-serialising can only differ from it.
-    let out = if ingress == upstream_dialect || ingress != Dialect::OpenAIChatCompletions {
+    let out = if ingress == upstream_dialect {
         body.clone()
     } else {
+        let id = request_id.to_string();
         serde_json::from_slice::<serde_json::Value>(body).map_or_else(
             |_| body.clone(),
-            |v| {
-                bytes::Bytes::from(
-                    oag_proto::openai::render_completion(&v, &request_id.to_string()).to_string(),
-                )
+            |v| match ingress {
+                Dialect::OpenAIChatCompletions => {
+                    bytes::Bytes::from(oag_proto::openai::render_completion(&v, &id).to_string())
+                }
+                Dialect::AnthropicMessages => bytes::Bytes::from(
+                    oag_proto::anthropic::render_message_response(&v, &id).to_string(),
+                ),
+                _ => body.clone(),
             },
         )
     };
@@ -633,17 +658,7 @@ fn stream_response(
     let max = state.config.gateway.max_stream_duration;
     let account = lease.account.account_id();
 
-    let upstream_dialect = decision.model.provider.native_dialect();
-    let egress = if ingress == upstream_dialect {
-        sse::Egress::Passthrough
-    } else if ingress == Dialect::OpenAIChatCompletions {
-        sse::Egress::ChatCompletions {
-            request_id: request_id.to_string(),
-            model: decision.model.id.as_str().to_owned(),
-        }
-    } else {
-        sse::Egress::Passthrough
-    };
+    let egress = egress_for(ingress, decision, request_id);
 
     let ctx = meter::Context {
         request_id,

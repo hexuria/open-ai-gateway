@@ -316,6 +316,272 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
     })
 }
 
+// ── rendering canonical events back into this dialect ─────────────────────────
+
+/// State carried while rendering canonical events as Anthropic SSE.
+///
+/// This dialect is the more structured of the two: content arrives as indexed
+/// *blocks* that must be explicitly opened and closed, where Chat Completions
+/// just streams deltas. So a renderer has to track which block is open and
+/// close it before opening another — a client that receives a
+/// `content_block_delta` for a block it was never told about will drop it.
+#[derive(Debug, Clone, Default)]
+pub struct RenderState {
+    id: String,
+    model: String,
+    started: bool,
+    /// The block index currently open, if any.
+    open_block: Option<usize>,
+    next_index: usize,
+    /// Whether the open block is a tool call, which closes differently.
+    open_is_tool: bool,
+    usage: Usage,
+    finished: bool,
+}
+
+impl RenderState {
+    #[must_use]
+    pub fn new(request_id: &str, model: &str) -> Self {
+        Self {
+            id: format!("msg_{request_id}"),
+            model: model.to_owned(),
+            ..Self::default()
+        }
+    }
+
+    fn frame(event: &str, body: &Value) -> String {
+        // Both lines: this dialect's clients dispatch on the `event:` name, and
+        // omitting it makes an SDK ignore the frame entirely.
+        format!("event: {event}\ndata: {body}\n\n")
+    }
+
+    fn close_open_block(&mut self, out: &mut String) {
+        if let Some(index) = self.open_block.take() {
+            out.push_str(&Self::frame(
+                "content_block_stop",
+                &json!({ "type": "content_block_stop", "index": index }),
+            ));
+        }
+        self.open_is_tool = false;
+    }
+
+    fn ensure_started(&mut self, out: &mut String) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        out.push_str(&Self::frame(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "usage": usage_json(&self.usage),
+                }
+            }),
+        ));
+    }
+}
+
+/// One canonical event → Anthropic SSE frames, if it produces any.
+pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String> {
+    let mut out = String::new();
+
+    match event {
+        StreamEvent::Start { model, usage } => {
+            if !model.is_empty() {
+                st.model.clone_from(model);
+            }
+            st.usage.merge(usage);
+            st.ensure_started(&mut out);
+        }
+
+        StreamEvent::TextDelta { text } => render_text(st, &mut out, text, false),
+        StreamEvent::ThinkingDelta { text } => render_text(st, &mut out, text, true),
+
+        StreamEvent::ToolUseStart { id, name } => {
+            st.ensure_started(&mut out);
+            st.close_open_block(&mut out);
+            let index = st.next_index;
+            st.next_index += 1;
+            st.open_block = Some(index);
+            st.open_is_tool = true;
+            out.push_str(&RenderState::frame(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": { "type": "tool_use", "id": id, "name": name, "input": {} }
+                }),
+            ));
+        }
+
+        StreamEvent::ToolUseDelta { partial_json, .. } => {
+            let index = st.open_block?;
+            out.push_str(&RenderState::frame(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": { "type": "input_json_delta", "partial_json": partial_json }
+                }),
+            ));
+        }
+
+        StreamEvent::ToolUseEnd { .. } => st.close_open_block(&mut out),
+
+        StreamEvent::UsageUpdate { usage } => {
+            st.usage.merge(usage);
+            return None;
+        }
+
+        StreamEvent::Stop { reason, usage } => {
+            if st.finished {
+                return None;
+            }
+            st.finished = true;
+            st.usage.merge(usage);
+            st.ensure_started(&mut out);
+            st.close_open_block(&mut out);
+
+            out.push_str(&RenderState::frame(
+                "message_delta",
+                &json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": stop_reason_str(*reason), "stop_sequence": Value::Null },
+                    "usage": { "output_tokens": st.usage.output_tokens }
+                }),
+            ));
+            out.push_str(&RenderState::frame(
+                "message_stop",
+                &json!({ "type": "message_stop" }),
+            ));
+        }
+
+        StreamEvent::Error { message } => {
+            out.push_str(&RenderState::frame(
+                "error",
+                &json!({ "type": "error",
+                         "error": { "type": "api_error", "message": message } }),
+            ));
+        }
+    }
+
+    (!out.is_empty()).then_some(out)
+}
+
+/// Emit a text or reasoning delta, opening a block first if none is open.
+fn render_text(st: &mut RenderState, out: &mut String, text: &str, thinking: bool) {
+    st.ensure_started(out);
+
+    // A tool block has to be closed before text can resume: this dialect has
+    // exactly one block open at a time, and interleaving them makes a client
+    // attach the text to the tool call.
+    if st.open_is_tool {
+        st.close_open_block(out);
+    }
+
+    if st.open_block.is_none() {
+        let index = st.next_index;
+        st.next_index += 1;
+        st.open_block = Some(index);
+        let empty = if thinking {
+            json!({ "type": "thinking", "thinking": "" })
+        } else {
+            json!({ "type": "text", "text": "" })
+        };
+        out.push_str(&RenderState::frame(
+            "content_block_start",
+            &json!({ "type": "content_block_start", "index": index, "content_block": empty }),
+        ));
+    }
+
+    let index = st.open_block.unwrap_or(0);
+    let delta = if thinking {
+        json!({ "type": "thinking_delta", "thinking": text })
+    } else {
+        json!({ "type": "text_delta", "text": text })
+    };
+    out.push_str(&RenderState::frame(
+        "content_block_delta",
+        &json!({ "type": "content_block_delta", "index": index, "delta": delta }),
+    ));
+}
+
+/// A Chat Completions response → an Anthropic Messages response.
+#[must_use]
+pub fn render_message_response(completion: &Value, request_id: &str) -> Value {
+    let choice = &completion["choices"][0];
+    let message = &choice["message"];
+    let mut content = Vec::new();
+
+    if let Some(text) = message["content"].as_str().filter(|t| !t.is_empty()) {
+        content.push(json!({ "type": "text", "text": text }));
+    }
+    for call in message["tool_calls"].as_array().unwrap_or(&Vec::new()) {
+        content.push(json!({
+            "type": "tool_use",
+            "id": call["id"],
+            "name": call["function"]["name"],
+            // A parsed value here, a JSON string there.
+            "input": call["function"]["arguments"]
+                .as_str()
+                .and_then(|a| serde_json::from_str::<Value>(a).ok())
+                .unwrap_or_else(|| json!({})),
+        }));
+    }
+
+    let u = &completion["usage"];
+    let cached = u["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .unwrap_or(0);
+
+    json!({
+        "id": format!("msg_{request_id}"),
+        "type": "message",
+        "role": "assistant",
+        "model": completion["model"],
+        "content": content,
+        "stop_reason": match choice["finish_reason"].as_str().unwrap_or("stop") {
+            "length" => "max_tokens",
+            "tool_calls" | "function_call" => "tool_use",
+            "content_filter" => "refusal",
+            _ => "end_turn",
+        },
+        "stop_sequence": Value::Null,
+        "usage": {
+            // Split back apart: this dialect reports the uncached prompt and
+            // the cached prefix separately.
+            "input_tokens": u["prompt_tokens"].as_u64().unwrap_or(0).saturating_sub(cached),
+            "output_tokens": u["completion_tokens"].as_u64().unwrap_or(0),
+            "cache_read_input_tokens": cached,
+            "cache_creation_input_tokens": 0,
+        }
+    })
+}
+
+fn usage_json(u: &Usage) -> Value {
+    json!({
+        "input_tokens": u.input_tokens,
+        "output_tokens": u.output_tokens,
+        "cache_read_input_tokens": u.cache_read_tokens,
+        "cache_creation_input_tokens": u.cache_write_tokens,
+    })
+}
+
+const fn stop_reason_str(r: StopReason) -> &'static str {
+    match r {
+        StopReason::MaxTokens => "max_tokens",
+        StopReason::StopSequence => "stop_sequence",
+        StopReason::ToolUse => "tool_use",
+        StopReason::Refusal => "refusal",
+        StopReason::EndTurn => "end_turn",
+    }
+}
+
 fn parse_usage(v: &Value) -> Usage {
     Usage {
         input_tokens: v["input_tokens"].as_u64().unwrap_or(0),
@@ -531,6 +797,163 @@ mod tests {
             extract_cache_blocks(&c).is_empty(),
             "no breakpoint was marked"
         );
+    }
+
+    /// Drive canonical events through the Anthropic renderer and return the
+    /// `event:` names in order, plus the reassembled text.
+    fn render_all(events: &[StreamEvent]) -> (Vec<String>, String) {
+        let mut st = RenderState::new("req1", "kimi/k2");
+        let mut raw = String::new();
+        for e in events {
+            if let Some(f) = render_event(e, &mut st) {
+                raw.push_str(&f);
+            }
+        }
+        let mut names = Vec::new();
+        let mut text = String::new();
+        for frame in raw.split("\n\n").filter(|f| !f.trim().is_empty()) {
+            for line in frame.lines() {
+                if let Some(n) = line.strip_prefix("event: ") {
+                    names.push(n.to_owned());
+                }
+                if let Some(d) = line.strip_prefix("data: ") {
+                    let v: Value = serde_json::from_str(d).expect("valid json");
+                    if v["type"] == "content_block_delta" {
+                        text.push_str(v["delta"]["text"].as_str().unwrap_or_default());
+                    }
+                }
+            }
+        }
+        (names, text)
+    }
+
+    #[test]
+    fn rendering_produces_the_dialects_exact_event_sequence() {
+        // A client here dispatches on the `event:` name and on blocks being
+        // opened before they are written to. Getting the order wrong makes an
+        // SDK drop content rather than error, which is worse.
+        let (names, text) = render_all(&[
+            StreamEvent::Start {
+                model: "kimi/k2".to_owned(),
+                usage: Usage {
+                    input_tokens: 900,
+                    ..Usage::default()
+                },
+            },
+            StreamEvent::TextDelta {
+                text: "Cheap ".to_owned(),
+            },
+            StreamEvent::TextDelta {
+                text: "answer.".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                usage: Usage {
+                    output_tokens: 30,
+                    ..Usage::default()
+                },
+            },
+        ]);
+
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(text, "Cheap answer.");
+    }
+
+    #[test]
+    fn a_tool_call_closes_the_text_block_before_opening_its_own() {
+        // One block open at a time in this dialect; interleaving them makes a
+        // client attach the text to the tool call.
+        let (names, _) = render_all(&[
+            StreamEvent::TextDelta {
+                text: "thinking...".to_owned(),
+            },
+            StreamEvent::ToolUseStart {
+                id: "toolu_1".to_owned(),
+                name: "f".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "toolu_1".to_owned(),
+                partial_json: "{}".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ]);
+
+        let starts: Vec<usize> = names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| *n == "content_block_start")
+            .map(|(i, _)| i)
+            .collect();
+        let stops: Vec<usize> = names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| *n == "content_block_stop")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(starts.len(), 2, "text block, then tool block");
+        assert!(
+            stops[0] < starts[1],
+            "the text block closes before the tool opens"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_starts_with_content_still_emits_message_start_first() {
+        // Some upstreams send no opening event at all; a client that never
+        // receives message_start ignores everything after it.
+        let (names, _) = render_all(&[StreamEvent::TextDelta {
+            text: "hi".to_owned(),
+        }]);
+        assert_eq!(names.first().map(String::as_str), Some("message_start"));
+    }
+
+    #[test]
+    fn a_duplicate_stop_does_not_terminate_the_stream_twice() {
+        let mut st = RenderState::new("r", "m");
+        let stop = StreamEvent::Stop {
+            reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        };
+        assert!(render_event(&stop, &mut st).is_some());
+        assert!(render_event(&stop, &mut st).is_none());
+    }
+
+    #[test]
+    fn a_completion_response_renders_back_into_this_dialect() {
+        let completion = serde_json::json!({
+            "model": "kimi-k2",
+            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                "role": "assistant", "content": null,
+                "tool_calls": [{"id": "call_1", "type": "function",
+                                "function": {"name": "f", "arguments": "{\"a\":1}"}}]
+            }}],
+            "usage": {"prompt_tokens": 900, "completion_tokens": 30,
+                      "prompt_tokens_details": {"cached_tokens": 400}}
+        });
+        let out = render_message_response(&completion, "req1");
+
+        assert_eq!(out["type"], "message");
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["content"][0]["type"], "tool_use");
+        // Arguments become a parsed value here, not a JSON string.
+        assert_eq!(out["content"][0]["input"]["a"], 1);
+        // And the prompt splits back into uncached and cached.
+        assert_eq!(out["usage"]["input_tokens"], 500);
+        assert_eq!(out["usage"]["cache_read_input_tokens"], 400);
     }
 
     #[test]
