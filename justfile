@@ -8,6 +8,19 @@ stack   := "docker compose -f deploy/compose/stack.yml"
 dev_db  := "postgres://oag:oag@127.0.0.1:5452/oag"
 dev_rd  := "redis://127.0.0.1:6399"
 
+# Local dev ports. Deliberately not 8080/8081, which collide with roughly every
+# other dev server, and deliberately in the 1024–32768 band: macOS hands out
+# 49152+ for outbound sockets and Linux 32768+, so anything above those can be
+# taken by the kernel out from under you between a check and a bind. These are
+# only the *host* ports for `just serve`; containers still listen on 8080/8081
+# internally, where nothing can collide.
+#
+# `serve` walks upward from these to the first genuinely free pair, so a clash
+# shifts the port instead of failing. Override the starting point if you want a
+# fixed one: `just pub_port=31000 adm_port=31001 serve`.
+pub_port := "29080"
+adm_port := "29081"
+
 # ── the gate ───────────────────────────────────────────────────────────────────
 # What CI runs, ordered so the cheapest check fails first.
 check: fmt-check lint test
@@ -39,6 +52,13 @@ dev-reset:
 # Bring up infrastructure and migrate it.
 dev: dev-up migrate
 
+# What the editor's run button launches (.claude/launch.json), so it must be safe
+# from a cold machine: `dev` is idempotent, and `serve` stays in the foreground,
+# which is what a dev-server supervisor expects.
+# Infrastructure, migrations, then the gateway — one target.
+dev-serve: dev
+    @just serve
+
 migrate:
     @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
@@ -55,12 +75,50 @@ bootstrap:
 
 # Run the gateway against the dev infrastructure.
 serve:
-    @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
-      OAG_SERVER__PUBLIC_ADDR="127.0.0.1:8080" \
-      OAG_SERVER__ADMIN_ADDR="127.0.0.1:8081" \
+    @set -- $(just _free-ports); pub=$1; adm=$2; \
+      if [ "$pub" != "{{pub_port}}" ] || [ "$adm" != "{{adm_port}}" ]; then \
+        echo "port {{pub_port}}/{{adm_port}} taken — using $pub/$adm instead"; \
+      fi; \
+      echo "  inference  http://127.0.0.1:$pub"; \
+      echo "  dashboard  http://127.0.0.1:$adm"; \
+      OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
+      OAG_SERVER__PUBLIC_ADDR="127.0.0.1:$pub" \
+      OAG_SERVER__ADMIN_ADDR="127.0.0.1:$adm" \
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
       cargo run -p oag -- serve
+
+# The pair `serve` would use right now.
+ports:
+    @set -- $(just _free-ports); \
+      echo "inference  127.0.0.1:$1"; \
+      echo "dashboard  127.0.0.1:$2"
+
+# First free pair at or above the configured start.
+#
+# Binding is the only reliable test: `lsof` misses sockets held in another
+# network namespace, and parsing it races anything starting concurrently. This
+# still races, but only across the gap between here and the server's own bind.
+_free-ports:
+    #!/usr/bin/env python3
+    import socket
+
+    def free(port, taken):
+        while port < 32768:
+            if port not in taken:
+                probe = socket.socket()
+                try:
+                    probe.bind(("127.0.0.1", port))
+                    probe.close()
+                    return port
+                except OSError:
+                    pass
+            port += 1
+        raise SystemExit("no free port below 32768")
+
+    inference = free({{pub_port}}, set())
+    dashboard = free({{adm_port}}, {inference})
+    print(inference, dashboard)
 
 # Show the resolved config, secrets redacted.
 config:

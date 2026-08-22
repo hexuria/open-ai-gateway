@@ -35,10 +35,17 @@ just serve      # :8080 inference, :8081 admin + dashboard
 Then point any Anthropic- or OpenAI-shaped client at it:
 
 ```bash
-curl -N localhost:8080/v1/messages -H "x-api-key: $OAG_KEY" \
+curl -N localhost:29080/v1/messages -H "x-api-key: $OAG_KEY" \
   -d '{"model":"oag/auto","max_tokens":256,"stream":true,
        "messages":[{"role":"user","content":"hello"}]}'
 ```
+
+Local dev binds **29080** (inference) and **29081** (dashboard) rather than
+8080/8081, which collide with nearly every other dev server. Both sit below the
+kernel's ephemeral range — macOS hands out 49152+, Linux 32768+ — so they cannot
+be claimed out from under you. If they are busy anyway, `just serve` walks up to
+the first free pair and prints what it chose; `just ports` shows it in advance.
+Containers still listen on 8080/8081 internally, where nothing can collide.
 
 `oag/auto` lets policy choose the model; `oag/cheap` and `oag/frontier` pin a
 rung. Name a real model and it is honoured.
@@ -46,7 +53,7 @@ rung. Name a real model and it is honoured.
 Clients that expect the usual discovery and preflight endpoints get them:
 
 ```bash
-curl localhost:8080/v1/models -H "x-api-key: $OAG_KEY"
+curl localhost:29080/v1/models -H "x-api-key: $OAG_KEY"
 ```
 
 `/v1/models` lists what *this* key may actually ask for — the route's ladder,
@@ -62,7 +69,7 @@ is one command, and Prometheus and Grafana are one flag more:
 just stack-up
 ```
 
-The dashboard is on the admin listener at `http://127.0.0.1:8081/`; Grafana, if
+The dashboard is on the admin listener at `http://127.0.0.1:29081/`; Grafana, if
 you brought up the observability profile, at `:3000`.
 
 ## Shape
