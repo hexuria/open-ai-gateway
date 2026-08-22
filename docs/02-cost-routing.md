@@ -110,13 +110,31 @@ which is the durable fix anyway.
 
 ## Budgets
 
-Per principal and per route, monthly, in USD.
+Three caps apply to every request, and they are independent:
+
+| Cap | Scope | Column |
+|---|---|---|
+| API key quota | One credential | `api_key.quota_usd` |
+| Route budget | Everyone sharing the route — the team-level cap | `route.monthly_budget_usd` |
+| Principal budget | One person, across all their keys | `principal.monthly_budget_usd` |
+
+**The tightest cap governs.** A generous principal budget cannot buy past a
+small key quota, and a fresh key cannot buy past a route that has spent its
+month. When a request is refused, the error names which cap bound it — the
+difference between raising a key's quota and widening a whole team's budget.
+A tie names the narrowest, for the same reason.
+
+The pressure bands, applied to whichever cap is tightest:
 
 | Spend | Pressure | Behaviour |
 |---|---|---|
 | < 80% | Normal | Route on merit. |
-| 80%–120% | Constrained | Downgrade to the cheapest rung the floor allows. |
-| > 120% | Exhausted | Refuse. |
+| 80%–100% | Constrained | Downgrade to the cheapest rung the floor allows. |
+| > 100% | Exhausted | Refuse. |
+
+The principal budget alone carries a grace band above its limit
+(`hard_stop_multiple`, 1.2 by default) before it refuses. The key quota and the
+route budget are walls at their number: `quota_usd = 50` means fifty.
 
 The grace band between the budget and the hard stop is the important part.
 **Degrade, do not deny.** A developer who can get no answer at all routes around

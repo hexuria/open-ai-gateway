@@ -76,6 +76,7 @@ impl BudgetState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Budgets {
     pub key: BudgetState,
+    pub route: BudgetState,
     pub principal: BudgetState,
 }
 
@@ -85,6 +86,7 @@ impl Budgets {
     pub fn principal_only(principal: BudgetState) -> Self {
         Self {
             key: BudgetState::unlimited(Decimal::ZERO),
+            route: BudgetState::unlimited(Decimal::ZERO),
             principal,
         }
     }
@@ -92,7 +94,10 @@ impl Budgets {
     /// The tighter of the two caps.
     #[must_use]
     pub fn pressure(&self) -> BudgetPressure {
-        self.key.pressure().max(self.principal.pressure())
+        self.key
+            .pressure()
+            .max(self.route.pressure())
+            .max(self.principal.pressure())
     }
 
     /// Which cap is binding. Ties go to the key: it is the narrower object and
@@ -100,11 +105,18 @@ impl Budgets {
     /// else the principal owns.
     #[must_use]
     pub fn binding(&self) -> BudgetScope {
-        if self.key.pressure() >= self.principal.pressure() {
-            BudgetScope::ApiKey
-        } else {
-            BudgetScope::Principal
-        }
+        // Listed widest first because `max_by_key` keeps the *last* maximum, so
+        // a tie resolves to the narrowest cap — the one an operator can raise
+        // without widening spend for everything else that shares the others.
+        // The ordering is the tie-break; do not sort this array.
+        [
+            (BudgetScope::Principal, self.principal.pressure()),
+            (BudgetScope::Route, self.route.pressure()),
+            (BudgetScope::ApiKey, self.key.pressure()),
+        ]
+        .into_iter()
+        .max_by_key(|&(_, pressure)| pressure)
+        .map_or(BudgetScope::Principal, |(scope, _)| scope)
     }
 }
 
@@ -746,6 +758,7 @@ mod tests {
                 limit_usd: Some(dec!(50)),
                 hard_stop_multiple: Decimal::ONE,
             },
+            route: BudgetState::unlimited(dec!(0)),
             principal: BudgetState::unlimited(dec!(45)),
         };
         assert_eq!(budgets.pressure(), BudgetPressure::Constrained);
@@ -775,6 +788,7 @@ mod tests {
                 limit_usd: Some(dec!(50)),
                 hard_stop_multiple: Decimal::ONE,
             },
+            route: BudgetState::unlimited(dec!(0)),
             principal: BudgetState::unlimited(dec!(50)),
         };
         let err = policy().decide(
@@ -801,6 +815,7 @@ mod tests {
                 limit_usd: Some(dec!(1000)),
                 hard_stop_multiple: Decimal::ONE,
             },
+            route: BudgetState::unlimited(dec!(0)),
             principal: BudgetState {
                 spent_usd: dec!(121),
                 limit_usd: Some(dec!(100)),
@@ -830,5 +845,65 @@ mod tests {
         // variants stay ordered from most headroom to least.
         assert!(BudgetPressure::Normal < BudgetPressure::Constrained);
         assert!(BudgetPressure::Constrained < BudgetPressure::Exhausted);
+    }
+
+    #[test]
+    fn a_route_budget_binds_when_key_and_principal_both_have_room() {
+        // The team-level cap. Same regression as the key quota:
+        // route.monthly_budget_usd was selected, shown in `oag admin`, and
+        // never compared against anything.
+        let budgets = Budgets {
+            key: BudgetState::unlimited(dec!(0)),
+            route: BudgetState {
+                spent_usd: dec!(500),
+                limit_usd: Some(dec!(500)),
+                hard_stop_multiple: Decimal::ONE,
+            },
+            principal: BudgetState::unlimited(dec!(0)),
+        };
+        assert_eq!(budgets.pressure(), BudgetPressure::Exhausted);
+        assert_eq!(budgets.binding(), BudgetScope::Route);
+
+        let err = policy().decide(
+            &RoutingMode::Managed,
+            None,
+            &RequestSignal::default(),
+            &budgets,
+            &catalog(),
+            1024,
+        );
+        assert!(matches!(
+            err,
+            Err(Error::BudgetExhausted {
+                scope: BudgetScope::Route
+            })
+        ));
+    }
+
+    #[test]
+    fn a_tie_names_the_narrowest_cap() {
+        let exhausted = || BudgetState {
+            spent_usd: dec!(10),
+            limit_usd: Some(dec!(10)),
+            hard_stop_multiple: Decimal::ONE,
+        };
+
+        // All three blown: name the key, which is the one an operator can raise
+        // without giving the whole route or the whole person more money.
+        let all = Budgets {
+            key: exhausted(),
+            route: exhausted(),
+            principal: exhausted(),
+        };
+        assert_eq!(all.binding(), BudgetScope::ApiKey);
+
+        // Key is fine, the other two tie: name the route over the principal for
+        // the same reason.
+        let wider = Budgets {
+            key: BudgetState::unlimited(dec!(0)),
+            route: exhausted(),
+            principal: exhausted(),
+        };
+        assert_eq!(wider.binding(), BudgetScope::Route);
     }
 }

@@ -1,9 +1,10 @@
 //! Redis: what the replicas need to agree on.
 //!
-//! Three things live here — concurrency slots, session pins, and the auth cache
-//! — and all three are expendable. Losing Redis costs a burst of database reads
-//! and a moment of sloppy concurrency accounting. It never loses money or
-//! credentials, because those are in Postgres.
+//! Four things live here — concurrency slots, session pins, the auth cache, and
+//! route rate limiting — and all four are expendable. Losing Redis costs a
+//! burst of database reads, a moment of sloppy concurrency accounting, and an
+//! unthrottled minute. It never loses money or credentials, because those are
+//! in Postgres.
 
 use oag_core::{AccountId, Error, Result};
 use redis::AsyncCommands;
@@ -11,6 +12,7 @@ use redis::aio::ConnectionManager;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use uuid::Uuid;
 
 /// Acquire a concurrency slot if the credential is under its limit.
 ///
@@ -37,6 +39,53 @@ end
 redis.call('ZADD', key, now, member)
 redis.call('EXPIRE', key, ttl * 2)
 return 1
+";
+
+/// Take one token from a route's bucket, returning the seconds to wait.
+///
+/// A token bucket rather than a fixed window. A fixed window lets a caller
+/// spend a whole minute's allowance in the last second of one window and the
+/// whole next allowance in the first second of the next, so a route limited to
+/// 60/min serves 120 in about two seconds — right when a burst is least
+/// welcome. Tokens here accrue continuously at `rate` per second, capped at
+/// `burst`.
+///
+/// Returned as a string because Lua numbers cross the Redis protocol as
+/// integers, and the whole point of the return value is its fraction.
+///
+/// `TIME` comes from Redis rather than the caller for the same reason the slot
+/// script uses it: replicas disagree about the clock, and Redis is the one
+/// thing they all agree on.
+const TAKE_TOKEN: &str = r"
+local key   = KEYS[1]
+local rate  = tonumber(ARGV[1])
+local burst = tonumber(ARGV[2])
+
+local t   = redis.call('TIME')
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+
+local b      = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(b[1])
+local ts     = tonumber(b[2])
+if tokens == nil or ts == nil then
+  tokens = burst
+  ts     = now
+end
+
+tokens = math.min(burst, tokens + (now - ts) * rate)
+
+local wait = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+else
+  wait = (1 - tokens) / rate
+end
+
+redis.call('HSET', key, 'tokens', tokens, 'ts', now)
+-- A bucket that has sat idle long enough to refill completely is
+-- indistinguishable from one that never existed, so let it expire.
+redis.call('EXPIRE', key, math.ceil(burst / rate) + 1)
+return tostring(wait)
 ";
 
 /// Redis, for cross-replica coordination.
@@ -117,6 +166,48 @@ impl Cache {
             .await
             .map_err(|e| Error::Internal(format!("acquiring slot: {e}")))?;
         Ok(taken == 1)
+    }
+
+    /// Take one request's worth of rate-limit allowance for a route.
+    ///
+    /// `Ok(None)` means proceed. `Ok(Some(d))` means the route is over its
+    /// limit and `d` is how long until a token is available.
+    ///
+    /// Fails **open**: if Redis is unreachable the request is allowed and a
+    /// warning is logged. Throttling is a courtesy to upstream providers, not a
+    /// correctness invariant — and unlike the spend caps, exceeding it cannot
+    /// cost money that the ledger will not see. Refusing traffic because the
+    /// coordination store blinked would trade a real outage for a theoretical
+    /// one.
+    pub async fn take_rate_token(&self, route: Uuid, rpm: u32) -> Result<Option<Duration>> {
+        if rpm == 0 {
+            return Ok(None);
+        }
+        let (rate, burst) = rate_and_burst(rpm);
+
+        let mut conn = match self.conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, %route, "rate limiting unavailable; allowing");
+                return Ok(None);
+            }
+        };
+        let wait: String = match redis::Script::new(TAKE_TOKEN)
+            .key(format!("oag:rate:{route}"))
+            .arg(rate)
+            .arg(burst)
+            .invoke_async(&mut conn)
+            .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, %route, "rate limiting unavailable; allowing");
+                return Ok(None);
+            }
+        };
+
+        let wait: f64 = wait.parse().unwrap_or(0.0);
+        Ok((wait > 0.0).then(|| Duration::from_secs_f64(wait)))
     }
 
     /// Give a slot back.
@@ -296,3 +387,98 @@ fn slot_key(account: AccountId) -> String {
 // Slots here expire by TTL and nothing else. A replica that dies leaves its
 // slots behind for at most one TTL, which is a bounded and self-healing error;
 // evicting by process identity is neither.
+
+/// Requests-per-minute expressed as a continuous refill rate and a bucket size.
+///
+/// Burst is the full minute's allowance: "60 requests per minute" plainly reads
+/// as permission to make 60 requests, and a caller who makes them in the first
+/// second has not broken the promise — they have simply spent it. What the
+/// bucket prevents is spending it twice inside one minute.
+fn rate_and_burst(rpm: u32) -> (f64, f64) {
+    let burst = f64::from(rpm.max(1));
+    (burst / 60.0, burst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpm_becomes_a_per_second_rate_and_a_full_minute_of_burst() {
+        let (rate, burst) = rate_and_burst(60);
+        assert!((rate - 1.0).abs() < f64::EPSILON);
+        assert!((burst - 60.0).abs() < f64::EPSILON);
+
+        // A limit of zero would mean an infinite wait rather than "no limit",
+        // so the floor is one. Callers pass `rpm == 0` only by mistake; the
+        // "unlimited" case is `rpm_limit IS NULL`, handled before we get here.
+        let (rate, burst) = rate_and_burst(0);
+        assert!(rate > 0.0 && burst >= 1.0);
+    }
+
+    /// The bucket itself, against a real Redis.
+    ///
+    /// Skipped when `OAG_TEST_REDIS_URL` is unset so a plain `cargo test` still
+    /// works; CI sets it, so this does run there. The Lua is the part worth
+    /// testing for real — the arithmetic above is trivial and the interesting
+    /// behaviour is entirely inside the script.
+    #[tokio::test]
+    async fn a_bucket_hands_out_exactly_its_burst_then_makes_you_wait() {
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let cache = Cache::connect(&url).expect("cache");
+        let route = Uuid::new_v4();
+
+        // Five per minute: five immediate, the sixth refused.
+        for i in 0..5 {
+            assert!(
+                cache
+                    .take_rate_token(route, 5)
+                    .await
+                    .expect("take")
+                    .is_none(),
+                "token {i} should have been free"
+            );
+        }
+        let wait = cache
+            .take_rate_token(route, 5)
+            .await
+            .expect("take")
+            .expect("sixth request in a 5/min bucket must be refused");
+
+        // One token accrues every twelve seconds at 5/min. Allow slack for the
+        // fractional token earned while the loop above was running.
+        assert!(
+            wait > Duration::from_secs(9) && wait <= Duration::from_secs(12),
+            "expected roughly a twelve second wait, got {wait:?}"
+        );
+
+        // A different route has its own bucket.
+        assert!(
+            cache
+                .take_rate_token(Uuid::new_v4(), 5)
+                .await
+                .expect("take")
+                .is_none(),
+            "buckets must not be shared between routes"
+        );
+    }
+
+    /// Fail-open is a deliberate policy choice, so it gets a test rather than
+    /// just a comment. Redis being down must not turn into a 429 storm.
+    #[tokio::test]
+    async fn an_unreachable_redis_allows_the_request() {
+        // Port 1 is reserved and nothing listens there.
+        let cache = Cache::connect("redis://127.0.0.1:1").expect("lazy connect");
+        assert!(
+            cache
+                .take_rate_token(Uuid::new_v4(), 1)
+                .await
+                .expect("must not surface an error")
+                .is_none(),
+            "a rate limiter that cannot reach Redis must allow, not refuse"
+        );
+    }
+}

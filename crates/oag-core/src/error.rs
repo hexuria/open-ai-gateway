@@ -14,6 +14,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetScope {
     ApiKey,
+    Route,
     Principal,
 }
 
@@ -21,6 +22,7 @@ impl std::fmt::Display for BudgetScope {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::ApiKey => "the quota on this API key",
+            Self::Route => "the monthly budget for this route",
             Self::Principal => "the monthly budget for this principal",
         })
     }
@@ -58,6 +60,12 @@ pub enum Error {
 
     #[error("{scope} exhausted")]
     BudgetExhausted { scope: BudgetScope },
+
+    /// Inbound throttling: the caller's route is over its requests-per-minute
+    /// limit. Distinct from `Disposition::RateLimited`, which is an *upstream*
+    /// provider throttling us.
+    #[error("route rate limit exceeded")]
+    RateLimited { retry_after: Duration },
 
     #[error("upstream {provider} returned {status}")]
     Upstream {

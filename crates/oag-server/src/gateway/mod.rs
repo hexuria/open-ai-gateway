@@ -337,6 +337,16 @@ async fn plan_request(
         .await?
         .ok_or_else(|| Error::Internal("route vanished between auth and routing".to_owned()))?;
 
+    // Throttle before doing any of the expensive work below — classification,
+    // catalog lookup, credential selection. A request that is going to be
+    // refused should be refused cheaply.
+    if let Some(rpm) = route.rpm_limit
+        && let Ok(rpm) = u32::try_from(rpm)
+        && let Some(retry_after) = state.cache.take_rate_token(route.id, rpm).await?
+    {
+        return Err(Error::RateLimited { retry_after });
+    }
+
     let ladder = parse_ladder(&route.tiers)?;
     let catalog = state.catalog().await;
 
@@ -376,6 +386,14 @@ async fn plan_request(
             limit_usd: auth.quota_usd,
             hard_stop_multiple: rust_decimal::Decimal::ONE,
         },
+        // A route budget is the team-level cap: it bounds everyone sharing the
+        // route, regardless of whose key they used. Like the key quota it is a
+        // wall at its number rather than inheriting the principal's grace.
+        route: BudgetState {
+            spent_usd: route.spent_usd,
+            limit_usd: route.monthly_budget_usd,
+            hard_stop_multiple: rust_decimal::Decimal::ONE,
+        },
         principal: BudgetState {
             spent_usd: auth.principal_spent_usd,
             limit_usd: auth.principal_budget_usd,
@@ -392,6 +410,8 @@ async fn plan_request(
         binding = %budget.binding(),
         key_spent = %budget.key.spent_usd,
         key_quota = ?budget.key.limit_usd,
+        route_spent = %budget.route.spent_usd,
+        route_budget = ?budget.route.limit_usd,
         spent = %budget.principal.spent_usd,
         limit = ?budget.principal.limit_usd,
         floor = ?policy.floor_name(),
@@ -907,6 +927,11 @@ fn error_response(e: &Error) -> Response {
             "budget_exhausted",
             format!("{scope} is exhausted"),
         ),
+        Error::RateLimited { .. } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            e.to_string(),
+        ),
         Error::NoCredential { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "no_credential",
@@ -935,14 +960,30 @@ fn error_response(e: &Error) -> Response {
         }
     };
 
-    (
+    let mut response = (
         status,
         axum::Json(serde_json::json!({
             "type": "error",
             "error": { "type": kind, "message": message }
         })),
     )
-        .into_response()
+        .into_response();
+
+    // A 429 without Retry-After leaves every client to guess, and they guess
+    // badly — usually by retrying immediately, which is the one thing the
+    // limit exists to prevent. Rounded up, and never zero.
+    if let Error::RateLimited { retry_after } = e {
+        let secs = retry_after.as_secs_f64().ceil().max(1.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let secs = secs as u64;
+        if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+    }
+
+    response
 }
 
 #[cfg(test)]
@@ -1108,6 +1149,38 @@ mod tests {
         assert_eq!(
             error_response(&Error::Unauthenticated).status(),
             StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn throttling_answers_429_and_says_how_long_to_wait() {
+        let response = error_response(&Error::RateLimited {
+            retry_after: std::time::Duration::from_millis(1500),
+        });
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Rounded up: a client told to wait 1s when a token lands at 1.5s
+        // simply comes back too early and is refused again.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn a_sub_second_wait_still_asks_for_at_least_one_second() {
+        let response = error_response(&Error::RateLimited {
+            retry_after: std::time::Duration::from_millis(1),
+        });
+        // Retry-After: 0 is an invitation to hot-loop.
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
         );
     }
 }

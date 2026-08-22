@@ -84,7 +84,16 @@ pub async fn authenticate(db: &Db, raw_key: &str) -> Result<Option<AuthContext>>
 
 pub async fn route_by_id(db: &Db, id: Uuid) -> Result<Option<RouteRow>> {
     sqlx::query_as::<_, RouteRow>(
-        "SELECT id, name, tiers, default_mode, floor_tier, rpm_limit, monthly_budget_usd, active
+        // The CASE matters: a route with no budget skips the aggregate
+        // entirely, so the common path costs one primary-key lookup. Routes
+        // that do have a budget pay an index range scan on
+        // usage_event_route_idx, which is what that index is for.
+        "SELECT id, name, tiers, default_mode, floor_tier, rpm_limit, monthly_budget_usd, active,
+                CASE WHEN monthly_budget_usd IS NULL THEN 0 ELSE COALESCE((
+                    SELECT SUM(u.cost_usd) FROM usage_event u
+                    WHERE u.route_id = route.id
+                      AND u.occurred_at >= date_trunc('month', now())
+                ), 0) END AS spent_usd
          FROM route WHERE id = $1",
     )
     .bind(id)
@@ -334,6 +343,7 @@ pub async fn upsert_model(db: &Db, m: &ModelRow, is_override: bool) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Db;
 
     #[test]
     fn hashing_is_stable_and_hex() {
@@ -351,5 +361,83 @@ mod tests {
     #[test]
     fn the_hash_does_not_contain_the_key() {
         assert!(!hash_key("oag_live_secret").contains("secret"));
+    }
+
+    /// `route_by_id` against a real Postgres.
+    ///
+    /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it. The month
+    /// boundary and the route filter are the kind of thing that cannot be
+    /// tested without a database, and the aggregate is skipped entirely for
+    /// routes with no budget — a behaviour worth pinning, since getting it
+    /// wrong means an index scan over the ledger on every single request.
+    #[tokio::test]
+    async fn route_spend_counts_this_month_and_this_route_only() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let capped: Uuid = sqlx::query_scalar(
+            "INSERT INTO route (id, name, tiers, default_mode, monthly_budget_usd)
+             VALUES (gen_random_uuid(), $1, '{\"cheap\":[\"kimi-k2\"]}'::jsonb, 'managed', 500)
+             RETURNING id",
+        )
+        .bind(format!("capped-{}", Uuid::new_v4()))
+        .fetch_one(db.pool())
+        .await
+        .expect("insert capped route");
+
+        let other: Uuid = sqlx::query_scalar(
+            "INSERT INTO route (id, name, tiers, default_mode)
+             VALUES (gen_random_uuid(), $1, '{\"cheap\":[\"kimi-k2\"]}'::jsonb, 'managed')
+             RETURNING id",
+        )
+        .bind(format!("uncapped-{}", Uuid::new_v4()))
+        .fetch_one(db.pool())
+        .await
+        .expect("insert uncapped route");
+
+        for (route, cost, ago) in [
+            (capped, "120.50", "0 days"),
+            (capped, "80.25", "0 days"),
+            // Two months back: a monthly cap must not see it.
+            (capped, "999.00", "2 months"),
+            // A different route's spend must not leak in.
+            (other, "777.00", "0 days"),
+        ] {
+            sqlx::query(
+                "INSERT INTO usage_event
+                   (request_id, route_id, cost_usd, occurred_at, model_id, tier, selection_reason, status)
+                 VALUES (gen_random_uuid(), $1, $2::numeric, now() - $3::interval,
+                         'kimi-k2', 'cheap', 'classified', 200)",
+            )
+            .bind(route)
+            .bind(cost)
+            .bind(ago)
+            .execute(db.pool())
+            .await
+            .expect("insert usage");
+        }
+
+        let row = route_by_id(&db, capped)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert_eq!(
+            row.spent_usd.to_string(),
+            "200.75000000",
+            "only this month, only this route"
+        );
+
+        // No budget means no aggregate: the value is zero regardless of the
+        // 777.00 sitting in the ledger for that route.
+        let row = route_by_id(&db, other)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert_eq!(row.monthly_budget_usd, None);
+        assert!(row.spent_usd.is_zero(), "uncapped routes skip the sum");
     }
 }

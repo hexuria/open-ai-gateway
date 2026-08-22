@@ -57,3 +57,10 @@ jobs:
       # Migrations are idempotent and advisory-locked: running twice must be a
       # no-op, which is what makes it safe for every replica to migrate on boot.
       - run: cargo run -p oag -- migrate
+      # The Redis-backed tests skip themselves when this is unset, so without
+      # it they would pass here while testing nothing. The token-bucket Lua in
+      # particular cannot be exercised any other way.
+      - run: cargo test -p oag-store
+        env:
+          OAG_TEST_REDIS_URL: redis://127.0.0.1:6379
+          OAG_TEST_DATABASE_URL: postgres://oag:oag@127.0.0.1:5432/oag
