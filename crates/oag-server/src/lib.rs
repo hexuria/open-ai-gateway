@@ -70,7 +70,36 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
         .route("/admin/api/accounts", get(admin::accounts))
         .route("/admin/api/routes", get(admin::routes))
         .route("/admin/api/usage", get(admin::usage))
+        .route(
+            "/admin/api/catalog/reload",
+            axum::routing::post(admin::reload_catalog),
+        )
         .with_state(state)
+}
+
+/// Reload the catalog on an interval, for as long as the process runs.
+///
+/// The catalog lives in memory, so without this a repriced or newly-seeded
+/// model needs every replica restarted before it is visible — and a replica
+/// holding a stale catalog looks perfectly healthy while failing to route.
+fn spawn_catalog_refresh(state: Arc<AppState>) {
+    let interval = state.config.gateway.catalog_refresh_interval;
+    if interval.is_zero() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick fires immediately, and the catalog was already loaded
+        // at boot; skip it rather than doing the same query twice.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match state.reload_catalog().await {
+                Ok(n) => tracing::debug!(models = n, "catalog refreshed"),
+                Err(e) => tracing::warn!(error = %e, "catalog refresh failed; keeping the old one"),
+            }
+        }
+    });
 }
 
 /// Bind both listeners and serve until shutdown.
@@ -84,6 +113,8 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
     let admin = tokio::net::TcpListener::bind(&admin_addr)
         .await
         .map_err(|e| oag_core::Error::Internal(format!("binding {admin_addr}: {e}")))?;
+
+    spawn_catalog_refresh(Arc::clone(&state));
 
     tracing::info!(%public_addr, %admin_addr, "listening");
 

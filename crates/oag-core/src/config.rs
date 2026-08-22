@@ -149,6 +149,13 @@ pub struct GatewayConfig {
     pub same_account_retries: u8,
     /// Credentials to try before giving up on the request.
     pub max_account_switches: u8,
+    /// How often to reload the model catalog from the database.
+    ///
+    /// The catalog is held in memory and swapped wholesale. Without a refresh,
+    /// seeding or repricing a model needs every replica restarted before it
+    /// takes effect — and the replicas give no sign that they are stale.
+    #[serde(with = "humantime_secs")]
+    pub catalog_refresh_interval: Duration,
     /// Override a provider's base URL, keyed by provider name.
     ///
     /// For self-hosted or proxied endpoints, a regional deployment, or a mock
@@ -165,6 +172,7 @@ impl Default for GatewayConfig {
             max_stream_duration: Duration::from_mins(30),
             same_account_retries: 2,
             max_account_switches: 3,
+            catalog_refresh_interval: Duration::from_mins(1),
             provider_base_urls: std::collections::BTreeMap::new(),
         }
     }
@@ -284,6 +292,16 @@ security:
             "sibling kept its default"
         );
         assert_eq!(cfg.server.max_body_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_catalog_refresh_interval_defaults_to_something_useful() {
+        // Zero disables it, which is a legitimate choice for a single-replica
+        // deployment that restarts on every change — but it must not be the
+        // default, or seeding a catalog appears to do nothing.
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(!cfg.gateway.catalog_refresh_interval.is_zero());
+        assert!(cfg.gateway.catalog_refresh_interval <= Duration::from_mins(5));
     }
 
     #[test]

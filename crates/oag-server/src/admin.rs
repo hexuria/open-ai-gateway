@@ -18,6 +18,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 
+/// Reload the catalog on this replica, immediately.
+///
+/// The periodic refresh means a change lands on its own within the interval;
+/// this is for when waiting is not acceptable. It affects **only the replica
+/// that serves the request** — with several behind a load balancer, the
+/// periodic refresh is what makes the change fleet-wide.
+pub async fn reload_catalog(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_admin(&state, &headers).await {
+        return r;
+    }
+    match state.reload_catalog().await {
+        Ok(n) => Json(json!({
+            "models": n,
+            "note": "this replica only; others pick the change up on their refresh interval",
+        }))
+        .into_response(),
+        Err(e) => failed(&e),
+    }
+}
+
 /// The dashboard.
 ///
 /// One self-contained file, embedded in the binary. A build toolchain,

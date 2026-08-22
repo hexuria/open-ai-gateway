@@ -91,8 +91,10 @@ async fn run() -> Result<()> {
 
             match state.reload_catalog().await {
                 Ok(0) => tracing::warn!(
-                    "model catalog is empty; every request will fail to route. \
-                     Run `oag admin seed-catalog`."
+                    interval_secs = state.config.gateway.catalog_refresh_interval.as_secs(),
+                    "model catalog is empty; every request will fail to route until it is \
+                     seeded. Run `oag admin seed-catalog` — the change is picked up on the \
+                     refresh interval, no restart needed."
                 ),
                 Ok(n) => tracing::info!(models = n, "catalog loaded"),
                 Err(e) => tracing::warn!(error = %e, "could not load catalog"),
