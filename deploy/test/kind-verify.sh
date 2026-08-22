@@ -228,7 +228,6 @@ echo "  restart issued with streams in flight; waiting for them to finish"
 # Only the streams. Each curl carries --max-time, so this is already bounded;
 # waiting on the wrong thing is what was unbounded.
 for pid in "${STREAM_PIDS[@]}"; do wait "$pid" || true; done
-kill "$PF" 2>/dev/null || true
 
 say "7/7  results"
 survived=0
@@ -256,8 +255,15 @@ pass "every stream survived a full rolling restart"
 # A completed stream that never reached the ledger would mean the metering task
 # was cut off with its pod — the disconnect-billing path failing silently, which
 # a stream-completion check alone cannot see.
-requests="$(curl -fsS "http://127.0.0.1:18081/admin/api/summary" -H "x-api-key: $KEY" 2>/dev/null \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin)["requests"])' 2>/dev/null || echo 0)"
+# Asked of Postgres directly. The port-forward is pinned to a pod the rollout
+# has just replaced, and the question here is what reached the DATABASE — routing
+# it through a replica that may no longer exist tests the wrong thing, and
+# returned 0 on a run where all eight streams had in fact completed.
+PG="$($KC get pod -o name | grep postgres | head -1 | cut -d/ -f2)"
+[ -n "$PG" ] || fail "could not find the postgres pod to read the ledger from"
+requests="$($KC exec "$PG" -- psql -U oag -d oag -At -c \
+  'SELECT count(*) FROM usage_event' 2>/dev/null | tr -d '[:space:]')"
+requests="${requests:-0}"
 echo "  ledger rows: $requests (expected >= $STREAMS)"
 [ "$requests" -ge "$STREAMS" ] \
   || fail "only $requests of $STREAMS completed streams reached the ledger — metering
