@@ -52,6 +52,7 @@ enum Renderer {
     None,
     ChatCompletions(oag_proto::openai::RenderState),
     Anthropic(oag_proto::anthropic::RenderState),
+    Gemini(oag_proto::gemini::RenderState),
 }
 
 impl Renderer {
@@ -64,6 +65,7 @@ impl Renderer {
             Egress::AnthropicMessages { request_id, model } => {
                 Self::Anthropic(oag_proto::anthropic::RenderState::new(request_id, model))
             }
+            Egress::Gemini => Self::Gemini(oag_proto::gemini::RenderState::new()),
         }
     }
 
@@ -72,6 +74,7 @@ impl Renderer {
             Self::None => None,
             Self::ChatCompletions(st) => oag_proto::openai::render_event(event, st),
             Self::Anthropic(st) => oag_proto::anthropic::render_event(event, st),
+            Self::Gemini(st) => oag_proto::gemini::render_event(event, st),
         }
     }
 }
@@ -91,6 +94,8 @@ pub enum Egress {
     /// upstream. The headline case, since it is what a Claude-shaped agent
     /// routed to a cheap model looks like.
     AnthropicMessages { request_id: String, model: String },
+    /// A Gemini-shaped client over some other upstream.
+    Gemini,
 }
 
 /// Read `response`, forward it to `tx`, and account for usage.

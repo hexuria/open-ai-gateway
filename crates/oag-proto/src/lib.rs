@@ -21,6 +21,7 @@
 
 pub mod anthropic;
 pub mod canonical;
+pub mod gemini;
 pub mod openai;
 pub mod stream;
 

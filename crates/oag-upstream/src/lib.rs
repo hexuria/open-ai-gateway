@@ -4,10 +4,12 @@
 
 pub mod adapter;
 pub mod anthropic;
+pub mod gemini;
 pub mod openai;
 pub mod transport;
 
 pub use adapter::{ProviderAdapter, UpstreamRequest};
 pub use anthropic::AnthropicAdapter;
+pub use gemini::GeminiAdapter;
 pub use openai::OpenAICompatAdapter;
 pub use transport::{HttpTransport, Transport, TransportKey, TransportPool};

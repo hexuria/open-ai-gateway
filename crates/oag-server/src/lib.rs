@@ -48,6 +48,11 @@ pub fn public_router(state: Arc<AppState>) -> Router {
             "/chat/completions",
             axum::routing::post(gateway::chat_completions),
         )
+        // Gemini puts the model and the mode in the path, separated by a colon.
+        .route(
+            "/v1beta/models/{*model_action}",
+            axum::routing::post(gateway::gemini_generate),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(
             state.config.server.max_body_bytes,
         ))

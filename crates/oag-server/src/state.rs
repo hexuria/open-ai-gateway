@@ -62,6 +62,14 @@ impl AppState {
             ))),
         );
 
+        adapters.insert(
+            Provider::Gemini,
+            Arc::new(oag_upstream::GeminiAdapter::new(base(
+                Provider::Gemini,
+                "https://generativelanguage.googleapis.com/v1beta",
+            ))),
+        );
+
         // Five providers, one adapter: they all speak Chat Completions and
         // differ only in base URL.
         for p in [

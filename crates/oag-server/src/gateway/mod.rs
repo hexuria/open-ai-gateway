@@ -43,6 +43,42 @@ pub async fn chat_completions(
     dispatch(state, headers, body, Dialect::OpenAIChatCompletions).await
 }
 
+/// `POST /v1beta/models/{model}:generateContent` — the Gemini surface.
+///
+/// The model and the streaming mode are in the path in this dialect, so they
+/// are recovered from it rather than from the body.
+pub async fn gemini_generate(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(model_action): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (model, action) = model_action
+        .rsplit_once(':')
+        .unwrap_or((model_action.as_str(), "generateContent"));
+    let stream = action.starts_with("stream");
+
+    // Re-express the path's model and mode as body fields, so the rest of the
+    // pipeline sees one shape whatever dialect the client used.
+    let mut wire: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error_response(&Error::Serde(e)),
+    };
+    wire["__oag_model"] = serde_json::Value::String(model.to_owned());
+    wire["__oag_stream"] = serde_json::Value::Bool(stream);
+    let Ok(patched) = serde_json::to_vec(&wire) else {
+        return error_response(&Error::Internal("re-encoding request".to_owned()));
+    };
+
+    dispatch(
+        state,
+        headers,
+        axum::body::Bytes::from(patched),
+        Dialect::GeminiGenerateContent,
+    )
+    .await
+}
+
 async fn dispatch(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -88,8 +124,16 @@ async fn handle(
     let wire: serde_json::Value = serde_json::from_slice(body)?;
     let mut canonical = match ingress {
         Dialect::OpenAIChatCompletions => oag_proto::openai::parse_request(&wire)?,
-        // Everything else parses as Anthropic for now; the remaining dialects
-        // are a codec each, not a change to this path.
+        Dialect::GeminiGenerateContent => {
+            let mut c = oag_proto::gemini::parse_request(&wire)?;
+            // Recovered from the path by `gemini_generate`.
+            wire["__oag_model"]
+                .as_str()
+                .unwrap_or_default()
+                .clone_into(&mut c.model);
+            c.stream = wire["__oag_stream"].as_bool().unwrap_or(false);
+            c
+        }
         _ => anthropic::parse_request(&wire)?,
     };
 
@@ -383,20 +427,34 @@ enum Attempt {
 ///
 /// Passthrough whenever the dialects agree, which is both faster and more
 /// faithful — we hand back the bytes the upstream considered correct.
-fn egress_for(ingress: Dialect, decision: &RoutingDecision, request_id: RequestId) -> sse::Egress {
+fn egress_for(
+    ingress: Dialect,
+    decision: &RoutingDecision,
+    request_id: RequestId,
+) -> Result<sse::Egress> {
     let upstream = decision.model.provider.native_dialect();
     if ingress == upstream {
-        return sse::Egress::Passthrough;
+        return Ok(sse::Egress::Passthrough);
     }
     let model = decision.model.id.as_str().to_owned();
     let request_id = request_id.to_string();
-    match ingress {
+    Ok(match ingress {
         Dialect::OpenAIChatCompletions => sse::Egress::ChatCompletions { request_id, model },
         Dialect::AnthropicMessages => sse::Egress::AnthropicMessages { request_id, model },
-        // No renderer for this dialect yet. Forwarding the upstream's own bytes
-        // is wrong, but visibly wrong, which beats an empty stream.
-        _ => sse::Egress::Passthrough,
-    }
+        Dialect::GeminiGenerateContent => sse::Egress::Gemini,
+        // Falling back to passthrough here would send the upstream's dialect to
+        // a client expecting a different one — bytes that parse as nothing and
+        // fail somewhere far from the cause. An error names the problem.
+        // `Dialect` is non-exhaustive, so this arm also catches anything added
+        // later — which is the safe direction: a new dialect fails loudly here
+        // until someone writes its renderer.
+        _ => {
+            return Err(Error::Internal(format!(
+                "no renderer from {upstream:?} to {ingress:?}; \
+                 route this request to a {ingress:?}-native provider instead"
+            )));
+        }
+    })
 }
 
 fn json_response(
@@ -422,6 +480,12 @@ fn json_response(
                 Dialect::AnthropicMessages => bytes::Bytes::from(
                     oag_proto::anthropic::render_message_response(&v, &id).to_string(),
                 ),
+                Dialect::GeminiGenerateContent => {
+                    bytes::Bytes::from(oag_proto::gemini::render_message_response(&v).to_string())
+                }
+                // No converter: hand back the upstream's own body rather than
+                // something half-translated. The streaming path errors instead,
+                // because a stream cannot be partly right.
                 _ => body.clone(),
             },
         )
@@ -662,7 +726,10 @@ fn stream_response(
     let max = state.config.gateway.max_stream_duration;
     let account = lease.account.account_id();
 
-    let egress = egress_for(ingress, decision, request_id);
+    let egress = match egress_for(ingress, decision, request_id) {
+        Ok(e) => e,
+        Err(e) => return error_response(&e),
+    };
 
     let ctx = meter::Context {
         request_id,
