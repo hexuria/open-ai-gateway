@@ -111,8 +111,22 @@ deploy/tofu/
     compute-cloudrun  compute-fargate  compute-containerapps
     edge-cloudflare
   stacks/
-    gcp-cloudrun     (data_mode = managed | neutral)
+    gcp-cloudrun          (data_mode = managed | neutral)
+    aws-fargate           (data_mode = managed | neutral)
+    azure-containerapps   (data_mode = managed | neutral)
 ```
+
+Every stack takes the same `data_mode`, and every data module satisfies the
+same two-output contract — `database_url`, `redis_url` — so the compute tier
+never knows which one is behind it. `managed` pins the deployment to that
+cloud's database; `neutral` (Neon + Upstash) lets compute move without the
+data moving with it.
+
+The two clouds differ in who owns the network. AWS brings its own VPC and
+subnet IDs, because most organisations already have one this should live in.
+Azure creates its own, because Container Apps and Postgres Flexible Server
+each require a subnet delegated specifically to them, and hand-built
+delegations fail in ways that surface only at apply time.
 
 Written for OpenTofu / Terraform ≥ 1.5. Each module carries `precondition`
 blocks for the mistakes that do not fail loudly:
@@ -141,8 +155,12 @@ blocks for the mistakes that do not fail loudly:
 | Kubernetes | deployed to `kind`: migration hook, in-cluster Postgres and Redis, two replicas ready, both listeners answering |
 | Request path | streamed through the Service; ledger row exact — `in=1200 cached=18000 out=142`, `$0.004085` against `$0.061275` |
 | Rolling update | 12 of 12 long streams survived a `rollout restart` mid-flight |
-| OpenTofu | all nine modules and stacks pass `terraform validate` |
+| OpenTofu | all modules and all three stacks pass `terraform validate` |
+| Container image | builds; `oag --version` runs; ELF `e_machine` matches the image architecture |
 
 Not verified: no `terraform apply` was run against a real cloud account. The
 configurations are validated and the reasoning behind each constraint is cited
-above, but nothing here has provisioned a real Cloud SQL instance.
+above, but nothing here has provisioned a real Cloud SQL instance. `validate`
+checks that a configuration is well-formed against the provider schema; it does
+not check that a quota exists, that an IAM binding is sufficient, or that two
+resources agree at runtime. Expect the first apply to find things.
