@@ -1,0 +1,19 @@
+[package]
+name = "oag-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+time.workspace = true
+rust_decimal.workspace = true
+zeroize.workspace = true
+
+[lints]
+workspace = true

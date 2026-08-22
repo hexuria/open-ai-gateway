@@ -1,0 +1,114 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/oag-core",
+    "crates/oag-router",
+    "crates/oag-proto",
+    "crates/oag-upstream",
+    "crates/oag-pool",
+    "crates/oag-store",
+    "crates/oag-server",
+    "crates/oag",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = ""
+publish = false
+
+[workspace.dependencies]
+oag-core = { path = "crates/oag-core" }
+oag-router = { path = "crates/oag-router" }
+oag-proto = { path = "crates/oag-proto" }
+oag-upstream = { path = "crates/oag-upstream" }
+oag-pool = { path = "crates/oag-pool" }
+oag-store = { path = "crates/oag-store" }
+oag-server = { path = "crates/oag-server" }
+
+# ── async runtime and HTTP server ──────────────────────────────────────────────
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+axum = { version = "0.8", features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "limit", "request-id", "timeout"] }
+http = "1"
+http-body-util = "0.1"
+
+# ── upstream HTTP client ───────────────────────────────────────────────────────
+# rustls only. No OpenSSL, no BoringSSL: see docs/03-providers.md §Transport.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "http2",
+    "stream",
+    "json",
+    "charset",
+] }
+
+# ── persistence ────────────────────────────────────────────────────────────────
+sqlx = { version = "0.9", default-features = false, features = [
+    "postgres",
+    "uuid",
+    "time",
+    "json",
+    "rust_decimal",
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "migrate",
+] }
+redis = { version = "1", default-features = false, features = [
+    "tokio-rustls-comp",
+    "connection-manager",
+    "script",
+] }
+moka = { version = "0.12", features = ["future"] }
+
+# ── serialisation and core types ───────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
+thiserror = "2"
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+time = { version = "0.3", features = ["serde-well-known", "macros"] }
+# Money is never f64. Every cost in this system is a Decimal.
+rust_decimal = { version = "1", features = ["serde-with-float", "macros"] }
+
+# ── credential sealing ─────────────────────────────────────────────────────────
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+base64 = "0.22"
+
+# ── observability ──────────────────────────────────────────────────────────────
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# ── cli ────────────────────────────────────────────────────────────────────────
+clap = { version = "4", features = ["derive", "env"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -2 }
+# Nothing in a gateway should take the process down. A panic in the request path
+# is a 500 for every in-flight stream on that replica, not just the one request.
+unwrap_used = "deny"
+panic = "deny"
+expect_used = "warn"
+todo = "warn"
+# Too noisy for a codebase this shape; re-enable case by case if it earns it.
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
