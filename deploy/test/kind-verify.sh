@@ -35,6 +35,9 @@ NS="${NS:-oag}"
 STREAMS="${STREAMS:-12}"
 # Long enough that the restart lands mid-stream, which is the whole test.
 STREAM_SECONDS="${STREAM_SECONDS:-90}"
+# Raise on a cold runner: it pulls the node image, postgres and redis before
+# anything here can start.
+HELM_TIMEOUT="${HELM_TIMEOUT:-20m}"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="$(mktemp -d)"
 
@@ -121,7 +124,7 @@ $KC rollout status deployment/mock-upstream --timeout=180s >/dev/null
 
 say "4/7  install the chart"
 helm --kube-context "kind-$CLUSTER" upgrade --install oag "$REPO_ROOT/deploy/helm/open-ai-gateway" \
-  -n "$NS" --wait --timeout 10m \
+  -n "$NS" --wait --timeout "${HELM_TIMEOUT:-20m}" \
   --set image.repository=oag --set image.tag=verify --set image.pullPolicy=Never \
   --set replicaCount=3 \
   --set data.mode=inCluster \

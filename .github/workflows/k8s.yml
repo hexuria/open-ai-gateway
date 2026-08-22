@@ -1,0 +1,70 @@
+name: k8s
+
+# The drain property — that a rolling restart severs no live stream — is the one
+# claim in the docs that was only ever checked by hand. This is where it stops
+# being an anecdote.
+#
+# Deliberately NOT on push yet: deploy/test/kind-verify.sh has never completed a
+# run, and a permanently red X on main teaches everyone to ignore CI. Run it with
+# workflow_dispatch until it is green, then add:
+#   push: { branches: [main] }
+#   pull_request: { paths: ['crates/**', 'deploy/**', 'migrations/**'] }
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly, so a regression surfaces within a day once this is stable.
+    - cron: "17 3 * * *"
+
+jobs:
+  drain:
+    runs-on: ubuntu-latest
+    # The image build alone is several minutes; the cluster, two StatefulSets and
+    # the migrate hook follow. Generous on purpose — a timeout here reads as a
+    # drain failure and sends the next person down the wrong path.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: oag-verify
+          # The script creates its own cluster if absent; this pre-installs the
+          # kind binary and warms the node image.
+          install_only: true
+
+      - uses: azure/setup-helm@v4
+
+      - name: runner capabilities
+        # If any of these is missing the failure below is confusing, so state it
+        # plainly up front.
+        run: |
+          docker info >/dev/null && echo "docker ok"
+          kind version
+          helm version --short
+          kubectl version --client -o yaml | head -3
+
+      - name: rolling restart severs no stream
+        env:
+          # Fewer, shorter streams than the local default: enough to land a
+          # restart mid-flight without spending twenty minutes proving it twice.
+          STREAMS: "8"
+          STREAM_SECONDS: "60"
+          # Keep the cluster so the diagnostics step below can read it.
+          KEEP: "1"
+        run: ./deploy/test/kind-verify.sh
+
+      - name: diagnostics
+        if: failure()
+        run: |
+          kubectl --context kind-oag-verify -n oag get pods -o wide || true
+          kubectl --context kind-oag-verify -n oag get events --sort-by=.lastTimestamp | tail -40 || true
+          kubectl --context kind-oag-verify -n oag describe pod -l app.kubernetes.io/name=open-ai-gateway || true
+          for c in gateway wait-for-postgres wait-for-redis; do
+            echo "=== $c ==="
+            kubectl --context kind-oag-verify -n oag logs -l app.kubernetes.io/name=open-ai-gateway -c "$c" --tail=60 || true
+          done
+          for j in $(kubectl --context kind-oag-verify -n oag get job -o name || true); do
+            echo "=== $j ==="; kubectl --context kind-oag-verify -n oag logs "$j" --tail=60 || true
+          done
+          helm --kube-context kind-oag-verify -n oag status oag || true
