@@ -745,8 +745,17 @@ fn render_tool_delta(
 }
 
 /// Close a tool call, emitting its assembled arguments.
+///
+/// Takes the call out of the open list rather than reading it in place, so a
+/// second end for the same id finds nothing and renders nothing. Upstreams do
+/// send one: Anthropic closes every content block with the same event, and a
+/// text block that follows a tool block reparses as an end for the tool. The
+/// frames this emits carry the function name and the complete arguments —
+/// everything a client needs to dispatch — so emitting them twice dispatches a
+/// side-effecting tool twice.
 fn render_tool_end(st: &mut RenderState, out: &mut String, id: &str) -> Option<()> {
-    let call = st.tools.iter().find(|t| t.call_id == id)?.clone();
+    let pos = st.tools.iter().position(|t| t.call_id == id)?;
+    let call = st.tools.remove(pos);
     out.push_str(&RenderState::frame(
         "response.function_call_arguments.done",
         &json!({
@@ -1197,6 +1206,86 @@ mod tests {
         assert_eq!(item["call_id"], "call_1");
         assert_eq!(item["arguments"], r#"{"path":"a.rs"}"#);
         assert_eq!(item["status"], "completed");
+    }
+
+    /// An Anthropic stream that uses a tool and then keeps talking.
+    ///
+    /// Anthropic closes every content block with the same `content_block_stop`,
+    /// and the accumulator keeps naming the last tool id after that tool has
+    /// ended — so the *text* block's stop parses as a second `ToolUseEnd` for a
+    /// call that is already closed.
+    const TOOL_THEN_TEXT: &[&str] = &[
+        r#"{"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":10}}}"#,
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_abc","name":"read_file","input":{}}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#,
+        r#"{"type":"content_block_stop","index":0}"#,
+        r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Done."}}"#,
+        r#"{"type":"content_block_stop","index":1}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#,
+    ];
+
+    /// Anthropic upstream events, parsed and rendered into this dialect, as the
+    /// `data:` payload of each frame.
+    fn anthropic_into_responses(lines: &[&str]) -> Vec<Value> {
+        let mut acc = StreamAccumulator::new();
+        let mut st = RenderState::new("r", "claude-opus-5");
+        let mut raw = String::new();
+        for line in lines {
+            for e in crate::anthropic::parse_event(line, &mut acc).expect("parses") {
+                acc.observe(&e);
+                if let Some(frames) = render_event(&e, &mut st) {
+                    raw.push_str(&frames);
+                }
+            }
+        }
+        raw.split("\n\n")
+            .filter(|f| !f.trim().is_empty())
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .map(|d| serde_json::from_str(d).expect("valid json"))
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_tool_call_is_not_closed_again_by_a_later_block_stop() {
+        // A duplicate `output_item.done` is not cosmetic here: it carries the
+        // function name and complete arguments, which is everything a client
+        // needs to dispatch — so a second one is a second dispatch, and a tool
+        // that writes something writes it twice.
+        let frames = anthropic_into_responses(TOOL_THEN_TEXT);
+
+        let closes: Vec<&Value> = frames
+            .iter()
+            .filter(|v| v["type"] == "response.output_item.done")
+            .filter(|v| v["item"]["type"] == "function_call")
+            .collect();
+
+        assert_eq!(
+            closes.len(),
+            1,
+            "the function-call item closes exactly once: {frames:#?}"
+        );
+        let item = &closes[0]["item"];
+        assert_eq!(item["call_id"], "toolu_abc");
+        assert_eq!(item["name"], "read_file", "and it names the function");
+        assert_eq!(item["arguments"], r#"{"path":"a.rs"}"#);
+
+        let arg_dones = frames
+            .iter()
+            .filter(|v| v["type"] == "response.function_call_arguments.done")
+            .count();
+        assert_eq!(
+            arg_dones, 1,
+            "the arguments are reported final exactly once: {frames:#?}"
+        );
+
+        // The text that followed must land in a message item of its own, not
+        // reopen the closed call.
+        assert!(
+            frames
+                .iter()
+                .any(|v| v["type"] == "response.output_text.delta" && v["delta"] == "Done.")
+        );
     }
 
     #[test]
