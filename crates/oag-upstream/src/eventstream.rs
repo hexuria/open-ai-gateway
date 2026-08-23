@@ -26,6 +26,14 @@ use base64::Engine as _;
 const PRELUDE_LEN: usize = 12;
 /// The prelude plus the trailing message CRC.
 const OVERHEAD: usize = PRELUDE_LEN + 4;
+/// The largest message the format allows.
+///
+/// `total_length` is a `u32` read straight off the wire, so a corrupt or
+/// hostile prelude can claim four gigabytes and the caller will keep buffering
+/// until it arrives. The spec caps a message at 16 MiB, so anything larger is
+/// not a big message — it is a bad length, and the same corruption the
+/// undersized case already refuses to resynchronise on.
+const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
 
 /// A message's headers, as far as we care about them.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -60,10 +68,12 @@ pub fn take_messages(buf: &mut Vec<u8>) -> Vec<Message> {
         let total = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
         let headers_len = u32::from_be_bytes([rest[4], rest[5], rest[6], rest[7]]) as usize;
 
-        // A frame claiming to be smaller than its own overhead, or claiming
-        // more headers than it has bytes, is corrupt. Stopping is the only safe
-        // move: advancing by a bogus length would resynchronise on garbage.
-        if total < OVERHEAD || headers_len > total - OVERHEAD {
+        // A frame claiming to be smaller than its own overhead, larger than the
+        // format permits, or with more headers than it has bytes, is corrupt.
+        // Stopping is the only safe move: advancing by a bogus length would
+        // resynchronise on garbage, and waiting for a length no real message
+        // has would buffer until the process runs out of memory.
+        if !(OVERHEAD..=MAX_MESSAGE_LEN).contains(&total) || headers_len > total - OVERHEAD {
             tracing::warn!(
                 total,
                 headers_len,

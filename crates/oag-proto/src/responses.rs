@@ -640,15 +640,41 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
             ));
         }
 
-        StreamEvent::Error { message } => {
-            out.push_str(&RenderState::frame(
-                "error",
-                &json!({ "type": "error", "message": message }),
-            ));
-        }
+        StreamEvent::Error { message } => render_failure(st, &mut out, message)?,
     }
 
     (!out.is_empty()).then_some(out)
+}
+
+/// Terminate the response as failed.
+///
+/// `response.failed`, not a bare `error` event: a client in this dialect waits
+/// for a terminal `response.*` frame and an `error` event is not one, so an SDK
+/// that dispatches on the response lifecycle keeps waiting after it — which is
+/// the stall this is meant to end.
+fn render_failure(st: &mut RenderState, out: &mut String, message: &str) -> Option<()> {
+    if st.finished {
+        return None;
+    }
+    st.finished = true;
+    st.ensure_created(out);
+    st.close_message(out);
+    out.push_str(&RenderState::frame(
+        "response.failed",
+        &json!({
+            "type": "response.failed",
+            "response": {
+                "id": st.id,
+                "object": "response",
+                "created_at": 0,
+                "status": "failed",
+                "model": st.model,
+                "error": { "code": "server_error", "message": message },
+                "usage": usage_json(&st.usage),
+            }
+        }),
+    ));
+    Some(())
 }
 
 /// Open a `function_call` item, closing any open message item first.

@@ -674,16 +674,20 @@ fn egress_for(
     framing: oag_upstream::Framing,
 ) -> Result<sse::Egress> {
     let upstream = decision.model.provider.native_dialect();
+    let model = decision.model.id.as_str().to_owned();
+    let request_id = request_id.to_string();
 
     // Matching dialects are not sufficient: passthrough forwards the upstream's
     // *bytes*, so it also requires that those bytes are already SSE. Bedrock's
     // dialect is Anthropic and its framing is binary — passing that through
     // would hand a client expecting `data:` lines a length-prefixed envelope.
     if ingress == upstream && framing == oag_upstream::Framing::Sse {
-        return Ok(sse::Egress::Passthrough);
+        return Ok(sse::Egress::Passthrough {
+            dialect: ingress,
+            request_id,
+            model,
+        });
     }
-    let model = decision.model.id.as_str().to_owned();
-    let request_id = request_id.to_string();
     Ok(match ingress {
         Dialect::OpenAIChatCompletions => sse::Egress::ChatCompletions { request_id, model },
         Dialect::AnthropicMessages => sse::Egress::AnthropicMessages { request_id, model },
@@ -1636,7 +1640,13 @@ mod tests {
             oag_upstream::Framing::Sse,
         )
         .expect("supported");
-        assert!(matches!(e, sse::Egress::Passthrough));
+        assert!(matches!(
+            e,
+            sse::Egress::Passthrough {
+                dialect: Dialect::OpenAIChatCompletions,
+                ..
+            }
+        ));
     }
 
     #[test]

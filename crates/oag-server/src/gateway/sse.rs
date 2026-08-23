@@ -23,6 +23,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// The most bytes we hold while waiting for one event to finish arriving.
+///
+/// The tail of the buffer is by definition a single incomplete frame, and the
+/// largest real one is a tool call whose arguments are a big JSON document —
+/// megabytes at the very outside. Past this it is not a large frame, it is an
+/// upstream that will never send the delimiter, and continuing to buffer is an
+/// unbounded allocation whose size a third party chooses. Failing the stream
+/// keeps the memory bounded and tells the client why it stopped.
+const MAX_PENDING: usize = 8 * 1024 * 1024;
+
 /// How the stream ended.
 #[derive(Debug, Clone)]
 pub struct StreamOutcome {
@@ -60,7 +70,7 @@ enum Renderer {
 impl Renderer {
     fn new(egress: &Egress) -> Self {
         match egress {
-            Egress::Passthrough => Self::None,
+            Egress::Passthrough { .. } => Self::None,
             Egress::ChatCompletions { request_id, model } => {
                 Self::ChatCompletions(oag_proto::openai::RenderState::new(request_id, model))
             }
@@ -72,6 +82,30 @@ impl Renderer {
                 Self::Responses(oag_proto::responses::RenderState::new(request_id, model))
             }
         }
+    }
+
+    /// A renderer for a dialect known only at runtime.
+    ///
+    /// Passthrough forwards the upstream's bytes and so needs no renderer while
+    /// the stream is healthy. A failure still has to be reported in a dialect,
+    /// and the client's is the upstream's — that is what made passthrough
+    /// applicable in the first place.
+    fn for_dialect(dialect: Dialect, request_id: &str, model: &str) -> Option<Self> {
+        Some(match dialect {
+            Dialect::OpenAIChatCompletions => {
+                Self::ChatCompletions(oag_proto::openai::RenderState::new(request_id, model))
+            }
+            Dialect::AnthropicMessages => {
+                Self::Anthropic(oag_proto::anthropic::RenderState::new(request_id, model))
+            }
+            Dialect::GeminiGenerateContent => Self::Gemini(oag_proto::gemini::RenderState::new()),
+            Dialect::OpenAIResponses => {
+                Self::Responses(oag_proto::responses::RenderState::new(request_id, model))
+            }
+            // `Dialect` is non-exhaustive. A dialect we cannot render cannot be
+            // told anything, and silence beats bytes in the wrong shape.
+            _ => return None,
+        })
     }
 
     fn render(&mut self, event: &oag_proto::StreamEvent) -> Option<String> {
@@ -93,7 +127,15 @@ pub enum Egress {
     /// Always preferred when it applies. We already hold bytes the upstream
     /// considered correct; re-serialising them can only introduce differences,
     /// and every difference is a client bug waiting to be blamed on us.
-    Passthrough,
+    ///
+    /// The dialect is carried anyway, because a stream that fails mid-flight
+    /// has to be told so in *some* dialect, and verbatim bytes end the moment
+    /// there are no more of them.
+    Passthrough {
+        dialect: Dialect,
+        request_id: String,
+        model: String,
+    },
     /// They differ: render each canonical event into the client's dialect.
     ChatCompletions { request_id: String, model: String },
     /// The other direction: an Anthropic-shaped client over a Chat Completions
@@ -168,15 +210,11 @@ pub async fn pump(
         // asked for SSE and Bedrock's binary envelope is not it. `egress_for`
         // guarantees a renderer for that case.
         let outbound = match &egress {
-            Egress::Passthrough => chunk,
+            Egress::Passthrough { .. } => chunk,
             _ => bytes::Bytes::from(translated),
         };
 
-        if outbound.is_empty() {
-            continue;
-        }
-
-        if !client_gone {
+        if !outbound.is_empty() && !client_gone {
             if tx.send(Ok(outbound)).await.is_ok() {
                 acc.mark_committed();
             } else {
@@ -188,6 +226,18 @@ pub async fn pump(
                 tracing::debug!("client disconnected; draining upstream for accounting");
             }
         }
+
+        // Checked here rather than before framing, so a single large read full
+        // of *complete* frames is not mistaken for one runaway frame: by this
+        // point `pending` holds only the incomplete tail.
+        if pending.len() > MAX_PENDING {
+            error = Some(format!(
+                "upstream sent {} bytes without completing an event",
+                pending.len()
+            ));
+            pending.clear();
+            break;
+        }
     }
 
     // Whatever is left is a partial frame; try once more in case it completed
@@ -197,11 +247,28 @@ pub async fn pump(
         let _ = fold_payloads(&payloads, &adapter, &mut acc, &mut render);
     }
 
+    // A stream that died mid-flight has to say so on the wire. Otherwise the
+    // client sees a truncated answer it has no way to distinguish from a short
+    // one, or — for every dialect whose stream simply stops — waits for a
+    // terminal event that is never coming and hangs until its own timeout,
+    // while the ledger records the 502 nobody was told about.
+    if let Some(message) = &error
+        && !client_gone
+        && let Some(frame) = error_frame(&egress, &mut render, message)
+    {
+        let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
+    }
+
     // A translated stream has to synthesise the sentinel the client's dialect
     // expects. Anthropic has no equivalent, so without this a Chat Completions
     // client waits for a [DONE] that never arrives and hangs until its own
     // timeout — which looks exactly like a slow model.
-    if !client_gone && matches!(egress, Egress::ChatCompletions { .. }) {
+    //
+    // Only on success: in this dialect `[DONE]` means the stream ended
+    // normally, so sending it after a failure reports the truncated answer as
+    // complete — and a client that already read the error chunk then has to
+    // decide which of two contradictory frames to believe.
+    if !client_gone && error.is_none() && matches!(egress, Egress::ChatCompletions { .. }) {
         let _ = tx
             .send(Ok(bytes::Bytes::from(oag_proto::openai::done_frame())))
             .await;
@@ -216,6 +283,29 @@ pub async fn pump(
         client_gone,
         error,
     }
+}
+
+/// The client-dialect frame that reports `message` as a stream failure.
+///
+/// `None` when there is no way to say it: a dialect with no renderer. Silence
+/// is the honest outcome there — bytes in the wrong shape would be worse than
+/// none, and the outcome still carries the error for the ledger.
+fn error_frame(egress: &Egress, render: &mut Renderer, message: &str) -> Option<Vec<u8>> {
+    let event = StreamEvent::Error {
+        message: message.to_owned(),
+    };
+    match egress {
+        Egress::Passthrough {
+            dialect,
+            request_id,
+            model,
+        } => Renderer::for_dialect(*dialect, request_id, model)?.render(&event),
+        // Through the live renderer, not around it: it holds the state the
+        // frame depends on — which items are open, whether the stream has
+        // already been terminated.
+        _ => render.render(&event),
+    }
+    .map(String::into_bytes)
 }
 
 /// Take every complete event payload from `buf`, leaving any partial tail.
@@ -238,11 +328,11 @@ fn take_payloads(buf: &mut Vec<u8>, framing: Framing) -> Vec<String> {
 fn take_sse_payloads(buf: &mut Vec<u8>) -> Vec<String> {
     // Frames are separated by a blank line. Anything after the last one is
     // incomplete and must wait for more bytes.
-    let Some(idx) = buf.windows(2).rposition(|w| w == b"\n\n") else {
+    let Some(idx) = last_blank_line(buf) else {
         return Vec::new();
     };
-    let complete = buf[..=idx + 1].to_vec();
-    buf.drain(..=idx + 1);
+    let complete = buf[..=idx].to_vec();
+    buf.drain(..=idx);
 
     let Ok(text) = std::str::from_utf8(&complete) else {
         return Vec::new();
@@ -254,6 +344,22 @@ fn take_sse_payloads(buf: &mut Vec<u8>) -> Vec<String> {
         .filter(|p| !p.is_empty() && *p != "[DONE]")
         .map(std::borrow::ToOwned::to_owned)
         .collect()
+}
+
+/// The index of the final newline of the last blank line in `buf`.
+///
+/// The line break is LF or CRLF, per provider — the SSE grammar permits either
+/// and real providers ship both. Matching only `\n\n` leaves a CRLF stream
+/// buffered forever: no content, no usage, and no error to explain it, because
+/// from the reader's point of view a frame simply never completed.
+fn last_blank_line(buf: &[u8]) -> Option<usize> {
+    // A blank line is one break immediately followed by another, so the byte
+    // before this `\n` is either the previous break's `\n` or the `\r` of this
+    // one's `\r\n` — in which case the `\n` before *that* is the break.
+    (1..buf.len()).rev().find(|&i| {
+        buf[i] == b'\n'
+            && (buf[i - 1] == b'\n' || (i >= 2 && buf[i - 1] == b'\r' && buf[i - 2] == b'\n'))
+    })
 }
 
 /// Parse the `data:` payloads out of complete frames and fold them in.
@@ -386,6 +492,26 @@ mod tests {
     }
 
     #[test]
+    fn crlf_blank_line_completes_a_frame() {
+        // The SSE grammar allows either line break and providers ship both.
+        // Matching only "\n\n" held a CRLF stream in `pending` forever: no
+        // content, no usage, and no error to explain it, because from the
+        // reader's side a frame simply never completed.
+        let mut buf = b"data: {\"a\":1}\r\n\r\ndata: {\"b\"".to_vec();
+        assert_eq!(take_payloads(&mut buf, Framing::Sse), vec![r#"{"a":1}"#]);
+        assert_eq!(buf, b"data: {\"b\"", "the partial tail still waits");
+
+        // Named events, which are CRLF's usual company, and a mixed pair.
+        let mut buf =
+            b"event: x\r\ndata: {\"a\":1}\r\n\r\nevent: y\ndata: {\"b\":2}\r\n\n".to_vec();
+        assert_eq!(
+            take_payloads(&mut buf, Framing::Sse),
+            vec![r#"{"a":1}"#, r#"{"b":2}"#]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn usage_accumulates_across_frames_split_mid_json() {
         // The realistic case: a TCP read boundary lands inside an event.
         let adapter = anthropic();
@@ -443,6 +569,177 @@ mod tests {
         let mut render = Renderer::None;
         let frame = vec![r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"f"}}"#.to_owned()];
         assert!(fold_payloads(&frame, &adapter, &mut acc, &mut render).0);
+    }
+
+    // ── how a stream ends ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn idle_timeout_emits_dialect_error_not_done() {
+        // The bug: an abnormal exit was a bare `break`, so it fell through to
+        // the unconditional `[DONE]`. A stream that died mid-answer told the
+        // client it had finished normally, while the ledger recorded the 502
+        // nobody was informed of.
+        let (tx, mut rx) = mpsc::channel(16);
+        let outcome = pump(
+            stalling(vec![sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an "}}"#,
+            )]),
+            anthropic(),
+            tx,
+            Duration::from_millis(50),
+            Duration::from_secs(30),
+            Egress::ChatCompletions {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(outcome.error.is_some(), "the idle watchdog fired");
+        let sent = drain(&mut rx).await;
+        assert!(sent.contains("half an "), "the partial answer went out");
+        assert!(
+            !sent.contains("[DONE]"),
+            "a failed stream must not report success: {sent}"
+        );
+
+        let last = sent.trim_end().rsplit("data: ").next().expect("a frame");
+        let v: serde_json::Value = serde_json::from_str(last).expect("the last frame is JSON");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("idle")),
+            "the frame names the failure: {last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_stream_still_ends_with_done() {
+        // The other half of the gate: withholding [DONE] on failure must not
+        // withhold it on success, or every healthy translated stream hangs.
+        let (tx, mut rx) = mpsc::channel(16);
+        let outcome = pump(
+            streamed(vec![sse(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+            )]),
+            anthropic(),
+            tx,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Egress::ChatCompletions {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(outcome.error.is_none());
+        assert!(drain(&mut rx).await.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn a_passthrough_client_is_told_the_stream_failed() {
+        // Passthrough forwards bytes and so has no renderer, which used to mean
+        // a failure was reported to the client as nothing at all: the stream
+        // just stopped, and the client waited for message_stop until its own
+        // timeout.
+        let (tx, mut rx) = mpsc::channel(16);
+        let outcome = pump(
+            stalling(vec![sse(r#"{"type":"ping"}"#)]),
+            anthropic(),
+            tx,
+            Duration::from_millis(50),
+            Duration::from_secs(30),
+            Egress::Passthrough {
+                dialect: Dialect::AnthropicMessages,
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(outcome.error.is_some());
+        let sent = drain(&mut rx).await;
+        assert!(
+            sent.contains("event: error") && sent.contains(r#""type":"error""#),
+            "the client's own dialect says so: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_pending_is_capped() {
+        // An upstream that never sends the delimiter used to be an unbounded
+        // allocation: `pending` grew for as long as bytes kept arriving, to
+        // whatever size the upstream chose.
+        let mib = bytes::Bytes::from(vec![b'x'; 1024 * 1024]);
+        let chunks = vec![mib; MAX_PENDING / (1024 * 1024) + 1];
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let outcome = pump(
+            stalling(chunks),
+            anthropic(),
+            tx,
+            // Long enough that neither watchdog can be what stops this: the cap
+            // trips within milliseconds of the bytes arriving.
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Egress::ChatCompletions {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("without completing an event")),
+            "the overflow, not the watchdog, ended it: {:?}",
+            outcome.error
+        );
+        assert!(!drain(&mut rx).await.contains("[DONE]"));
+    }
+
+    /// One SSE frame carrying `payload`.
+    fn sse(payload: &str) -> bytes::Bytes {
+        bytes::Bytes::from(format!("data: {payload}\n\n"))
+    }
+
+    /// A streaming response body over `chunks`, ending cleanly after them.
+    fn streamed(chunks: Vec<bytes::Bytes>) -> reqwest::Response {
+        into_response(futures_util::stream::iter(
+            chunks.into_iter().map(Ok::<_, std::io::Error>),
+        ))
+    }
+
+    /// The same, but the body hangs after the last chunk rather than ending —
+    /// which is what an upstream that stops sending looks like from here.
+    fn stalling(chunks: Vec<bytes::Bytes>) -> reqwest::Response {
+        into_response(
+            futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>)).chain(
+                futures_util::stream::once(async {
+                    std::future::pending::<()>().await;
+                    Ok(bytes::Bytes::new())
+                }),
+            ),
+        )
+    }
+
+    fn into_response<S>(stream: S) -> reqwest::Response
+    where
+        S: futures_util::stream::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
+    {
+        reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(stream)))
+    }
+
+    /// Everything the client's response body received, as text.
+    async fn drain(rx: &mut mpsc::Receiver<Chunk>) -> String {
+        let mut out = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            out.extend_from_slice(&chunk.expect("no io error on this path"));
+        }
+        String::from_utf8(out).expect("utf8")
     }
 
     // ── framing ──────────────────────────────────────────────────────────────
