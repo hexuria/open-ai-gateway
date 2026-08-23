@@ -39,8 +39,14 @@
   .pill { display:inline-block; padding:1px 8px; border-radius:99px;
           font-size:12px; border:1px solid var(--line); }
   .scroll { overflow-x:auto; }
-  input { background:var(--panel); border:1px solid var(--line); color:var(--fg);
+  input, select { background:var(--panel); border:1px solid var(--line); color:var(--fg);
           padding:7px 10px; border-radius:7px; font:inherit; min-width:260px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:end; }
+  .field { display:flex; flex-direction:column; gap:4px; }
+  .field input, .field select { min-width:160px; }
+  .field .wide { min-width:240px; }
+  .note { color:var(--dim); font-size:13px; margin:0 0 12px; }
+  a.dash { color:var(--accent); }
   button { background:var(--accent); border:0; color:#08131a; padding:7px 14px;
            border-radius:7px; font:inherit; font-weight:600; cursor:pointer; }
   .err { color:var(--bad); margin-top:10px; }
@@ -77,6 +83,36 @@
     <h2>By tier</h2>
     <div class="scroll"><table id="tiers"></table></div>
 
+    <h2>Services</h2>
+    <p class="note">Capability backends. The gateway registers a row and health-checks it;
+      it does not run the sandbox, tool, guard, or browser.</p>
+    <div class="card" style="margin-bottom:16px">
+      <div class="row">
+        <div class="field"><label class="label" for="svc-name">Name</label>
+          <input id="svc-name" placeholder="orgo"></div>
+        <div class="field"><label class="label" for="svc-kind">Kind</label>
+          <select id="svc-kind">
+            <option value="sandbox">sandbox</option>
+            <option value="tool">tool</option>
+            <option value="guard">guard</option>
+            <option value="reduce">reduce</option>
+            <option value="harness">harness</option>
+            <option value="browser">browser</option>
+            <option value="other">other</option>
+          </select></div>
+        <div class="field"><label class="label" for="svc-base">Base URL</label>
+          <input id="svc-base" class="wide" placeholder="https://orgo.internal"></div>
+        <div class="field"><label class="label" for="svc-health">Health path</label>
+          <input id="svc-health" placeholder="/health" value="/health"></div>
+        <div class="field"><label class="label" for="svc-dash">Dashboard URL</label>
+          <input id="svc-dash" class="wide" placeholder="https://orgo.internal/ui"></div>
+        <div class="field"><label class="label" for="svc-auth">Credential id</label>
+          <input id="svc-auth" class="wide" placeholder="optional account id"></div>
+        <button id="svc-add" type="button">Add</button>
+      </div>
+    </div>
+    <div class="scroll"><table id="services"></table></div>
+
     <h2>Credentials</h2>
     <div class="scroll"><table id="accounts"></table></div>
 
@@ -104,16 +140,25 @@ async function get(path) {
 // Auth is a header, not a cookie, so a cross-origin page cannot forge one of
 // these: it would need to set x-api-key, which requires a preflight the browser
 // refuses. That is what makes bodyless POST actions safe here.
-async function post(path) {
-  const r = await fetch(path, { method: 'POST', headers: { 'x-api-key': $('key').value } });
+async function send(method, path, body) {
+  const r = await fetch(path, {
+    method,
+    headers: {
+      'x-api-key': $('key').value,
+      ...(body ? { 'content-type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
   if (!r.ok) {
-    const body = await r.json().catch(() => ({}));
+    const payload = await r.json().catch(() => ({}));
     // Must be an Error: the single catch in load() reads e.message, and a bare
     // string throw renders as an empty error bar.
-    throw new Error(body.error ?? `${path} → HTTP ${r.status}`);
+    throw new Error(payload.error ?? `${path} → HTTP ${r.status}`);
   }
   return r.json();
 }
+
+async function post(path) { return send('POST', path); }
 
 function table(el, cols, rows) {
   const head = `<tr>${cols.map(c => `<th>${esc(c.h)}</th>`).join('')}</tr>`;
@@ -130,9 +175,10 @@ const state = s => `<span class="pill ${s === 'ready' ? 'good' : s === 'disabled
 async function load() {
   $('err').textContent = '';
   try {
-    const [s, accounts, keys, routes, usage] = await Promise.all([
+    const [s, accounts, keys, routes, usage, services] = await Promise.all([
       get('/admin/api/summary'), get('/admin/api/accounts'), get('/admin/api/keys'),
       get('/admin/api/routes'), get('/admin/api/usage?limit=25'),
+      get('/admin/api/services'),
     ]);
     localStorage.setItem('oag_key', $('key').value);
 
@@ -150,6 +196,27 @@ async function load() {
       { h:'If frontier', f:r => '$' + r.counterfactual_usd, num:true },
       { h:'Saved',   f:r => `<span class="good">$${esc(r.saved_usd)}</span>`, num:true },
     ], s.by_tier);
+
+    const health = h => `<span class="pill ${
+      h === 'ok' ? 'good' : h === 'error' || h === 'disabled' ? 'bad' : 'warn'
+    }">${esc(h)}</span>`;
+
+    table($('services'), [
+      { h:'Name', f:s => esc(s.name) },
+      { h:'Kind', f:s => `<span class="pill">${esc(s.kind)}</span>` },
+      { h:'Health', f:s => health(s.health) +
+          (s.last_error ? `<span class="reason">${esc(s.last_error)}</span>` : '') },
+      { h:'Dashboard', f:s => s.dashboard_url
+          ? `<a class="dash" href="${esc(s.dashboard_url)}" target="_blank" rel="noopener noreferrer">open</a>`
+          : '—' },
+      { h:'Base', f:s => `<code>${esc(s.base_url)}</code>` },
+      { h:'', f:s => [
+          btn('svc-check', s.id, 'Check', 'btn-quiet'),
+          s.enabled
+            ? btn('svc-disable', s.id, 'Disable', 'btn-danger')
+            : btn('svc-enable', s.id, 'Enable', 'btn-quiet'),
+        ].join(' ') },
+    ], services);
 
     table($('accounts'), [
       { h:'Name',     f:a => esc(a.name) },
@@ -224,6 +291,9 @@ const ACTIONS = {
   'enable':         id => [`/admin/api/accounts/${id}/enable`, null],
   'clear-cooldown': id => [`/admin/api/accounts/${id}/clear-cooldown`, null],
   'revoke':         id => [`/admin/api/keys/${id}/revoke`, 'Revoke this key? It cannot be undone.'],
+  'svc-disable':    id => [`/admin/api/services/${id}/disable`, 'Disable this service?'],
+  'svc-enable':     id => [`/admin/api/services/${id}/enable`, null],
+  'svc-check':      id => [`/admin/api/services/${id}/check`, null],
 };
 
 document.querySelector('main').addEventListener('click', async e => {
@@ -238,6 +308,28 @@ document.querySelector('main').addEventListener('click', async e => {
   } catch (err) {
     $('err').textContent = err.message;
     e.target.disabled = false;
+  }
+});
+
+$('svc-add').addEventListener('click', async () => {
+  $('err').textContent = '';
+  const auth = $('svc-auth').value.trim();
+  try {
+    await send('POST', '/admin/api/services', {
+      name: $('svc-name').value.trim(),
+      kind: $('svc-kind').value,
+      base_url: $('svc-base').value.trim(),
+      health_path: $('svc-health').value.trim() || '/health',
+      dashboard_url: $('svc-dash').value.trim() || null,
+      auth_ref: auth || null,
+    });
+    $('svc-name').value = '';
+    $('svc-base').value = '';
+    $('svc-dash').value = '';
+    $('svc-auth').value = '';
+    await load();
+  } catch (err) {
+    $('err').textContent = err.message;
   }
 });
 

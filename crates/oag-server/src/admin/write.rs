@@ -20,11 +20,10 @@
 //! absent field into a null one.
 
 use super::auth::AdminActor;
-use super::failed;
+use super::{failed, not_found};
 use crate::AppState;
 use axum::Json;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use oag_core::AccountId;
 use serde_json::json;
@@ -114,10 +113,6 @@ pub async fn revoke_key(
         Ok(None) => not_found("no key with that id"),
         Err(e) => failed(&e),
     }
-}
-
-fn not_found(message: &str) -> Response {
-    (StatusCode::NOT_FOUND, Json(json!({ "error": message }))).into_response()
 }
 
 /// The record of who changed what.

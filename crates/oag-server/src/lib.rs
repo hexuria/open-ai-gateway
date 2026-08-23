@@ -26,7 +26,7 @@ pub use shutdown::Lifecycle;
 pub use state::AppState;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use oag_core::Result;
 use std::sync::Arc;
 
@@ -79,6 +79,14 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/routes", get(admin::routes))
         .route("/usage", get(admin::usage))
         .route("/keys", get(admin::keys))
+        .route(
+            "/services",
+            get(admin::list_services).post(admin::create_service),
+        )
+        .route("/services/{id}", patch(admin::update_service))
+        .route("/services/{id}/disable", post(admin::disable_service))
+        .route("/services/{id}/enable", post(admin::enable_service))
+        .route("/services/{id}/check", post(admin::check_service))
         .route("/catalog/reload", post(admin::reload_catalog))
         .route("/accounts/{id}/disable", post(admin::disable_account))
         .route("/accounts/{id}/enable", post(admin::enable_account))
@@ -256,6 +264,24 @@ server:
         (
             "POST",
             "/admin/api/keys/00000000-0000-0000-0000-000000000001/revoke",
+        ),
+        ("GET", "/admin/api/services"),
+        ("POST", "/admin/api/services"),
+        (
+            "PATCH",
+            "/admin/api/services/00000000-0000-0000-0000-000000000001",
+        ),
+        (
+            "POST",
+            "/admin/api/services/00000000-0000-0000-0000-000000000001/disable",
+        ),
+        (
+            "POST",
+            "/admin/api/services/00000000-0000-0000-0000-000000000001/enable",
+        ),
+        (
+            "POST",
+            "/admin/api/services/00000000-0000-0000-0000-000000000001/check",
         ),
     ];
 

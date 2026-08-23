@@ -28,6 +28,7 @@ rust_decimal.workspace = true
 sqlx.workspace = true
 time.workspace = true
 uuid.workspace = true
+url.workspace = true
 bytes = "1"
 futures-util.workspace = true
 tokio-stream = "0.1"
