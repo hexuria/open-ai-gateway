@@ -65,9 +65,14 @@ resource "google_cloud_run_v2_service" "this" {
 
       ports {
         # Cloud Run routes to exactly ONE port. The gateway's two-listener shape
-        # cannot survive that, so single-listener mode puts the admin API,
-        # /metrics and /health/ready on the same port. They still require an
-        # admin key; restrict this service with `ingress` and IAM.
+        # cannot survive that, so single-listener mode puts the admin API, the
+        # dashboard, /metrics and /health/ready on the same port.
+        #
+        # Only /admin/api requires an admin key. The dashboard, /metrics and
+        # /health/ready are outside that layer by design — the page renders
+        # before an operator has typed a key, and the scraper and the probe hold
+        # none — so on a shared port they answer any caller who reaches the
+        # service. `ingress` and IAM are the control here, not the key.
         container_port = 8080
       }
 

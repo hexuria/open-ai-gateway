@@ -9,7 +9,7 @@ Those are three *roles*, not necessarily three processes:
 
 | Role | Question it answers | What changes for AI traffic |
 |---|---|---|
-| **Reverse proxy / edge** | Terminate the connection safely | TLS, HTTP/2, SSO for the admin UI. Must not compress or buffer `text/event-stream`. |
+| **Reverse proxy / edge** | Terminate the connection safely | TLS, HTTP/2, and an allow-list of the paths it will proxy at all. Must not compress or buffer `text/event-stream`. |
 | **Load balancer** | Which replica? | **Least-request, never round-robin.** Completions vary 100× in duration. Needs outlier ejection and very long draining. |
 | **API gateway** | Is this caller allowed, and where does this request really go? | Authn, budget, model routing, credential selection, translation, metering. |
 
@@ -32,7 +32,7 @@ buffering hazard, and duplicated auth.
                             ▼
   ┌──────────────────────────────────────────────────────────┐
   │  EDGE — Caddy                                            │
-  │  TLS · HTTP/2 · OIDC for the admin UI · serves the SPA    │
+  │  TLS · HTTP/2 · inference paths ONLY, no catch-all        │
   │  compression allow-list that EXCLUDES text/event-stream   │
   └──────────────────────────────────────────────────────────┘
                             │  h2c, no buffering
@@ -196,6 +196,16 @@ wrong function is visible in ten lines. `/`, `/metrics` and `/health/ready` sit
 outside it on purpose — the page must load before anyone can type a key, and
 the scraper and the orchestrator do not have one.
 
+So **reachability is the only control over those three**, which makes it the
+edge's problem, and an edge does that job as an allow-list rather than a
+catch-all. `deploy/caddy/Caddyfile` proxies the inference paths and answers 404
+to everything else; the admin site is a separate listener that
+`deploy/compose/stack.yml` does not publish. The Helm ingress does the same
+thing by routing the `public` Service port and omitting the admin one. A
+`handle { reverse_proxy oag-1:8081 }` fallback — which is what the bundled
+Caddyfile used to end with — puts the dashboard and every gauge in `/metrics` on
+the public TLS vhost, and `/admin/api` one key behind it.
+
 Auth is an `x-api-key` header rather than a cookie, so a cross-origin page
 cannot forge a write: it would need to set a custom header, which requires a
 preflight the browser refuses. The dashboard keeps the key in `localStorage`,
@@ -204,9 +214,11 @@ narrows the channel, it does not close it, since nothing in CSP constrains
 top-level navigation.
 
 **With `single_listener: true`** — which Cloud Run and Container Apps force —
-the admin routes are merged onto the public listener, so `disable` and `revoke`
-are internet-reachable and one key is the only thing in the way. Restrict the
-service with ingress rules or IAM; do not rely on the key alone.
+the admin routes are merged onto the public listener and there is no second
+listener to keep off it. `disable` and `revoke` are then reachable with one key;
+the dashboard, `/metrics` and `/health/ready` are reachable with none, because
+they were never behind the key in the first place. Restrict the service with
+ingress rules or IAM. The key is not covering this.
 
 Every write emits one line at `warn` on the `oag::audit` target, naming the
 actor, the action and the subject. `warn` rather than `info` because the log

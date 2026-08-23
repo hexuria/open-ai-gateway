@@ -57,8 +57,14 @@ pub struct ServerConfig {
     /// Some platforms route to exactly **one** container port — Cloud Run and
     /// Azure Container Apps both do — and on those the admin listener is simply
     /// unreachable, which takes `/health/ready` and `/metrics` with it. This
-    /// exists for them. The admin routes still require an admin-role API key;
-    /// what is lost is the second layer, not the first.
+    /// exists for them.
+    ///
+    /// What it costs is not symmetric. `/admin/api` keeps its admin-role key, so
+    /// the writes lose the second layer and keep the first. The dashboard,
+    /// `/metrics` and `/health/ready` sit outside that layer by design and never
+    /// had a first layer to keep, so on a shared port they are simply
+    /// unauthenticated. Restrict the service with the platform's ingress rules
+    /// or IAM; the key is not doing that work for you.
     #[serde(default)]
     pub single_listener: bool,
 }

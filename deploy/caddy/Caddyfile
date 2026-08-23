@@ -1,6 +1,11 @@
-# Edge tier: TLS termination and the admin UI. Internal network only —
-# this gateway is not meant to face the public internet, which is why there is
-# no WAF, no IP reputation, and no challenge page here.
+# Edge tier: TLS termination. Internal network only — this gateway is not meant
+# to face the public internet, which is why there is no WAF, no IP reputation,
+# and no challenge page here.
+#
+# `gateway.internal` is the only vhost `deploy/compose/stack.yml` publishes, so
+# treat it as the reachable surface whatever the network is meant to be. It
+# carries inference and nothing else: an unmatched path is refused here rather
+# than falling through to a backend.
 #
 # Everything in this file that looks fussy is about one thing: not breaking
 # server-sent events. See docs/01-deployment.md §The seven traps.
@@ -17,40 +22,9 @@
 	}
 }
 
-gateway.internal {
-	tls internal
-
-	# ── inference ──────────────────────────────────────────────────────────────
-	# Everything under the API paths goes to the load balancer, which fans out
-	# across gateway replicas.
-	@inference path /v1/* /v1beta/* /chat/* /responses* /embeddings*
-	handle @inference {
-		reverse_proxy envoy:10000 {
-			# Caddy detects text/event-stream and flushes immediately, so
-			# flush_interval is deliberately left unset. Setting it to -1 forces
-			# immediate flushing for *every* response, which also disables the
-			# response-buffering that non-streaming JSON benefits from.
-			transport http {
-				keepalive 5m
-				keepalive_idle_conns 256
-				# Never compress toward the load balancer: it would buffer.
-				compression off
-				# No response deadline. A completion legitimately runs minutes.
-				read_timeout 0
-				write_timeout 0
-			}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
-
-	# ── admin UI and API ───────────────────────────────────────────────────────
-	# Separate upstream port. The load balancer never sees admin traffic, and
-	# the admin listener is never reachable from the inference path.
-	handle {
-		reverse_proxy oag-1:8081
-	}
-
+# Shared by both sites below. A snippet rather than a copy, so the SSE
+# compression trap cannot be fixed on one vhost and left wrong on the other.
+(hardening) {
 	# ── compression ────────────────────────────────────────────────────────────
 	# An allow-list of concrete content types, never `text/*`.
 	#
@@ -80,4 +54,72 @@ gateway.internal {
 		output stdout
 		format json
 	}
+}
+
+gateway.internal {
+	tls internal
+
+	# ── inference ──────────────────────────────────────────────────────────────
+	# Everything under the API paths goes to the load balancer, which fans out
+	# across gateway replicas.
+	#
+	# An allow-list, and it has to stay one: it mirrors `public_router` in
+	# crates/oag-server/src/lib.rs. A route added there and not here is a 404 at
+	# the edge, which is the safe direction to be wrong in.
+	@inference path /v1/* /v1beta/* /chat/* /responses* /embeddings* /models /health/live
+	handle @inference {
+		reverse_proxy envoy:10000 {
+			# Caddy detects text/event-stream and flushes immediately, so
+			# flush_interval is deliberately left unset. Setting it to -1 forces
+			# immediate flushing for *every* response, which also disables the
+			# response-buffering that non-streaming JSON benefits from.
+			transport http {
+				keepalive 5m
+				keepalive_idle_conns 256
+				# Never compress toward the load balancer: it would buffer.
+				compression off
+				# No response deadline. A completion legitimately runs minutes.
+				read_timeout 0
+				write_timeout 0
+			}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Anything else is not served on this vhost.
+	#
+	# This used to be `reverse_proxy oag-1:8081` with a comment claiming the
+	# admin listener was "never reachable from the inference path". It was: the
+	# catch-all put `/`, `/metrics` and `/admin/api/*` on the one published
+	# port, so the dashboard and every gauge in it answered anyone who could
+	# reach 443, and `disable`/`revoke` were one key away. Do not reintroduce a
+	# catch-all here — a fallback that proxies is a fallback that exposes
+	# whatever the next route to exist happens to be.
+	handle {
+		respond 404
+	}
+
+	import hardening
+}
+
+# ── admin UI and API ──────────────────────────────────────────────────────────
+# Its own site on its own port, deliberately not a path on the vhost above.
+# `deploy/compose/stack.yml` publishes 443 and 80 and not this, so the listener
+# exists inside the compose network and nowhere else — the same posture as the
+# Helm ingress, which routes the `public` port and omits the admin one.
+#
+# To reach the dashboard from the host, publish it to loopback on purpose — add
+# `ports: ["127.0.0.1:8443:8443"]` to the caddy service, never `8443:8443`.
+#
+# `/admin/api` authenticates, but `/`, `/metrics` and `/health/ready` do not:
+# the page has to load before an operator can type a key into it, and the
+# scraper and the orchestrator hold none. Reachability is the only control over
+# those three, which is why this listener is where it is.
+https://admin.gateway.internal:8443 {
+	tls internal
+
+	reverse_proxy oag-1:8081
+
+	import hardening
 }

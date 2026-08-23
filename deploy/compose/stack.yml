@@ -67,6 +67,10 @@ services:
   caddy:
     image: caddy:2-alpine
     depends_on: [envoy]
+    # 443 and 80 only. The Caddyfile's admin site listens on 8443 and is
+    # deliberately not published: reachability is the only thing protecting the
+    # dashboard, /metrics and /health/ready, which sit outside the admin key
+    # layer by design. Publish it to loopback if you want it from the host.
     ports: ["443:443", "80:80"]
     volumes:
       - ../caddy/Caddyfile:/etc/caddy/Caddyfile:ro
