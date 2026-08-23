@@ -318,18 +318,9 @@ async fn run_with_escalation(
             // Streaming: the bytes are already on their way to the client, so
             // there is nothing left to judge. See the note on MAX_ESCALATIONS.
             Attempt::Streaming { response, lease } => {
-                return Ok(stream_response(
-                    state,
-                    response,
-                    state.adapter(decision.model.provider)?,
-                    &lease,
-                    auth,
-                    &decision,
-                    request_id,
-                    started,
-                    ingress,
-                    guard,
-                ));
+                return stream_response(
+                    state, response, lease, auth, &decision, request_id, started, ingress, guard,
+                );
             }
             Attempt::Rejected(e) => Err(e),
             Attempt::Collected {
@@ -380,13 +371,17 @@ async fn run_with_escalation(
             // tokens — capture the abandoned attempt now and write it after
             // the served row, so the surviving primary key keeps the answer
             // the client actually got.
+            //
+            // Released here rather than left to the drop, and awaited: the
+            // rung above may pick this same credential, and a release still
+            // in flight would look like a credential with no room.
             if let Ok((_, accumulator, lease)) = &answer {
                 abandoned = Some(meter::abandon(
                     meter_context(auth, &decision, lease, request_id, started, escalations),
                     accumulator,
                     gate,
                 ));
-                select::release(state, lease.account.account_id(), &lease.request_id).await;
+                lease.release().await;
             }
             canonical.model.clone_from(&next.model.upstream_name);
             decision = next;
@@ -412,7 +407,8 @@ async fn run_with_escalation(
         // way: a gate we could not act on is exactly the signal that a rung is
         // mis-set for this workload.
         let ctx = meter_context(auth, &decision, &lease, request_id, started, escalations);
-        select::release(state, lease.account.account_id(), &lease.request_id).await;
+        // Before the ledger write, which is ours rather than the credential's.
+        lease.release().await;
         // `triggering_gate` when we escalated, otherwise whatever this attempt
         // tripped — so the ledger always names the reason, never nothing.
         meter::record_collected(state, &ctx, &accumulator, triggering_gate.or(gate)).await;
@@ -830,20 +826,20 @@ async fn forward_with_failover(
             }
             // Nothing about another credential would help.
             Outcome::Fatal(e) => {
-                select::release(state, account, &lease.request_id).await;
+                lease.release().await;
                 return Err(e);
             }
             // The credential did its job; the *model* would not take the
             // request. Every other credential reaches the same model, so
             // failing over is pointless — hand it up to escalation instead.
             Outcome::Escalate(e) => {
-                select::release(state, account, &lease.request_id).await;
+                lease.release().await;
                 return Ok(Attempt::Rejected(e));
             }
             Outcome::Switch(e) => {
                 tracing::warn!(%request_id, %account, error = %e, "switching credential");
                 last_error = e;
-                select::release(state, account, &lease.request_id).await;
+                lease.release().await;
                 excluded.insert(account);
             }
         }
@@ -1012,55 +1008,60 @@ async fn try_credential(
 }
 
 /// Hand the upstream stream to the client.
+///
+/// Takes the lease by value, and resolves everything that can still fail before
+/// committing it to the pump task. Both of those failures used to happen with
+/// the lease held by somebody else: the adapter lookup `?`d out of the caller
+/// and the renderer returned a response from here, and neither released the
+/// credential's slot — so the slot sat there for the full `SLOT_TTL` while
+/// nothing was in flight. Now they are two `?`s over an owned lease, and the
+/// lease's guard hands the slot back on the way out.
 #[allow(clippy::too_many_arguments)]
 fn stream_response(
     state: &Arc<AppState>,
     response: reqwest::Response,
-    adapter: Arc<dyn oag_upstream::ProviderAdapter>,
-    lease: &select::Lease,
+    lease: select::Lease,
     auth: &oag_store::AuthContext,
     decision: &RoutingDecision,
     request_id: RequestId,
     started: Instant,
     ingress: Dialect,
     guard: crate::shutdown::InFlightGuard,
-) -> Response {
+) -> Result<Response> {
+    let adapter = state.adapter(decision.model.provider)?;
+    let egress = egress_for(ingress, decision, request_id, adapter.framing())?;
+
     // Bounded: a slow client parks the reader instead of buffering the whole
     // response in memory.
     let (tx, rx) = mpsc::channel::<sse::Chunk>(64);
 
     let idle = state.config.gateway.stream_idle_timeout;
     let max = state.config.gateway.max_stream_duration;
-    let account = lease.account.account_id();
-
-    let egress = match egress_for(ingress, decision, request_id, adapter.framing()) {
-        Ok(e) => e,
-        Err(e) => return error_response(&e),
-    };
 
     // A streamed response is delivered as it arrives, so it is never abandoned
     // and never retried: there is only ever one attempt.
-    let ctx = meter_context(auth, decision, lease, request_id, started, 0);
+    let ctx = meter_context(auth, decision, &lease, request_id, started, 0);
 
     let state2 = Arc::clone(state);
-    let lease_id = lease.request_id.clone();
 
     // The pump runs as its own task so it outlives the client's connection.
     // If the client hangs up, this keeps draining and still records what the
     // provider is going to bill us for.
     tokio::spawn(async move {
-        // The guard rides along and is dropped here, when the stream is
-        // genuinely finished — which is what makes the shutdown drain wait for
-        // it rather than exiting out from under it.
+        // Both the guard and the lease ride along and finish here, when the
+        // stream genuinely ends. The guard is what makes the shutdown drain
+        // wait for the stream rather than exiting out from under it; the lease
+        // is what keeps the credential's slot held for exactly as long as it is
+        // really in use.
         let _guard = guard;
         let outcome = sse::pump(response, adapter, tx, idle, max, egress).await;
-        select::release(&state2, account, &lease_id).await;
+        lease.release().await;
         meter::record(&state2, &ctx, &outcome).await;
     });
 
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
 
-    Response::builder()
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
@@ -1071,7 +1072,7 @@ fn stream_response(
         .header("x-oag-tier", decision.tier.name.as_str())
         .header("x-oag-request-id", request_id.to_string())
         .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
 /// Turn a successful response into the attempt the caller returns.
@@ -1541,6 +1542,99 @@ mod tests {
         )
         .expect("supported");
         assert!(matches!(e, sse::Egress::ChatCompletions { .. }));
+    }
+
+    /// A state that dials nothing: `Db::connect` builds a lazy pool and
+    /// `Cache::connect` only opens a redis client, so the adapter lookup these
+    /// tests are about runs long before any backend would.
+    fn state() -> Arc<AppState> {
+        let src = r#"
+database:
+  url: "postgres://oag:oag@127.0.0.1:1/oag"
+redis:
+  url: "redis://127.0.0.1:1"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+"#;
+        let config = oag_core::config::Config::from_yaml(src).expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        Arc::new(AppState::new(config, db, cache).expect("state"))
+    }
+
+    fn auth_context() -> oag_store::AuthContext {
+        oag_store::AuthContext {
+            api_key_id: uuid::Uuid::nil(),
+            principal_id: uuid::Uuid::nil(),
+            route_id: uuid::Uuid::nil(),
+            key_floor_tier: None,
+            admin: false,
+            quota_usd: None,
+            spent_usd: rust_decimal::Decimal::ZERO,
+            principal_budget_usd: None,
+            principal_hard_stop_multiple: rust_decimal::Decimal::ONE,
+            principal_spent_usd: rust_decimal::Decimal::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_adapter_or_egress_error_releases_slot() {
+        // `vertex` is a routable provider with no adapter registered, so the
+        // streaming arm fails *after* a credential has been leased — the same
+        // shape as a dialect pair with no renderer. Both used to return past
+        // every release, stranding the slot for the whole SLOT_TTL; eight of
+        // those on one credential and it answers AtCapacity with nothing in
+        // flight.
+        let state = state();
+        let slots = Arc::new(select::testing::CountingSlots::default());
+
+        let result = stream_response(
+            &state,
+            reqwest::Response::from(http::Response::new("stub")),
+            select::testing::lease(&slots),
+            &auth_context(),
+            &decision_for(oag_core::Provider::Vertex),
+            RequestId::new(),
+            Instant::now(),
+            Dialect::AnthropicMessages,
+            state.lifecycle.track(),
+        );
+
+        assert!(result.is_err(), "there is no adapter for vertex");
+        assert_eq!(slots.settled().await, 1, "and the slot came back");
+    }
+
+    #[tokio::test]
+    async fn a_live_stream_keeps_its_slot_until_the_pump_is_done() {
+        // The other half of it. The lease is moved into the pump task rather
+        // than dropped when the handler returns, because a handler returns as
+        // soon as the headers are decided — releasing there would hand back a
+        // slot that is still streaming, which oversubscribes the credential
+        // rather than merely leaking from it.
+        let state = state();
+        let slots = Arc::new(select::testing::CountingSlots::default());
+
+        // A body that never yields, so the pump is still running when the
+        // assertion below looks.
+        let body = reqwest::Body::wrap_stream(futures_util::stream::pending::<
+            std::result::Result<bytes::Bytes, std::io::Error>,
+        >());
+
+        let result = stream_response(
+            &state,
+            reqwest::Response::from(http::Response::new(body)),
+            select::testing::lease(&slots),
+            &auth_context(),
+            &decision_for(oag_core::Provider::Anthropic),
+            RequestId::new(),
+            Instant::now(),
+            Dialect::AnthropicMessages,
+            state.lifecycle.track(),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(slots.settled().await, 0, "still in flight");
     }
 
     #[test]

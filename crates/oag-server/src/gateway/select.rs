@@ -5,6 +5,8 @@ use oag_core::{AccountId, Error, Provider, Result};
 use oag_pool::{Candidate, SessionKey};
 use oag_store::{AccountRow, repo};
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// How long a conversation stays pinned to a credential without being used.
@@ -20,12 +22,124 @@ const STICKY_TTL: Duration = Duration::from_mins(30);
 /// oversubscribed.
 const SLOT_TTL: Duration = Duration::from_mins(35);
 
+/// Where a concurrency slot goes back to.
+///
+/// A trait only so that [`SlotGuard`]'s `Drop` can be exercised without a
+/// Redis; the one production implementor is [`oag_store::Cache`].
+#[async_trait::async_trait]
+pub trait SlotStore: Send + Sync + 'static {
+    async fn release(&self, account: AccountId, request_id: &str);
+}
+
+#[async_trait::async_trait]
+impl SlotStore for oag_store::Cache {
+    async fn release(&self, account: AccountId, request_id: &str) {
+        // Best-effort. A slot that never gets handed back expires on its own
+        // within [`SLOT_TTL`], which is why the TTL exists — a leaked slot is
+        // bounded, not permanent.
+        if let Err(e) = self.release_slot(account, request_id).await {
+            tracing::debug!(error = %e, "could not release slot; it will expire");
+        }
+    }
+}
+
+/// The concurrency slot a lease holds, given back when the lease is dropped.
+///
+/// The same shape as `InFlightGuard`, for the same reason. Both are counts a
+/// request borrows and has to return, and returning them by an explicit call at
+/// every exit only ever covers the exits somebody remembered — so the streaming
+/// path, which resolves its adapter and its renderer *after* a credential is
+/// already leased, returned past every release. A stranded slot sits there for
+/// the full [`SLOT_TTL`]; eight of them on one credential and it reports itself
+/// `AtCapacity` with nothing in flight.
+///
+/// Held behind an `Arc` by [`Lease`], so a cloned lease releases once, when the
+/// last clone goes. A clone dropped while the original is still streaming would
+/// hand back a slot that is genuinely in use, oversubscribing the credential —
+/// which is worse than leaking one.
+pub struct SlotGuard {
+    store: Arc<dyn SlotStore>,
+    account: AccountId,
+    request_id: String,
+    released: AtomicBool,
+}
+
+impl std::fmt::Debug for SlotGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlotGuard")
+            .field("account", &self.account)
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SlotGuard {
+    async fn release(&self) {
+        if self.released.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.store.release(self.account, &self.request_id).await;
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if *self.released.get_mut() {
+            return;
+        }
+        // Redis is async and `Drop` is not, so the release becomes a task.
+        // Nothing awaits it, and nothing can — the whole job of this drop is to
+        // cover the paths nobody wrote a release on, and a release that never
+        // runs is the same bounded leak the TTL already covers.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!("no runtime to release a slot on; it will expire");
+            return;
+        };
+        let store = Arc::clone(&self.store);
+        let account = self.account;
+        let request_id = std::mem::take(&mut self.request_id);
+        runtime.spawn(async move { store.release(account, &request_id).await });
+    }
+}
+
 /// The chosen credential, plus the slot that has to be given back.
 #[derive(Debug, Clone)]
 pub struct Lease {
     pub account: AccountRow,
     pub request_id: String,
     pub via_sticky: bool,
+    /// Never read: its `Drop` is the whole of it.
+    slot: Arc<SlotGuard>,
+}
+
+impl Lease {
+    /// Give the slot back now, rather than whenever this lease is dropped.
+    ///
+    /// Worth the explicit call wherever the ordering matters, because the drop
+    /// spawns its release and so cannot be ordered against what happens next.
+    /// Escalation needs that ordering: the rung above may pick this very
+    /// credential, and its `acquire_slot` racing our release would either find
+    /// a credential with no room or — both attempts carry the same request id —
+    /// have the slot it just took removed underneath it.
+    pub async fn release(&self) {
+        self.slot.release().await;
+    }
+}
+
+/// A lease over `account`, holding its slot until the last clone is dropped.
+fn leased(state: &AppState, account: AccountRow, request_id: &str, via_sticky: bool) -> Lease {
+    let slot = SlotGuard {
+        store: Arc::new(state.cache.clone()),
+        account: account.account_id(),
+        request_id: request_id.to_owned(),
+        released: AtomicBool::new(false),
+    };
+    Lease {
+        account,
+        request_id: request_id.to_owned(),
+        via_sticky,
+        slot: Arc::new(slot),
+    }
 }
 
 /// Choose a credential for this request.
@@ -61,11 +175,7 @@ pub async fn lease(
     if excluded.is_empty()
         && let Some(row) = try_pinned(state, &rows, &sticky_key, now, request_id).await
     {
-        return Ok(Lease {
-            account: row,
-            request_id: request_id.to_owned(),
-            via_sticky: true,
-        });
+        return Ok(leased(state, row, request_id, true));
     }
 
     // 2. The cascade. Try in order, because the winner may have filled its last
@@ -126,11 +236,7 @@ pub async fn lease(
                 .await;
             metrics::counter!("oag_selection_total", "stage" => format!("{:?}", selection.stage))
                 .increment(1);
-            return Ok(Lease {
-                account: row.clone(),
-                request_id: request_id.to_owned(),
-                via_sticky: false,
-            });
+            return Ok(leased(state, row.clone(), request_id, false));
         }
 
         // Lost the race for the last slot. Drop it and re-run rather than
@@ -150,16 +256,6 @@ pub async fn lease(
         });
     }
     Err(Error::NoCredential { provider })
-}
-
-/// Give the slot back.
-///
-/// Best-effort. If this fails the slot expires on its own within [`SLOT_TTL`],
-/// which is why the TTL exists — a leaked slot is bounded, not permanent.
-pub async fn release(state: &AppState, account: AccountId, request_id: &str) {
-    if let Err(e) = state.cache.release_slot(account, request_id).await {
-        tracing::debug!(error = %e, "could not release slot; it will expire");
-    }
 }
 
 /// Reuse this conversation's pinned credential, if it is still usable.
@@ -238,9 +334,121 @@ fn fastrand_u64() -> u64 {
     x
 }
 
+/// A slot store that counts releases instead of dialling Redis, and a lease
+/// wired to one.
+///
+/// Not inside `tests` because the gateway's own tests need to build a lease and
+/// a lease's guard is private to this module.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::{AccountId, AtomicBool, Lease, SlotGuard, SlotStore};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    pub(crate) struct CountingSlots {
+        released: Arc<AtomicUsize>,
+    }
+
+    impl CountingSlots {
+        /// The release count once the task that `Drop` spawned has had a chance
+        /// to run. A drop cannot await, so a test has to yield to it — and
+        /// keeping the yields going past the first release is what catches a
+        /// second one.
+        pub(crate) async fn settled(&self) -> usize {
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            self.released.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SlotStore for CountingSlots {
+        async fn release(&self, _account: AccountId, _request_id: &str) {
+            self.released.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A lease with no database row behind it.
+    pub(crate) fn lease(store: &Arc<CountingSlots>) -> Lease {
+        let account = oag_store::AccountRow {
+            id: uuid::Uuid::nil(),
+            name: "test".to_owned(),
+            provider: "anthropic".to_owned(),
+            kind: "api_key".to_owned(),
+            credentials_sealed: Vec::new(),
+            credentials_nonce: Vec::new(),
+            token_version: 0,
+            token_expires_at: None,
+            owner_principal_id: None,
+            proxy_url: None,
+            priority: 0,
+            max_concurrency: 1,
+            schedulable: true,
+            cooldown_until: None,
+            rate_limited_until: None,
+            window_resets_at: None,
+            last_used_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        Lease {
+            request_id: "req-1".to_owned(),
+            via_sticky: false,
+            slot: Arc::new(SlotGuard {
+                store: Arc::clone(store) as Arc<dyn SlotStore>,
+                account: account.account_id(),
+                request_id: "req-1".to_owned(),
+                released: AtomicBool::new(false),
+            }),
+            account,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::{CountingSlots, lease as test_lease};
     use super::*;
+
+    #[tokio::test]
+    async fn a_dropped_lease_hands_its_slot_back() {
+        // The whole point of the guard: an early return anywhere between
+        // `lease` and the end of the request gives the slot back, whether or
+        // not whoever wrote that return thought about it.
+        let slots = Arc::new(CountingSlots::default());
+        drop(test_lease(&slots));
+        assert_eq!(slots.settled().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_cloned_lease_hands_its_slot_back_once_the_last_clone_goes() {
+        // Both clones name one slot in Redis. Releasing on the first drop would
+        // hand back a slot the other clone is still streaming through, which
+        // oversubscribes the credential rather than merely leaking from it.
+        let slots = Arc::new(CountingSlots::default());
+        let lease = test_lease(&slots);
+        let clone = lease.clone();
+
+        drop(lease);
+        assert_eq!(slots.settled().await, 0, "the clone still holds the slot");
+
+        drop(clone);
+        assert_eq!(slots.settled().await, 1);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_release_is_not_repeated_when_the_lease_drops() {
+        // Escalation releases explicitly so the next rung can re-lease the same
+        // credential. A second release on drop would be aimed at the *new*
+        // slot, since both attempts carry the same request id.
+        let slots = Arc::new(CountingSlots::default());
+        let lease = test_lease(&slots);
+        lease.release().await;
+        assert_eq!(slots.settled().await, 1);
+
+        drop(lease);
+        assert_eq!(slots.settled().await, 1);
+    }
 
     #[test]
     fn eligibility_matches_the_schedulers_view() {
