@@ -183,6 +183,33 @@ impl ModelRow {
     }
 }
 
+/// One registered capability service.
+///
+/// The catalog stores a pointer, not an implementation. `auth_ref` is a
+/// foreign key into `account` — the existing credential pool — so a service
+/// that needs a secret does not get a second vault.
+#[derive(Debug, Clone, FromRow)]
+pub struct ServiceRow {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub base_url: String,
+    pub health_path: String,
+    pub dashboard_url: Option<String>,
+    pub auth_ref: Option<Uuid>,
+    pub enabled: bool,
+    pub last_ok: Option<OffsetDateTime>,
+    pub last_error: Option<String>,
+    pub created_at: OffsetDateTime,
+}
+
+impl ServiceRow {
+    #[must_use]
+    pub fn service_id(&self) -> oag_core::ServiceId {
+        oag_core::ServiceId::from_uuid(self.id)
+    }
+}
+
 /// A row to append to the ledger.
 #[derive(Debug, Clone)]
 pub struct UsageWrite {

@@ -13,12 +13,17 @@
 //! Every `/admin/api` route is authenticated by one layer applied in
 //! [`crate::admin_routes`] rather than by a call inside each handler, because a
 //! handler that forgets the call is silently public and nothing about it looks
-//! wrong. Reads live here; writes are in [`write`].
+//! wrong. Reads live here; incident writes are in [`write`]; the service
+//! catalog is in [`services`].
 
 pub mod auth;
+pub mod services;
 pub mod write;
 
 pub use auth::{AdminActor, require_admin_layer};
+pub use services::{
+    check_service, create_service, disable_service, enable_service, list_services, update_service,
+};
 pub use write::{clear_cooldown, disable_account, enable_account, revoke_key};
 
 use crate::AppState;
@@ -85,6 +90,14 @@ pub(crate) fn failed(e: &oag_core::Error) -> Response {
         Json(json!({ "error": "query failed" })),
     )
         .into_response()
+}
+
+pub(crate) fn invalid(message: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+}
+
+pub(crate) fn not_found(message: &str) -> Response {
+    (StatusCode::NOT_FOUND, Json(json!({ "error": message }))).into_response()
 }
 
 // Column tuples for the read queries. Named aliases rather than inline tuples

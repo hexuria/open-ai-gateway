@@ -73,6 +73,7 @@ async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }
+url = "2"
 # Money is never f64. Every cost in this system is a Decimal.
 rust_decimal = { version = "1", features = ["serde-with-float", "macros"] }
 

@@ -12,10 +12,12 @@ pub mod error;
 pub mod id;
 pub mod provider;
 pub mod seal;
+pub mod service;
 pub mod tier;
 
 pub use error::{BudgetScope, Disposition, Error, Result};
-pub use id::{AccountId, ApiKeyId, PrincipalId, RequestId, RouteId};
+pub use id::{AccountId, ApiKeyId, PrincipalId, RequestId, RouteId, ServiceId};
 pub use provider::Provider;
 pub use seal::{Kek, Sealed};
+pub use service::{ServiceKind, catalog_url, health_url, ip_is_denied};
 pub use tier::{Tier, TierName};
