@@ -30,7 +30,7 @@ pub async fn messages(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    dispatch(state, headers, body, Dialect::AnthropicMessages).await
+    dispatch(state, headers, body, Dialect::AnthropicMessages, None).await
 }
 
 /// `POST /v1/chat/completions` — the OpenAI-shaped surface.
@@ -42,7 +42,7 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    dispatch(state, headers, body, Dialect::OpenAIChatCompletions).await
+    dispatch(state, headers, body, Dialect::OpenAIChatCompletions, None).await
 }
 
 /// `POST /v1/responses` — OpenAI's newer surface, and the one their current
@@ -52,7 +52,22 @@ pub async fn responses(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    dispatch(state, headers, body, Dialect::OpenAIResponses).await
+    dispatch(state, headers, body, Dialect::OpenAIResponses, None).await
+}
+
+/// What the Gemini dialect carries in the path rather than in the body.
+///
+/// Handed down as an argument. It used to travel *inside* the body: the handler
+/// parsed the client's JSON, assigned `wire["__oag_model"]` and
+/// `wire["__oag_stream"]`, and re-encoded the whole document for `handle` to
+/// read the two fields back out of. Two things were wrong with that. `IndexMut`
+/// on a `serde_json::Value` panics for anything that is not an object or null,
+/// and the re-encode copied a body that may be up to `server.max_body_bytes`
+/// for the sake of two values the handler already had in hand.
+#[derive(Debug, Clone, Copy)]
+struct PathFields<'a> {
+    model: &'a str,
+    stream: bool,
 }
 
 /// `POST /v1beta/models/{model}:generateContent` — the Gemini surface.
@@ -84,23 +99,28 @@ pub async fn gemini_generate(
     }
     let stream = action.starts_with("stream");
 
-    // Re-express the path's model and mode as body fields, so the rest of the
-    // pipeline sees one shape whatever dialect the client used.
-    let mut wire: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return error_response(&Error::Serde(e)),
-    };
-    wire["__oag_model"] = serde_json::Value::String(model.to_owned());
-    wire["__oag_stream"] = serde_json::Value::Bool(stream);
-    let Ok(patched) = serde_json::to_vec(&wire) else {
-        return error_response(&Error::Internal("re-encoding request".to_owned()));
-    };
+    // Every dialect's request is an object, and this is where a body that is not
+    // one is answered rather than assumed. It used to be assumed: the path's
+    // model and mode were written into the parsed body with `IndexMut`, which
+    // panics on any `Value` that is not an object or null — so `[]`, `123`,
+    // `"x"` or `true` aborted the request task. Before `authenticate`, so no key
+    // was needed to do it, and with nothing catching the unwind it severed the
+    // connection instead of answering on it: on HTTP/2 that resets every sibling
+    // stream multiplexed onto the same connection.
+    //
+    // Deserialising into a map *is* the check. Malformed JSON and well-formed
+    // non-objects both fail it, both with a message naming what was wrong, and
+    // both are already a 400 through `Error::Serde`.
+    if let Err(e) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body) {
+        return error_response(&Error::Serde(e));
+    }
 
     dispatch(
         state,
         headers,
-        axum::body::Bytes::from(patched),
+        body,
         Dialect::GeminiGenerateContent,
+        Some(PathFields { model, stream }),
     )
     .await
 }
@@ -110,6 +130,7 @@ async fn dispatch(
     headers: HeaderMap,
     body: axum::body::Bytes,
     ingress: Dialect,
+    path: Option<PathFields<'_>>,
 ) -> Response {
     // The guard is *moved* down the call chain and, for a streamed response,
     // into the task that pumps it. It must outlive the response body, not just
@@ -119,7 +140,7 @@ async fn dispatch(
     let guard = state.lifecycle.track();
     let request_id = RequestId::new();
 
-    match handle(&state, &headers, &body, request_id, ingress, guard).await {
+    match handle(&state, &headers, &body, request_id, ingress, path, guard).await {
         Ok(response) => response,
         Err(e) => {
             metrics::counter!("oag_requests_total", "outcome" => "error").increment(1);
@@ -134,6 +155,7 @@ async fn handle(
     body: &[u8],
     request_id: RequestId,
     ingress: Dialect,
+    path: Option<PathFields<'_>>,
     guard: crate::shutdown::InFlightGuard,
 ) -> Result<Response> {
     let started = Instant::now();
@@ -148,12 +170,12 @@ async fn handle(
         Dialect::OpenAIResponses => oag_proto::responses::parse_request(&wire)?,
         Dialect::GeminiGenerateContent => {
             let mut c = oag_proto::gemini::parse_request(&wire)?;
-            // Recovered from the path by `gemini_generate`.
-            wire["__oag_model"]
-                .as_str()
-                .unwrap_or_default()
-                .clone_into(&mut c.model);
-            c.stream = wire["__oag_stream"].as_bool().unwrap_or(false);
+            // In this dialect the model and the mode are in the path, not the
+            // body, so `gemini_generate` passes them down.
+            if let Some(PathFields { model, stream }) = path {
+                model.clone_into(&mut c.model);
+                c.stream = stream;
+            }
             c
         }
         _ => anthropic::parse_request(&wire)?,

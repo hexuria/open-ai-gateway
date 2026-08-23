@@ -26,9 +26,61 @@ pub use shutdown::Lifecycle;
 pub use state::AppState;
 
 use axum::Router;
+use axum::http::StatusCode;
+use axum::response::IntoResponse as _;
 use axum::routing::{get, patch, post};
 use oag_core::Result;
 use std::sync::Arc;
+
+/// Turn a panic anywhere under a router into a 500 on the connection.
+///
+/// Insurance, not a fix: the fix is for the request path not to panic, and
+/// `clippy::panic` is denied workspace-wide to keep it that way. But that lint
+/// only covers the panics we *write*. It says nothing about an `IndexMut` on a
+/// `serde_json::Value`, a slice index, an arithmetic overflow, or any of the
+/// same inside a dependency — and a gateway is the wrong place to find out which
+/// of those is reachable.
+///
+/// What the layer buys is the difference between an answer and a severed
+/// connection. An unwind that reaches hyper closes the connection without a
+/// response, so the client cannot tell a bug from a network fault; on HTTP/2 it
+/// resets every *other* stream multiplexed onto that connection too, which turns
+/// one caller's malformed request into unrelated callers' failures.
+fn catch_panic() -> tower_http::catch_panic::CatchPanicLayer<PanicIsFiveHundred> {
+    tower_http::catch_panic::CatchPanicLayer::custom(PanicIsFiveHundred)
+}
+
+/// The error envelope every other failure on these surfaces uses, at 500.
+#[derive(Debug, Clone, Copy)]
+struct PanicIsFiveHundred;
+
+impl tower_http::catch_panic::ResponseForPanic for PanicIsFiveHundred {
+    type ResponseBody = axum::body::Body;
+
+    fn response_for_panic(
+        &mut self,
+        err: Box<dyn std::any::Any + Send + 'static>,
+    ) -> axum::http::Response<Self::ResponseBody> {
+        // Logged, never returned. A panic message carries whatever was in scope
+        // — the same reason `Error::Internal` is not surfaced to a client.
+        let detail = err
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| err.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        tracing::error!(panic = detail, "a handler panicked; answering 500");
+        ::metrics::counter!("oag_panics_total").increment(1);
+
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({
+                "type": "error",
+                "error": { "type": "internal_error", "message": "internal error" }
+            })),
+        )
+            .into_response()
+    }
+}
 
 /// The inference routes, without the shared health endpoint.
 fn inference_routes() -> Router<Arc<AppState>> {
@@ -136,6 +188,8 @@ pub fn public_router(state: Arc<AppState>) -> Router {
 
     routes
         .layer(axum::extract::DefaultBodyLimit::max(limit))
+        // Outermost, so it also covers the layers below it.
+        .layer(catch_panic())
         .with_state(state)
 }
 
@@ -143,6 +197,7 @@ pub fn public_router(state: Arc<AppState>) -> Router {
 pub fn admin_router(state: Arc<AppState>) -> Router {
     admin_routes(&state)
         .route("/health/live", get(health::live))
+        .layer(catch_panic())
         .with_state(state)
 }
 
@@ -301,6 +356,95 @@ server:
             .body(Body::empty())
             .expect("request");
         router.oneshot(request).await.expect("response").status()
+    }
+
+    async fn post_status(router: Router, path: &str, body: &'static str) -> StatusCode {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("request");
+        router.oneshot(request).await.expect("response").status()
+    }
+
+    /// Valid JSON that is not an object.
+    ///
+    /// The first four *panicked*. `gemini_generate` re-expressed the path's
+    /// model and mode as body fields by assigning `wire["__oag_model"]`, and
+    /// `IndexMut` on a `serde_json::Value` panics for anything that is not an
+    /// object or null. `null` did not panic — `IndexMut` silently turns it into
+    /// an object — but it is not a request either.
+    const NON_OBJECT_BODIES: [&str; 5] = ["[]", "123", "\"x\"", "true", "null"];
+
+    #[tokio::test]
+    async fn gemini_non_object_body_is_400_not_panic() {
+        // Reached before `authenticate`, so no key was needed to abort a request
+        // task — and with nothing catching the unwind, hyper closed the
+        // connection rather than answering on it, which on HTTP/2 resets every
+        // sibling stream on that connection. The assertion is 400 *and* the
+        // absence of a key: authenticating first would hide the panic behind a
+        // 401 without removing it.
+        for body in NON_OBJECT_BODIES {
+            let got = post_status(
+                public_router(state(false)),
+                "/v1beta/models/gemini-2.5-pro:generateContent",
+                body,
+            )
+            .await;
+            assert_eq!(
+                got,
+                StatusCode::BAD_REQUEST,
+                "a body of {body} must be refused as the client error it is"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streaming_gemini_path_rejects_a_non_object_too() {
+        // The same handler serves both actions, and only one of them was ever
+        // exercised by hand.
+        let got = post_status(
+            public_router(state(false)),
+            "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+            "[]",
+        )
+        .await;
+        assert_eq!(got, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_object_body_still_reaches_authentication() {
+        // The other half of the guard: it must reject the shape the pipeline
+        // cannot read, and nothing else. A well-formed body with no key is a
+        // 401, exactly as before — a guard that answered 400 here would be
+        // rejecting every real request.
+        let got = post_status(
+            public_router(state(false)),
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+        )
+        .await;
+        assert_eq!(got, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_handler_answers_500_rather_than_dropping_the_connection() {
+        // The insurance behind the fix above. `clippy::panic` is denied, which
+        // covers the panics this workspace writes and says nothing about an
+        // `IndexMut`, a slice index, or an overflow in a dependency. Both public
+        // routers carry this layer; the route here is synthetic because, after
+        // the fix, there is no longer a request that panics.
+        async fn boom() -> StatusCode {
+            panic!("boom")
+        }
+
+        let router: Router = Router::new().route("/boom", get(boom)).layer(catch_panic());
+
+        assert_eq!(
+            status(router, "GET", "/boom").await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[tokio::test]
