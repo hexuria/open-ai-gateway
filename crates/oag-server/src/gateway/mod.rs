@@ -11,6 +11,7 @@ pub mod sse;
 pub use authn::{Caller, require_key_layer};
 
 use crate::AppState;
+use crate::breakers::{Breakers, Dispatch};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -867,6 +868,16 @@ async fn try_credential(
 
     let mut last = Error::NoCredential { provider };
 
+    // Claim the breaker here rather than in selection. Selection reads, so a
+    // recovering credential keeps its half-open probe until something is
+    // actually about to be sent to it; the guard hands the probe back if we
+    // return before reaching the wire.
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let Some(mut dispatch) = Dispatch::claim(&state.breakers, account, now) else {
+        // Raced: another request took the probe between the filter and here.
+        return Outcome::Switch(last);
+    };
+
     for attempt in 0..=state.config.gateway.same_account_retries {
         let request = match adapter.build(&oag_upstream::UpstreamRequest {
             canonical,
@@ -891,34 +902,10 @@ async fn try_credential(
             Err(e) => return Outcome::Switch(e),
         };
 
+        dispatch.sent();
         match transport.execute(request).await {
             Ok(response) if response.status().is_success() => {
-                let _ = oag_store::repo::touch_account(&state.db, account).await;
-                state.breakers.record_success(account);
-                metrics::counter!(
-                    "oag_requests_total",
-                    "outcome" => "ok",
-                    "provider" => provider.as_str(),
-                )
-                .increment(1);
-
-                return if canonical.stream {
-                    Outcome::Ok(Box::new(Attempt::Streaming {
-                        response,
-                        lease: lease.clone(),
-                    }))
-                } else {
-                    // The upstream's dialect, which is what its body is in —
-                    // not the client's, which `json_response` converts to.
-                    match sse::collect(response, provider.native_dialect()).await {
-                        Ok((body, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
-                            body,
-                            accumulator,
-                            lease: lease.clone(),
-                        })),
-                        Err(e) => Outcome::Switch(e),
-                    }
-                };
+                return succeeded(state, provider, lease, response, canonical.stream).await;
             }
 
             Ok(response) => {
@@ -947,9 +934,15 @@ async fn try_credential(
                 }
             }
 
+            // Nothing came back at all: connect, TLS, DNS, or a timeout.
             Err(e) => {
                 last = e;
-                if attempt < state.config.gateway.same_account_retries {
+                let retrying = attempt < state.config.gateway.same_account_retries;
+                tracing::warn!(%request_id, %account, error = %last, retrying, "upstream unreachable");
+                if let Some(d) = transport_failure(&state.breakers, account, retrying) {
+                    apply_disposition(state, account, d).await;
+                }
+                if retrying {
                     tokio::time::sleep(backoff(attempt)).await;
                 } else {
                     return Outcome::Switch(last);
@@ -1022,6 +1015,80 @@ fn stream_response(
         .header("x-oag-request-id", request_id.to_string())
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Turn a successful response into the attempt the caller returns.
+///
+/// The body is collected here unless the client asked for a stream: only a
+/// streaming client can be handed the upstream body as it arrives.
+async fn succeeded(
+    state: &Arc<AppState>,
+    provider: oag_core::Provider,
+    lease: &select::Lease,
+    response: reqwest::Response,
+    stream: bool,
+) -> Outcome {
+    let account = lease.account.account_id();
+    let _ = oag_store::repo::touch_account(&state.db, account).await;
+    state.breakers.record_success(account);
+    metrics::counter!(
+        "oag_requests_total",
+        "outcome" => "ok",
+        "provider" => provider.as_str(),
+    )
+    .increment(1);
+
+    if stream {
+        return Outcome::Ok(Box::new(Attempt::Streaming {
+            response,
+            lease: lease.clone(),
+        }));
+    }
+    // The upstream's dialect, which is what its body is in —
+    // not the client's, which `json_response` converts to.
+    match sse::collect(response, provider.native_dialect()).await {
+        Ok((body, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
+            body,
+            accumulator,
+            lease: lease.clone(),
+        })),
+        Err(e) => Outcome::Switch(e),
+    }
+}
+
+/// How long a credential sits out after the transport itself failed.
+///
+/// The same thirty seconds a 5xx gets, for the same reason: the credential is
+/// probably fine and something between us and the provider is not, so the pause
+/// wants to be long enough to stop hammering and short enough to come back.
+const TRANSPORT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Account for a failure that never produced an HTTP status — connect, TLS,
+/// DNS, timeout.
+///
+/// [`Error::disposition`] cannot classify these: all it sees is `Internal`, so
+/// it says fatal, and this path used to skip the breaker entirely as a result.
+/// The consequence is backwards. A credential behind a dead proxy fails
+/// *fastest*, so it always carries the lowest in-flight count, so the
+/// least-loaded stage prefers it over every healthy credential — and it never
+/// trips, because nothing ever records the failures.
+///
+/// Returns the disposition to persist, or `None` while same-credential retries
+/// remain: a cooldown written between two attempts on the same credential would
+/// only be contradicted by the next one.
+fn transport_failure(
+    breakers: &Breakers,
+    account: AccountId,
+    retrying: bool,
+) -> Option<Disposition> {
+    breakers.record_failure(account);
+    if retrying {
+        None
+    } else {
+        Some(Disposition::FailoverAccount {
+            cooldown: TRANSPORT_COOLDOWN,
+        })
+    }
 }
 
 /// Persist what a failure says about a credential.
@@ -1250,6 +1317,43 @@ mod tests {
     #[test]
     fn short_bodies_are_not_truncated() {
         assert_eq!(truncate("brief", 512), "brief");
+    }
+
+    #[test]
+    fn transport_error_records_breaker_failure() {
+        // A credential behind a dead proxy never returns a status, so nothing
+        // on the HTTP path records anything against it. Left unrecorded it
+        // fails fastest, looks idlest, and the least-loaded stage keeps picking
+        // it — for ever, because it never trips.
+        let breakers = Breakers::new();
+        let account = AccountId::new();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+        for _ in 0..64 {
+            transport_failure(&breakers, account, true);
+        }
+        assert!(
+            !breakers.permits(account, now),
+            "a run of unreachable attempts must trip the breaker"
+        );
+        assert_eq!(breakers.open_count(now), 1);
+    }
+
+    #[test]
+    fn a_transport_failure_cools_the_credential_down_once_retries_are_spent() {
+        // Only at the end: a cooldown written between two attempts on the same
+        // credential is contradicted by the very next attempt.
+        let breakers = Breakers::new();
+        let account = AccountId::new();
+
+        assert_eq!(transport_failure(&breakers, account, true), None);
+        assert_eq!(
+            transport_failure(&breakers, account, false),
+            Some(Disposition::FailoverAccount {
+                cooldown: TRANSPORT_COOLDOWN
+            }),
+            "the same failover the HTTP path applies"
+        );
     }
 
     fn decision_for(provider: oag_core::Provider) -> RoutingDecision {

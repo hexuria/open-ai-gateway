@@ -85,7 +85,12 @@ pub async fn lease(
             // credential fails fast, so it always has the lowest in-flight
             // count, so the least-loaded stage actively prefers it. Filtering
             // afterwards would be too late.
-            if !state.breakers.allows(row.account_id(), now) {
+            //
+            // A read, deliberately. We are asking about every candidate and
+            // will send to one; spending a half-open probe here would spend it
+            // on credentials this request never touches. The probe is claimed
+            // where the request is dispatched.
+            if !state.breakers.permits(row.account_id(), now) {
                 continue;
             }
             if let Some(c) = candidate_for(state, row, now).await {
@@ -178,7 +183,7 @@ async fn try_pinned(
     let row = rows.iter().find(|r| r.account_id() == pinned)?;
     let candidate = candidate_for(state, row, now).await?;
 
-    if !is_eligible(&candidate, now) || !state.breakers.allows(pinned, now) {
+    if !is_eligible(&candidate, now) || !state.breakers.permits(pinned, now) {
         return None;
     }
     let acquired = state
