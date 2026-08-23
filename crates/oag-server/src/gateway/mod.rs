@@ -1170,12 +1170,38 @@ async fn apply_disposition(state: &AppState, account: AccountId, d: Disposition)
     }
 }
 
-/// How long the provider asked us to wait, if it said.
+/// The longest a provider's own `Retry-After` may bench one of our credentials.
+///
+/// An hour, and the ceiling matters more than the number. A genuinely day-long
+/// quota costs at most one refused request per hour past this, which the breaker
+/// and the cooldown then absorb — whereas trusting the provider's arithmetic
+/// costs a credential nobody can get back.
+const MAX_RETRY_AFTER: u64 = 3_600;
+
+/// How long the provider asked us to wait, if it said — and if the answer is
+/// usable.
 ///
 /// Only the delta-seconds form. The HTTP-date form is equally legal and no
 /// provider we speak to sends it, and a date read wrongly is worse than no hint
 /// at all — the caller has a sane default and a misparsed one would override it.
+///
+/// Anything outside one second to [`MAX_RETRY_AFTER`] is treated as no header at
+/// all, and that validation is not decoration: this value is *persisted* as
+/// `rate_limited_until`, and `repo::clear_cooldown` deliberately does not clear
+/// that column, so a number we accept here cannot be undone from the admin
+/// surface at all. Somebody has to reach for psql. Two values in the wild:
+///
+/// - **`0`**, which Cloudflare sends in front of several providers. Taken
+///   literally it means "wait no time", so the credential the provider has just
+///   throttled becomes immediately selectable again — strictly worse than the
+///   one-minute default it replaced.
+/// - **an epoch timestamp**, from confusing `Retry-After` with a reset time. In
+///   seconds it benches the credential until the 2080s. In milliseconds it
+///   overflows the `OffsetDateTime` addition in [`apply_disposition`] and takes
+///   the request down with it.
 fn upstream_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    // A negative or fractional value fails this parse and is thereby rejected
+    // too, which is the right answer for both.
     let secs: u64 = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
@@ -1183,7 +1209,9 @@ fn upstream_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::tim
         .trim()
         .parse()
         .ok()?;
-    Some(std::time::Duration::from_secs(secs))
+    (1..=MAX_RETRY_AFTER)
+        .contains(&secs)
+        .then(|| std::time::Duration::from_secs(secs))
 }
 
 /// Exponential backoff, capped.
@@ -1241,20 +1269,23 @@ fn truncate(s: &str, max: usize) -> String {
 /// - **402** is [`Error::BudgetExhausted`], i.e. "you are out of money", which
 ///   sends the caller to top up an account that is fine.
 /// - **403** is "this key may not use this route".
+/// - **407** asks the *client* to authenticate to a proxy it does not know
+///   exists. Ours is the only proxy in the path, configured per credential, so
+///   this is our own configuration failing.
 ///
-/// All three are credential-side, and by the time one reaches here every
-/// credential in the pool has already been tried and failed over. So the honest
-/// answer is the one that says the gateway cannot reach a working upstream: 502.
-/// Not 503 — that is [`Error::NoCredential`] and [`Error::AtCapacity`], both of
-/// which mean "come back shortly" and neither of which is true of a pool whose
-/// keys are all dead.
+/// All four are ours to fix, and by the time one reaches here every credential in
+/// the pool has already been tried and failed over. So the honest answer is the
+/// one that says the gateway cannot reach a working upstream: 502. Not 503 —
+/// that is [`Error::NoCredential`] and [`Error::AtCapacity`], both of which mean
+/// "come back shortly" and neither of which is true of a pool whose keys are all
+/// dead.
 ///
 /// Everything else keeps the provider's status, because everything else is
 /// already about the right party: 400, 413 and 422 are the client's own request,
 /// and 5xx already reads as ours.
 fn client_status_for(upstream: u16) -> StatusCode {
     match upstream {
-        401..=403 => StatusCode::BAD_GATEWAY,
+        401..=403 | 407 => StatusCode::BAD_GATEWAY,
         other => StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_GATEWAY),
     }
 }
@@ -1786,10 +1817,11 @@ security:
     }
 
     #[test]
-    fn no_credential_side_status_is_forwarded_to_the_client() {
-        // 402 is BudgetExhausted and 403 is a route this key may not use. Both
-        // send the caller to fix an account that is fine.
-        for status in [401u16, 402, 403] {
+    fn our_own_credential_failures_are_never_dressed_as_the_clients() {
+        // 402 is BudgetExhausted, 403 is a route this key may not use, and 407
+        // asks the client to authenticate to our proxy. Every one of them sends
+        // the caller to fix something on their side that is already fine.
+        for status in [401u16, 402, 403, 407] {
             let response = error_response(&upstream(status, ""));
             assert_eq!(
                 response.status(),
@@ -1860,6 +1892,102 @@ security:
         );
         assert_eq!(upstream_retry_after(&h), None);
         assert_eq!(upstream_retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn an_unusable_retry_after_is_treated_as_no_header_at_all() {
+        // This number is persisted as `rate_limited_until`, and
+        // `repo::clear_cooldown` deliberately leaves that column alone — so
+        // anything accepted here is a credential no operator can get back
+        // without psql. It used to be accepted verbatim.
+        for (value, why) in [
+            (
+                "0",
+                "Cloudflare sends it, and it un-benches the credential the \
+                 provider just throttled",
+            ),
+            (
+                "1756000000",
+                "an epoch timestamp in seconds holds the credential out until the 2080s",
+            ),
+            (
+                "1756000000000",
+                "the same mistake in milliseconds overflowed the clock and panicked",
+            ),
+            ("-5", "a negative wait is not a wait"),
+            (
+                "86400",
+                "a day is longer than we will hold a credential out on a provider's word",
+            ),
+            ("3601", "one second past the ceiling is still past it"),
+            ("", "no value"),
+            ("later", "not a number"),
+        ] {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(value).expect("a valid header value"),
+            );
+            assert_eq!(
+                upstream_retry_after(&h),
+                None,
+                "Retry-After: {value} — {why}"
+            );
+        }
+
+        // And the edges of what is accepted, so the bound is pinned from both
+        // sides rather than only rejected from one.
+        for secs in [1u64, MAX_RETRY_AFTER] {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(&secs.to_string()).expect("value"),
+            );
+            assert_eq!(
+                upstream_retry_after(&h),
+                Some(std::time::Duration::from_secs(secs))
+            );
+        }
+    }
+
+    #[test]
+    fn no_provider_header_can_bench_a_credential_past_the_ceiling() {
+        // The arithmetic `apply_disposition` performs, without a database
+        // behind it. The millisecond case used to panic on this very addition
+        // and take the request task with it; the second case landed in 2081,
+        // and 0 released the credential immediately.
+        let now = time::OffsetDateTime::now_utc();
+        let ceiling = now + std::time::Duration::from_secs(MAX_RETRY_AFTER);
+
+        for value in [
+            "1756000000000",
+            "1756000000",
+            "0",
+            "-5",
+            "99999999999999999999",
+            "86400",
+            "30",
+        ] {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(value).expect("a valid header value"),
+            );
+
+            // Exactly what `apply_disposition` computes for a rate limit, and
+            // it panics here rather than returning if the wait is absurd.
+            let wait = upstream_retry_after(&h).unwrap_or(std::time::Duration::from_mins(1));
+            let until = now + wait;
+
+            assert!(
+                until > now,
+                "Retry-After: {value} must still hold the credential out for something"
+            );
+            assert!(
+                until <= ceiling,
+                "Retry-After: {value} must not outlast the ceiling"
+            );
+        }
     }
 
     #[test]

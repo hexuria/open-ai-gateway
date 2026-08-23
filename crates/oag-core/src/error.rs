@@ -85,6 +85,11 @@ pub enum Error {
         /// by the time either consumer needs it: the credential's cooldown and
         /// the client's own `Retry-After` are both guesses without it, and a
         /// 429 answered with a guess is a 429 answered badly.
+        ///
+        /// Must already be bounded by whoever builds this. It is added to the
+        /// clock and persisted as a credential's `rate_limited_until`, so an
+        /// unvalidated one either benches a working credential for decades or
+        /// overflows the addition outright. See `upstream_retry_after`.
         retry_after: Option<Duration>,
     },
 
