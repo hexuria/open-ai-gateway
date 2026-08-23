@@ -537,9 +537,7 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
     let frame = match event {
         // Announces the model, and carries the role the rest of the chunks omit.
         StreamEvent::Start { model, usage } => {
-            if !st.model.is_empty() {
-                st.model.clone_from(model);
-            }
+            crate::stream::adopt_model(&mut st.model, model);
             st.usage.merge(usage);
             st.role_sent = true;
             st.chunk(&json!({ "role": "assistant", "content": "" }), None)
@@ -984,6 +982,57 @@ mod tests {
         };
         assert_eq!(idx(&a), 0);
         assert_eq!(idx(&b), 1);
+    }
+
+    #[test]
+    fn openai_start_does_not_overwrite_gateway_model() {
+        // Upstreams that omit the model in their opening frame parse to a
+        // `Start` carrying an empty name, and both the Anthropic and Responses
+        // parsers do exactly that. Guarding on the render state's model rather
+        // than the incoming one inverts the test — the state is built with the
+        // model the client routed on, so it is never empty — and the response
+        // goes out with `"model": ""` on every chunk.
+        let body = |f: &str| -> Value {
+            let raw = f
+                .strip_prefix("data: ")
+                .and_then(|s| s.strip_suffix("\n\n"))
+                .expect("body");
+            serde_json::from_str(raw).expect("json")
+        };
+
+        let mut st = RenderState::new("r", "anthropic/haiku");
+        let frame = render_event(
+            &StreamEvent::Start {
+                model: String::new(),
+                usage: Usage::default(),
+            },
+            &mut st,
+        )
+        .expect("frame");
+        assert_eq!(body(&frame)["model"], "anthropic/haiku");
+
+        // And a subsequent chunk, which reads the same state, agrees.
+        let next = render_event(
+            &StreamEvent::TextDelta {
+                text: "hi".to_owned(),
+            },
+            &mut st,
+        )
+        .expect("frame");
+        assert_eq!(body(&next)["model"], "anthropic/haiku");
+
+        // An upstream that does announce a model is still adopted, matching
+        // the other two dialects.
+        let mut named = RenderState::new("r", "anthropic/haiku");
+        let frame = render_event(
+            &StreamEvent::Start {
+                model: "claude-3-5-haiku-20241022".to_owned(),
+                usage: Usage::default(),
+            },
+            &mut named,
+        )
+        .expect("frame");
+        assert_eq!(body(&frame)["model"], "claude-3-5-haiku-20241022");
     }
 
     #[test]

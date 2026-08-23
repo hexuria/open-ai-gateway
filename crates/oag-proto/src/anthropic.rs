@@ -441,9 +441,7 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
 
     match event {
         StreamEvent::Start { model, usage } => {
-            if !model.is_empty() {
-                st.model.clone_from(model);
-            }
+            crate::stream::adopt_model(&mut st.model, model);
             st.usage.merge(usage);
             st.ensure_started(&mut out);
         }

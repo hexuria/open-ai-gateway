@@ -440,10 +440,29 @@ pub struct RenderState {
     message: Option<(usize, String)>,
     /// Text accumulated in the open message, needed for its `done` events.
     text: String,
-    /// Open tool calls: call id → (item index, item id, accumulated arguments).
-    tools: Vec<(String, usize, String, String)>,
+    /// Open tool calls, in the order they were opened.
+    tools: Vec<ToolCall>,
     usage: Usage,
     finished: bool,
+}
+
+/// An open `function_call` output item.
+///
+/// Named fields rather than a tuple: four of the five are strings, and the
+/// positional form is what let the function name go missing — there was no
+/// obvious slot for it, so the closing frame shipped a literal `""` instead.
+#[derive(Debug, Clone)]
+struct ToolCall {
+    call_id: String,
+    /// This item's index in the output list.
+    index: usize,
+    item_id: String,
+    /// Kept from the opening event because this dialect repeats the function
+    /// name on the item's `done` frame, and that frame is where clients read it
+    /// from — an empty one there leaves them with a call they cannot dispatch.
+    name: String,
+    /// Arguments accumulated across this call's deltas.
+    args: String,
 }
 
 impl RenderState {
@@ -559,9 +578,7 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
 
     match event {
         StreamEvent::Start { model, usage } => {
-            if !model.is_empty() {
-                st.model.clone_from(model);
-            }
+            crate::stream::adopt_model(&mut st.model, model);
             st.usage.merge(usage);
             st.ensure_created(&mut out);
         }
@@ -686,8 +703,13 @@ fn render_tool_start(st: &mut RenderState, out: &mut String, id: &str, name: &st
     let index = st.next_index;
     st.next_index += 1;
     let item_id = format!("fc_{index}");
-    st.tools
-        .push((id.to_owned(), index, item_id.clone(), String::new()));
+    st.tools.push(ToolCall {
+        call_id: id.to_owned(),
+        index,
+        item_id: item_id.clone(),
+        name: name.to_owned(),
+        args: String::new(),
+    });
 
     out.push_str(&RenderState::frame(
         "response.output_item.added",
@@ -709,9 +731,9 @@ fn render_tool_delta(
     id: &str,
     partial_json: &str,
 ) -> Option<()> {
-    let (_, index, item_id, args) = st.tools.iter_mut().find(|(call, ..)| call == id)?;
-    args.push_str(partial_json);
-    let (index, item_id) = (*index, item_id.clone());
+    let call = st.tools.iter_mut().find(|t| t.call_id == id)?;
+    call.args.push_str(partial_json);
+    let (index, item_id) = (call.index, call.item_id.clone());
     out.push_str(&RenderState::frame(
         "response.function_call_arguments.delta",
         &json!({
@@ -724,22 +746,22 @@ fn render_tool_delta(
 
 /// Close a tool call, emitting its assembled arguments.
 fn render_tool_end(st: &mut RenderState, out: &mut String, id: &str) -> Option<()> {
-    let (call_id, index, item_id, args) = st.tools.iter().find(|(call, ..)| call == id)?.clone();
+    let call = st.tools.iter().find(|t| t.call_id == id)?.clone();
     out.push_str(&RenderState::frame(
         "response.function_call_arguments.done",
         &json!({
             "type": "response.function_call_arguments.done",
-            "item_id": item_id, "output_index": index, "arguments": args,
+            "item_id": call.item_id, "output_index": call.index, "arguments": call.args,
         }),
     ));
     out.push_str(&RenderState::frame(
         "response.output_item.done",
         &json!({
             "type": "response.output_item.done",
-            "output_index": index,
+            "output_index": call.index,
             "item": {
-                "id": item_id, "type": "function_call", "status": "completed",
-                "call_id": call_id, "name": "", "arguments": args,
+                "id": call.item_id, "type": "function_call", "status": "completed",
+                "call_id": call.call_id, "name": call.name, "arguments": call.args,
             }
         }),
     ));
@@ -1135,6 +1157,46 @@ mod tests {
             first_done < second_added,
             "the message item must close before the tool item opens: {names:?}"
         );
+    }
+
+    #[test]
+    fn responses_output_item_done_carries_function_name() {
+        // Clients in this dialect read the function name off the item's `done`
+        // frame — it is the one that reports the item complete — so dropping it
+        // there hands them a finished call they cannot dispatch, even though
+        // the `added` frame minutes earlier had the name.
+        let mut st = RenderState::new("r", "m");
+        let raw: String = [
+            StreamEvent::ToolUseStart {
+                id: "call_1".into(),
+                name: "read_file".into(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_1".into(),
+                partial_json: r#"{"path":"a.rs"}"#.into(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_1".into(),
+            },
+        ]
+        .iter()
+        .filter_map(|e| render_event(e, &mut st))
+        .collect();
+
+        let items: Vec<Value> = raw
+            .split("\n\n")
+            .filter(|f| !f.trim().is_empty())
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .map(|d| serde_json::from_str(d).expect("valid json"))
+            .filter(|v: &Value| v["type"] == "response.output_item.done")
+            .collect();
+
+        assert_eq!(items.len(), 1, "the tool item closes exactly once");
+        let item = &items[0]["item"];
+        assert_eq!(item["name"], "read_file");
+        assert_eq!(item["call_id"], "call_1");
+        assert_eq!(item["arguments"], r#"{"path":"a.rs"}"#);
+        assert_eq!(item["status"], "completed");
     }
 
     #[test]
