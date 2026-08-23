@@ -216,10 +216,12 @@ pub struct UsageWrite {
     pub request_id: Uuid,
     /// Which forwarding attempt this row accounts for, counted from zero.
     ///
-    /// Part of the ledger's key, because one client request can pay for two
-    /// attempts when a quality gate abandons a cheap answer and retries a rung
-    /// up. Keyed on the request id alone, the second write conflicted with the
-    /// first and was silently dropped.
+    /// One client request can pay for two when a quality gate abandons a cheap
+    /// answer and retries a rung up. Recorded and uniquely indexed now, but not
+    /// yet part of the ledger's primary key: while that is still `request_id`
+    /// alone, the second attempt's write is dropped rather than kept. Dropping
+    /// the key here instead would break the previous release mid-deploy, so it
+    /// waits for a contract release of its own.
     pub attempt: i16,
     pub principal_id: Option<Uuid>,
     pub api_key_id: Option<Uuid>,

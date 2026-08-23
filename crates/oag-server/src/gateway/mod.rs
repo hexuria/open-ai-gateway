@@ -286,10 +286,29 @@ async fn run_with_escalation(
     // the final attempt's gate would leave this empty on exactly the rows where
     // it matters, because a successful escalation trips no gate.
     let mut triggering_gate: Option<oag_router::QualityGate> = None;
+    // The attempt a gate condemned, waiting to be metered. Held rather than
+    // written on the spot: the served row has to reach the ledger first, because
+    // until the primary key contracts onto `(request_id, attempt)` only the
+    // first row for a request survives.
+    let mut abandoned: Option<meter::Abandoned> = None;
 
     loop {
         let attempt =
-            forward_with_failover(state, auth, &decision, canonical, session, request_id).await?;
+            match forward_with_failover(state, auth, &decision, canonical, session, request_id)
+                .await
+            {
+                Ok(attempt) => attempt,
+                // The retry died, so there is no served row to come — but the
+                // attempt we abandoned to make it was still generated and
+                // invoiced. Failing the request does not make that spend go
+                // away, and this is the last chance to record it.
+                Err(e) => {
+                    if let Some(abandoned) = &abandoned {
+                        meter::record_abandoned(state, abandoned).await;
+                    }
+                    return Err(e);
+                }
+            };
 
         let (body, accumulator, lease) = match attempt {
             // Streaming: the bytes are already on their way to the client, so
@@ -346,20 +365,18 @@ async fn run_with_escalation(
 
             // The abandoned attempt is not free. The provider generated those
             // tokens and will invoice them long before our quality gate had an
-            // opinion, so the row goes in the ledger for the model that
-            // produced it — otherwise escalation looks costless and the number
-            // that would justify moving a rung never appears anywhere.
-            let abandoned = meter::Context {
-                request_id,
-                auth: auth.clone(),
-                decision: decision.clone(),
-                account: lease.account.account_id(),
-                started,
-                attempt: i16::from(escalations),
-            };
+            // opinion, so it is owed a row against the model that produced it —
+            // otherwise escalation looks costless and the number that would
+            // justify moving a rung never appears anywhere. Captured now, while
+            // its usage and latency are still its own, and written after the
+            // answer we serve.
+            abandoned = Some(meter::abandon(
+                meter_context(auth, &decision, &lease, request_id, started, escalations),
+                &accumulator,
+                gate,
+            ));
 
             select::release(state, lease.account.account_id(), &lease.request_id).await;
-            meter::record_abandoned(state, &abandoned, &accumulator, gate).await;
 
             canonical.model.clone_from(&next.model.upstream_name);
             decision = next;
@@ -380,20 +397,42 @@ async fn run_with_escalation(
         // Either it was fine, or nothing better exists. Record the gate either
         // way: a gate we could not act on is exactly the signal that a rung is
         // mis-set for this workload.
-        let ctx = meter::Context {
-            request_id,
-            auth: auth.clone(),
-            decision: decision.clone(),
-            account: lease.account.account_id(),
-            started,
-            attempt: i16::from(escalations),
-        };
+        let ctx = meter_context(auth, &decision, &lease, request_id, started, escalations);
         select::release(state, lease.account.account_id(), &lease.request_id).await;
         // `triggering_gate` when we escalated, otherwise whatever this attempt
         // tripped — so the ledger always names the reason, never nothing.
         meter::record_collected(state, &ctx, &accumulator, triggering_gate.or(gate)).await;
+        // Second, and only ever second: this is the row the surviving primary key
+        // drops, and the served one above is the row that must not be dropped.
+        if let Some(abandoned) = &abandoned {
+            meter::record_abandoned(state, abandoned).await;
+        }
 
         return Ok(json_response(&body, &decision, request_id, ingress));
+    }
+}
+
+/// What the ledger needs about one forwarding attempt.
+///
+/// Built in one place because an attempt is metered from three: the streamed
+/// path, the collected path, and the attempt a quality gate abandons. A second
+/// copy of this literal is how one of them ends up attributing spend to the
+/// wrong account.
+fn meter_context(
+    auth: &oag_store::AuthContext,
+    decision: &RoutingDecision,
+    lease: &select::Lease,
+    request_id: RequestId,
+    started: Instant,
+    attempt: u8,
+) -> meter::Context {
+    meter::Context {
+        request_id,
+        auth: auth.clone(),
+        decision: decision.clone(),
+        account: lease.account.account_id(),
+        started,
+        attempt: i16::from(attempt),
     }
 }
 
@@ -949,16 +988,9 @@ fn stream_response(
         Err(e) => return error_response(&e),
     };
 
-    let ctx = meter::Context {
-        request_id,
-        auth: auth.clone(),
-        decision: decision.clone(),
-        account,
-        started,
-        // A streamed response is delivered as it arrives, so it is never
-        // abandoned and never retried: there is only ever one attempt.
-        attempt: 0,
-    };
+    // A streamed response is delivered as it arrives, so it is never abandoned
+    // and never retried: there is only ever one attempt.
+    let ctx = meter_context(auth, decision, lease, request_id, started, 0);
 
     let state2 = Arc::clone(state);
     let lease_id = lease.request_id.clone();

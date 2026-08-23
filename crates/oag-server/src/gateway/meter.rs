@@ -22,6 +22,9 @@ pub struct Context {
     /// One client request can pay for two: a quality gate can abandon a cheap
     /// answer and retry a rung up. Both are real spend, so both need a row, and
     /// the request id alone cannot tell them apart.
+    ///
+    /// Recorded now, load-bearing after the ledger's primary key contracts onto
+    /// `(request_id, attempt)`. Until then the second row is dropped.
     pub attempt: i16,
 }
 
@@ -88,12 +91,25 @@ fn usage_write(
     let cost = ctx.decision.model.pricing.cost(&usage);
 
     // What the same tokens would have cost on the route's top rung. The
-    // difference, summed, is the number that justifies the gateway.
-    let counterfactual = ctx
-        .decision
-        .ceiling_model
-        .as_ref()
-        .map_or(cost, |m| m.pricing.cost(&usage));
+    // difference, summed, is the number that justifies the gateway — which is
+    // why an abandoned attempt gets none of it. There is one baseline per client
+    // request, and the served row already carries it; giving the attempt we
+    // threw away a second full-price baseline would book its wasted cost as
+    // savings, so the requests that cost us the most extra would be the ones
+    // reporting that they saved the most.
+    let (counterfactual, counterfactual_model) = match fate {
+        Fate::Served => (
+            ctx.decision
+                .ceiling_model
+                .as_ref()
+                .map_or(cost, |m| m.pricing.cost(&usage)),
+            ctx.decision
+                .ceiling_model
+                .as_ref()
+                .map(|m| m.id.as_str().to_owned()),
+        ),
+        Fate::Abandoned => (Decimal::ZERO, None),
+    };
 
     // `escalated_from_tier` is set only when we actually climbed a rung;
     // `escalation_gate` is set whenever a gate tripped. Keeping them separate
@@ -126,11 +142,7 @@ fn usage_write(
         usage,
         cost_usd: cost,
         counterfactual_usd: counterfactual,
-        counterfactual_model_id: ctx
-            .decision
-            .ceiling_model
-            .as_ref()
-            .map(|m| m.id.as_str().to_owned()),
+        counterfactual_model_id: counterfactual_model,
         status: if outcome.error.is_some() { 502 } else { 200 },
         latency_ms: i32::try_from(outcome.total.as_millis()).ok(),
         ttft_ms: outcome.ttft.and_then(|d| i32::try_from(d.as_millis()).ok()),
@@ -153,6 +165,31 @@ pub async fn record_collected(
     record_with_gate(state, ctx, &outcome, gate, false, Fate::Served).await;
 }
 
+/// An attempt the quality gate condemned, captured at the moment we gave up on
+/// it and held until the request it belongs to is finished.
+///
+/// Captured rather than written there and then because of when it has to reach
+/// the ledger, not what it contains. Until the primary key is contracted onto
+/// `(request_id, attempt)`, only the first row for a request survives — and the
+/// row that has to survive is the one the client was served. Captured here, its
+/// latency and usage are still its own rather than the retry's.
+#[derive(Debug, Clone)]
+pub struct Abandoned {
+    ctx: Context,
+    outcome: StreamOutcome,
+    gate: oag_router::QualityGate,
+}
+
+/// Take note of an attempt we are about to abandon.
+pub fn abandon(
+    ctx: Context,
+    accumulator: &oag_proto::StreamAccumulator,
+    gate: oag_router::QualityGate,
+) -> Abandoned {
+    let outcome = collected(&ctx, accumulator);
+    Abandoned { ctx, outcome, gate }
+}
+
 /// Record an attempt we paid for and then threw away.
 ///
 /// The provider generated those tokens and will invoice them; the quality gate
@@ -162,15 +199,19 @@ pub async fn record_collected(
 ///
 /// The row carries the client's request id, so it stays attributable to the one
 /// request that was made, and `attempt` plus a `selection_reason` of
-/// `abandoned` separate it from the answer that was actually served.
-pub async fn record_abandoned(
-    state: &AppState,
-    ctx: &Context,
-    accumulator: &oag_proto::StreamAccumulator,
-    gate: oag_router::QualityGate,
-) {
-    let outcome = collected(ctx, accumulator);
-    record_with_gate(state, ctx, &outcome, Some(gate), false, Fate::Abandoned).await;
+/// `abandoned` separate it from the answer that was actually served. Until the
+/// ledger's key contracts, this write loses to the served row it follows and is
+/// dropped; the served row is the one that must not be.
+pub async fn record_abandoned(state: &AppState, abandoned: &Abandoned) {
+    record_with_gate(
+        state,
+        &abandoned.ctx,
+        &abandoned.outcome,
+        Some(abandoned.gate),
+        false,
+        Fate::Abandoned,
+    )
+    .await;
 }
 
 /// The outcome of a response that arrived in one piece.
@@ -340,7 +381,22 @@ mod tests {
                 tier: oag_core::Tier::new("cheap", 0),
                 reason: SelectionReason::Classified,
                 capability_escalated_from: None,
-                ceiling_model: None,
+                // Ten times the price, so a row that wrongly claims the full
+                // baseline is visibly different from one that claims none.
+                ceiling_model: Some(ModelSpec {
+                    id: ModelId::new("frontier/big"),
+                    provider: oag_core::Provider::Anthropic,
+                    upstream_name: "big".to_owned(),
+                    pricing: Pricing {
+                        input_per_mtok: Decimal::TEN,
+                        output_per_mtok: Decimal::TEN,
+                        cache_read_per_mtok: None,
+                        cache_write_per_mtok: None,
+                    },
+                    context_window: 1_000,
+                    max_output_tokens: 100,
+                    capabilities: Capabilities::default(),
+                }),
             },
             account: oag_core::AccountId::from_uuid(Uuid::new_v4()),
             started: Instant::now(),
@@ -416,6 +472,29 @@ mod tests {
         assert!(
             abandoned.cost_usd > Decimal::ZERO,
             "escalation is not free, and the ledger has to say so"
+        );
+
+        // The savings figure is `SUM(counterfactual - cost)`, so a baseline on
+        // the abandoned row is not a harmless duplicate: it books the cost of
+        // the answer we threw away as money saved. Escalated requests, the ones
+        // that cost the most extra, would report saving the most.
+        assert_eq!(
+            abandoned.counterfactual_usd,
+            Decimal::ZERO,
+            "there is one baseline per client request, and the served row has it"
+        );
+        assert_eq!(abandoned.counterfactual_model_id, None);
+        assert!(
+            served.counterfactual_usd > served.cost_usd,
+            "the served row still carries the real baseline"
+        );
+        assert_eq!(
+            served.counterfactual_model_id.as_deref(),
+            Some("frontier/big")
+        );
+        assert!(
+            served.counterfactual_usd - served.cost_usd - abandoned.cost_usd > Decimal::ZERO,
+            "and the two rows together net out to a saving, not an invented one"
         );
     }
 }

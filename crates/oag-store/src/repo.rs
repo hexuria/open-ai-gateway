@@ -310,8 +310,17 @@ pub async fn store_credentials(
 
 /// Append to the usage ledger.
 ///
-/// `ON CONFLICT DO NOTHING` on the request id makes metering idempotent: a
-/// retried write after a partial failure conflicts instead of billing twice.
+/// `ON CONFLICT DO NOTHING` makes metering idempotent: a retried write after a
+/// partial failure conflicts instead of billing twice.
+///
+/// Deliberately with no conflict target, which is the only form that is correct
+/// on both sides of the ledger's key change. Naming one is naming an index that
+/// has to exist: `(request_id)` breaks the moment the primary key is contracted
+/// away, and `(request_id, attempt)` breaks on any database that has not had
+/// that index built yet — either way with 42P10, mid-deploy, on the write that
+/// carries the spend. Untargeted, every unique constraint is an arbiter, so
+/// while the primary key survives a second attempt is silently dropped, and once
+/// it is gone the same statement starts keeping both rows with no code change.
 pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
     sqlx::query(
         r"
@@ -322,7 +331,7 @@ pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
             cost_usd, counterfactual_usd, counterfactual_model_id,
             status, latency_ms, ttft_ms, streamed
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
-        ON CONFLICT (request_id, attempt) DO NOTHING
+        ON CONFLICT DO NOTHING
         ",
     )
     .bind(w.request_id)
@@ -1051,14 +1060,49 @@ mod tests {
         );
     }
 
+    /// The expand half of expand/contract, which is what this release ships.
+    ///
+    /// The column and a unique `(request_id, attempt)` index are added; the
+    /// primary key on `request_id` alone survives, because the previous release
+    /// is still serving during a rolling deploy and its metering names
+    /// `ON CONFLICT (request_id)`. So a second attempt for one request does not
+    /// reach the ledger yet — and what matters is that it is *dropped* rather
+    /// than raised. An error here would fail the write carrying the served
+    /// attempt's spend, which is worse than the row we are missing.
+    ///
+    /// Both rows start landing when a later release drops the primary key. No
+    /// code changes then: the untargeted `ON CONFLICT DO NOTHING` simply has one
+    /// fewer arbiter to conflict with.
     #[tokio::test]
-    async fn both_attempts_of_an_escalated_request_reach_the_ledger() {
+    async fn a_second_attempt_is_dropped_rather_than_erroring_while_the_old_key_survives() {
         let Some(db) = test_db() else {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
             return;
         };
         db.migrate().await.expect("migrate");
         let (principal, route, account) = seed(&db).await;
+
+        // The rolling-deploy guard, and the reason this test exists at all.
+        // Drop this key and every insert from the previous release fails with
+        // 42P10 — for the whole overlap window, and again after a rollback.
+        let pk: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+             WHERE conname = 'usage_event_pkey'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("the previous release still meters against this key");
+        assert_eq!(pk, "PRIMARY KEY (request_id)");
+
+        // And the index the contract release will key on, built ahead of it.
+        let wide: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes
+             WHERE indexname = 'usage_event_request_attempt_key'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("the wider key exists before anything depends on it");
+        assert!(wide.contains("UNIQUE"), "must be unique to be an arbiter");
 
         let raw = format!("meter-{}", Uuid::new_v4());
         let key: Uuid = sqlx::query_scalar(
@@ -1104,29 +1148,34 @@ mod tests {
             streamed: false,
         };
 
-        record_usage(&db, &write(0, "abandoned", "0.25"))
-            .await
-            .expect("abandoned attempt");
+        // Production order: the answer the client was served goes first,
+        // precisely because it is the one that must survive the old key.
         record_usage(&db, &write(1, "escalated", "1.75"))
             .await
             .expect("served attempt");
+        record_usage(&db, &write(0, "abandoned", "0.25"))
+            .await
+            .expect("a dropped row is not an error");
 
-        let (rows, spend): (i64, Decimal) = sqlx::query_as(
-            "SELECT count(*), coalesce(sum(cost_usd), 0) FROM usage_event WHERE request_id = $1",
+        let (rows, reason): (i64, String) = sqlx::query_as(
+            "SELECT count(*), min(selection_reason) FROM usage_event WHERE request_id = $1",
         )
         .bind(request_id)
         .fetch_one(db.pool())
         .await
         .expect("read back");
 
-        // Keyed on the request id alone, the second write conflicted with the
-        // first and `DO NOTHING` discarded it — so one attempt's spend was
-        // absent from the ledger while the invoice still charged for it.
-        assert_eq!(rows, 2, "one row per attempt");
-        assert_eq!(spend.to_string(), "2.00000000", "both attempts are billed");
+        assert_eq!(
+            rows, 1,
+            "the surviving primary key admits one row per request"
+        );
+        assert_eq!(
+            reason, "escalated",
+            "and it has to be the answer the client got, not the one we discarded"
+        );
 
-        // Per-attempt, not per-request: idempotence is what stops a retried
-        // write from double-billing, and it has to survive the wider key.
+        // Idempotence is the reason the conflict clause is there in the first
+        // place, and it must outlive the key change.
         record_usage(&db, &write(1, "escalated", "1.75"))
             .await
             .expect("replay");
@@ -1136,6 +1185,6 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .expect("count");
-        assert_eq!(rows, 2, "a replayed write is still a no-op");
+        assert_eq!(rows, 1, "a replayed write is still a no-op");
     }
 }
