@@ -186,6 +186,9 @@ pub async fn pump(
                 error = Some(format!("upstream idle for {}s", idle_timeout.as_secs()));
                 break;
             }
+            // The body ended. Whether that was the end of the *answer* is not
+            // knowable here — the last frame may still be in `pending` — so it
+            // is judged after the loop, from the terminal event.
             Ok(None) => break,
             Ok(Some(Err(e))) => {
                 error = Some(format!("upstream read failed: {e}"));
@@ -247,13 +250,35 @@ pub async fn pump(
         let _ = fold_payloads(&payloads, &adapter, &mut acc, &mut render);
     }
 
+    // Whether the response reached its own end. Every dialect marks that with a
+    // terminal event, so this — and not how the read loop happened to exit — is
+    // what decides whether the client is owed a sentinel or an error.
+    //
+    // Read after the tail fold, because the frame carrying the terminal event
+    // can be the one that completes exactly at EOF.
+    let complete = acc.stop_reason().is_some();
+
+    // An upstream that closes cleanly before the terminal event has truncated
+    // the answer, and nothing in the loop can tell: the read simply ends, the
+    // same way it ends on success. Unnamed here, that is the whole bug — a
+    // partial answer handed to the client stamped complete.
+    if error.is_none() && !complete {
+        error = Some("upstream closed before the response was complete".to_owned());
+    }
+
     // A stream that died mid-flight has to say so on the wire. Otherwise the
     // client sees a truncated answer it has no way to distinguish from a short
     // one, or — for every dialect whose stream simply stops — waits for a
     // terminal event that is never coming and hangs until its own timeout,
     // while the ledger records the 502 nobody was told about.
-    if let Some(message) = &error
+    //
+    // Only when the response never completed. A connection that drops *after*
+    // the terminal event cost the client nothing, and an error appended to an
+    // answer it has already seen end is a contradiction it has to resolve
+    // alone.
+    if !complete
         && !client_gone
+        && let Some(message) = &error
         && let Some(frame) = error_frame(&egress, &mut render, message)
     {
         let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
@@ -264,11 +289,11 @@ pub async fn pump(
     // client waits for a [DONE] that never arrives and hangs until its own
     // timeout — which looks exactly like a slow model.
     //
-    // Only on success: in this dialect `[DONE]` means the stream ended
-    // normally, so sending it after a failure reports the truncated answer as
-    // complete — and a client that already read the error chunk then has to
-    // decide which of two contradictory frames to believe.
-    if !client_gone && error.is_none() && matches!(egress, Egress::ChatCompletions { .. }) {
+    // Gated on the response being complete rather than on the read having gone
+    // well: `[DONE]` asserts that this answer is whole, which stays true after
+    // a terminal event however the connection then behaved, and is false before
+    // one however tidily the upstream hung up.
+    if !client_gone && complete && matches!(egress, Egress::ChatCompletions { .. }) {
         let _ = tx
             .send(Ok(bytes::Bytes::from(oag_proto::openai::done_frame())))
             .await;
@@ -614,6 +639,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_eof_without_a_terminal_event_is_a_failure() {
+        // The quiet half of the same bug: the upstream closes the connection
+        // tidily, mid-answer. The read loop cannot tell that from success — it
+        // just ends — so it fell through to [DONE] and stamped a truncated
+        // answer complete, which is the one failure a client cannot detect.
+        let (tx, mut rx) = mpsc::channel(16);
+        let outcome = pump(
+            streamed(vec![sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an "}}"#,
+            )]),
+            anthropic(),
+            tx,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Egress::ChatCompletions {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(
+            outcome.error.is_some(),
+            "a stream with no terminal event did not succeed"
+        );
+        let sent = drain(&mut rx).await;
+        assert!(
+            !sent.contains("[DONE]"),
+            "a truncated answer must not claim to be whole: {sent}"
+        );
+        assert!(
+            sent.contains("upstream_error"),
+            "the client is told: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_stream_ends_with_an_error_in_anthropic_s_dialect() {
+        // Same cause, and the dialect with no sentinel to get wrong: here the
+        // stream simply stopped, so the client waited for message_stop until its
+        // own timeout.
+        let (tx, mut rx) = mpsc::channel(16);
+        let outcome = pump(
+            streamed(vec![sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an "}}"#,
+            )]),
+            anthropic(),
+            tx,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Egress::AnthropicMessages {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(outcome.error.is_some());
+        let sent = drain(&mut rx).await;
+        assert!(sent.contains("event: error"), "silence is the bug: {sent}");
+        assert!(
+            !sent.contains("message_stop"),
+            "and this answer did not end normally: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_error_after_the_terminal_event_still_completes_the_stream() {
+        // The inverse, and a regression the error frame introduced: the answer
+        // was whole and the connection dropped on the way out. Treating that as
+        // a stream failure appends an error to a response the client has
+        // already seen end, and withholds the sentinel it is waiting for.
+        let (tx, mut rx) = mpsc::channel(16);
+        let outcome = pump(
+            failing(vec![sse(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+            )]),
+            anthropic(),
+            tx,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Egress::ChatCompletions {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(
+            outcome.error.is_some(),
+            "the transport failure is still recorded"
+        );
+        let sent = drain(&mut rx).await;
+        assert!(
+            sent.contains("[DONE]"),
+            "a complete answer keeps its sentinel: {sent}"
+        );
+        assert!(
+            !sent.contains("upstream_error"),
+            "and gains no frame contradicting it: {sent}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_clean_stream_still_ends_with_done() {
         // The other half of the gate: withholding [DONE] on failure must not
         // withhold it on success, or every healthy translated stream hangs.
@@ -698,7 +827,12 @@ mod tests {
             "the overflow, not the watchdog, ended it: {:?}",
             outcome.error
         );
-        assert!(!drain(&mut rx).await.contains("[DONE]"));
+        let sent = drain(&mut rx).await;
+        assert!(!sent.contains("[DONE]"));
+        assert!(
+            sent.contains("without completing an event"),
+            "the client is told why it stopped: {sent}"
+        );
     }
 
     /// One SSE frame carrying `payload`.
@@ -711,6 +845,18 @@ mod tests {
         into_response(futures_util::stream::iter(
             chunks.into_iter().map(Ok::<_, std::io::Error>),
         ))
+    }
+
+    /// The same, but the body fails after the last chunk — what a connection
+    /// reset partway through looks like from here.
+    fn failing(chunks: Vec<bytes::Bytes>) -> reqwest::Response {
+        into_response(
+            futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>)).chain(
+                futures_util::stream::once(async {
+                    Err(std::io::Error::other("connection reset by peer"))
+                }),
+            ),
+        )
     }
 
     /// The same, but the body hangs after the last chunk rather than ending —
