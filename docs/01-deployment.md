@@ -163,6 +163,13 @@ The gateway refuses to boot without `security.signing_secret` and
 sub2api generates its equivalents per instance when the environment does not
 supply them, so replica A mints tokens replica B rejects.
 
+`signing_secret` also authenticates the shared auth cache in Redis, so a replica
+holding a different one still authenticates correctly — it just ignores the
+others' cache entries and reads Postgres instead. Rotating the secret is
+therefore safe and needs no flush: every existing entry stops verifying, and the
+in-process caches age out within 15s. There is no dual-secret window, so plan on
+one cold cache after a rotation.
+
 **Concurrency slots expire by TTL and nothing else.** sub2api runs a cleanup at
 every boot that removes every Redis slot not carrying the current process's
 randomly-regenerated prefix — which, with more than one replica, removes every

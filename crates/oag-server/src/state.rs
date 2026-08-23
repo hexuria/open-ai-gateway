@@ -95,7 +95,12 @@ impl AppState {
         }
 
         Ok(Self {
-            auth: AuthCache::new(db.clone(), cache.clone(), 10_000),
+            auth: AuthCache::new(
+                db.clone(),
+                cache.clone(),
+                10_000,
+                &config.security.signing_secret,
+            ),
             transports: TransportPool::new(2_048, Duration::from_mins(15), Duration::from_secs(10)),
             config: Arc::new(config),
             db,

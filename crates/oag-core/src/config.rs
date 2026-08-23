@@ -130,7 +130,11 @@ pub struct RedisConfig {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
-    /// Signs admin session tokens. Must be identical across replicas.
+    /// Signs admin session tokens, and authenticates the Redis auth cache so a
+    /// planted entry cannot pass for an identity. Must be identical across
+    /// replicas: one that disagrees ignores the others' cache writes and falls
+    /// back to Postgres, which is correct but needlessly expensive. Changing it
+    /// invalidates every cached auth entry rather than requiring a flush.
     pub signing_secret: String,
     /// Key-encryption key for sealing upstream credentials at rest,
     /// base64-encoded, 32 bytes. Must be identical across replicas.

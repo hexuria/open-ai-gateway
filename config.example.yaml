@@ -46,6 +46,10 @@ security:
   # replica A mints tokens replica B rejects — an intermittent auth failure
   # that looks like anything but a config problem.
   #
+  # signing_secret also authenticates the auth cache in Redis, so an entry
+  # planted there cannot pass for an identity. Changing it invalidates that
+  # cache — safe, and costs one cold cache.
+  #
   #   openssl rand -base64 48   # signing_secret
   #   openssl rand -base64 32   # credential_kek
   signing_secret: "REPLACE_ME"
