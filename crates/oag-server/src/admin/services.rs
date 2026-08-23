@@ -83,7 +83,7 @@ pub async fn create_service(
 ) -> Response {
     let validated = match validate(&input, true) {
         Ok(v) => v,
-        Err(e) => return invalid(&e.to_string()),
+        Err(e) => return invalid_err(&e),
     };
     let id = Uuid::now_v7();
     let row = match repo::insert_service(
@@ -121,7 +121,7 @@ pub async fn update_service(
     };
     let validated = match validate(&input, existing.enabled) {
         Ok(v) => v,
-        Err(e) => return invalid(&e.to_string()),
+        Err(e) => return invalid_err(&e),
     };
     let row = match repo::update_service(
         &state.db,
@@ -353,6 +353,13 @@ fn truncate(s: &str, max: usize) -> String {
         return s.to_owned();
     }
     s.chars().take(max).collect()
+}
+
+fn invalid_err(e: &oag_core::Error) -> Response {
+    match e {
+        oag_core::Error::Config(msg) => invalid(msg),
+        other => invalid(&other.to_string()),
+    }
 }
 
 fn write_failed(e: &oag_core::Error) -> Response {
