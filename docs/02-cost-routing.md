@@ -101,7 +101,7 @@ Only shapes a stronger model would plausibly fix:
 | `Refusal` | Declined a task within policy. |
 | `Truncated` | Hit the output limit mid-answer. |
 | `MalformedToolCall` | Tool arguments did not parse. The classic small-model failure on an agentic prompt, and the most valuable thing to escalate on. |
-| `ContextOverflow` | Rejected as too long or too complex. |
+| `ContextOverflow` | The upstream rejected the request outright — a 413, a 422, or one of the 400s whose body says the prompt does not fit. A malformed 400 is *not* this: the frontier rung would reject bad JSON exactly as the cheap one did. |
 
 Transport failures are **absent on purpose**. Escalating on a 500 would quietly
 migrate the whole fleet onto expensive models every time a provider had a bad
@@ -122,6 +122,10 @@ and by then a streamed response has already been delivered. Retrying would mean
 the client saw two answers. Streamed responses still have their gate recorded,
 so you can see how often a rung produces unusable answers and move the rung —
 which is the durable fix anyway.
+
+`ContextOverflow` is the exception, and streamed requests do get it: the upstream
+refused the request before sending anything, so there is no half-delivered answer
+to protect and the client has seen nothing to contradict.
 
 ## Budgets
 

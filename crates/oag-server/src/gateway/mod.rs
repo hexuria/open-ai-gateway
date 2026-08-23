@@ -311,7 +311,10 @@ async fn run_with_escalation(
                 }
             };
 
-        let (body, accumulator, lease) = match attempt {
+        // An answer to judge, or a refusal to escalate on. Both ask the same
+        // question — is a rung up worth trying — so they share the one loop
+        // below rather than growing a second escalation path.
+        let answer = match attempt {
             // Streaming: the bytes are already on their way to the client, so
             // there is nothing left to judge. See the note on MAX_ESCALATIONS.
             Attempt::Streaming { response, lease } => {
@@ -328,14 +331,21 @@ async fn run_with_escalation(
                     guard,
                 ));
             }
+            Attempt::Rejected(e) => Err(e),
             Attempt::Collected {
                 body,
                 accumulator,
                 lease,
-            } => (body, accumulator, lease),
+            } => Ok((body, accumulator, lease)),
         };
 
-        let gate = accumulator.quality_gate();
+        let gate = match &answer {
+            // The model would not take the request at all. Nothing was billed
+            // and nothing reached the client, so this is the one escalation a
+            // streaming request can also take.
+            Err(_) => Some(oag_router::QualityGate::ContextOverflow),
+            Ok((_, accumulator, _)) => accumulator.quality_gate(),
+        };
 
         // Retry one rung up when the answer was unusable and a rung is left.
         //
@@ -355,7 +365,7 @@ async fn run_with_escalation(
         {
             tracing::info!(
                 %request_id, from = %decision.tier, to = %next.tier, ?gate,
-                "escalating: the cheaper model produced an unusable answer"
+                "escalating: this rung could not answer the request"
             );
             metrics::counter!(
                 "oag_escalations_total",
@@ -364,21 +374,20 @@ async fn run_with_escalation(
             )
             .increment(1);
 
-            // The abandoned attempt is not free. The provider generated those
-            // tokens and will invoice them long before our quality gate had an
-            // opinion, so it is owed a row against the model that produced it —
-            // otherwise escalation looks costless and the number that would
-            // justify moving a rung never appears anywhere. Captured now, while
-            // its usage and latency are still its own, and written after the
-            // answer we serve.
-            abandoned = Some(meter::abandon(
-                meter_context(auth, &decision, &lease, request_id, started, escalations),
-                &accumulator,
-                gate,
-            ));
-
-            select::release(state, lease.account.account_id(), &lease.request_id).await;
-
+            // A rejection released its lease on the way out and was never
+            // generated, so it is not owed a ledger row. A collected answer
+            // still holds a lease, and the provider already invoiced those
+            // tokens — capture the abandoned attempt now and write it after
+            // the served row, so the surviving primary key keeps the answer
+            // the client actually got.
+            if let Ok((_, accumulator, lease)) = &answer {
+                abandoned = Some(meter::abandon(
+                    meter_context(auth, &decision, lease, request_id, started, escalations),
+                    accumulator,
+                    gate,
+                ));
+                select::release(state, lease.account.account_id(), &lease.request_id).await;
+            }
             canonical.model.clone_from(&next.model.upstream_name);
             decision = next;
             escalations += 1;
@@ -394,6 +403,10 @@ async fn run_with_escalation(
             );
             metrics::counter!("oag_escalations_suppressed_total").increment(1);
         }
+
+        // No rung left to try. A refusal is now the caller's error — the same
+        // one they used to get before the first attempt was allowed to climb.
+        let (body, accumulator, lease) = answer?;
 
         // Either it was fine, or nothing better exists. Record the gate either
         // way: a gate we could not act on is exactly the signal that a rung is
@@ -628,6 +641,10 @@ async fn plan_request(
 /// Streamed responses still have their gate recorded, so an operator can see
 /// how often a rung produces unusable answers and move the rung — which is the
 /// durable fix anyway.
+///
+/// A *rejected* request is the exception, streamed or not: the upstream refused
+/// it before sending anything, so there is no half-delivered answer to protect
+/// and the client has seen nothing to contradict.
 const MAX_ESCALATIONS: u8 = 1;
 
 /// What one forwarding attempt produced.
@@ -643,6 +660,10 @@ enum Attempt {
         accumulator: oag_proto::StreamAccumulator,
         lease: select::Lease,
     },
+    /// The model refused the request itself — too long, or beyond what it can
+    /// do. No credential can help and the lease is already released, but a
+    /// rung up can, so this is carried back rather than returned as an error.
+    Rejected(Error),
 }
 
 /// A complete, non-streamed response.
@@ -812,6 +833,13 @@ async fn forward_with_failover(
                 select::release(state, account, &lease.request_id).await;
                 return Err(e);
             }
+            // The credential did its job; the *model* would not take the
+            // request. Every other credential reaches the same model, so
+            // failing over is pointless — hand it up to escalation instead.
+            Outcome::Escalate(e) => {
+                select::release(state, account, &lease.request_id).await;
+                return Ok(Attempt::Rejected(e));
+            }
             Outcome::Switch(e) => {
                 tracing::warn!(%request_id, %account, error = %e, "switching credential");
                 last_error = e;
@@ -833,8 +861,39 @@ enum Outcome {
     Ok(Box<Attempt>),
     /// Try a different credential.
     Switch(Error),
+    /// Stop switching credentials and try a better model instead.
+    Escalate(Error),
     /// Stop: another credential cannot help.
     Fatal(Error),
+}
+
+/// What a rejected attempt says to do next.
+///
+/// Split out of [`try_credential`] as a pure function because it is the point
+/// where a context-length rejection either climbs the ladder or fails the
+/// caller, and that decision should be testable without a transport, a lease,
+/// and a database behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Same credential, after a backoff.
+    Retry,
+    /// A bigger model.
+    Escalate,
+    /// A different credential.
+    Switch,
+    /// Nothing.
+    Fatal,
+}
+
+fn step_for(disposition: Disposition, retries_left: bool) -> Step {
+    match disposition {
+        Disposition::RetrySameAccount if retries_left => Step::Retry,
+        Disposition::EscalateTier => Step::Escalate,
+        Disposition::Fatal => Step::Fatal,
+        // Rate limited, unhealthy, or out of same-credential retries: all of
+        // them are answered by somebody else's credential.
+        _ => Step::Switch,
+    }
 }
 
 /// Try one credential, with bounded same-credential retries.
@@ -923,14 +982,12 @@ async fn try_credential(
                 apply_disposition(state, account, disposition).await;
                 last = err;
 
-                match disposition {
-                    Disposition::RetrySameAccount
-                        if attempt < state.config.gateway.same_account_retries =>
-                    {
-                        tokio::time::sleep(backoff(attempt)).await;
-                    }
-                    Disposition::Fatal | Disposition::EscalateTier => return Outcome::Fatal(last),
-                    _ => return Outcome::Switch(last),
+                let retries_left = attempt < state.config.gateway.same_account_retries;
+                match step_for(disposition, retries_left) {
+                    Step::Retry => tokio::time::sleep(backoff(attempt)).await,
+                    Step::Escalate => return Outcome::Escalate(last),
+                    Step::Switch => return Outcome::Switch(last),
+                    Step::Fatal => return Outcome::Fatal(last),
                 }
             }
 
@@ -1353,6 +1410,64 @@ mod tests {
                 cooldown: TRANSPORT_COOLDOWN
             }),
             "the same failover the HTTP path applies"
+        );
+    }
+
+    fn upstream(status: u16, body: &str) -> Error {
+        Error::Upstream {
+            provider: oag_core::Provider::Anthropic,
+            account: AccountId::new(),
+            status,
+            body: body.to_owned(),
+        }
+    }
+
+    #[test]
+    fn upstream_413_is_outcome_escalate_not_fatal() {
+        // A 413 from a 128k rung used to end the request: `EscalateTier` was
+        // mapped to `Fatal` here and never reached `policy.escalate`, so the
+        // client got the provider's rejection while the rung that could have
+        // held the prompt sat one step up, untried.
+        assert_eq!(
+            step_for(upstream(413, "").disposition(), false),
+            Step::Escalate
+        );
+        assert_eq!(
+            step_for(
+                upstream(400, "prompt is too long: 210000 tokens").disposition(),
+                false
+            ),
+            Step::Escalate
+        );
+    }
+
+    #[test]
+    fn a_bad_request_still_fails_the_caller() {
+        // The other half of the same decision: escalation costs money, so only
+        // a capability rejection buys a rung.
+        assert_eq!(
+            step_for(upstream(400, "messages: required").disposition(), false),
+            Step::Fatal
+        );
+    }
+
+    #[test]
+    fn an_unhealthy_credential_is_switched_rather_than_escalated() {
+        // Escalating here would migrate the fleet onto expensive models every
+        // time a provider had a bad afternoon.
+        assert_eq!(
+            step_for(upstream(503, "").disposition(), false),
+            Step::Switch
+        );
+        assert_eq!(
+            step_for(upstream(429, "").disposition(), false),
+            Step::Switch
+        );
+        // Transient, and the retry budget decides which of the two it is.
+        assert_eq!(step_for(upstream(408, "").disposition(), true), Step::Retry);
+        assert_eq!(
+            step_for(upstream(408, "").disposition(), false),
+            Step::Switch
         );
     }
 

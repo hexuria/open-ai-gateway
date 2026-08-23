@@ -799,6 +799,40 @@ mod tests {
     }
 
     #[test]
+    fn a_context_overflow_climbs_to_a_rung_that_can_hold_the_prompt() {
+        // What makes escalating on an upstream 413 worth doing at all: the
+        // rung above is not merely more expensive, it is re-picked against the
+        // request's requirements, so the model we climb to is one whose window
+        // actually fits the prompt the last one refused.
+        let p = policy();
+        let cheap = p.ladder().floor();
+        let d = p
+            .escalate(
+                &cheap,
+                QualityGate::ContextOverflow,
+                &RequestSignal {
+                    prompt_tokens: 150_000,
+                    ..RequestSignal::default()
+                },
+                &catalog(),
+                1024,
+            )
+            .expect("escalates");
+        assert!(
+            u64::from(d.model.context_window) >= 150_000,
+            "climbed to {} — a window no bigger than the one that just refused",
+            d.model.id.as_str()
+        );
+        assert!(matches!(
+            d.reason,
+            SelectionReason::Escalated {
+                gate: QualityGate::ContextOverflow,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn escalation_terminates_at_the_ceiling() {
         let p = policy();
         let top = p.ladder().ceiling();
