@@ -316,6 +316,53 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
     })
 }
 
+/// A complete non-streamed response → the events its stream would have carried.
+///
+/// The counterpart to [`parse_event`], and it has to reach the same accumulator
+/// state: the quality gate reads the text and tool-call counts, so a reader
+/// that takes only usage leaves every non-streamed response looking empty.
+#[must_use]
+pub fn parse_response(body: &Value) -> Vec<StreamEvent> {
+    let usage = parse_usage(&body["usage"]);
+    let mut events = vec![StreamEvent::UsageUpdate { usage }];
+
+    for block in body["content"].as_array().unwrap_or(&Vec::new()) {
+        match block["type"].as_str().unwrap_or_default() {
+            "text" => events.push(StreamEvent::TextDelta {
+                text: block["text"].as_str().unwrap_or_default().to_owned(),
+            }),
+            "thinking" => events.push(StreamEvent::ThinkingDelta {
+                text: block["thinking"].as_str().unwrap_or_default().to_owned(),
+            }),
+            "tool_use" => {
+                let id = block["id"].as_str().unwrap_or_default().to_owned();
+                events.push(StreamEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: block["name"].as_str().unwrap_or_default().to_owned(),
+                });
+                // Whole, not fragmented — a non-streamed tool call is already
+                // complete JSON, so the malformed-arguments gate should never
+                // fire on one.
+                events.push(StreamEvent::ToolUseDelta {
+                    id: id.clone(),
+                    partial_json: block["input"].to_string(),
+                });
+                events.push(StreamEvent::ToolUseEnd { id });
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(reason) = body["stop_reason"].as_str() {
+        events.push(StreamEvent::Stop {
+            reason: parse_stop_reason(reason),
+            usage,
+        });
+    }
+
+    events
+}
+
 // ── rendering canonical events back into this dialect ─────────────────────────
 
 /// State carried while rendering canonical events as Anthropic SSE.

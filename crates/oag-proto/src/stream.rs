@@ -86,6 +86,8 @@ pub struct StreamAccumulator {
     stop_reason: Option<StopReason>,
     /// Partial tool arguments, keyed by call id.
     tool_buffers: Vec<(String, String)>,
+    /// Set when nothing here was read from the response at all.
+    unparsed: bool,
 }
 
 impl StreamAccumulator {
@@ -130,6 +132,16 @@ impl StreamAccumulator {
         self.committed = true;
     }
 
+    /// Note that the response body could not be read at all.
+    ///
+    /// Not the same thing as an empty answer, and the difference is money. An
+    /// empty answer is the model's failure and worth escalating; a body we have
+    /// no reader for is ours, and gating on it escalates every request to the
+    /// expensive rung while recording zero tokens for either attempt.
+    pub fn mark_unparsed(&mut self) {
+        self.unparsed = true;
+    }
+
     /// Whether we can still fail this request over to another credential.
     #[must_use]
     pub const fn can_failover(&self) -> bool {
@@ -166,6 +178,12 @@ impl StreamAccumulator {
     #[must_use]
     pub fn quality_gate(&self) -> Option<oag_router::QualityGate> {
         use oag_router::QualityGate;
+
+        // Nothing observed because nothing was readable. Judging that would
+        // blame the model for our own blind spot.
+        if self.unparsed {
+            return None;
+        }
 
         if self.text_len == 0 && self.tool_calls == 0 {
             return Some(QualityGate::EmptyResponse);
@@ -242,6 +260,18 @@ mod tests {
             usage: Usage::default(),
         });
         assert_eq!(acc.quality_gate(), Some(QualityGate::EmptyResponse));
+    }
+
+    #[test]
+    fn a_body_nothing_could_read_is_not_an_empty_response() {
+        // The two look identical from here — no text, no tool calls — and they
+        // must not be treated the same. An empty answer is the model's failure
+        // and worth paying a better model to retry; a body we have no reader for
+        // is ours, and escalating on it means paying twice for every request
+        // through that upstream and recording tokens for neither attempt.
+        let mut acc = StreamAccumulator::new();
+        acc.mark_unparsed();
+        assert_eq!(acc.quality_gate(), None);
     }
 
     #[test]

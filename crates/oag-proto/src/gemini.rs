@@ -213,6 +213,16 @@ fn parse_content(v: &Value) -> Option<Message> {
 /// One SSE `data:` payload → canonical events.
 pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
     let v: Value = serde_json::from_str(payload)?;
+    Ok(parse_response(&v))
+}
+
+/// A complete non-streamed `generateContent` body → canonical events.
+///
+/// The same reader as [`parse_event`], because in this dialect it is the same
+/// shape: a whole response is one chunk's `candidates` and `usageMetadata`
+/// rather than a different envelope.
+#[must_use]
+pub fn parse_response(v: &Value) -> Vec<StreamEvent> {
     let mut events = Vec::new();
 
     if let Some(usage) = v.get("usageMetadata") {
@@ -222,7 +232,7 @@ pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<St
     }
 
     let Some(candidate) = v["candidates"].as_array().and_then(|c| c.first()) else {
-        return Ok(events);
+        return events;
     };
 
     for part in candidate["content"]["parts"]
@@ -268,7 +278,7 @@ pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<St
         });
     }
 
-    Ok(events)
+    events
 }
 
 // ── rendering canonical events back into this dialect ─────────────────────────

@@ -316,16 +316,17 @@ pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
     sqlx::query(
         r"
         INSERT INTO usage_event (
-            request_id, principal_id, api_key_id, route_id, account_id,
+            request_id, attempt, principal_id, api_key_id, route_id, account_id,
             model_id, tier, selection_reason, escalated_from_tier, escalation_gate,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
             cost_usd, counterfactual_usd, counterfactual_model_id,
             status, latency_ms, ttft_ms, streamed
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-        ON CONFLICT (request_id) DO NOTHING
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+        ON CONFLICT (request_id, attempt) DO NOTHING
         ",
     )
     .bind(w.request_id)
+    .bind(w.attempt)
     .bind(w.principal_id)
     .bind(w.api_key_id)
     .bind(w.route_id)
@@ -1048,5 +1049,93 @@ mod tests {
             matches!(err, Error::Config(_)),
             "a dangling auth_ref is a config error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn both_attempts_of_an_escalated_request_reach_the_ledger() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+
+        let raw = format!("meter-{}", Uuid::new_v4());
+        let key: Uuid = sqlx::query_scalar(
+            "INSERT INTO api_key (id, key_hash, key_prefix, name, principal_id, route_id)
+             VALUES (gen_random_uuid(), $1, 'oag_live_test', $2, $3, $4)
+             RETURNING id",
+        )
+        .bind(hash_key(&raw))
+        .bind(&raw)
+        .bind(principal)
+        .bind(route)
+        .fetch_one(db.pool())
+        .await
+        .expect("mint");
+
+        // One client request, two attempts: a cheap answer that tripped a
+        // quality gate, and the retry a rung up that was actually served.
+        let request_id = Uuid::new_v4();
+        let write = |attempt: i16, reason: &str, cost: &str| UsageWrite {
+            request_id,
+            attempt,
+            principal_id: Some(principal),
+            api_key_id: Some(key),
+            route_id: Some(route),
+            account_id: Some(account.as_uuid()),
+            model_id: "kimi-k2".to_owned(),
+            tier: "cheap".to_owned(),
+            selection_reason: reason.to_owned(),
+            escalated_from_tier: None,
+            escalation_gate: Some("Refusal".to_owned()),
+            usage: oag_router::Usage {
+                input_tokens: 1_000,
+                output_tokens: 20,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            cost_usd: cost.parse().expect("decimal"),
+            counterfactual_usd: Decimal::ZERO,
+            counterfactual_model_id: None,
+            status: 200,
+            latency_ms: Some(10),
+            ttft_ms: None,
+            streamed: false,
+        };
+
+        record_usage(&db, &write(0, "abandoned", "0.25"))
+            .await
+            .expect("abandoned attempt");
+        record_usage(&db, &write(1, "escalated", "1.75"))
+            .await
+            .expect("served attempt");
+
+        let (rows, spend): (i64, Decimal) = sqlx::query_as(
+            "SELECT count(*), coalesce(sum(cost_usd), 0) FROM usage_event WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("read back");
+
+        // Keyed on the request id alone, the second write conflicted with the
+        // first and `DO NOTHING` discarded it — so one attempt's spend was
+        // absent from the ledger while the invoice still charged for it.
+        assert_eq!(rows, 2, "one row per attempt");
+        assert_eq!(spend.to_string(), "2.00000000", "both attempts are billed");
+
+        // Per-attempt, not per-request: idempotence is what stops a retried
+        // write from double-billing, and it has to survive the wider key.
+        record_usage(&db, &write(1, "escalated", "1.75"))
+            .await
+            .expect("replay");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM usage_event WHERE request_id = $1")
+                .bind(request_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("count");
+        assert_eq!(rows, 2, "a replayed write is still a no-op");
     }
 }

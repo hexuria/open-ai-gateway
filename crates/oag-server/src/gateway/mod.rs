@@ -344,7 +344,23 @@ async fn run_with_escalation(
             )
             .increment(1);
 
+            // The abandoned attempt is not free. The provider generated those
+            // tokens and will invoice them long before our quality gate had an
+            // opinion, so the row goes in the ledger for the model that
+            // produced it — otherwise escalation looks costless and the number
+            // that would justify moving a rung never appears anywhere.
+            let abandoned = meter::Context {
+                request_id,
+                auth: auth.clone(),
+                decision: decision.clone(),
+                account: lease.account.account_id(),
+                started,
+                attempt: i16::from(escalations),
+            };
+
             select::release(state, lease.account.account_id(), &lease.request_id).await;
+            meter::record_abandoned(state, &abandoned, &accumulator, gate).await;
+
             canonical.model.clone_from(&next.model.upstream_name);
             decision = next;
             escalations += 1;
@@ -370,6 +386,7 @@ async fn run_with_escalation(
             decision: decision.clone(),
             account: lease.account.account_id(),
             started,
+            attempt: i16::from(escalations),
         };
         select::release(state, lease.account.account_id(), &lease.request_id).await;
         // `triggering_gate` when we escalated, otherwise whatever this attempt
@@ -852,7 +869,9 @@ async fn try_credential(
                         lease: lease.clone(),
                     }))
                 } else {
-                    match sse::collect(response).await {
+                    // The upstream's dialect, which is what its body is in —
+                    // not the client's, which `json_response` converts to.
+                    match sse::collect(response, provider.native_dialect()).await {
                         Ok((body, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
                             body,
                             accumulator,
@@ -936,6 +955,9 @@ fn stream_response(
         decision: decision.clone(),
         account,
         started,
+        // A streamed response is delivered as it arrives, so it is never
+        // abandoned and never retried: there is only ever one attempt.
+        attempt: 0,
     };
 
     let state2 = Arc::clone(state);

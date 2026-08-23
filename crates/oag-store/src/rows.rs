@@ -214,6 +214,13 @@ impl ServiceRow {
 #[derive(Debug, Clone)]
 pub struct UsageWrite {
     pub request_id: Uuid,
+    /// Which forwarding attempt this row accounts for, counted from zero.
+    ///
+    /// Part of the ledger's key, because one client request can pay for two
+    /// attempts when a quality gate abandons a cheap answer and retries a rung
+    /// up. Keyed on the request id alone, the second write conflicted with the
+    /// first and was silently dropped.
+    pub attempt: i16,
     pub principal_id: Option<Uuid>,
     pub api_key_id: Option<Uuid>,
     pub route_id: Option<Uuid>,
