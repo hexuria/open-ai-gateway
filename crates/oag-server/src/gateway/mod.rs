@@ -965,12 +965,16 @@ async fn try_credential(
 
             Ok(response) => {
                 let status = response.status().as_u16();
+                // Read before the body is consumed: `text()` takes the whole
+                // response, headers included.
+                let retry_after = upstream_retry_after(response.headers());
                 let body = response.text().await.unwrap_or_default();
                 let err = Error::Upstream {
                     provider,
                     account,
                     status,
                     body: truncate(&body, 512),
+                    retry_after,
                 };
                 let disposition = err.disposition();
                 tracing::warn!(%request_id, status, ?disposition, "upstream rejected");
@@ -1166,6 +1170,22 @@ async fn apply_disposition(state: &AppState, account: AccountId, d: Disposition)
     }
 }
 
+/// How long the provider asked us to wait, if it said.
+///
+/// Only the delta-seconds form. The HTTP-date form is equally legal and no
+/// provider we speak to sends it, and a date read wrongly is worse than no hint
+/// at all — the caller has a sane default and a misparsed one would override it.
+fn upstream_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(std::time::Duration::from_secs(secs))
+}
+
 /// Exponential backoff, capped.
 fn backoff(attempt: u8) -> std::time::Duration {
     let ms = 300u64.saturating_mul(1 << u32::from(attempt.min(4)));
@@ -1210,11 +1230,42 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// The status a client should see for a failure that came from a provider.
+///
+/// Three upstream statuses mean something else entirely at *our* edge, and
+/// forwarding them verbatim tells the client the opposite of what happened:
+///
+/// - **401** is "your gateway key is wrong". An SDK handed one deletes the key
+///   the operator just issued and asks the user to re-authenticate — while the
+///   real fault is that our own provider credentials have expired.
+/// - **402** is [`Error::BudgetExhausted`], i.e. "you are out of money", which
+///   sends the caller to top up an account that is fine.
+/// - **403** is "this key may not use this route".
+///
+/// All three are credential-side, and by the time one reaches here every
+/// credential in the pool has already been tried and failed over. So the honest
+/// answer is the one that says the gateway cannot reach a working upstream: 502.
+/// Not 503 — that is [`Error::NoCredential`] and [`Error::AtCapacity`], both of
+/// which mean "come back shortly" and neither of which is true of a pool whose
+/// keys are all dead.
+///
+/// Everything else keeps the provider's status, because everything else is
+/// already about the right party: 400, 413 and 422 are the client's own request,
+/// and 5xx already reads as ours.
+fn client_status_for(upstream: u16) -> StatusCode {
+    match upstream {
+        401..=403 => StatusCode::BAD_GATEWAY,
+        other => StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_GATEWAY),
+    }
+}
+
 /// Map an error to a response.
 ///
-/// Upstream bodies are passed through so a client sees the provider's own
-/// message rather than a generic 502 it cannot act on. Internal errors are not:
-/// they can carry connection strings and file paths.
+/// The provider's own body is still surfaced, so a client sees more than a bare
+/// 502 — but under `error.upstream`, beside our error rather than as it. Its
+/// *status* is deliberately not always ours: see [`client_status_for`].
+/// Internal errors are surfaced as nothing at all: they can carry connection
+/// strings and file paths.
 pub(crate) fn error_response(e: &Error) -> Response {
     let (status, kind, message) = match e {
         Error::Unauthenticated => (
@@ -1244,11 +1295,11 @@ pub(crate) fn error_response(e: &Error) -> Response {
             e.to_string(),
         ),
         Error::NoViableModel => (StatusCode::BAD_REQUEST, "no_viable_model", e.to_string()),
-        Error::Upstream { status, body, .. } => (
-            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
-            "upstream_error",
-            body.clone(),
-        ),
+        // The message is ours; the provider's is nested below rather than
+        // substituted for it.
+        Error::Upstream { status, .. } => {
+            (client_status_for(*status), "upstream_error", e.to_string())
+        }
         Error::Serde(_) => (StatusCode::BAD_REQUEST, "invalid_request", e.to_string()),
         Error::StreamIdle(_) => (StatusCode::GATEWAY_TIMEOUT, "stream_idle", e.to_string()),
         _ => {
@@ -1261,20 +1312,48 @@ pub(crate) fn error_response(e: &Error) -> Response {
         }
     };
 
-    let mut response = (
-        status,
-        axum::Json(serde_json::json!({
-            "type": "error",
-            "error": { "type": kind, "message": message }
-        })),
-    )
-        .into_response();
+    let mut payload = serde_json::json!({
+        "type": "error",
+        "error": { "type": kind, "message": message }
+    });
+
+    // The provider's error as a *value*, next to ours. It used to be our
+    // `error.message`, which meant an SDK reading `error.message` found a whole
+    // JSON document encoded into a string — so every parser that looked for a
+    // message read one and reported gibberish, and anything looking deeper found
+    // nothing. The provider's status goes with it, since it is no longer
+    // necessarily the status line.
+    if let Error::Upstream { status, body, .. } = e {
+        payload["error"]["upstream_status"] = serde_json::json!(*status);
+        if !body.is_empty() {
+            // Truncated bodies stop being valid JSON, so a string is the
+            // fallback rather than the failure.
+            payload["error"]["upstream"] = serde_json::from_str(body)
+                .unwrap_or_else(|_| serde_json::Value::String(body.clone()));
+        }
+    }
+
+    let mut response = (status, axum::Json(payload)).into_response();
 
     // A 429 without Retry-After leaves every client to guess, and they guess
-    // badly — usually by retrying immediately, which is the one thing the
-    // limit exists to prevent. Rounded up, and never zero.
-    if let Error::RateLimited { retry_after } = e {
-        let secs = retry_after.as_secs_f64().ceil().max(1.0);
+    // badly — usually by retrying immediately, which is the one thing the limit
+    // exists to prevent. Rounded up, and never zero.
+    //
+    // A forwarded upstream throttle needs this every bit as much as our own
+    // inbound one, and used to get nothing: the header was set for
+    // `RateLimited` alone, so the 429s a client is most likely to see arrived
+    // bare.
+    let wait = match e {
+        Error::RateLimited { retry_after } => Some(*retry_after),
+        Error::Upstream {
+            status: 429,
+            retry_after,
+            ..
+        } => Some(retry_after.unwrap_or(std::time::Duration::from_secs(1))),
+        _ => None,
+    };
+    if let Some(wait) = wait {
+        let secs = wait.as_secs_f64().ceil().max(1.0);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let secs = secs as u64;
         if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
@@ -1420,7 +1499,24 @@ mod tests {
             account: AccountId::new(),
             status,
             body: body.to_owned(),
+            retry_after: None,
         }
+    }
+
+    /// What the client actually parses. A status assertion alone would have
+    /// missed the double-encoded body this file used to send.
+    async fn json_body(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a complete body");
+        serde_json::from_slice(&bytes).expect("an error envelope is JSON")
+    }
+
+    fn retry_after_of(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
     }
 
     #[test]
@@ -1646,11 +1742,124 @@ security:
         );
     }
 
+    #[tokio::test]
+    async fn internal_errors_do_not_leak_their_message() {
+        // They can carry connection strings and file paths. Asserting on the
+        // status alone never checked the thing the test is named for.
+        let response = error_response(&Error::Internal("postgres://user:pw@host/db".to_owned()));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "internal_error");
+        assert_eq!(body["error"]["message"], "internal error");
+        assert!(
+            !body.to_string().contains("postgres://"),
+            "nothing from the error may reach the client: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_401_maps_to_502() {
+        // The collision: 401 is *our* "your gateway key is wrong". A 401 here
+        // means the provider credentials are expired, and every one has already
+        // been tried — but an SDK reading the status deletes the gateway key the
+        // operator just issued and sends the user to re-authenticate against a
+        // key that was never the problem.
+        let response = error_response(&upstream(
+            401,
+            r#"{"error":{"type":"authentication_error","message":"OAuth token has expired"}}"#,
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "upstream_error");
+        // Still diagnosable: the provider's status is reported, just not as ours.
+        assert_eq!(body["error"]["upstream_status"], 401);
+        // And its body is a value a parser can walk into, not a string that
+        // happens to hold JSON.
+        assert_eq!(
+            body["error"]["upstream"]["error"]["message"],
+            "OAuth token has expired"
+        );
+        // Above all, not something the client mistakes for its own auth failure.
+        assert_ne!(body["error"]["type"], "authentication_error");
+    }
+
     #[test]
-    fn internal_errors_do_not_leak_their_message() {
-        // They can carry connection strings and file paths.
-        let r = error_response(&Error::Internal("postgres://user:pw@host/db".to_owned()));
-        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    fn no_credential_side_status_is_forwarded_to_the_client() {
+        // 402 is BudgetExhausted and 403 is a route this key may not use. Both
+        // send the caller to fix an account that is fine.
+        for status in [401u16, 402, 403] {
+            let response = error_response(&upstream(status, ""));
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "upstream {status} must not become the client's {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_the_client_can_fix_keeps_the_providers_status() {
+        // The other half. These are about the bytes the client sent, so the
+        // client is the only party who can act on them — and 413 in particular
+        // is what the ladder failed to escalate past, which is worth saying
+        // plainly rather than collapsing into "bad gateway".
+        for status in [400u16, 413, 422] {
+            let response = error_response(&upstream(status, ""));
+            assert_eq!(response.status().as_u16(), status);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_429_forwards_retry_after() {
+        // The provider told us how long to wait and we dropped it on the floor:
+        // the header was only ever set for our own inbound throttle, so a
+        // forwarded 429 reached the client with nothing to back off by.
+        let response = error_response(&Error::Upstream {
+            provider: oag_core::Provider::Anthropic,
+            account: AccountId::new(),
+            status: 429,
+            body: r#"{"error":{"message":"rate limit"}}"#.to_owned(),
+            retry_after: Some(std::time::Duration::from_secs(30)),
+        });
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after_of(&response), Some("30"));
+        assert_eq!(
+            json_body(response).await["error"]["upstream"]["error"]["message"],
+            "rate limit"
+        );
+    }
+
+    #[test]
+    fn an_upstream_429_without_a_hint_still_names_a_wait() {
+        // No header from the provider is not licence to omit ours: a 429 with
+        // no Retry-After is an invitation to retry immediately.
+        assert_eq!(
+            retry_after_of(&error_response(&upstream(429, ""))),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn a_providers_retry_after_is_read_from_the_response() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("42"));
+        assert_eq!(
+            upstream_retry_after(&h),
+            Some(std::time::Duration::from_secs(42))
+        );
+
+        // The HTTP-date form is legal and unparsed on purpose: the caller's
+        // default beats a date read wrongly.
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(upstream_retry_after(&h), None);
+        assert_eq!(upstream_retry_after(&HeaderMap::new()), None);
     }
 
     #[test]

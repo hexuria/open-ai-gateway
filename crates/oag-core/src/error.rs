@@ -79,6 +79,13 @@ pub enum Error {
         account: AccountId,
         status: u16,
         body: String,
+        /// The provider's own `Retry-After`, when it sent one.
+        ///
+        /// Carried on the error because the response it came from is long gone
+        /// by the time either consumer needs it: the credential's cooldown and
+        /// the client's own `Retry-After` are both guesses without it, and a
+        /// 429 answered with a guess is a 429 answered badly.
+        retry_after: Option<Duration>,
     },
 
     #[error("upstream stream stalled after {0:?} with no data")]
@@ -124,13 +131,24 @@ impl Error {
         const COOLDOWN: Duration = Duration::from_mins(10);
 
         match self {
-            Self::Upstream { status, body, .. } => match status {
+            Self::Upstream {
+                status,
+                body,
+                retry_after,
+                ..
+            } => match status {
                 401 | 403 => Disposition::FailoverAccount { cooldown: COOLDOWN },
                 402 => Disposition::FailoverAccount {
                     cooldown: Duration::from_hours(1),
                 },
                 408 | 409 | 425 => Disposition::RetrySameAccount,
-                429 => Disposition::RateLimited { retry_after: None },
+                // The provider's own `Retry-After` when it sent one. This was
+                // hard-coded `None`, which meant every upstream throttle got
+                // the same flat one-minute sit-out — twelve times too long for
+                // a five-second limit, and far too short for an hourly quota.
+                429 => Disposition::RateLimited {
+                    retry_after: *retry_after,
+                },
                 // 529 is Anthropic's "overloaded". Not our credential's fault,
                 // but hammering it makes things worse for everyone.
                 500 | 502 | 503 | 504 | 529 => Disposition::FailoverAccount {
@@ -198,6 +216,7 @@ mod tests {
             account: AccountId::new(),
             status,
             body: body.to_owned(),
+            retry_after: None,
         }
     }
 
@@ -280,5 +299,28 @@ mod tests {
             upstream(429).disposition(),
             Disposition::RateLimited { .. }
         ));
+    }
+
+    #[test]
+    fn a_providers_retry_after_decides_how_long_the_credential_sits_out() {
+        // It used to be discarded and replaced with a flat minute, so a
+        // credential throttled for five seconds was benched for sixty and one
+        // throttled for an hour came back to be refused again.
+        let Disposition::RateLimited { retry_after } = Error::Upstream {
+            provider: Provider::Anthropic,
+            account: AccountId::new(),
+            status: 429,
+            body: String::new(),
+            retry_after: Some(Duration::from_secs(30)),
+        }
+        .disposition() else {
+            panic!("429 is a rate limit");
+        };
+        assert_eq!(retry_after, Some(Duration::from_secs(30)));
+        // And with no hint the caller still has to pick a default.
+        assert_eq!(
+            upstream(429).disposition(),
+            Disposition::RateLimited { retry_after: None }
+        );
     }
 }
