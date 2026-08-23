@@ -7,9 +7,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ── docker daemon ───────────────────────────────────────────────────────────────
-# No init system in the pod, so start dockerd directly and only once.
+# No init system in the pod, so start dockerd directly and only once, detached
+# so it outlives this start script rather than being torn down when start
+# returns.
 if ! sudo docker info >/dev/null 2>&1; then
-  sudo dockerd >/tmp/dockerd.log 2>&1 &
+  # No live daemon, so a leftover pid file is stale and would block startup.
+  pgrep -x dockerd >/dev/null || sudo rm -f /var/run/docker.pid
+  # Detach fully: nohup + background inside a root shell that exits immediately,
+  # so dockerd is reparented to init and outlives this start script.
+  sudo sh -c 'nohup dockerd >/tmp/dockerd.log 2>&1 &'
   for _ in $(seq 1 60); do
     sudo docker info >/dev/null 2>&1 && break
     sleep 1
