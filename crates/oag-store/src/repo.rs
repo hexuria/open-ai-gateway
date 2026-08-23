@@ -1,7 +1,7 @@
 //! Queries.
 
 use crate::Db;
-use crate::rows::{AccountRow, AuthContext, ModelRow, RouteRow, UsageWrite};
+use crate::rows::{AccountRow, AuthContext, ModelRow, RouteRow, ServiceRow, UsageWrite};
 use oag_core::{AccountId, Error, Result};
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
@@ -380,6 +380,167 @@ pub async fn catalog(db: &Db) -> Result<Vec<ModelRow>> {
     .map_err(|e| Error::Internal(format!("loading catalog: {e}")))
 }
 
+const LIST_SERVICES_SQL: &str = concat!(
+    "SELECT ",
+    "id, name, kind, base_url, health_path, dashboard_url, ",
+    "auth_ref, enabled, last_ok, last_error, created_at ",
+    "FROM service ORDER BY name"
+);
+const SERVICE_BY_ID_SQL: &str = concat!(
+    "SELECT ",
+    "id, name, kind, base_url, health_path, dashboard_url, ",
+    "auth_ref, enabled, last_ok, last_error, created_at ",
+    "FROM service WHERE id = $1"
+);
+const INSERT_SERVICE_SQL: &str = concat!(
+    "INSERT INTO service (",
+    "id, name, kind, base_url, health_path, dashboard_url, auth_ref",
+    ") VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING ",
+    "id, name, kind, base_url, health_path, dashboard_url, ",
+    "auth_ref, enabled, last_ok, last_error, created_at"
+);
+const UPDATE_SERVICE_SQL: &str = concat!(
+    "UPDATE service SET ",
+    "name = $2, kind = $3, base_url = $4, health_path = $5, ",
+    "dashboard_url = $6, auth_ref = $7, enabled = $8 ",
+    "WHERE id = $1 RETURNING ",
+    "id, name, kind, base_url, health_path, dashboard_url, ",
+    "auth_ref, enabled, last_ok, last_error, created_at"
+);
+const RECORD_HEALTH_SQL: &str = concat!(
+    "UPDATE service SET ",
+    "last_ok = CASE WHEN $2 THEN now() ELSE last_ok END, ",
+    "last_error = $3 ",
+    "WHERE id = $1 RETURNING ",
+    "id, name, kind, base_url, health_path, dashboard_url, ",
+    "auth_ref, enabled, last_ok, last_error, created_at"
+);
+
+/// Values to insert a catalog row. Validation of URLs and kind belongs to
+/// the caller — the store persists what it is given, and the SQL CHECKs are
+/// the second line.
+#[derive(Debug, Clone)]
+pub struct NewService<'a> {
+    pub id: Uuid,
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub base_url: &'a str,
+    pub health_path: &'a str,
+    pub dashboard_url: Option<&'a str>,
+    pub auth_ref: Option<Uuid>,
+}
+
+/// Replacement values for a catalog row. Health columns are not here: they
+/// are written only by [`record_service_health`].
+#[derive(Debug, Clone)]
+pub struct ServiceUpdate<'a> {
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub base_url: &'a str,
+    pub health_path: &'a str,
+    pub dashboard_url: Option<&'a str>,
+    pub auth_ref: Option<Uuid>,
+    pub enabled: bool,
+}
+
+pub async fn list_services(db: &Db) -> Result<Vec<ServiceRow>> {
+    sqlx::query_as::<_, ServiceRow>(LIST_SERVICES_SQL)
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("listing services: {e}")))
+}
+
+pub async fn service_by_id(db: &Db, id: Uuid) -> Result<Option<ServiceRow>> {
+    sqlx::query_as::<_, ServiceRow>(SERVICE_BY_ID_SQL)
+        .bind(id)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("loading service: {e}")))
+}
+
+pub async fn insert_service(db: &Db, s: &NewService<'_>) -> Result<ServiceRow> {
+    sqlx::query_as::<_, ServiceRow>(INSERT_SERVICE_SQL)
+        .bind(s.id)
+        .bind(s.name)
+        .bind(s.kind)
+        .bind(s.base_url)
+        .bind(s.health_path)
+        .bind(s.dashboard_url)
+        .bind(s.auth_ref)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| map_service_write_error("creating service", &e))
+}
+
+pub async fn update_service(
+    db: &Db,
+    id: Uuid,
+    s: &ServiceUpdate<'_>,
+) -> Result<Option<ServiceRow>> {
+    sqlx::query_as::<_, ServiceRow>(UPDATE_SERVICE_SQL)
+        .bind(id)
+        .bind(s.name)
+        .bind(s.kind)
+        .bind(s.base_url)
+        .bind(s.health_path)
+        .bind(s.dashboard_url)
+        .bind(s.auth_ref)
+        .bind(s.enabled)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|e| map_service_write_error("updating service", &e))
+}
+
+/// Take a service out of the catalog's active set, or put it back.
+pub async fn set_service_enabled(db: &Db, id: Uuid, enabled: bool) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>("UPDATE service SET enabled = $2 WHERE id = $1 RETURNING name")
+        .bind(id)
+        .bind(enabled)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("setting service enabled: {e}")))
+}
+
+/// Record the outcome of a health probe.
+///
+/// A success stamps `last_ok` and clears `last_error`. A failure writes the
+/// error and leaves `last_ok` alone, so "was healthy, now is not" stays
+/// visible.
+pub async fn record_service_health(
+    db: &Db,
+    id: Uuid,
+    ok: bool,
+    error: Option<&str>,
+) -> Result<Option<ServiceRow>> {
+    sqlx::query_as::<_, ServiceRow>(RECORD_HEALTH_SQL)
+        .bind(id)
+        .bind(ok)
+        .bind(error)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("recording service health: {e}")))
+}
+
+fn map_service_write_error(what: &str, e: &sqlx::Error) -> Error {
+    if let Some(db) = e.as_database_error() {
+        match db.code().as_deref() {
+            Some("23505") => {
+                return Error::Config("a service with that name already exists".to_owned());
+            }
+            Some("23503") => {
+                return Error::Config(
+                    "auth_ref does not match a credential in the pool".to_owned(),
+                );
+            }
+            Some("23514") => {
+                return Error::Config("service row failed a database check".to_owned());
+            }
+            _ => {}
+        }
+    }
+    Error::Internal(format!("{what}: {e}"))
+}
+
 /// Insert or update a catalog entry, never clobbering an operator override.
 pub async fn upsert_model(db: &Db, m: &ModelRow, is_override: bool) -> Result<()> {
     sqlx::query(
@@ -747,6 +908,145 @@ mod tests {
                 .expect("auth")
                 .expect("found")
                 .admin
+        );
+    }
+
+    async fn insert_named_service(db: &Db, name: &str) -> ServiceRow {
+        insert_service(
+            db,
+            &NewService {
+                id: Uuid::now_v7(),
+                name,
+                kind: "sandbox",
+                base_url: "http://127.0.0.1:9",
+                health_path: "/health",
+                dashboard_url: Some("http://127.0.0.1:9/ui"),
+                auth_ref: None,
+            },
+        )
+        .await
+        .expect("insert service")
+    }
+
+    #[tokio::test]
+    async fn the_service_catalog_round_trips_and_records_health() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let tag = Uuid::new_v4();
+        let name = format!("orgo-{tag}");
+
+        let row = insert_named_service(&db, &name).await;
+        assert!(row.enabled);
+        assert!(row.last_ok.is_none());
+        assert!(row.last_error.is_none());
+
+        let listed = list_services(&db).await.expect("list");
+        assert!(
+            listed.iter().any(|s| s.id == row.id),
+            "inserted service must appear in the catalog"
+        );
+
+        let ok = record_service_health(&db, row.id, true, None)
+            .await
+            .expect("record ok")
+            .expect("exists");
+        assert!(ok.last_ok.is_some());
+        assert!(ok.last_error.is_none());
+
+        let bad = record_service_health(&db, row.id, false, Some("health returned HTTP 503"))
+            .await
+            .expect("record err")
+            .expect("exists");
+        assert_eq!(bad.last_ok, ok.last_ok, "a failed probe must keep last_ok");
+        assert_eq!(bad.last_error.as_deref(), Some("health returned HTTP 503"));
+
+        set_service_enabled(&db, row.id, false)
+            .await
+            .expect("disable")
+            .expect("exists");
+        let disabled = service_by_id(&db, row.id)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert!(!disabled.enabled);
+
+        let updated = update_service(
+            &db,
+            row.id,
+            &ServiceUpdate {
+                name: &name,
+                kind: "browser",
+                base_url: "http://127.0.0.1:19",
+                health_path: "/ready",
+                dashboard_url: None,
+                auth_ref: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("update")
+        .expect("exists");
+        assert_eq!(updated.kind, "browser");
+        assert!(updated.enabled);
+        assert!(updated.dashboard_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_service_name_is_a_config_error() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let name = format!("dup-{}", Uuid::new_v4());
+        insert_named_service(&db, &name).await;
+        let err = insert_service(
+            &db,
+            &NewService {
+                id: Uuid::now_v7(),
+                name: &name,
+                kind: "tool",
+                base_url: "http://127.0.0.1:9",
+                health_path: "/health",
+                dashboard_url: None,
+                auth_ref: None,
+            },
+        )
+        .await
+        .expect_err("duplicate name");
+        assert!(
+            matches!(err, Error::Config(_)),
+            "unique name must fail as Config, not Internal: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_ref_must_point_at_an_existing_credential() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let err = insert_service(
+            &db,
+            &NewService {
+                id: Uuid::now_v7(),
+                name: &format!("ref-{}", Uuid::new_v4()),
+                kind: "tool",
+                base_url: "http://127.0.0.1:9",
+                health_path: "/health",
+                dashboard_url: None,
+                auth_ref: Some(Uuid::now_v7()),
+            },
+        )
+        .await
+        .expect_err("missing credential");
+        assert!(
+            matches!(err, Error::Config(_)),
+            "a dangling auth_ref is a config error: {err}"
         );
     }
 }

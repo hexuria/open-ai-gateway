@@ -17,4 +17,5 @@ pub use auth::AuthCache;
 pub use cache::Cache;
 pub use db::Db;
 pub use health::{Readiness, readiness};
-pub use rows::{AccountRow, AuthContext, ModelRow, RouteRow, UsageWrite};
+pub use repo::{NewService, ServiceUpdate};
+pub use rows::{AccountRow, AuthContext, ModelRow, RouteRow, ServiceRow, UsageWrite};

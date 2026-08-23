@@ -65,6 +65,10 @@ typed_id!(
 );
 typed_id!(ApiKeyId, "Identifies an inbound client credential.");
 typed_id!(PrincipalId, "Identifies an organisation member.");
+typed_id!(
+    ServiceId,
+    "Identifies one registered capability service in the catalog."
+);
 
 /// Identifies one inbound request for its whole lifetime.
 ///
