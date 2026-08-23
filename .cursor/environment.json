@@ -1,0 +1,16 @@
+{
+  "name": "open-ai-gateway",
+  "install": "bash .cursor/install.sh",
+  "start": "bash .cursor/start.sh",
+  "terminals": [
+    {
+      "name": "gateway",
+      "command": "just serve",
+      "description": "The gateway, built and run against the dev Postgres + Redis. Inference on :29080, admin API + dashboard on :29081 (it walks up to the first free pair and prints the chosen ports). Run `just bootstrap` once for an API key and the model catalog."
+    }
+  ],
+  "ports": [
+    { "name": "inference", "port": 29080 },
+    { "name": "dashboard", "port": 29081 }
+  ]
+}
