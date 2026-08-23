@@ -1330,6 +1330,12 @@ pub(crate) fn error_response(e: &Error) -> Response {
             e.to_string(),
         ),
         Error::NoViableModel => (StatusCode::BAD_REQUEST, "no_viable_model", e.to_string()),
+        // The client's own request is the thing that cannot be served, and the
+        // message names the field and the dialect — enough to either drop the
+        // field or pin the request to a provider that has it.
+        Error::UnsupportedField { .. } => {
+            (StatusCode::BAD_REQUEST, "unsupported_field", e.to_string())
+        }
         // The message is ours; the provider's is nested below rather than
         // substituted for it.
         Error::Upstream { status, .. } => {
@@ -2015,6 +2021,18 @@ security:
             error_response(&Error::Unauthenticated).status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[test]
+    fn a_field_the_target_dialect_cannot_express_is_the_client_s_error() {
+        // Not a 500: nothing is broken here, the request simply asked for
+        // something the model it routed to has no way to do. And not a silent
+        // success either — the whole point is that the caller is told.
+        let r = error_response(&Error::UnsupportedField {
+            field: "response_format",
+            dialect: Dialect::AnthropicMessages,
+        });
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

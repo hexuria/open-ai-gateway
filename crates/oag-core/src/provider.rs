@@ -102,3 +102,26 @@ pub enum Dialect {
     /// `POST /v1beta/models/{model}:generateContent`
     GeminiGenerateContent,
 }
+
+impl Dialect {
+    /// How to name this dialect in a message a client will read.
+    ///
+    /// The `Debug` spelling leaks our enum variants at people debugging their
+    /// own request bodies; these are the names the vendors' own documentation
+    /// uses, so a caller can go and look the field up.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AnthropicMessages => "Anthropic Messages",
+            Self::OpenAIChatCompletions => "OpenAI Chat Completions",
+            Self::OpenAIResponses => "OpenAI Responses",
+            Self::GeminiGenerateContent => "Gemini generateContent",
+        }
+    }
+}
+
+impl fmt::Display for Dialect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}

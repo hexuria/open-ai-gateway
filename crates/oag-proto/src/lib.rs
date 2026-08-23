@@ -27,8 +27,8 @@ pub mod responses;
 pub mod stream;
 
 pub use canonical::{
-    CacheControl, CanonicalRequest, ContentBlock, Message, Role, Tool, count_input_tokens,
-    extract_cache_blocks,
+    CacheControl, CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
+    count_input_tokens, extract_cache_blocks,
 };
 pub use stream::{StopReason, StreamAccumulator, StreamEvent};
 

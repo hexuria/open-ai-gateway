@@ -73,6 +73,19 @@ pub enum Error {
     #[error("unsupported action: {action}")]
     UnsupportedAction { action: String },
 
+    /// The client set a request field the chosen upstream dialect has no way to
+    /// put on the wire.
+    ///
+    /// A refusal rather than a silent drop, because the two are
+    /// indistinguishable from the client's side and only one of them is
+    /// debuggable: a caller who asked for a JSON object and received prose sees
+    /// a model that ignored its instructions, not a gateway that removed them.
+    #[error("{dialect} cannot express `{field}`, which this request set")]
+    UnsupportedField {
+        field: &'static str,
+        dialect: crate::provider::Dialect,
+    },
+
     #[error("upstream {provider} returned {status}")]
     Upstream {
         provider: Provider,

@@ -110,6 +110,10 @@ mod tests {
             temperature: None,
             thinking_budget: None,
             client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
         }
     }
 

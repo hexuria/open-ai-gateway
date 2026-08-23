@@ -19,12 +19,23 @@
 //!   bare string delta, rather than a chunk with a choices array.
 //! - Usage is `input_tokens`/`output_tokens`, and the input count includes the
 //!   cached prefix.
+//! - Structured output is `text.format`, nested, rather than a top-level
+//!   `response_format`.
+//! - There is no `stop`. It is the one carried request field this dialect has
+//!   no home for, so a client that set stop sequences cannot be served here.
+//! - Conversations continue by `previous_response_id`, which no other dialect
+//!   has, because no other dialect stores the turn.
 
-use crate::canonical::{CanonicalRequest, ContentBlock, Message, Role, Tool};
+use crate::canonical::{
+    CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
+};
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
-use oag_core::Result;
+use oag_core::provider::Dialect;
+use oag_core::{Error, Result};
 use oag_router::Usage;
 use serde_json::{Value, json};
+
+const DIALECT: Dialect = Dialect::OpenAIResponses;
 
 /// Canonical → Responses wire JSON.
 pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Value> {
@@ -76,6 +87,41 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     if req.thinking_budget.is_some() {
         // No token budget in this dialect; effort is the closest thing it has.
         body["reasoning"] = json!({ "effort": "medium" });
+    }
+
+    // The one field this dialect cannot take. Chat Completions has `stop`,
+    // Anthropic has `stop_sequences`, Gemini has `stopSequences`; Responses
+    // dropped the concept, so a request that relies on it has to be refused
+    // rather than silently allowed to run past its stopping point.
+    if !req.stop.is_empty() {
+        return Err(Error::UnsupportedField {
+            field: "stop",
+            dialect: DIALECT,
+        });
+    }
+
+    if let Some(choice) = &req.tool_choice {
+        body["tool_choice"] = match choice {
+            ToolChoice::Auto => json!("auto"),
+            ToolChoice::Required => json!("required"),
+            ToolChoice::None => json!("none"),
+            // Flat, unlike Chat Completions' nested `function` wrapper.
+            ToolChoice::Tool { name } => json!({ "type": "function", "name": name }),
+        };
+    }
+    if let Some(format) = &req.response_format {
+        // Nested under `text`, and the schema fields are flat inside it rather
+        // than wrapped in a `json_schema` object as in Chat Completions.
+        body["text"] = json!({ "format": match format {
+            ResponseFormat::Text => json!({ "type": "text" }),
+            ResponseFormat::JsonObject => json!({ "type": "json_object" }),
+            ResponseFormat::JsonSchema { name, schema, strict } => json!({
+                "type": "json_schema", "name": name, "schema": schema, "strict": strict,
+            }),
+        }});
+    }
+    if let Some(id) = &req.previous_response_id {
+        body["previous_response_id"] = json!(id);
     }
     Ok(body)
 }
@@ -198,7 +244,42 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         // the classifier sees that reasoning was asked for.
         thinking_budget: body["reasoning"]["effort"].as_str().map(|_| 4096),
         client_session: body["user"].as_str().map(std::borrow::ToOwned::to_owned),
+        tool_choice: parse_tool_choice(&body["tool_choice"]),
+        response_format: parse_response_format(&body["text"]["format"]),
+        // No such field in this dialect.
+        stop: Vec::new(),
+        previous_response_id: body["previous_response_id"]
+            .as_str()
+            .map(std::borrow::ToOwned::to_owned),
     })
+}
+
+fn parse_tool_choice(v: &Value) -> Option<ToolChoice> {
+    if let Some(s) = v.as_str() {
+        return match s {
+            "auto" => Some(ToolChoice::Auto),
+            "required" => Some(ToolChoice::Required),
+            "none" => Some(ToolChoice::None),
+            _ => None,
+        };
+    }
+    Some(ToolChoice::Tool {
+        name: v["name"].as_str()?.to_owned(),
+    })
+}
+
+fn parse_response_format(v: &Value) -> Option<ResponseFormat> {
+    match v["type"].as_str()? {
+        "text" => Some(ResponseFormat::Text),
+        "json_object" => Some(ResponseFormat::JsonObject),
+        // Flat here: no `json_schema` wrapper around the name and schema.
+        "json_schema" => Some(ResponseFormat::JsonSchema {
+            name: v["name"].as_str().unwrap_or("response").to_owned(),
+            schema: v["schema"].clone(),
+            strict: v["strict"].as_bool().unwrap_or(false),
+        }),
+        _ => None,
+    }
 }
 
 /// Fold one `input` item into the canonical message list.
@@ -1050,6 +1131,10 @@ mod tests {
             temperature: None,
             thinking_budget: None,
             client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
         };
         let back = render_request(&c, "m").expect("renders");
         assert_eq!(back["input"][0]["content"][0]["type"], "input_text");
@@ -1064,6 +1149,85 @@ mod tests {
             c.messages[0].content.first(),
             Some(ContentBlock::Text { text, .. }) if text == "hello"
         ));
+    }
+
+    #[test]
+    fn previous_response_id_survives_a_round_trip() {
+        // The only dialect that has it, and the field that makes a follow-up
+        // turn make sense at all.
+        let c = parse_request(&json!({
+            "model": "gpt-5", "input": "and the second one?",
+            "previous_response_id": "resp_abc",
+        }))
+        .expect("parses");
+        assert_eq!(c.previous_response_id.as_deref(), Some("resp_abc"));
+
+        let back = render_request(&c, "gpt-5").expect("renders");
+        assert_eq!(back["previous_response_id"], "resp_abc");
+    }
+
+    #[test]
+    fn a_json_schema_round_trips_through_text_format() {
+        // Nested under `text` and flat inside it, where Chat Completions nests
+        // the same fields one level deeper under `json_schema`.
+        let schema = json!({"type": "object", "properties": {"n": {"type": "number"}}});
+        let c = parse_request(&json!({
+            "model": "gpt-5", "input": "hi",
+            "text": {"format": {
+                "type": "json_schema", "name": "answer",
+                "schema": schema.clone(), "strict": true,
+            }},
+            "tool_choice": "required",
+        }))
+        .expect("parses");
+        assert!(matches!(
+            c.response_format,
+            Some(ResponseFormat::JsonSchema { ref name, strict: true, .. }) if name == "answer"
+        ));
+        assert_eq!(c.tool_choice, Some(ToolChoice::Required));
+
+        let back = render_request(&c, "gpt-5").expect("renders");
+        assert_eq!(back["text"]["format"]["type"], "json_schema");
+        assert_eq!(back["text"]["format"]["name"], "answer");
+        assert_eq!(back["text"]["format"]["schema"], schema);
+        assert!(
+            back["text"]["format"].get("json_schema").is_none(),
+            "that wrapper belongs to Chat Completions"
+        );
+        assert_eq!(back["tool_choice"], "required");
+    }
+
+    #[test]
+    fn stop_sequences_are_refused_rather_than_dropped() {
+        // This dialect has no `stop` at all. Dropping it lets generation run
+        // straight past the point the client said to stop, and the client has
+        // no way to tell that from a model that ignored a stop sequence.
+        let c = crate::openai::parse_request(&json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["\n\n"],
+        }))
+        .expect("parses");
+
+        let err = render_request(&c, "gpt-5").expect_err("must not be dropped");
+        assert!(matches!(
+            err,
+            Error::UnsupportedField {
+                field: "stop",
+                dialect: Dialect::OpenAIResponses,
+            }
+        ));
+    }
+
+    #[test]
+    fn a_named_tool_choice_renders_flat() {
+        let c = crate::openai::parse_request(&json!({
+            "model": "m", "messages": [],
+            "tool_choice": {"type": "function", "function": {"name": "read_file"}}
+        }))
+        .expect("parses");
+        let back = render_request(&c, "gpt-5").expect("renders");
+        assert_eq!(back["tool_choice"]["name"], "read_file");
+        assert!(back["tool_choice"].get("function").is_none(), "flat here");
     }
 
     // ── rendering ────────────────────────────────────────────────────────────
