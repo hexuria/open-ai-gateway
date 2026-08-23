@@ -1,11 +1,14 @@
 //! The inference request path.
 
+pub mod authn;
 pub mod count_tokens;
 pub mod meter;
 pub mod models;
 pub mod refresh;
 pub mod select;
 pub mod sse;
+
+pub use authn::{Caller, require_key_layer};
 
 use crate::AppState;
 use axum::body::Body;
@@ -25,12 +28,17 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// `POST /v1/messages` — the Anthropic-native surface.
+///
+/// [`Caller`] before `Bytes` is load-bearing, not stylistic: it is a
+/// head-only extractor, so an unauthenticated request is answered without the
+/// body ever being buffered. See [`authn`].
 pub async fn messages(
     State(state): State<Arc<AppState>>,
+    Caller(auth): Caller,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    dispatch(state, headers, body, Dialect::AnthropicMessages, None).await
+    dispatch(state, auth, headers, body, Dialect::AnthropicMessages, None).await
 }
 
 /// `POST /v1/chat/completions` — the OpenAI-shaped surface.
@@ -39,20 +47,30 @@ pub async fn messages(
 /// having a canonical form in the middle.
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    Caller(auth): Caller,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    dispatch(state, headers, body, Dialect::OpenAIChatCompletions, None).await
+    dispatch(
+        state,
+        auth,
+        headers,
+        body,
+        Dialect::OpenAIChatCompletions,
+        None,
+    )
+    .await
 }
 
 /// `POST /v1/responses` — OpenAI's newer surface, and the one their current
 /// SDKs default to.
 pub async fn responses(
     State(state): State<Arc<AppState>>,
+    Caller(auth): Caller,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    dispatch(state, headers, body, Dialect::OpenAIResponses, None).await
+    dispatch(state, auth, headers, body, Dialect::OpenAIResponses, None).await
 }
 
 /// What the Gemini dialect carries in the path rather than in the body.
@@ -76,6 +94,7 @@ struct PathFields<'a> {
 /// are recovered from it rather than from the body.
 pub async fn gemini_generate(
     State(state): State<Arc<AppState>>,
+    Caller(auth): Caller,
     axum::extract::Path(model_action): axum::extract::Path<String>,
     headers: HeaderMap,
     body: axum::body::Bytes,
@@ -90,7 +109,7 @@ pub async fn gemini_generate(
     // silently cost money and answered nothing.
     match action {
         "generateContent" | "streamGenerateContent" => {}
-        "countTokens" => return count_tokens::gemini_count(&state, &headers, &body).await,
+        "countTokens" => return count_tokens::gemini_count(&state, &auth, &body).await,
         other => {
             return error_response(&Error::UnsupportedAction {
                 action: other.to_owned(),
@@ -99,24 +118,13 @@ pub async fn gemini_generate(
     }
     let stream = action.starts_with("stream");
 
-    // Every dialect's request is an object, and this is where a body that is not
-    // one is answered rather than assumed. It used to be assumed: the path's
-    // model and mode were written into the parsed body with `IndexMut`, which
-    // panics on any `Value` that is not an object or null — so `[]`, `123`,
-    // `"x"` or `true` aborted the request task. Before `authenticate`, so no key
-    // was needed to do it, and with nothing catching the unwind it severed the
-    // connection instead of answering on it: on HTTP/2 that resets every sibling
-    // stream multiplexed onto the same connection.
-    //
-    // Deserialising into a map *is* the check. Malformed JSON and well-formed
-    // non-objects both fail it, both with a message naming what was wrong, and
-    // both are already a 400 through `Error::Serde`.
-    if let Err(e) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body) {
-        return error_response(&Error::Serde(e));
+    if let Err(e) = require_object_body(&body) {
+        return error_response(&e);
     }
 
     dispatch(
         state,
+        auth,
         headers,
         body,
         Dialect::GeminiGenerateContent,
@@ -125,8 +133,27 @@ pub async fn gemini_generate(
     .await
 }
 
+/// Refuse a body this dialect's pipeline cannot read, as the client error it is.
+///
+/// It used to be assumed rather than checked: the path's model and mode were
+/// written into the parsed body with `IndexMut`, which panics on any `Value`
+/// that is not an object or null — so `[]`, `123`, `"x"` or `true` aborted the
+/// request task, and with nothing catching the unwind that severed the
+/// connection instead of answering on it. On HTTP/2 severing resets every
+/// sibling stream multiplexed onto the same connection.
+///
+/// Deserialising into a map *is* the check. Malformed JSON and well-formed
+/// non-objects both fail it, both with a message naming what was wrong, and
+/// both are already a 400 through `Error::Serde`.
+fn require_object_body(body: &[u8]) -> Result<()> {
+    serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(body)
+        .map(|_| ())
+        .map_err(Error::Serde)
+}
+
 async fn dispatch(
     state: Arc<AppState>,
+    auth: Arc<oag_store::AuthContext>,
     headers: HeaderMap,
     body: axum::body::Bytes,
     ingress: Dialect,
@@ -140,7 +167,11 @@ async fn dispatch(
     let guard = state.lifecycle.track();
     let request_id = RequestId::new();
 
-    match handle(&state, &headers, &body, request_id, ingress, path, guard).await {
+    match handle(
+        &state, &auth, &headers, &body, request_id, ingress, path, guard,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(e) => {
             metrics::counter!("oag_requests_total", "outcome" => "error").increment(1);
@@ -149,8 +180,10 @@ async fn dispatch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     state: &Arc<AppState>,
+    auth: &Arc<oag_store::AuthContext>,
     headers: &HeaderMap,
     body: &[u8],
     request_id: RequestId,
@@ -160,9 +193,9 @@ async fn handle(
 ) -> Result<Response> {
     let started = Instant::now();
 
-    // ── authenticate ──────────────────────────────────────────────────────────
-    let auth = authenticate(state, headers).await?;
-
+    // Authentication already happened, in `require_key_layer`, before the body
+    // extractor ran.
+    //
     // ── parse ─────────────────────────────────────────────────────────────────
     let wire: serde_json::Value = serde_json::from_slice(body)?;
     let mut canonical = match ingress {
@@ -181,7 +214,7 @@ async fn handle(
         _ => anthropic::parse_request(&wire)?,
     };
 
-    let plan = plan_request(state, &auth, &canonical, headers).await?;
+    let plan = plan_request(state, auth, &canonical, headers).await?;
 
     tracing::info!(
         %request_id,
@@ -205,7 +238,7 @@ async fn handle(
 
     run_with_escalation(
         state,
-        &auth,
+        auth,
         plan,
         &mut canonical,
         &session,
@@ -354,22 +387,6 @@ struct Plan {
     signal: oag_router::RequestSignal,
     catalog: Arc<oag_router::Catalog>,
     pressure: oag_router::BudgetPressure,
-}
-
-/// Authenticate an inbound key.
-///
-/// Shared by every client-facing handler rather than inlined per handler: a
-/// second copy is how one endpoint ends up accepting a key the others reject.
-pub(crate) async fn authenticate(
-    state: &Arc<AppState>,
-    headers: &HeaderMap,
-) -> Result<Arc<oag_store::AuthContext>> {
-    let raw_key = extract_key(headers).ok_or(Error::Unauthenticated)?;
-    state
-        .auth
-        .authenticate(raw_key)
-        .await?
-        .ok_or(Error::Unauthenticated)
 }
 
 /// Load the caller's route and build the policy it implies.
@@ -1019,7 +1036,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// Upstream bodies are passed through so a client sees the provider's own
 /// message rather than a generic 502 it cannot act on. Internal errors are not:
 /// they can carry connection strings and file paths.
-fn error_response(e: &Error) -> Response {
+pub(crate) fn error_response(e: &Error) -> Response {
     let (status, kind, message) = match e {
         Error::Unauthenticated => (
             StatusCode::UNAUTHORIZED,
@@ -1129,6 +1146,35 @@ mod tests {
         assert_eq!(
             extract_key(&headers(&[("authorization", "Basic abc")])),
             None
+        );
+    }
+
+    #[test]
+    fn a_gemini_body_that_is_not_an_object_is_a_client_error() {
+        // The router no longer reaches this without a key, so the guard is
+        // asserted here rather than through a request. Every one of these
+        // used to panic inside `IndexMut`, severing the connection — which on
+        // HTTP/2 resets every sibling stream multiplexed onto it. `null` did
+        // not panic; `IndexMut` silently turned it into an object.
+        for body in ["[]", "123", "\"x\"", "true", "null", "{", ""] {
+            let Err(err) = require_object_body(body.as_bytes()) else {
+                panic!("a body of {body} is not a request and must not be accepted as one");
+            };
+            assert!(
+                matches!(err, Error::Serde(_)),
+                "a body of {body} must map to a 400, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gemini_object_body_passes_the_guard() {
+        // The other half: it must refuse the shape the pipeline cannot read and
+        // nothing else. A guard that rejected this would refuse every real
+        // request.
+        assert!(
+            require_object_body(br#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#)
+                .is_ok()
         );
     }
 

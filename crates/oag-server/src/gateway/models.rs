@@ -10,10 +10,9 @@
 //! failure much later and much further from its cause. That also makes this an
 //! entitlement surface, which is why it authenticates.
 
-use super::{authenticate, error_response, policy_for};
+use super::{Caller, error_response, policy_for};
 use crate::AppState;
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use oag_core::{Provider, TierName, tier::RoutingMode};
 use oag_router::Entitlement;
@@ -22,12 +21,12 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// `GET /v1/models` and `/models`.
-pub async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn list(State(state): State<Arc<AppState>>, Caller(auth): Caller) -> Response {
     let Resolved {
         policy,
         providers,
         mode,
-    } = match resolve(&state, &headers).await {
+    } = match resolve(&state, &auth).await {
         Ok(r) => r,
         Err(response) => return response,
     };
@@ -46,12 +45,12 @@ pub async fn list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Res
 
 /// `GET /v1beta/models`, which uses a different envelope and different field
 /// names. Deliberately does not share a renderer with [`list`].
-pub async fn list_gemini(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn list_gemini(State(state): State<Arc<AppState>>, Caller(auth): Caller) -> Response {
     let Resolved {
         policy,
         providers,
         mode,
-    } = match resolve(&state, &headers).await {
+    } = match resolve(&state, &auth).await {
         Ok(r) => r,
         Err(response) => return response,
     };
@@ -86,11 +85,11 @@ struct Resolved {
 }
 
 /// Who is asking, and what the route lets them reach.
-async fn resolve(state: &Arc<AppState>, headers: &HeaderMap) -> Result<Resolved, Response> {
-    let auth = authenticate(state, headers)
-        .await
-        .map_err(|e| error_response(&e))?;
-    let (route, policy) = policy_for(state, &auth)
+async fn resolve(
+    state: &Arc<AppState>,
+    auth: &oag_store::AuthContext,
+) -> Result<Resolved, Response> {
+    let (route, policy) = policy_for(state, auth)
         .await
         .map_err(|e| error_response(&e))?;
     let providers = providers_for(state, route.id, auth.principal_id)

@@ -30,6 +30,9 @@ time.workspace = true
 uuid.workspace = true
 url.workspace = true
 bytes = "1"
+# The connection builder `axum::serve` hides. Without it `server.header_read_timeout`
+# and `server.idle_timeout` cannot be applied at all.
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 futures-util.workspace = true
 tokio-stream = "0.1"
 async-trait.workspace = true

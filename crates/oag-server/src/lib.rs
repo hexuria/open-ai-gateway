@@ -18,6 +18,7 @@ pub mod admin;
 pub mod breakers;
 pub mod gateway;
 pub mod health;
+pub mod listen;
 pub mod metrics;
 pub mod shutdown;
 pub mod state;
@@ -83,16 +84,21 @@ impl tower_http::catch_panic::ResponseForPanic for PanicIsFiveHundred {
 }
 
 /// The inference routes, without the shared health endpoint.
-fn inference_routes() -> Router<Arc<AppState>> {
+///
+/// Every route declared here is authenticated before its body is read, by the
+/// `route_layer` at the bottom of the function. Declaring an inference route
+/// anywhere else is the only way to produce an unauthenticated one, and the
+/// handlers cannot be written without a [`gateway::Caller`] anyway.
+fn inference_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/messages", axum::routing::post(gateway::messages))
         .route(
             "/v1/messages/count_tokens",
             axum::routing::post(gateway::count_tokens::count_tokens)
-                // The outer limit is `server.max_body_bytes`, 256 MiB by
-                // default. This endpoint does a full parse plus a `to_string`
-                // of every tool schema, and a real count_tokens body carries no
-                // payload worth megabytes. The inner limit wins for this route.
+                // The outer limit is `server.max_body_bytes`. This endpoint
+                // does a full parse plus a `to_string` of every tool schema,
+                // and a real count_tokens body carries no payload worth
+                // megabytes. The inner limit wins for this route.
                 .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
         )
         // Discovery. Both spellings, because SDKs given a custom base URL
@@ -117,6 +123,14 @@ fn inference_routes() -> Router<Arc<AppState>> {
             "/v1beta/models/{*model_action}",
             axum::routing::post(gateway::gemini_generate),
         )
+        // `route_layer`, so an unmatched path 404s without an auth round trip
+        // — and, more importantly, so this runs *before* a handler's `Bytes`
+        // extractor. An unauthenticated POST is refused on its headers rather
+        // than after `max_body_bytes` have been read into this process.
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(state),
+            gateway::require_key_layer,
+        ))
 }
 
 /// The admin routes, without the shared health endpoint.
@@ -168,7 +182,7 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
 /// detail, and answering it does not require being reachable from outside.
 pub fn public_router(state: Arc<AppState>) -> Router {
     let limit = state.config.server.max_body_bytes;
-    let routes = inference_routes().route("/health/live", get(health::live));
+    let routes = inference_routes(&state).route("/health/live", get(health::live));
 
     // On a single-port platform there is nowhere else for the admin routes to
     // live, so they join this listener rather than vanishing entirely.
@@ -231,6 +245,10 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
     let public_addr = state.config.server.public_addr.clone();
     let lifecycle = Arc::clone(&state.lifecycle);
     let drain = state.config.gateway.max_stream_duration;
+    // `axum::serve` builds its own hyper connection and exposes none of it, so
+    // these two settings were config and documentation with nothing reading
+    // them. See [`listen`].
+    let deadlines = listen::Deadlines::from(&state.config.server);
 
     let public = tokio::net::TcpListener::bind(&public_addr)
         .await
@@ -245,10 +263,14 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
              this port they are unauthenticated — restrict it at the edge."
         );
         spawn_catalog_refresh(Arc::clone(&state));
-        return axum::serve(public, public_router(state))
-            .with_graceful_shutdown(shutdown::signal(lifecycle, drain))
-            .await
-            .map_err(|e| oag_core::Error::Internal(format!("listener: {e}")));
+        listen::serve(
+            public,
+            public_router(state),
+            deadlines,
+            shutdown::signal(lifecycle, drain),
+        )
+        .await;
+        return Ok(());
     }
 
     let admin_addr = state.config.server.admin_addr.clone();
@@ -259,14 +281,20 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
     tracing::info!(%public_addr, %admin_addr, "listening");
     spawn_catalog_refresh(Arc::clone(&state));
 
-    let public_srv = axum::serve(public, public_router(Arc::clone(&state)))
-        .with_graceful_shutdown(shutdown::signal(Arc::clone(&lifecycle), drain));
-    let admin_srv = axum::serve(admin, admin_router(state))
-        .with_graceful_shutdown(shutdown::signal(lifecycle, drain));
+    let public_srv = listen::serve(
+        public,
+        public_router(Arc::clone(&state)),
+        deadlines,
+        shutdown::signal(Arc::clone(&lifecycle), drain),
+    );
+    let admin_srv = listen::serve(
+        admin,
+        admin_router(state),
+        deadlines,
+        shutdown::signal(lifecycle, drain),
+    );
 
-    let (a, b) = tokio::join!(public_srv, admin_srv);
-    a.map_err(|e| oag_core::Error::Internal(format!("public listener: {e}")))?;
-    b.map_err(|e| oag_core::Error::Internal(format!("admin listener: {e}")))?;
+    tokio::join!(public_srv, admin_srv);
     Ok(())
 }
 
@@ -283,6 +311,10 @@ mod router_tests {
     /// client, so neither touches the network here. Every assertion below is
     /// about routing and the auth layer, which run before any backend does.
     fn state(single_listener: bool) -> Arc<AppState> {
+        state_with(single_listener, 32 * 1024 * 1024)
+    }
+
+    fn state_with(single_listener: bool, max_body_bytes: usize) -> Arc<AppState> {
         let src = format!(
             r#"
 database:
@@ -294,6 +326,7 @@ security:
   credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 server:
   single_listener: {single_listener}
+  max_body_bytes: {max_body_bytes}
 "#
         );
         let config = oag_core::config::Config::from_yaml(&src).expect("test config");
@@ -370,21 +403,28 @@ server:
 
     /// Valid JSON that is not an object.
     ///
-    /// The first four *panicked*. `gemini_generate` re-expressed the path's
-    /// model and mode as body fields by assigning `wire["__oag_model"]`, and
-    /// `IndexMut` on a `serde_json::Value` panics for anything that is not an
-    /// object or null. `null` did not panic — `IndexMut` silently turns it into
-    /// an object — but it is not a request either.
+    /// The first four *panicked* before the previous change: `gemini_generate`
+    /// re-expressed the path's model and mode as body fields by assigning
+    /// `wire["__oag_model"]`, and `IndexMut` on a `serde_json::Value` panics for
+    /// anything that is not an object or null. `null` did not panic — `IndexMut`
+    /// silently turns it into an object — but it is not a request either.
+    ///
+    /// None of them reach the parse any more; the layer below answers first.
+    /// `gateway::require_object_body` owns that assertion now, as a unit test
+    /// that needs no key.
     const NON_OBJECT_BODIES: [&str; 5] = ["[]", "123", "\"x\"", "true", "null"];
 
     #[tokio::test]
-    async fn gemini_non_object_body_is_400_not_panic() {
-        // Reached before `authenticate`, so no key was needed to abort a request
-        // task — and with nothing catching the unwind, hyper closed the
-        // connection rather than answering on it, which on HTTP/2 resets every
-        // sibling stream on that connection. The assertion is 400 *and* the
-        // absence of a key: authenticating first would hide the panic behind a
-        // 401 without removing it.
+    async fn a_public_post_is_answered_from_its_headers_before_its_body_is_read() {
+        // The finding. Every handler took `axum::body::Bytes`, and an extractor
+        // runs before the handler — so a caller with no credential at all had
+        // `server.max_body_bytes` buffered on its behalf before anything looked
+        // at a key. That was 256 MiB against a 1 Gi replica with no
+        // unauthenticated rate limit in front of it.
+        //
+        // These bodies used to come back 400, from a shape check the Gemini
+        // handler ran on the buffered bytes. 401 now, because nothing looks at
+        // the body until a key has resolved.
         for body in NON_OBJECT_BODIES {
             let got = post_status(
                 public_router(state(false)),
@@ -394,38 +434,94 @@ server:
             .await;
             assert_eq!(
                 got,
-                StatusCode::BAD_REQUEST,
-                "a body of {body} must be refused as the client error it is"
+                StatusCode::UNAUTHORIZED,
+                "a body of {body} was inspected before the key was"
             );
         }
     }
 
     #[tokio::test]
-    async fn a_streaming_gemini_path_rejects_a_non_object_too() {
-        // The same handler serves both actions, and only one of them was ever
-        // exercised by hand.
-        let got = post_status(
-            public_router(state(false)),
-            "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
-            "[]",
-        )
-        .await;
-        assert_eq!(got, StatusCode::BAD_REQUEST);
+    async fn an_oversized_anonymous_post_is_401_rather_than_413() {
+        // The sharpest form of the same assertion. 413 is the body extractor
+        // talking: to know the body was too large, it had to be reading it. A
+        // caller with no key must never get that far, whatever it claims to be
+        // sending — so the answer is 401, decided from the head alone.
+        let router = public_router(state_with(false, 1024));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from("x".repeat(64 * 1024)))
+            .expect("request");
+        let got = router.oneshot(request).await.expect("response").status();
+        assert_eq!(
+            got,
+            StatusCode::UNAUTHORIZED,
+            "the body was measured before the key was read"
+        );
     }
 
     #[tokio::test]
-    async fn an_object_body_still_reaches_authentication() {
-        // The other half of the guard: it must reject the shape the pipeline
-        // cannot read, and nothing else. A well-formed body with no key is a
-        // 401, exactly as before — a guard that answered 400 here would be
-        // rejecting every real request.
-        let got = post_status(
-            public_router(state(false)),
+    async fn every_public_post_refuses_an_anonymous_caller() {
+        // One layer over the whole inference router rather than a call at the
+        // top of each handler, for the same reason the admin API has one: with
+        // per-handler checks this could only cover the handlers someone
+        // remembered to write a check into.
+        const POSTS: [&str; 7] = [
+            "/v1/messages",
+            "/v1/messages/count_tokens",
+            "/v1/chat/completions",
+            "/chat/completions",
+            "/v1/responses",
+            "/responses",
             "/v1beta/models/gemini-2.5-pro:generateContent",
-            r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
-        )
-        .await;
+        ];
+        for path in POSTS {
+            let got =
+                post_status(public_router(state(false)), path, r#"{"model":"oag/auto"}"#).await;
+            assert_eq!(got, StatusCode::UNAUTHORIZED, "{path} answered {got}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_body_is_still_refused_on_the_key() {
+        // The other half of "authentication runs from the headers": with no
+        // body at all there is nothing to buffer, and the answer must still be
+        // the same 401 rather than whatever the parse would have said.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::empty())
+            .expect("request");
+        let got = public_router(state(false))
+            .oneshot(request)
+            .await
+            .expect("response")
+            .status();
         assert_eq!(got, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn liveness_stays_outside_the_key_layer() {
+        // The layer is on the inference routes, not on the public router: an
+        // orchestrator probing liveness holds no API key, and a replica that
+        // answered 401 here would be restarted forever.
+        //
+        // A key that is *present but wrong* is deliberately not asserted
+        // anywhere in this module — resolving one reaches Postgres, whose pool
+        // has a ten-second acquire timeout, so it would cost a real stall and
+        // depend on a local database existing.
+        let got = status(public_router(state(false)), "GET", "/health/live").await;
+        assert_eq!(got, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_inference_path_is_404_without_touching_the_backend() {
+        // `route_layer`, not `layer`: authenticating an unroutable path costs a
+        // cache lookup and possibly a database round trip for a request that
+        // was never going to be served.
+        let got = post_status(public_router(state(false)), "/v1/nonexistent", "{}").await;
+        assert_eq!(got, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

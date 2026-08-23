@@ -17,11 +17,18 @@ server:
   # network — the default binds to loopback so an accidental deployment does not
   # expose it.
   admin_addr: "127.0.0.1:8081"
+  # How long a client may take to send its request headers. A trickle of header
+  # bytes with no deadline is a slowloris.
   header_read_timeout: 10
-  # Connection idle timeout. Deliberately NOT a response deadline: a streamed
-  # completion legitimately runs for many minutes.
+  # How long an HTTP/2 connection may go quiet before it is pinged. Deliberately
+  # NOT a response deadline: a streamed completion legitimately runs for many
+  # minutes, and the ping is answered by the transport rather than the
+  # application, so an idle-but-alive stream survives it.
   idle_timeout: 120
-  max_body_bytes: 268435456
+  # 32 MiB, buffered in memory per in-flight request. Raising this multiplies by
+  # your concurrency: at 256 MiB, the previous default, a handful of concurrent
+  # large POSTs exceeds the memory limit the Helm chart asks for.
+  max_body_bytes: 33554432
 
 database:
   url: "postgres://oag:oag@localhost:5432/oag"

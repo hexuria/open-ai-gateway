@@ -39,14 +39,30 @@ pub struct ServerConfig {
     /// means every admin endpoint inherits the public listener's exposure.
     pub admin_addr: String,
     /// How long a client may take to send its request headers.
+    ///
+    /// Applied to the HTTP/1 connection in `oag_server::serve`. Without it a
+    /// trickle of header bytes holds a connection open indefinitely, which is
+    /// the whole of a slowloris.
     #[serde(with = "humantime_secs")]
     pub header_read_timeout: Duration,
-    /// Idle keep-alive timeout. Deliberately *not* a whole-response write
-    /// timeout: a streamed completion legitimately runs for many minutes and
-    /// any total-response deadline will sever it.
+    /// How long an HTTP/2 connection may go quiet before it is pinged, and
+    /// dropped if the ping is not answered.
+    ///
+    /// Deliberately *not* a whole-response write timeout: a streamed completion
+    /// legitimately runs for many minutes and any total-response deadline will
+    /// sever it. A ping is answered by the peer's transport, not by its
+    /// application, so an idle-but-alive stream survives one.
     #[serde(with = "humantime_secs")]
     pub idle_timeout: Duration,
-    /// Maximum inbound body. Large because image and document payloads are.
+    /// Maximum inbound body.
+    ///
+    /// This is buffered in memory, per in-flight request, before the request is
+    /// parsed. It used to default to 256 MiB — chosen for image and document
+    /// payloads, and roughly a quarter of the memory limit the Helm chart asks
+    /// for, so a handful of concurrent large POSTs was an OOM. 32 MiB still
+    /// carries a base64 image well past any provider's own inline-attachment
+    /// ceiling; a deployment that genuinely needs more can raise it, knowing
+    /// what it is multiplying by its concurrency.
     pub max_body_bytes: usize,
     /// Serve admin routes on the public listener instead of their own.
     ///
@@ -76,7 +92,7 @@ impl Default for ServerConfig {
             admin_addr: "127.0.0.1:8081".to_owned(),
             header_read_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_mins(2),
-            max_body_bytes: 256 * 1024 * 1024,
+            max_body_bytes: 32 * 1024 * 1024,
             single_listener: false,
         }
     }
@@ -342,7 +358,37 @@ security:
             cfg.server.public_addr, "0.0.0.0:8080",
             "sibling kept its default"
         );
-        assert_eq!(cfg.server.max_body_bytes, 256 * 1024 * 1024);
+        assert_eq!(cfg.server.max_body_bytes, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_default_body_limit_is_survivable_at_the_deployed_memory_limit() {
+        // It was 256 MiB, buffered per in-flight request before anything was
+        // parsed, against the 1 Gi the Helm chart asks for — so four concurrent
+        // large POSTs was an OOM, and until authentication moved in front of
+        // the body extractor they did not have to be authenticated ones.
+        //
+        // The bound is deliberately generous rather than an equality: the point
+        // is the order of magnitude, not this exact number.
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(
+            cfg.server.max_body_bytes <= 64 * 1024 * 1024,
+            "a per-request buffer of {} bytes does not fit a 1 Gi replica under concurrency",
+            cfg.server.max_body_bytes
+        );
+        // And still large enough for the payloads this gateway exists to carry.
+        assert!(cfg.server.max_body_bytes >= 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_connection_deadlines_default_to_something_the_server_can_apply() {
+        // Both were config and documentation with nothing reading them until
+        // `oag_server::listen` replaced `axum::serve`. A zero here would mean
+        // "disabled", which is not what a slowloris mitigation should default
+        // to.
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(!cfg.server.header_read_timeout.is_zero());
+        assert!(!cfg.server.idle_timeout.is_zero());
     }
 
     #[test]

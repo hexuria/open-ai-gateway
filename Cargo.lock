@@ -1557,6 +1557,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body-util",
+ "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
  "oag-core",

@@ -16,10 +16,9 @@
 //! token: that is a throughput guard, not a money guard, and an unthrottled
 //! preflight is still traffic.
 
-use super::{authenticate, error_response};
+use super::{Caller, error_response};
 use crate::AppState;
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use oag_core::{Error, Result};
 use serde_json::{Value, json};
@@ -28,10 +27,10 @@ use std::sync::Arc;
 /// `POST /v1/messages/count_tokens`.
 pub async fn count_tokens(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
+    Caller(auth): Caller,
     body: axum::body::Bytes,
 ) -> Response {
-    match count(&state, &headers, &body, Body::Anthropic).await {
+    match count(&state, &auth, &body, Body::Anthropic).await {
         Ok(tokens) => (
             [("x-oag-token-count", "estimate")],
             axum::Json(json!({ "input_tokens": tokens, "oag_estimate": true })),
@@ -44,10 +43,10 @@ pub async fn count_tokens(
 /// The Gemini spelling of the same thing, reached via `models/x:countTokens`.
 pub(super) async fn gemini_count(
     state: &Arc<AppState>,
-    headers: &HeaderMap,
+    auth: &oag_store::AuthContext,
     body: &axum::body::Bytes,
 ) -> Response {
-    match count(state, headers, body, Body::Gemini).await {
+    match count(state, auth, body, Body::Gemini).await {
         Ok(tokens) => (
             [("x-oag-token-count", "estimate")],
             axum::Json(json!({ "totalTokens": tokens, "oag_estimate": true })),
@@ -68,12 +67,10 @@ enum Body {
 
 async fn count(
     state: &Arc<AppState>,
-    headers: &HeaderMap,
+    auth: &oag_store::AuthContext,
     body: &[u8],
     dialect: Body,
 ) -> Result<u64> {
-    let auth = authenticate(state, headers).await?;
-
     let route = oag_store::repo::route_by_id(&state.db, auth.route_id)
         .await?
         .ok_or_else(|| Error::Internal("route vanished between auth and counting".to_owned()))?;
