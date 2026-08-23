@@ -136,6 +136,17 @@ to run after each apply. Documented, not hidden.
   principal is deliberately refused — it gets pasted into SDK configs.
 - **Local dev binds 29080/29081**, not 8080/8081, which collide with everything.
   `just serve` walks up to the first free pair and prints what it chose.
+- **Three GitHub identities exist on the machine this was built on**, and only
+  one owns this repo. `hexuria` owns it; the `hexuria.github.com` remote is an
+  SSH alias in `~/.ssh/config` that selects `~/.ssh/id_hexuria`, which is why
+  pushes work. `gh` also holds `codeitlikemiley` and `hugoforbes88`, which have
+  READ — so with either of those active, `gh workflow run`, PR creation and
+  anything else token-based fails with `HTTP 403: Must have admin rights`.
+  `gh auth switch --user hexuria` fixes it, and is what the active account is
+  now set to. The same applies to Claude Code cloud sessions: they authenticate
+  through the GitHub integration, never through your local SSH config, so
+  connect them while `hexuria` is active or they inherit READ.
+
 - **The name is settled.** `open-ai-gateway` was a deliberate decision, not an
   oversight.
 
