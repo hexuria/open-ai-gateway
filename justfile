@@ -5,6 +5,7 @@ default:
 
 compose := "docker compose -f deploy/compose/dev.yml"
 stack   := "docker compose -f deploy/compose/stack.yml"
+floci   := "docker compose -f deploy/floci/docker-compose.yml"
 dev_db  := env("OAG_DATABASE__URL", "postgres://oag:oag@127.0.0.1:5452/oag")
 dev_rd  := env("OAG_REDIS__URL", "redis://127.0.0.1:6399")
 
@@ -165,6 +166,20 @@ stack-observe:
 # Restart one replica under load; the other two must not drop a stream.
 stack-roll:
     {{stack}} restart oag-2
+
+# ── local "GCP" via floci ────────────────────────────────────────────────────
+# Deploy OAG onto a local floci GCP as a real Cloud Run service. See deploy/floci.
+floci-up:
+    @./deploy/floci/deploy.sh
+
+# Tear down floci + Postgres + Redis, and the Cloud Run container floci spawned.
+floci-down:
+    -@docker ps -aq --filter "name=floci-gcp-cloudrun-open-ai-gateway" | xargs -r docker rm -f
+    {{floci}} down
+
+# Follow the floci emulator + gateway logs.
+floci-logs:
+    {{floci}} logs -f
 
 # ── verification ───────────────────────────────────────────────────────────────
 # Needs no credentials and no cluster, and guards the savings figure itself.
