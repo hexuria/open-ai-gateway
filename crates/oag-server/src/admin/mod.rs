@@ -148,6 +148,16 @@ type UsageRowTuple = (
 
 type SummaryTotals = (i64, rust_decimal::Decimal, rust_decimal::Decimal, i64, i64);
 
+// name, requests, api-value, monthly-fee, remaining-pct, window-label.
+type SeatTuple = (
+    String,
+    i64,
+    rust_decimal::Decimal,
+    Option<rust_decimal::Decimal>,
+    Option<rust_decimal::Decimal>,
+    Option<String>,
+);
+
 type TierTotals = (String, i64, rust_decimal::Decimal, rust_decimal::Decimal);
 
 /// The headline numbers: what was spent, and what it would have cost.
@@ -190,6 +200,13 @@ pub struct SeatRow {
     /// its fee. `None` when the seat is unpriced. Negative means this seat's
     /// traffic has not yet earned its fee back.
     pub saved_usd: Option<String>,
+    /// Remaining allowance from the provider's own usage API, 0..100. `None`
+    /// until the poller has read it — an unpolled seat's headroom is unknown,
+    /// not full.
+    pub remaining_pct: Option<String>,
+    /// The window the percentage is measured over ("weekly"), for the label
+    /// beside it. `None` when never polled.
+    pub usage_window: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,17 +237,14 @@ pub struct Window {
 /// only what the seat actually served. Failures degrade to an empty list — a
 /// missing subscriptions table should not take down the whole summary.
 async fn seat_summaries(db: &oag_store::Db, days: i32) -> Vec<SeatRow> {
-    let seats: Vec<(
-        String,
-        i64,
-        rust_decimal::Decimal,
-        Option<rust_decimal::Decimal>,
-    )> = sqlx::query_as(
+    let seats: Vec<SeatTuple> = sqlx::query_as(
         r"
             SELECT a.name,
                    COUNT(u.request_id),
                    COALESCE(SUM(u.counterfactual_api_usd), 0),
-                   a.monthly_cost_usd
+                   a.monthly_cost_usd,
+                   a.usage_remaining_pct,
+                   a.usage_window_label
             FROM account a
             LEFT JOIN usage_event u
                    ON u.account_id = a.id
@@ -238,7 +252,7 @@ async fn seat_summaries(db: &oag_store::Db, days: i32) -> Vec<SeatRow> {
                   AND u.cost_usd = 0
                   AND u.counterfactual_api_usd > 0
             WHERE a.kind = 'oauth'
-            GROUP BY a.id, a.name, a.monthly_cost_usd
+            GROUP BY a.id, a.name, a.monthly_cost_usd, a.usage_remaining_pct, a.usage_window_label
             ORDER BY COALESCE(SUM(u.counterfactual_api_usd), 0) DESC, a.name
             ",
     )
@@ -250,7 +264,7 @@ async fn seat_summaries(db: &oag_store::Db, days: i32) -> Vec<SeatRow> {
     let day_frac = rust_decimal::Decimal::from(days) / rust_decimal::Decimal::from(30);
     seats
         .into_iter()
-        .map(|(name, requests, api_value, monthly)| {
+        .map(|(name, requests, api_value, monthly, remaining, window)| {
             // Prorate each seat's own fee to the window. An unpriced seat yields
             // None for both cost and saving — its API value is still shown, but
             // a saving cannot be invented from a fee nobody entered.
@@ -270,6 +284,8 @@ async fn seat_summaries(db: &oag_store::Db, days: i32) -> Vec<SeatRow> {
                 api_value_usd: format!("{api_value:.4}"),
                 plan_cost_usd,
                 saved_usd,
+                remaining_pct: remaining.map(|r| format!("{r:.0}")),
+                usage_window: window,
             }
         })
         .collect()

@@ -22,6 +22,7 @@ pub mod listen;
 pub mod metrics;
 pub mod shutdown;
 pub mod state;
+pub mod usage_poll;
 
 pub use shutdown::Lifecycle;
 pub use state::AppState;
@@ -263,6 +264,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
              this port they are unauthenticated — restrict it at the edge."
         );
         spawn_catalog_refresh(Arc::clone(&state));
+        usage_poll::spawn_usage_poll(Arc::clone(&state));
         listen::serve(
             public,
             public_router(state),
@@ -280,6 +282,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
 
     tracing::info!(%public_addr, %admin_addr, "listening");
     spawn_catalog_refresh(Arc::clone(&state));
+    usage_poll::spawn_usage_poll(Arc::clone(&state));
 
     let public_srv = listen::serve(
         public,

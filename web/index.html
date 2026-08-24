@@ -217,6 +217,15 @@ async function load() {
             const cls = parseFloat(r.saved_usd) >= 0 ? 'good' : 'bad';
             return `<span class="${cls}">$${esc(r.saved_usd)}</span>`;
           }, num:true },
+        // Remaining allowance from the provider's own usage API. '—' until the
+        // poller has read it; a low figure turns amber, exhausted turns red.
+        { h:'Remaining',   f:r => {
+            if (r.remaining_pct == null) return '—';
+            const pct = parseFloat(r.remaining_pct);
+            const cls = pct <= 0 ? 'bad' : pct < 15 ? 'warn' : 'good';
+            const win = r.usage_window ? ` <span class="reason">${esc(r.usage_window)}</span>` : '';
+            return `<span class="${cls}">${esc(r.remaining_pct)}%</span>${win}`;
+          }, num:true },
       ], seats);
     } else {
       $('subs').hidden = true;

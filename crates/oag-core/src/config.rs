@@ -211,6 +211,15 @@ pub struct GatewayConfig {
     /// takes effect — and the replicas give no sign that they are stale.
     #[serde(with = "humantime_secs")]
     pub catalog_refresh_interval: Duration,
+    /// How often to poll each subscription seat's provider for remaining quota.
+    ///
+    /// A flat-rate seat has a usage window (Grok's weekly pool, Codex's 5-hour
+    /// window); this reading feeds both the dashboard and the scheduler, which
+    /// skips an exhausted seat. Slower than the catalog refresh because a
+    /// provider's own usage API is a courtesy, not a hot path, and hammering it
+    /// invites its own rate limit.
+    #[serde(with = "humantime_secs")]
+    pub usage_poll_interval: Duration,
     /// AWS region for Bedrock. Also part of the SigV4 signing scope, so it has
     /// to be right even when `provider_base_urls` points somewhere else.
     #[serde(default = "default_bedrock_region")]
@@ -232,6 +241,7 @@ impl Default for GatewayConfig {
             same_account_retries: 2,
             max_account_switches: 3,
             catalog_refresh_interval: Duration::from_mins(1),
+            usage_poll_interval: Duration::from_mins(5),
             bedrock_region: default_bedrock_region(),
             provider_base_urls: std::collections::BTreeMap::new(),
         }
