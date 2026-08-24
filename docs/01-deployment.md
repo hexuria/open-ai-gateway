@@ -183,8 +183,10 @@ advisory lock serialises them.
 ## The admin API
 
 It performs writes: disable or enable a credential, clear a cooldown, revoke a
-key. Four operations, chosen because they are what you reach for during an
-incident. Everything you can do calmly at a prompt stays in `oag admin`.
+key — the four operations you reach for during an incident — and the
+capability-service catalog (register, health-check, enable, disable; see
+[05-services.md](05-services.md)). Everything you can do calmly at a prompt
+stays in `oag admin`.
 
 **Authority is on the key, not the principal.** `api_key.admin` is what the
 admin API checks. This matters because `oag admin init` prints a key the
@@ -235,17 +237,21 @@ filter is a free-form string and an operator quietening a noisy deployment to
 ## Migrations
 
 `oag migrate` runs them under a Postgres advisory lock; `oag serve` does not run
-them at all. There is one migration, and it is a baseline that gets edited in
-place rather than accumulating a chain — which is only safe while no database
-anyone cares about has applied it.
+them at all. There are three files:
+
+| File | What it is |
+|---|---|
+| `migrations/0001_baseline.sql` | The original schema. Still edited in place — only safe while no database anyone cares about has applied it. |
+| `migrations/0002_services.sql` | Capability-service catalog. Shipped. |
+| `migrations/0003_usage_event_attempt.sql` | Ledger expand: `attempt` column and a unique index on `(request_id, attempt)`. The primary key on `request_id` stays for this release so a rolling deploy does not 42P10. |
 
 sqlx checksums applied migrations. Against a database that ran an earlier
 version of `0001`, `oag migrate` fails closed with *migration 1 was previously
 applied but has been modified* and applies nothing — including any later
 migration. In development the fix is to recreate the database. In production it
 is a hand-patched `_sqlx_migrations.checksum`, so once this project has a real
-deployment the baseline stops being editable and changes become `0002`, `0003`,
-and so on.
+deployment the baseline stops being editable and changes become `0004` and on.
+Do not treat `0002` as the next unused number: `0002` is the catalog.
 
 ## Verifying it
 

@@ -156,8 +156,10 @@ stack-roll:
 verify:
     @./deploy/test/local-verify.sh
 
-# Needs kind, takes several minutes, and DOES NOT PASS YET — see the status note
-# at the top of deploy/test/kind-verify.sh before relying on it.
+# Needs kind, takes several minutes. Passes in CI (`.github/workflows/k8s.yml`)
+# on every relevant push: 8 of 8 streams across a rollout restart, all 8 in the
+# ledger. See the status note at the top of deploy/test/kind-verify.sh. Proves
+# drain, not circuit breakers.
 # A rolling restart severing no live stream, and every drained stream metered.
 verify-k8s:
     @./deploy/test/kind-verify.sh

@@ -93,7 +93,8 @@ web/index.html   the dashboard, embedded in the binary
 Four of the eight crates do no I/O at all. That is deliberate and it is the
 main structural bet: routing policy, translation, and credential scheduling are
 the things most worth testing exhaustively and least worth spinning up a
-database for. The suite is ~180 tests and runs in well under a second.
+database for. Those four carry 214 tests and run in well under a second. The
+workspace as a whole is 390.
 
 The dashboard is a single self-contained HTML file compiled into the binary. A
 build toolchain and `node_modules` for a handful of read views is what "less is

@@ -38,14 +38,17 @@ them needs no services at all.
 ```
 POST /v1/messages
   │
-  ├─ tower       body limit · request id · header-read timeout
+  ├─ tower       request id · header-read timeout
   │              (never a whole-body timeout)
   │
   ├─ auth        Bearer / x-api-key / x-goog-api-key → sha256
+  │              from the headers, before the body is read
   │              → moka L1 (short TTL + negative cache)
-  │              → Redis L2 (single-flight on miss)
+  │              → Redis L2 (HMAC with signing_secret; single-flight on miss)
   │              → Postgres
   │              invalidated by Redis pub/sub; then budget and route checks
+  │
+  ├─ body        DefaultBodyLimit after a key has resolved
   │
   ├─ ROUTE       passthrough? honour the named model, subject to floor tier
   │              managed?     classify → pick tier → pick model
@@ -67,12 +70,14 @@ POST /v1/messages
   ├─ stream      reader task → bounded channel → SSE writer
   │              upstream idle watchdog · downstream keepalive
   │              client gone → keep draining upstream, the tokens are billed
+  │              a mid-flight death is named; the buffer is capped
   │
   ├─ meter       merge usage patches → price actual and counterfactual
-  │              → usage_event, idempotent on request id
+  │              → usage_event per attempt; charge only the written row
+  │              (PK still request_id this release; see 0003)
   │
   └─ on failure  classify → retry same credential
-                          → or escalate a tier
+                          → or escalate a tier (context reject included)
                           → or cool down, exclude, and re-enter the pool
 ```
 
@@ -104,6 +109,8 @@ which, so the whole policy is unit-testable without a network.
 
 ## What is in Redis, and why losing it is survivable
 
-Concurrency slots, session pins, and the auth cache. All three are expendable:
-losing Redis costs a burst of database reads and a moment of sloppy concurrency
-accounting. It never loses money or credentials, because those are in Postgres.
+Concurrency slots, session pins, and the auth cache (HMAC'd with
+`signing_secret`, so a replica holding a different one ignores the others'
+entries). All three are expendable: losing Redis costs a burst of database
+reads and a moment of sloppy concurrency accounting. It never loses money or
+credentials, because those are in Postgres.
