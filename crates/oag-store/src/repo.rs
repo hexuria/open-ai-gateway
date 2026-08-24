@@ -276,6 +276,58 @@ pub async fn rate_limit(db: &Db, id: AccountId, until: OffsetDateTime) -> Result
     Ok(())
 }
 
+/// Every OAuth (subscription seat) account, for the usage poller to sweep.
+///
+/// Not filtered by route or principal like `candidates`: the poller reads a
+/// seat's remaining quota regardless of who may use it. Disabled seats are
+/// skipped — polling one nobody will schedule spends a request for nothing.
+pub async fn schedulable_oauth_accounts(db: &Db) -> Result<Vec<AccountRow>> {
+    sqlx::query_as::<_, AccountRow>(
+        r"
+        SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
+               token_version, token_expires_at, owner_principal_id, proxy_url,
+               priority, max_concurrency, schedulable, cooldown_until,
+               rate_limited_until, window_resets_at, last_used_at
+        FROM account WHERE kind = 'oauth' AND schedulable
+        ",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("loading oauth accounts: {e}")))
+}
+
+/// Store a usage-poll reading: the remaining-quota columns, and the window
+/// reset the scheduler prefers to drain first. `resets_at` also lands in
+/// `window_resets_at` — the same field the failover path fills from a provider
+/// `Retry-After`, and the poller is just another writer of it.
+pub async fn record_usage_poll(
+    db: &Db,
+    id: AccountId,
+    remaining_pct: f64,
+    window_label: &str,
+    resets_at: Option<OffsetDateTime>,
+) -> Result<()> {
+    sqlx::query(
+        r"
+        UPDATE account
+           SET usage_remaining_pct = $2,
+               usage_window_label  = $3,
+               usage_polled_at     = now(),
+               window_resets_at    = COALESCE($4, window_resets_at),
+               updated_at          = now()
+         WHERE id = $1
+        ",
+    )
+    .bind(id.as_uuid())
+    .bind(rust_decimal::Decimal::try_from(remaining_pct).unwrap_or_default())
+    .bind(window_label)
+    .bind(resets_at)
+    .execute(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("recording usage poll: {e}")))?;
+    Ok(())
+}
+
 /// Persist refreshed credential material.
 ///
 /// The `token_version` guard is a compare-and-swap: two replicas that refresh
