@@ -13,6 +13,7 @@ path = "src/main.rs"
 oag-core.workspace = true
 oag-server.workspace = true
 oag-store.workspace = true
+oag-upstream.workspace = true
 clap.workspace = true
 serde_yaml_ng.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }

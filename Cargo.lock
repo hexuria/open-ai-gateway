@@ -1481,6 +1481,7 @@ dependencies = [
  "oag-router",
  "oag-server",
  "oag-store",
+ "oag-upstream",
  "rand 0.8.7",
  "rust_decimal",
  "serde_json",
@@ -1610,6 +1611,7 @@ name = "oag-upstream"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64",
  "futures-util",
  "hex",

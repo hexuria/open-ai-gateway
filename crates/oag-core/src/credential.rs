@@ -67,6 +67,11 @@ pub struct SecretMaterial {
     #[serde(default)]
     #[zeroize(skip)]
     pub version: u64,
+    /// The OAuth client id the refresh grant must be presented under. Only
+    /// OAuth credentials carry one; the token endpoint rejects a refresh
+    /// token presented by a different client, so it travels with the pair.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_id: Option<String>,
 }
 
 impl fmt::Debug for SecretMaterial {
@@ -79,6 +84,7 @@ impl fmt::Debug for SecretMaterial {
             )
             .field("expires_at", &self.expires_at)
             .field("version", &self.version)
+            .field("client_id", &self.client_id)
             .finish()
     }
 }

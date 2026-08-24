@@ -55,12 +55,27 @@ pub enum AdminCommand {
     AddAccount {
         #[arg(long)]
         name: String,
-        #[arg(long)]
-        provider: String,
+        /// Not needed with `--from-grok`, which knows its provider.
+        #[arg(long, required_unless_present = "from_grok")]
+        provider: Option<String>,
         /// The provider API key. Read from `OAG_ACCOUNT_SECRET` if omitted, so it
         /// need not appear in shell history or the process table.
-        #[arg(long, env = "OAG_ACCOUNT_SECRET", hide_env_values = true)]
-        secret: String,
+        #[arg(
+            long,
+            env = "OAG_ACCOUNT_SECRET",
+            hide_env_values = true,
+            required_unless_present = "from_grok",
+            conflicts_with = "from_grok"
+        )]
+        secret: Option<String>,
+        /// Import every signed-in Grok CLI session as an xAI OAuth credential.
+        /// Reads `~/.grok/auth.json` (or `--auth-file`), never writes it.
+        #[arg(long)]
+        from_grok: bool,
+        /// Where to read Grok CLI sessions from. Repeatable; the first file a
+        /// token appears in wins.
+        #[arg(long, requires = "from_grok")]
+        auth_file: Vec<String>,
         #[arg(long, default_value = "default")]
         route: String,
         #[arg(long, default_value_t = 8)]
@@ -71,6 +86,11 @@ pub enum AdminCommand {
         /// docs/compliance.md.
         #[arg(long)]
         owner_email: Option<String>,
+        /// Put an OAuth seat in the shared pool anyway. Deliberate opt-in:
+        /// subscription seats are sanctioned for the holder's own use, so the
+        /// default for `--from-grok` is per-principal binding.
+        #[arg(long, requires = "from_grok", conflicts_with = "owner_email")]
+        shared: bool,
     },
     /// Load model pricing into the catalog.
     SeedCatalog {
@@ -129,23 +149,48 @@ pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Resu
             name,
             provider,
             secret,
+            from_grok,
+            auth_file,
             route,
             max_concurrency,
             priority,
             owner_email,
+            shared,
         } => {
-            add_account(
-                db,
-                kek,
-                &name,
-                &provider,
-                &secret,
-                &route,
-                max_concurrency,
-                priority,
-                owner_email.as_deref(),
-            )
-            .await
+            if from_grok {
+                import_grok(
+                    db,
+                    kek,
+                    &name,
+                    &auth_file,
+                    &route,
+                    max_concurrency,
+                    priority,
+                    owner_email.as_deref(),
+                    shared,
+                )
+                .await
+            } else {
+                // clap enforces both when --from-grok is absent; this is the
+                // belt to that suspender.
+                let (Some(provider), Some(secret)) = (provider, secret) else {
+                    return Err(oag_core::Error::Config(
+                        "--provider and --secret are required without --from-grok".to_owned(),
+                    ));
+                };
+                add_account(
+                    db,
+                    kek,
+                    &name,
+                    &provider,
+                    &secret,
+                    &route,
+                    max_concurrency,
+                    priority,
+                    owner_email.as_deref(),
+                )
+                .await
+            }
         }
         AdminCommand::SeedCatalog { from } => seed_catalog(db, from.as_deref()).await,
         AdminCommand::SetMode { route, mode } => set_mode(db, &route, &mode).await,
@@ -311,40 +356,182 @@ async fn add_account(
         refresh_token: None,
         expires_at: None,
         version: 0,
+        client_id: None,
     };
-    let sealed = kek.seal_json(&material)?;
 
-    let owner_id = match owner_email {
+    let owner_id = find_owner(db, owner_email).await?;
+    let id = insert_account(
+        db,
+        kek,
+        name,
+        provider,
+        "api_key",
+        &material,
+        route,
+        max_concurrency,
+        priority,
+        owner_id,
+    )
+    .await?;
+
+    println!("account {name} ({provider}) -> {id}");
+    println!(
+        "  sealed at rest, attached to route '{route}', {}",
+        scope_of(owner_id)
+    );
+    Ok(())
+}
+
+/// Import every signed-in Grok CLI session as an xAI OAuth credential.
+///
+/// Reads the CLI's `auth.json` and never writes it: the CLI owns that file,
+/// and rotated tokens land in the `account` row instead, where `ensure_fresh`
+/// persists them version-guarded.
+#[allow(clippy::too_many_arguments)]
+async fn import_grok(
+    db: &Db,
+    kek: &Kek,
+    name: &str,
+    auth_files: &[String],
+    route: &str,
+    max_concurrency: i32,
+    priority: i16,
+    owner_email: Option<&str>,
+    shared: bool,
+) -> Result<()> {
+    // A subscription seat is sanctioned for its holder's own use, so binding
+    // to a principal is the default and pooling is the explicit choice —
+    // docs/compliance.md has the distinction this encodes.
+    if owner_email.is_none() && !shared {
+        return Err(oag_core::Error::Config(
+            "a subscription seat binds to one principal by default: pass \
+             --owner-email <email>, or --shared to pool it deliberately"
+                .to_owned(),
+        ));
+    }
+
+    let paths: Vec<String> = if auth_files.is_empty() {
+        let home = std::env::var("HOME")
+            .map_err(|_| oag_core::Error::Config("HOME is not set; pass --auth-file".to_owned()))?;
+        vec![format!("{home}/.grok/auth.json")]
+    } else {
+        auth_files.to_vec()
+    };
+
+    let mut batches = Vec::new();
+    for path in &paths {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| oag_core::Error::Config(format!("reading {path}: {e}")))?;
+        batches.push(
+            oag_upstream::xai_oauth::sessions_from_json(&json)
+                .map_err(|e| oag_core::Error::Config(format!("{path}: {e}")))?,
+        );
+    }
+    let sessions = oag_upstream::xai_oauth::union_sessions(batches);
+    if sessions.is_empty() {
+        return Err(oag_core::Error::Config(format!(
+            "no signed-in xAI session in {}; run `grok` and log in first",
+            paths.join(", ")
+        )));
+    }
+
+    let owner_id = find_owner(db, owner_email).await?;
+    let many = sessions.len() > 1;
+    for (i, session) in sessions.into_iter().enumerate() {
+        let row_name = if many {
+            format!("{name}-{}", i + 1)
+        } else {
+            name.to_owned()
+        };
+        let refreshable = session.refresh_token.is_some();
+        let id = insert_account(
+            db,
+            kek,
+            &row_name,
+            oag_core::Provider::XAI,
+            "oauth",
+            &session.into_material(),
+            route,
+            max_concurrency,
+            priority,
+            owner_id,
+        )
+        .await?;
+        println!("account {row_name} (xai, oauth) -> {id}");
+        if !refreshable {
+            println!("  no refresh token in this session: it will die at expiry");
+        }
+    }
+    println!(
+        "  sealed at rest, attached to route '{route}', {}",
+        scope_of(owner_id)
+    );
+    println!("  auth.json was read, not written; the Grok CLI stays signed in");
+    Ok(())
+}
+
+async fn find_owner(db: &Db, owner_email: Option<&str>) -> Result<Option<Uuid>> {
+    match owner_email {
         Some(email) => {
             let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM principal WHERE email = $1")
                 .bind(email)
                 .fetch_optional(db.pool())
                 .await
                 .map_err(|e| oag_core::Error::Internal(format!("finding owner: {e}")))?;
-            Some(
-                row.ok_or_else(|| {
-                    oag_core::Error::Config(format!("no principal with email {email}"))
-                })?
-                .0,
-            )
+            let id = row
+                .ok_or_else(|| oag_core::Error::Config(format!("no principal with email {email}")))?
+                .0;
+            Ok(Some(id))
         }
-        None => None,
-    };
+        None => Ok(None),
+    }
+}
+
+const fn scope_of(owner_id: Option<Uuid>) -> &'static str {
+    if owner_id.is_some() {
+        "personal (bound to one principal)"
+    } else {
+        "shared pool"
+    }
+}
+
+/// Seal the material and insert one account row, attached to a route.
+#[allow(clippy::too_many_arguments)]
+async fn insert_account(
+    db: &Db,
+    kek: &Kek,
+    name: &str,
+    provider: oag_core::Provider,
+    kind: &str,
+    material: &SecretMaterial,
+    route: &str,
+    max_concurrency: i32,
+    priority: i16,
+    owner_id: Option<Uuid>,
+) -> Result<Uuid> {
+    let sealed = kek.seal_json(material)?;
+    // Denormalised so the scheduler can skip expired credentials without
+    // decrypting every candidate; see the schema comment.
+    let expires = material
+        .expires_at
+        .and_then(|e| time::OffsetDateTime::from_unix_timestamp(e).ok());
 
     let id = Uuid::now_v7();
     sqlx::query(
         r"
         INSERT INTO account (
             id, name, provider, kind, credentials_sealed, credentials_nonce,
-            owner_principal_id, priority, max_concurrency
-        ) VALUES ($1,$2,$3,'api_key',$4,$5,$6,$7,$8)
+            token_expires_at, owner_principal_id, priority, max_concurrency
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
         ",
     )
     .bind(id)
     .bind(name)
     .bind(provider.as_str())
+    .bind(kind)
     .bind(&sealed.ciphertext)
     .bind(&sealed.nonce)
+    .bind(expires)
     .bind(owner_id)
     .bind(priority)
     .bind(max_concurrency)
@@ -361,14 +548,7 @@ async fn add_account(
     .await
     .map_err(|e| oag_core::Error::Internal(format!("attaching account to route: {e}")))?;
 
-    let scope = if owner_id.is_some() {
-        "personal (bound to one principal)"
-    } else {
-        "shared pool"
-    };
-    println!("account {name} ({provider}) -> {id}");
-    println!("  sealed at rest, attached to route '{route}', {scope}");
-    Ok(())
+    Ok(id)
 }
 
 async fn set_mode(db: &Db, route: &str, mode: &str) -> Result<()> {
