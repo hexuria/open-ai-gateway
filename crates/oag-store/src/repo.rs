@@ -308,24 +308,54 @@ pub async fn store_credentials(
     Ok(result.rows_affected() == 1)
 }
 
-/// Append to the usage ledger.
+/// Append to the usage ledger and debit the key that paid for it.
 ///
-/// `ON CONFLICT DO NOTHING` on the request id makes metering idempotent: a
-/// retried write after a partial failure conflicts instead of billing twice.
+/// `ON CONFLICT DO NOTHING` makes metering idempotent: a retried write after a
+/// partial failure conflicts instead of billing twice.
+///
+/// Deliberately with no conflict target, which is the only form that is correct
+/// on both sides of the ledger's key change. Naming one is naming an index that
+/// has to exist: `(request_id)` breaks the moment the primary key is contracted
+/// away, and `(request_id, attempt)` breaks on any database that has not had
+/// that index built yet — either way with 42P10, mid-deploy, on the write that
+/// carries the spend. Untargeted, every unique constraint is an arbiter, so
+/// while the primary key survives a second attempt is silently dropped, and once
+/// it is gone the same statement starts keeping both rows with no code change.
+///
+/// One statement, because the row and the debit are one fact. Two statements on
+/// two pooled connections is two transactions: a crash between them leaves spend
+/// in the ledger that the quota check cannot see, and — worse — an
+/// unconditional `UPDATE` charges for inserts that never happened. Both writes
+/// the conflict clause exists to swallow, the replay and the second attempt the
+/// surviving primary key drops, still moved `spent_usd`. `RETURNING` into the
+/// CTE ties the two together: no row inserted, nothing to join against, no
+/// debit. The idempotence now covers the money and not just the row.
 pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
     sqlx::query(
         r"
-        INSERT INTO usage_event (
-            request_id, principal_id, api_key_id, route_id, account_id,
-            model_id, tier, selection_reason, escalated_from_tier, escalation_gate,
-            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-            cost_usd, counterfactual_usd, counterfactual_model_id,
-            status, latency_ms, ttft_ms, streamed
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-        ON CONFLICT (request_id) DO NOTHING
+        WITH ins AS (
+            INSERT INTO usage_event (
+                request_id, attempt, principal_id, api_key_id, route_id, account_id,
+                model_id, tier, selection_reason, escalated_from_tier, escalation_gate,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                cost_usd, counterfactual_usd, counterfactual_model_id,
+                status, latency_ms, ttft_ms, streamed
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+            ON CONFLICT DO NOTHING
+            RETURNING api_key_id, cost_usd
+        )
+        -- Key spend is denormalised for the quota check, which must not run a
+        -- SUM over the ledger on every request. Debiting the amount the ledger
+        -- accepted, rather than the amount passed in, is what keeps the counter
+        -- and the rows it stands for from drifting apart.
+        UPDATE api_key k
+           SET spent_usd = k.spent_usd + ins.cost_usd, last_used_at = now()
+          FROM ins
+         WHERE k.id = ins.api_key_id
         ",
     )
     .bind(w.request_id)
+    .bind(w.attempt)
     .bind(w.principal_id)
     .bind(w.api_key_id)
     .bind(w.route_id)
@@ -349,17 +379,6 @@ pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
     .execute(db.pool())
     .await
     .map_err(|e| Error::Internal(format!("recording usage: {e}")))?;
-
-    // Key spend is denormalised for the quota check, which must not run a
-    // SUM over the ledger on every request.
-    sqlx::query(
-        "UPDATE api_key SET spent_usd = spent_usd + $2, last_used_at = now() WHERE id = $1",
-    )
-    .bind(w.api_key_id)
-    .bind(w.cost_usd)
-    .execute(db.pool())
-    .await
-    .map_err(|e| Error::Internal(format!("updating key spend: {e}")))?;
 
     Ok(())
 }
@@ -594,6 +613,7 @@ pub async fn upsert_model(db: &Db, m: &ModelRow, is_override: bool) -> Result<()
 mod tests {
     use super::*;
     use crate::Db;
+    use rust_decimal::dec;
 
     #[test]
     fn hashing_is_stable_and_hex() {
@@ -1047,6 +1067,271 @@ mod tests {
         assert!(
             matches!(err, Error::Config(_)),
             "a dangling auth_ref is a config error: {err}"
+        );
+    }
+
+    /// The expand half of expand/contract, which is what this release ships.
+    ///
+    /// The column and a unique `(request_id, attempt)` index are added; the
+    /// primary key on `request_id` alone survives, because the previous release
+    /// is still serving during a rolling deploy and its metering names
+    /// `ON CONFLICT (request_id)`. So a second attempt for one request does not
+    /// reach the ledger yet — and what matters is that it is *dropped* rather
+    /// than raised. An error here would fail the write carrying the served
+    /// attempt's spend, which is worse than the row we are missing.
+    ///
+    /// Both rows start landing when a later release drops the primary key. No
+    /// code changes then: the untargeted `ON CONFLICT DO NOTHING` simply has one
+    /// fewer arbiter to conflict with.
+    #[tokio::test]
+    async fn a_second_attempt_is_dropped_rather_than_erroring_while_the_old_key_survives() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+
+        // The rolling-deploy guard, and the reason this test exists at all.
+        // Drop this key and every insert from the previous release fails with
+        // 42P10 — for the whole overlap window, and again after a rollback.
+        let pk: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+             WHERE conname = 'usage_event_pkey'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("the previous release still meters against this key");
+        assert_eq!(pk, "PRIMARY KEY (request_id)");
+
+        // And the index the contract release will key on, built ahead of it.
+        let wide: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes
+             WHERE indexname = 'usage_event_request_attempt_key'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("the wider key exists before anything depends on it");
+        assert!(wide.contains("UNIQUE"), "must be unique to be an arbiter");
+
+        let raw = format!("meter-{}", Uuid::new_v4());
+        let key: Uuid = sqlx::query_scalar(
+            "INSERT INTO api_key (id, key_hash, key_prefix, name, principal_id, route_id)
+             VALUES (gen_random_uuid(), $1, 'oag_live_test', $2, $3, $4)
+             RETURNING id",
+        )
+        .bind(hash_key(&raw))
+        .bind(&raw)
+        .bind(principal)
+        .bind(route)
+        .fetch_one(db.pool())
+        .await
+        .expect("mint");
+
+        // One client request, two attempts: a cheap answer that tripped a
+        // quality gate, and the retry a rung up that was actually served.
+        let request_id = Uuid::new_v4();
+        let write = |attempt: i16, reason: &str, cost: &str| UsageWrite {
+            request_id,
+            attempt,
+            principal_id: Some(principal),
+            api_key_id: Some(key),
+            route_id: Some(route),
+            account_id: Some(account.as_uuid()),
+            model_id: "kimi-k2".to_owned(),
+            tier: "cheap".to_owned(),
+            selection_reason: reason.to_owned(),
+            escalated_from_tier: None,
+            escalation_gate: Some("Refusal".to_owned()),
+            usage: oag_router::Usage {
+                input_tokens: 1_000,
+                output_tokens: 20,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            cost_usd: cost.parse().expect("decimal"),
+            counterfactual_usd: Decimal::ZERO,
+            counterfactual_model_id: None,
+            status: 200,
+            latency_ms: Some(10),
+            ttft_ms: None,
+            streamed: false,
+        };
+
+        // Production order: the answer the client was served goes first,
+        // precisely because it is the one that must survive the old key.
+        record_usage(&db, &write(1, "escalated", "1.75"))
+            .await
+            .expect("served attempt");
+        record_usage(&db, &write(0, "abandoned", "0.25"))
+            .await
+            .expect("a dropped row is not an error");
+
+        let (rows, reason): (i64, String) = sqlx::query_as(
+            "SELECT count(*), min(selection_reason) FROM usage_event WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("read back");
+
+        assert_eq!(
+            rows, 1,
+            "the surviving primary key admits one row per request"
+        );
+        assert_eq!(
+            reason, "escalated",
+            "and it has to be the answer the client got, not the one we discarded"
+        );
+
+        // Idempotence is the reason the conflict clause is there in the first
+        // place, and it must outlive the key change.
+        record_usage(&db, &write(1, "escalated", "1.75"))
+            .await
+            .expect("replay");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM usage_event WHERE request_id = $1")
+                .bind(request_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("count");
+        assert_eq!(rows, 1, "a replayed write is still a no-op");
+    }
+
+    /// A key with no spend yet, and a way to build ledger writes against it.
+    async fn metered_key(db: &Db) -> (Uuid, impl Fn(Uuid, i16, &str, &str) -> UsageWrite) {
+        let (principal, route, account) = seed(db).await;
+        let raw = format!("meter-{}", Uuid::new_v4());
+        let key: Uuid = sqlx::query_scalar(
+            "INSERT INTO api_key (id, key_hash, key_prefix, name, principal_id, route_id)
+             VALUES (gen_random_uuid(), $1, 'oag_live_test', $2, $3, $4)
+             RETURNING id",
+        )
+        .bind(hash_key(&raw))
+        .bind(&raw)
+        .bind(principal)
+        .bind(route)
+        .fetch_one(db.pool())
+        .await
+        .expect("mint");
+
+        let build = move |request_id: Uuid, attempt: i16, reason: &str, cost: &str| UsageWrite {
+            request_id,
+            attempt,
+            principal_id: Some(principal),
+            api_key_id: Some(key),
+            route_id: Some(route),
+            account_id: Some(account.as_uuid()),
+            model_id: "kimi-k2".to_owned(),
+            tier: "cheap".to_owned(),
+            selection_reason: reason.to_owned(),
+            escalated_from_tier: None,
+            escalation_gate: None,
+            usage: oag_router::Usage {
+                input_tokens: 1_000,
+                output_tokens: 20,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            cost_usd: cost.parse().expect("decimal"),
+            counterfactual_usd: Decimal::ZERO,
+            counterfactual_model_id: None,
+            status: 200,
+            latency_ms: Some(10),
+            ttft_ms: None,
+            streamed: false,
+        };
+
+        (key, build)
+    }
+
+    /// The denormalised counter the quota check reads.
+    async fn key_spend(db: &Db, key: Uuid) -> Decimal {
+        sqlx::query_scalar("SELECT spent_usd FROM api_key WHERE id = $1")
+            .bind(key)
+            .fetch_one(db.pool())
+            .await
+            .expect("read spend")
+    }
+
+    /// Idempotence has to cover the debit, not just the row.
+    ///
+    /// Metering retries: the write can fail after the row lands, and the caller
+    /// replays it. `ON CONFLICT DO NOTHING` makes the second insert a no-op, so
+    /// the spend it carries has already been counted — charging for it again
+    /// walks a key toward its quota on nothing but a retry.
+    #[tokio::test]
+    async fn a_replayed_write_does_not_debit_the_key_twice() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (key, write) = metered_key(&db).await;
+
+        let request_id = Uuid::new_v4();
+        record_usage(&db, &write(request_id, 0, "classified", "1.50"))
+            .await
+            .expect("first write");
+        assert_eq!(key_spend(&db, key).await, dec!(1.50));
+
+        record_usage(&db, &write(request_id, 0, "classified", "1.50"))
+            .await
+            .expect("replay");
+        assert_eq!(
+            key_spend(&db, key).await,
+            dec!(1.50),
+            "the replay added no ledger row, so it must add no spend either"
+        );
+    }
+
+    /// The debit follows the row, including when the row is dropped.
+    ///
+    /// While the primary key on `request_id` alone survives, the second attempt
+    /// for a request never reaches the ledger. Its spend must not reach the key
+    /// either: `SUM(cost_usd)` over the ledger and `api_key.spent_usd` are two
+    /// views of the same money, and a debit with no row behind it makes them
+    /// disagree with nothing to reconcile against.
+    #[tokio::test]
+    async fn a_dropped_attempt_does_not_debit_the_key() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+
+        // The premise: without this key the second insert would land, and the
+        // second debit would be right.
+        let pk: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+             WHERE conname = 'usage_event_pkey'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("the previous release still meters against this key");
+        assert_eq!(pk, "PRIMARY KEY (request_id)");
+
+        let (key, write) = metered_key(&db).await;
+        let request_id = Uuid::new_v4();
+
+        record_usage(&db, &write(request_id, 1, "escalated", "1.75"))
+            .await
+            .expect("served attempt");
+        record_usage(&db, &write(request_id, 0, "abandoned", "0.25"))
+            .await
+            .expect("a dropped row is not an error");
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM usage_event WHERE request_id = $1")
+                .bind(request_id)
+                .fetch_one(db.pool())
+                .await
+                .expect("count");
+        assert_eq!(rows, 1, "the surviving primary key admits one row");
+        assert_eq!(
+            key_spend(&db, key).await,
+            dec!(1.75),
+            "only the attempt that made it into the ledger may debit the key"
         );
     }
 }

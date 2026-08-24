@@ -214,6 +214,15 @@ impl ServiceRow {
 #[derive(Debug, Clone)]
 pub struct UsageWrite {
     pub request_id: Uuid,
+    /// Which forwarding attempt this row accounts for, counted from zero.
+    ///
+    /// One client request can pay for two when a quality gate abandons a cheap
+    /// answer and retries a rung up. Recorded and uniquely indexed now, but not
+    /// yet part of the ledger's primary key: while that is still `request_id`
+    /// alone, the second attempt's write is dropped rather than kept. Dropping
+    /// the key here instead would break the previous release mid-deploy, so it
+    /// waits for a contract release of its own.
+    pub attempt: i16,
     pub principal_id: Option<Uuid>,
     pub api_key_id: Option<Uuid>,
     pub route_id: Option<Uuid>,

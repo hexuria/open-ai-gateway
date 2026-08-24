@@ -377,17 +377,84 @@ pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<St
 
     if let Some(reason) = choice["finish_reason"].as_str().filter(|r| !r.is_empty()) {
         events.push(StreamEvent::Stop {
-            reason: match reason {
-                "length" => StopReason::MaxTokens,
-                "tool_calls" | "function_call" => StopReason::ToolUse,
-                "content_filter" => StopReason::Refusal,
-                _ => StopReason::EndTurn,
-            },
+            reason: parse_finish_reason(reason),
             usage: Usage::default(),
         });
     }
 
     Ok(events)
+}
+
+/// A complete non-streamed response → the events its stream would have carried.
+///
+/// Same fields, different envelope: the assistant turn arrives whole under
+/// `message` rather than as `delta` fragments. Without this the accumulator
+/// sees no text and no tool calls, so the quality gate reads every one of these
+/// responses as empty and escalates it.
+#[must_use]
+pub fn parse_response(body: &Value) -> Vec<StreamEvent> {
+    let usage = parse_usage(&body["usage"]);
+    let mut events = vec![StreamEvent::UsageUpdate { usage }];
+
+    let choice = &body["choices"][0];
+    let message = &choice["message"];
+
+    if let Some(text) = message["content"].as_str().filter(|t| !t.is_empty()) {
+        events.push(StreamEvent::TextDelta {
+            text: text.to_owned(),
+        });
+    }
+
+    // The same side channel several OpenAI-compatible providers use when
+    // streaming reasoning.
+    if let Some(text) = message["reasoning_content"]
+        .as_str()
+        .or_else(|| message["reasoning"].as_str())
+        .filter(|t| !t.is_empty())
+    {
+        events.push(StreamEvent::ThinkingDelta {
+            text: text.to_owned(),
+        });
+    }
+
+    for call in message["tool_calls"].as_array().unwrap_or(&Vec::new()) {
+        let id = call["id"].as_str().unwrap_or_default().to_owned();
+        events.push(StreamEvent::ToolUseStart {
+            id: id.clone(),
+            name: call["function"]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        });
+        // Arguments arrive complete here, where a stream splits them across
+        // chunks, so the malformed-arguments gate should never fire on one.
+        events.push(StreamEvent::ToolUseDelta {
+            id: id.clone(),
+            partial_json: call["function"]["arguments"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        });
+        events.push(StreamEvent::ToolUseEnd { id });
+    }
+
+    if let Some(reason) = choice["finish_reason"].as_str().filter(|r| !r.is_empty()) {
+        events.push(StreamEvent::Stop {
+            reason: parse_finish_reason(reason),
+            usage,
+        });
+    }
+
+    events
+}
+
+fn parse_finish_reason(raw: &str) -> StopReason {
+    match raw {
+        "length" => StopReason::MaxTokens,
+        "tool_calls" | "function_call" => StopReason::ToolUse,
+        "content_filter" => StopReason::Refusal,
+        _ => StopReason::EndTurn,
+    }
 }
 
 fn parse_usage(v: &Value) -> Usage {

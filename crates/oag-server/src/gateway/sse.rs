@@ -16,6 +16,7 @@
 
 use futures_util::StreamExt;
 use oag_core::Error;
+use oag_core::provider::Dialect;
 use oag_proto::{StreamAccumulator, StreamEvent};
 use oag_upstream::{Framing, ProviderAdapter};
 use std::sync::Arc;
@@ -300,8 +301,15 @@ fn fold_payloads(
 /// have reached, because that is what `quality_gate` reads. Extracting only
 /// usage would leave `text_len` at zero, and every non-streaming response would
 /// then look like an empty one — so every single one would escalate.
+///
+/// Which is why `dialect` is a parameter rather than an assumption. This read
+/// Anthropic's field names whatever the upstream was, so a Chat Completions or
+/// Gemini body yielded nothing at all: no tokens in the ledger, and an
+/// empty-response gate that escalated a perfectly good answer onto the
+/// expensive rung. It is the upstream's dialect, not the client's.
 pub async fn collect(
     response: reqwest::Response,
+    dialect: Dialect,
 ) -> std::result::Result<(bytes::Bytes, StreamAccumulator), Error> {
     let bytes = response
         .bytes()
@@ -310,61 +318,27 @@ pub async fn collect(
 
     let mut acc = StreamAccumulator::new();
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        tracing::warn!("a successful upstream response was not JSON");
+        acc.mark_unparsed();
         return Ok((bytes, acc));
     };
 
-    acc.observe(&StreamEvent::UsageUpdate {
-        usage: oag_router::Usage {
-            input_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
-            output_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
-            cache_read_tokens: v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0),
-            cache_write_tokens: v["usage"]["cache_creation_input_tokens"]
-                .as_u64()
-                .unwrap_or(0),
-        },
-    });
-
-    // Replay the content as the events a stream would have produced.
-    if let Some(blocks) = v["content"].as_array() {
-        for block in blocks {
-            match block["type"].as_str().unwrap_or_default() {
-                "text" => acc.observe(&StreamEvent::TextDelta {
-                    text: block["text"].as_str().unwrap_or_default().to_owned(),
-                }),
-                "thinking" => acc.observe(&StreamEvent::ThinkingDelta {
-                    text: block["thinking"].as_str().unwrap_or_default().to_owned(),
-                }),
-                "tool_use" => {
-                    let id = block["id"].as_str().unwrap_or_default().to_owned();
-                    acc.observe(&StreamEvent::ToolUseStart {
-                        id: id.clone(),
-                        name: block["name"].as_str().unwrap_or_default().to_owned(),
-                    });
-                    // Whole, not fragmented — a non-streamed tool call is
-                    // already complete JSON, so the malformed-arguments gate
-                    // should never fire on one.
-                    acc.observe(&StreamEvent::ToolUseDelta {
-                        partial_json: block["input"].to_string(),
-                        id: id.clone(),
-                    });
-                    acc.observe(&StreamEvent::ToolUseEnd { id });
-                }
-                _ => {}
-            }
+    let events = match dialect {
+        Dialect::AnthropicMessages => oag_proto::anthropic::parse_response(&v),
+        Dialect::OpenAIChatCompletions => oag_proto::openai::parse_response(&v),
+        Dialect::GeminiGenerateContent => oag_proto::gemini::parse_response(&v),
+        // No provider declares Responses as its native dialect, so nothing
+        // reaches this today — but `Dialect` is non-exhaustive, and the next one
+        // added must not be silently judged by a reader it does not have.
+        other => {
+            tracing::warn!(dialect = ?other, "no non-streaming reader for this dialect");
+            acc.mark_unparsed();
+            return Ok((bytes, acc));
         }
-    }
+    };
 
-    if let Some(reason) = v["stop_reason"].as_str() {
-        acc.observe(&StreamEvent::Stop {
-            reason: match reason {
-                "max_tokens" => oag_proto::StopReason::MaxTokens,
-                "stop_sequence" => oag_proto::StopReason::StopSequence,
-                "tool_use" => oag_proto::StopReason::ToolUse,
-                "refusal" => oag_proto::StopReason::Refusal,
-                _ => oag_proto::StopReason::EndTurn,
-            },
-            usage: *acc.usage(),
-        });
+    for e in &events {
+        acc.observe(e);
     }
 
     Ok((bytes, acc))
@@ -501,6 +475,165 @@ mod tests {
         assert!(take_payloads(&mut buf, Framing::AwsEventStream).is_empty());
         buf.extend_from_slice(&whole[split..]);
         assert_eq!(take_payloads(&mut buf, Framing::AwsEventStream).len(), 1);
+    }
+
+    // ── non-streamed bodies ──────────────────────────────────────────────────
+    //
+    // Every one of these used to be read with Anthropic's field names, whatever
+    // the upstream was. A Chat Completions or Gemini body therefore yielded
+    // nothing at all: no tokens for the ledger, and an accumulator that looked
+    // like an empty response — so a perfectly good answer tripped the gate and
+    // escalated onto the expensive rung.
+
+    /// A complete upstream response, as `collect` receives one.
+    fn body(json: &str) -> reqwest::Response {
+        reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .body(json.to_owned())
+                .expect("response"),
+        )
+    }
+
+    #[tokio::test]
+    async fn collect_parses_openai_usage_and_text() {
+        let (_, acc) = collect(
+            body(
+                r#"{
+                    "choices": [{
+                        "index": 0,
+                        "message": { "role": "assistant", "content": "the answer is 4" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 1200,
+                        "completion_tokens": 142,
+                        "prompt_tokens_details": { "cached_tokens": 200 }
+                    }
+                }"#,
+            ),
+            Dialect::OpenAIChatCompletions,
+        )
+        .await
+        .expect("collects");
+
+        // 1200 total prompt less the 200 served from cache, which is priced
+        // separately rather than counted twice.
+        assert_eq!(acc.usage().input_tokens, 1_000);
+        assert_eq!(acc.usage().cache_read_tokens, 200);
+        assert_eq!(acc.usage().output_tokens, 142);
+        assert_eq!(
+            acc.quality_gate(),
+            None,
+            "an answer with text in it must not escalate"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_parses_gemini_usage_and_text() {
+        let (_, acc) = collect(
+            body(
+                r#"{
+                    "candidates": [{
+                        "content": { "role": "model", "parts": [{ "text": "the answer is 4" }] },
+                        "finishReason": "STOP"
+                    }],
+                    "usageMetadata": {
+                        "promptTokenCount": 1200,
+                        "cachedContentTokenCount": 200,
+                        "candidatesTokenCount": 142
+                    }
+                }"#,
+            ),
+            Dialect::GeminiGenerateContent,
+        )
+        .await
+        .expect("collects");
+
+        assert_eq!(acc.usage().input_tokens, 1_000);
+        assert_eq!(acc.usage().cache_read_tokens, 200);
+        assert_eq!(acc.usage().output_tokens, 142);
+        assert_eq!(acc.quality_gate(), None);
+    }
+
+    #[tokio::test]
+    async fn collect_still_parses_anthropic_usage_and_text() {
+        let (_, acc) = collect(
+            body(
+                r#"{
+                    "content": [{ "type": "text", "text": "the answer is 4" }],
+                    "stop_reason": "end_turn",
+                    "usage": {
+                        "input_tokens": 1000,
+                        "output_tokens": 142,
+                        "cache_read_input_tokens": 200,
+                        "cache_creation_input_tokens": 300
+                    }
+                }"#,
+            ),
+            Dialect::AnthropicMessages,
+        )
+        .await
+        .expect("collects");
+
+        assert_eq!(acc.usage().input_tokens, 1_000);
+        assert_eq!(acc.usage().cache_read_tokens, 200);
+        assert_eq!(acc.usage().cache_write_tokens, 300);
+        assert_eq!(acc.usage().output_tokens, 142);
+        assert_eq!(acc.quality_gate(), None);
+    }
+
+    #[tokio::test]
+    async fn a_tool_only_openai_answer_is_neither_empty_nor_malformed() {
+        // The agentic case: no text at all, and arguments that arrive whole
+        // rather than in fragments. Read as Anthropic this was an empty
+        // response; read as fragments it would look like a truncated tool call.
+        let (_, acc) = collect(
+            body(
+                r#"{
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": "{\"path\": \"src/main.rs\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }],
+                    "usage": { "prompt_tokens": 50, "completion_tokens": 12 }
+                }"#,
+            ),
+            Dialect::OpenAIChatCompletions,
+        )
+        .await
+        .expect("collects");
+
+        assert_eq!(acc.usage().output_tokens, 12);
+        assert_eq!(acc.quality_gate(), None);
+    }
+
+    #[tokio::test]
+    async fn a_body_with_no_reader_is_not_judged_as_an_empty_answer() {
+        // Nothing serves Responses as an upstream today, so this stands in for
+        // whichever dialect is added next. Gating on it would escalate every
+        // request through it while recording zero tokens for either attempt —
+        // blaming the model for a gap that is ours.
+        let (bytes, acc) = collect(
+            body(r#"{"output":[{"type":"message"}],"usage":{"input_tokens":10}}"#),
+            Dialect::OpenAIResponses,
+        )
+        .await
+        .expect("collects");
+
+        assert_eq!(acc.quality_gate(), None, "unreadable is not unusable");
+        assert!(!bytes.is_empty(), "the client still gets the body");
     }
 
     /// Build one AWS event-stream message carrying `inner`.
