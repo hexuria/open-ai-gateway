@@ -41,10 +41,14 @@ These are **shipped**. They are not pickup. The first live credential is still
 the first pickup; nothing below invents a live-provider story.
 
 ```bash
-just verify        # request path end to end vs a mock upstream, ~1 min, no credentials
-just verify-k8s    # rolling restart severs no stream; needs kind, ~10 min
-just check         # fmt + clippy + tests
-just dev-serve     # local gateway; also what the editor run button launches
+just verify           # Anthropic request path vs the Python mock, ~1 min, no credentials
+just verify-breakers  # circuit breaker trips; the next request never hits upstream
+just verify-dialects  # OpenAI + Gemini adapters vs aimock; needs Node (`npx`)
+just verify-bedrock   # Bedrock event-stream vs VidaiMock; needs Docker
+just verify-translate # OpenAI client → Anthropic mock; the hub, not a native adapter
+just verify-k8s       # rolling restart severs no stream; needs kind, ~10 min
+just check            # fmt + clippy + tests
+just dev-serve        # local gateway; also what the editor run button launches
 ```
 
 `just verify-k8s` also runs in CI (`.github/workflows/k8s.yml`) on every push
@@ -54,7 +58,8 @@ and all 8 reach the ledger. That claim used to be an anecdote from one manual
 check; it is now checked by a runner. It still only proves drain — not
 breakers. See pickup #3.
 
-`just verify` is the one to run first on a new machine. It passes today with:
+`just verify` is the one to run first on a new machine. It needs no Node and no
+keys. It passes today with:
 
 ```
 anthropic/claude-haiku-4.5 on 'cheap': in=100 out=18,
@@ -123,6 +128,34 @@ keep the model name and the tool name. `tool_choice`, `response_format`,
 for them, and refused with a 400 naming the field and the dialect where they
 do not.
 
+### Verify-mocks
+
+`just verify-breakers`, `just verify-dialects`, `just verify-bedrock` and
+`just verify-translate` run in CI as the `verify-mocks` job
+(`.github/workflows/ci.yml`). Dummy secrets only.
+
+What those add, verified 2026-08-24:
+
+- **Breakers.** Two inbound 408s (three same-account retries each) trip the
+  threshold of 5. A third request returns `503 no_credential` and the mock's
+  POST count stays at 6. 5xx/529 cannot prove this: they cool the account via
+  the scheduler before the breaker ever sees five failures.
+- **OpenAI and Gemini adapters.** Non-stream and stream, both dialects, through
+  the gateway against [aimock](https://github.com/CopilotKit/aimock) 1.39.0.
+  Ledger rows have non-zero tokens and a counterfactual above actual. Dummy
+  keys (`sk-mock`). Not a real provider.
+- **Bedrock event-stream.** `just verify-bedrock` points the adapter at
+  VidaiMock with `deploy/test/vidaimock/` overlay. Frames are AWS event-stream
+  with CRC32 and `{"bytes": "<base64 of Anthropic event>"}` — an encoder this
+  repo did not write. Non-stream invoke and a live stream both meter 100/12
+  and beat the frontier counterfactual. Dummy IAM pair; SigV4 is signed but
+  not verified. This is not AWS's wire.
+- **Cross-dialect translation.** `just verify-translate` sends Chat Completions
+  at `oag/auto` with only an Anthropic mock account on the route. The client
+  gets `chat.completion` / `chat.completion.chunk` + `[DONE]`; the mock sees
+  `POST /v1/messages`. A passthrough would have leaked Anthropic SSE. Ledger
+  rows are the cheap Anthropic model: 100/12 non-stream, 100/`CHUNKS*3` stream.
+
 ## Pick up here
 
 In priority order. Local and CI verification of the stacks above is done.
@@ -131,8 +164,10 @@ decision.
 
 ### 1. Point it at one real credential
 
-Nothing has ever talked to a real provider. The adapters, credential unsealing
-and the SigV4 path have only ever run against the mock upstream.
+Nothing has ever talked to a real provider. Anthropic, OpenAI and Gemini have
+now been E2E'd against mocks of their wire formats. That is not the same as
+AWS's Bedrock framing, Anthropic's OAuth token endpoint, or Anthropic's
+tokenizer.
 
 ```bash
 just dev-serve
@@ -142,16 +177,22 @@ oag admin add-account --name anthropic-1 --provider anthropic --secret sk-...
 Then send a request through `oag/auto` and read the ledger row. This also
 unblocks three things that cannot move without it:
 
-- **Bedrock**: the event-stream decoder was verified against an encoder written
-  in the same commit, which proves self-consistency and nothing about AWS's
-  actual framing.
+- **Bedrock vs AWS**: `just verify-bedrock` proves the decoder against
+  VidaiMock's encoder (correct `{"bytes":}` wrap, real CRC32). It does not
+  prove AWS's framing. A real Bedrock call is still the only way to catch a
+  vendor-specific header or CRC quirk. aimock's Bedrock path is still the
+  wrong inner payload — do not point `provider_base_urls.bedrock` at it.
+  Overlay and survey: `deploy/test/vidaimock/`, [docs/05-llm-mocks.md](docs/05-llm-mocks.md).
 - **OAuth**: the two-layer refresh (process mutex, fleet lock, version stamp,
   `invalid_grant` recovery) is the most concurrency-sensitive code in the repo
-  and has only unit coverage.
+  and has only unit coverage. `AnthropicAdapter::refresh` is still the default
+  `Ok(None)` — the HTTP call to Anthropic's token URL does not exist yet. A mock
+  of that endpoint is a small custom thing, not aimock.
 - **`count_tokens` calibration**: the divisors in `oag_proto::count_input_tokens`
   are reasoned, not measured. Run five real prompts through Anthropic's own
   `count_tokens` and adjust. Until then the `oag_estimate: true` flag is doing
-  real work.
+  real work. llm-mock exposes `/v1/messages/count_tokens` but documents it as
+  an approximation (probed: `"Hello!"` → 2). Not a tokenizer.
 
 ### 2. Run `deploy/tofu/verify-migration-gate.sh` once per cloud
 
@@ -184,12 +225,14 @@ to run after each apply. Documented, not hidden.
 
 ### 3. Smaller, all self-contained
 
-- **Circuit breakers** are wired and unit-tested (`oag-pool`, `oag-server`)
-  but not exercised end to end in kind. Rechecked 2026-08-24:
-  `deploy/test/kind-verify.sh` still only proves drain — no `MOCK_FAIL_*`,
-  no breaker assertion. The mock has `MOCK_FAIL_STATUS` and `MOCK_FAIL_FIRST`
-  for exactly this, and `kind-verify.sh` is a working template for that kind
-  of test. Do not treat #5 as having closed this.
+- **Circuit breakers in kind**: `just verify-breakers` now proves the trip end
+  to end against the local mock — two 408s, and the third request is refused
+  without touching upstream. What it does not prove is the same behaviour
+  inside kind under a rollout: `deploy/test/kind-verify.sh` still only proves
+  drain — no `MOCK_FAIL_*`, no breaker assertion. The mock has
+  `MOCK_FAIL_STATUS` and `MOCK_FAIL_FIRST` for exactly this, and
+  `kind-verify.sh` is a working template for that kind of test. Do not treat
+  #5 as having closed this.
 - **In-cluster Postgres** is a single StatefulSet with no operator, no PITR and
   no pooling. Fine for kind; wrong for the credential store. Use CloudNativePG
   with `data.mode=external`.
@@ -205,9 +248,17 @@ to run after each apply. Documented, not hidden.
   canonical spelling. A row written as `moonshot` (SQL, or any path that
   skips the parse) is advertised by `/v1/models` and never actually
   selectable. Normalise on write or filter the listing.
+- **CRC32 on our event-stream test encoder.** The tests write prelude/message
+  CRC as `0` (`oag-upstream/src/eventstream.rs`). VidaiMock now checks the
+  decoder against real CRCs end to end; filling in the unit-test encoder is
+  still a self-contained change, no aimock, no Node.
 
 ## Things that will bite if you do not know them
 
+- **aimock is a dev/CI dialect stand-in, not an upstream.** Do not point a real
+  deployment at it. Do not replace `deploy/test/mock-upstream.py` in `just verify`
+  or `just verify-k8s`: that mock is stdlib-only so it can run from a ConfigMap
+  with no image. aimock needs Node.
 - **The Cloud Run stack's plan is never clean.** The API does not return
   `run_execution_token`, so it re-diffs every plan. That is what makes the
   migration execute. Do not silence it with `ignore_changes`, and do not use

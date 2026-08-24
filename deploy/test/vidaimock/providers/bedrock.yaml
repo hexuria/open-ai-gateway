@@ -1,0 +1,19 @@
+# Shadows VidaiMock's bundled bedrock.yaml.
+#
+# Bundled invoke is Converse-shaped and stream chunks were empty `{"bytes":""}`.
+# This overlay feeds encode_chunk Anthropic event JSON so oag-upstream's
+# event-stream decoder unwraps a real content_block_delta.
+name: "bedrock"
+matcher: "^/model/.*/invoke(-with-response-stream)?$"
+priority: 100
+response_template: "bedrock/invoke.json.j2"
+stream:
+  enabled: true
+  encoding: "aws-event-stream"
+  lifecycle:
+    on_start:
+      template_path: "bedrock/stream_start.json.j2"
+    on_chunk:
+      template_path: "bedrock/stream_delta.json.j2"
+    on_stop:
+      template_path: "bedrock/stream_stop.json.j2"

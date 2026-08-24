@@ -13,8 +13,10 @@ with no image to build, push, or keep in step with anything.
 Behaviour is set by environment:
   MOCK_STREAM_SECONDS  how long a streamed response takes end to end (default 20)
   MOCK_CHUNKS          how many content deltas to spread across it (default 20)
-  MOCK_FAIL_STATUS     if set, every request returns this status instead
-  MOCK_FAIL_FIRST      fail only the first N requests, then serve normally
+  MOCK_FAIL_STATUS     if set, every POST returns this status instead
+  MOCK_FAIL_FIRST      fail only the first N POSTs, then serve normally
+
+GET /_seen returns the POST count as plain text, without incrementing it.
 """
 
 import json
@@ -33,16 +35,21 @@ _lock = threading.Lock()
 _seen = 0
 
 
-def _should_fail():
-    """Whether this request fails, and why. Counted under a lock so
-    MOCK_FAIL_FIRST means N requests total rather than N per thread."""
+def _record_and_status():
+    """Count this POST, then decide whether it fails.
+
+    Every POST increments, including health probes that POST an empty body.
+    MOCK_FAIL_STATUS fails every request; MOCK_FAIL_FIRST fails only the first
+    N. Counted under a lock so N is total rather than N per thread.
+    """
     global _seen
-    if FAIL_STATUS:
-        return int(FAIL_STATUS)
     with _lock:
         _seen += 1
-        if _seen <= FAIL_FIRST:
-            return 529
+        n = _seen
+    if FAIL_STATUS:
+        return int(FAIL_STATUS)
+    if n <= FAIL_FIRST:
+        return 529
     return None
 
 
@@ -52,6 +59,20 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write("mock: " + fmt % args + "\n")
 
+    def do_GET(self):
+        # The breaker harness needs the POST count without adding to it.
+        if self.path.split("?", 1)[0].rstrip("/") == "/_seen":
+            with _lock:
+                n = _seen
+            payload = str(n).encode()
+            self.send_response(200)
+            self.send_header("content-type", "text/plain")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        self.send_error(404)
+
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("content-length", 0) or 0))
         try:
@@ -59,7 +80,7 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             request = {}
 
-        status = _should_fail()
+        status = _record_and_status()
         if status:
             payload = json.dumps(
                 {"type": "error", "error": {"type": "overloaded_error", "message": "mock failure"}}

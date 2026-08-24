@@ -67,3 +67,48 @@ jobs:
         env:
           OAG_TEST_REDIS_URL: redis://127.0.0.1:6379
           OAG_TEST_DATABASE_URL: postgres://oag:oag@127.0.0.1:5432/oag
+
+  # The request path against mocks, not real providers. Separate from
+  # `integration` so a store-test failure is not mixed with "aimock would not
+  # start" and so we can install Node without paying for it on the pure job.
+  verify-mocks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: oag
+          POSTGRES_PASSWORD: oag
+          POSTGRES_DB: oag
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U oag" --health-interval 2s
+          --health-timeout 3s --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s
+          --health-timeout 3s --health-retries 20
+    env:
+      OAG_DATABASE__URL: postgres://oag:oag@127.0.0.1:5432/oag
+      OAG_REDIS__URL: redis://127.0.0.1:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: psql
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: circuit breaker trips and the next request is refused
+        run: ./deploy/test/breaker-verify.sh
+      - name: OpenAI client over Anthropic mock (cross-dialect)
+        run: ./deploy/test/translate-verify.sh
+      - name: OpenAI and Gemini adapters against aimock
+        run: ./deploy/test/dialects-verify.sh
+      - name: Bedrock event-stream against VidaiMock
+        run: ./deploy/test/bedrock-verify.sh
