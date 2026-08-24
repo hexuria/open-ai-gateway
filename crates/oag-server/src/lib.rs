@@ -120,6 +120,14 @@ pub fn public_router(state: Arc<AppState>) -> Router {
 
     // On a single-port platform there is nowhere else for the admin routes to
     // live, so they join this listener rather than vanishing entirely.
+    //
+    // What joins it is all of [`admin_routes`], not just `/admin/api`. The
+    // three routes that sit outside the admin layer on purpose — `/`,
+    // `/metrics`, `/health/ready` — have nothing but reachability protecting
+    // them, and here there is none: the dashboard and every gauge in it answer
+    // whoever can reach the port. `/admin/api` keeps its key, so the writes
+    // lose one layer of two and the reads lose the only one they had. Restrict
+    // the service with the platform's ingress rules or IAM.
     let routes = if state.config.server.single_listener {
         routes.merge(admin_routes(&state))
     } else {
@@ -176,9 +184,10 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
     if state.config.server.single_listener {
         tracing::warn!(
             %public_addr,
-            "single-listener mode: the admin API, /metrics and /health/ready are on \
-             the public listener. They still require an admin key, but the second \
-             layer of separation is gone — restrict this port at the edge."
+            "single-listener mode: the admin API, the dashboard, /metrics and \
+             /health/ready are on the public listener. /admin/api still requires an \
+             admin key; the dashboard, /metrics and /health/ready never did, so on \
+             this port they are unauthenticated — restrict it at the edge."
         );
         spawn_catalog_refresh(Arc::clone(&state));
         return axum::serve(public, public_router(state))
@@ -345,6 +354,42 @@ server:
         )
         .await;
         assert_eq!(got, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn single_listener_puts_the_dashboard_and_metrics_on_the_public_port_unauthenticated() {
+        // The other half of the test above, and the part the deploy comments
+        // used to get wrong by saying the merged routes "still require an admin
+        // key". `/admin/api` does. These two never have — `/` has to render
+        // before an operator can type a key into it and `/metrics` is scraped
+        // without one — so merging them onto the public listener publishes them.
+        //
+        // Asserting the exposure rather than fixing it: the fix is reachability,
+        // which is the edge's job. `deploy/caddy/Caddyfile` keeps them off the
+        // published vhost and the Helm ingress routes the public port only;
+        // Cloud Run and Container Apps route to one port and cannot, which is
+        // why their modules point at ingress rules and IAM instead. If this
+        // test ever fails, a key was added to one of them and every scraper and
+        // orchestrator probe in every deployment just broke.
+        for path in ["/", "/metrics"] {
+            let got = status(public_router(state(true)), "GET", path).await;
+            assert_ne!(
+                got,
+                StatusCode::NOT_FOUND,
+                "{path} is not merged onto the public listener at all"
+            );
+            assert_ne!(
+                got,
+                StatusCode::UNAUTHORIZED,
+                "{path} now wants a key; the scrapers and probes that hold none are broken"
+            );
+        }
+
+        // And with two listeners they are not on the public port to begin with.
+        for path in ["/", "/metrics"] {
+            let got = status(public_router(state(false)), "GET", path).await;
+            assert_eq!(got, StatusCode::NOT_FOUND, "{path} leaked onto inference");
+        }
     }
 
     #[tokio::test]

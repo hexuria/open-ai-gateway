@@ -122,8 +122,11 @@ resource "azurerm_container_app" "this" {
         value = "0.0.0.0:8080"
       }
       env {
-        # Ingress routes to one port, so the admin API, /metrics and
-        # /health/ready share it. They still require an admin key.
+        # Ingress routes to one port, so the admin API, the dashboard,
+        # /metrics and /health/ready share it. Only /admin/api requires an
+        # admin key; the other three are outside that layer by design and are
+        # therefore unauthenticated on this port. Keep ingress internal, or put
+        # an authenticating front door in front of it.
         name  = "OAG_SERVER__SINGLE_LISTENER"
         value = "true"
       }
