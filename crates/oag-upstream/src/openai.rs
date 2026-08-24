@@ -14,6 +14,9 @@ use oag_proto::{StreamAccumulator, StreamEvent, openai};
 pub struct OpenAICompatAdapter {
     provider: Provider,
     base_url: String,
+    /// Where xAI's OIDC server lives. Only the refresh path reads it, and only
+    /// for `Provider::XAI`; tests point it at a local mock.
+    auth_base: String,
 }
 
 impl OpenAICompatAdapter {
@@ -22,7 +25,15 @@ impl OpenAICompatAdapter {
         Self {
             provider,
             base_url: base_url.into(),
+            auth_base: crate::xai_oauth::DEFAULT_AUTH_BASE.to_owned(),
         }
+    }
+
+    /// Override the OIDC server, for tests against a local mock.
+    #[must_use]
+    pub fn with_auth_base(mut self, auth_base: impl Into<String>) -> Self {
+        self.auth_base = auth_base.into();
+        self
     }
 
     /// The public endpoint for a provider, where it has one.
@@ -72,6 +83,20 @@ impl ProviderAdapter for OpenAICompatAdapter {
 
     fn parse_event(&self, raw: &str, acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
         openai::parse_event(raw, acc)
+    }
+
+    async fn refresh(
+        &self,
+        credential: &oag_core::credential::SecretMaterial,
+    ) -> Result<Option<oag_core::credential::SecretMaterial>> {
+        // Of the five providers this adapter serves, only xAI issues
+        // subscription OAuth tokens. The others hold static keys, for which
+        // "nothing to refresh" is the correct answer.
+        if self.provider == Provider::XAI {
+            crate::xai_oauth::refresh(credential, &self.auth_base).await
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -130,6 +155,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             version: 0,
+            client_id: None,
         }
     }
 

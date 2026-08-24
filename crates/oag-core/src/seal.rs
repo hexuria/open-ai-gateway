@@ -197,6 +197,7 @@ mod tests {
             refresh_token: Some("refresh-abc".to_owned()),
             expires_at: Some(1_800_000_000),
             version: 7,
+            client_id: None,
         };
         let sealed = k.seal_json(&cred).expect("seals");
         let back: SecretMaterial = k.open_json(&sealed).expect("opens");

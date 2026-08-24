@@ -232,6 +232,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             version: 0,
+            client_id: None,
         }
     }
 

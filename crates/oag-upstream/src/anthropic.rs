@@ -124,6 +124,7 @@ mod tests {
             refresh_token: None,
             expires_at: None,
             version: 0,
+            client_id: None,
         }
     }
 
@@ -133,6 +134,7 @@ mod tests {
             refresh_token: Some("refresh".to_owned()),
             expires_at: Some(9_999_999_999),
             version: 1,
+            client_id: None,
         }
     }
 
