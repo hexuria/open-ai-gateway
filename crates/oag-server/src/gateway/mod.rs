@@ -443,6 +443,11 @@ fn meter_context(
         account: lease.account.account_id(),
         started,
         attempt: i16::from(attempt),
+        // An unrecognised kind is treated as metered: better to record a real
+        // per-request cost than to silently zero one because a discriminator
+        // was misspelled.
+        flat_rate: oag_core::credential::CredentialKind::from_column(&lease.account.kind)
+            .is_some_and(oag_core::credential::CredentialKind::flat_rate),
     }
 }
 

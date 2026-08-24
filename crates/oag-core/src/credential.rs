@@ -33,6 +33,30 @@ impl CredentialKind {
     pub const fn refreshable(self) -> bool {
         matches!(self, Self::OAuth | Self::Vertex | Self::ServiceAccount)
     }
+
+    /// Whether usage on this kind is billed at a flat rate rather than per
+    /// token. A subscription seat is paid for by a monthly fee, so the marginal
+    /// cost of a request is zero and the metered price becomes a counterfactual
+    /// — see `usage_event.counterfactual_api_usd`.
+    #[must_use]
+    pub const fn flat_rate(self) -> bool {
+        matches!(self, Self::OAuth)
+    }
+
+    /// Parse the discriminator as stored in `account.kind`. Unknown strings map
+    /// to `None` rather than erroring: the caller decides what an unrecognised
+    /// kind means, and for flat-rate classification the safe answer is "metered".
+    #[must_use]
+    pub fn from_column(s: &str) -> Option<Self> {
+        match s {
+            "api_key" => Some(Self::ApiKey),
+            "oauth" => Some(Self::OAuth),
+            "bedrock" => Some(Self::Bedrock),
+            "vertex" => Some(Self::Vertex),
+            "service_account" => Some(Self::ServiceAccount),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for CredentialKind {

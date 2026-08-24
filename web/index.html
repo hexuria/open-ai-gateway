@@ -83,6 +83,19 @@
     <h2>By tier</h2>
     <div class="scroll"><table id="tiers"></table></div>
 
+    <section id="subs" hidden>
+      <h2>Subscriptions</h2>
+      <p class="note">Flat-rate seats are billed monthly, not per token, so their
+        requests cost $0 at the margin and inflate the frontier figure above.
+        This nets what they displaced in pay-per-token spend against what they
+        cost — the honest test of whether a seat earns its fee.</p>
+      <div class="grid">
+        <div class="card"><div class="label">API spend displaced</div><div class="big good" id="sub-avoided">—</div></div>
+        <div class="card"><div class="label">Seat fees (window)</div><div class="big" id="sub-cost">—</div></div>
+        <div class="card"><div class="label">Net</div><div class="big" id="sub-net">—</div></div>
+      </div>
+    </section>
+
     <h2>Services</h2>
     <p class="note">Capability backends. The gateway registers a row and health-checks it;
       it does not run the sandbox, tool, guard, or browser.</p>
@@ -187,6 +200,24 @@ async function load() {
     $('saved').textContent = '$' + s.saved_usd;
     $('pct').textContent   = s.saved_pct + '%';
     $('cache').textContent = s.cache_hit_rate + '%';
+
+    // Subscriptions: only shown once at least one seat carries a price, so an
+    // empty section never implies "seats saved nothing" when the truth is
+    // "no seat fees were recorded".
+    const sub = s.subscription;
+    if (sub && sub.priced_seats > 0) {
+      $('subs').hidden = false;
+      $('sub-avoided').textContent = '$' + sub.avoided_api_usd;
+      $('sub-cost').textContent    = '$' + sub.seat_cost_usd;
+      const net = $('sub-net');
+      net.textContent = '$' + sub.net_usd;
+      // Net is the one figure here that can go either way, so it carries the
+      // colour: green when the seats have earned their fee back, red when the
+      // traffic has not yet justified them.
+      net.className = 'big ' + (parseFloat(sub.net_usd) >= 0 ? 'good' : 'bad');
+    } else {
+      $('subs').hidden = true;
+    }
     $('reqs').textContent  = s.requests;
 
     table($('tiers'), [
