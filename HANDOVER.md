@@ -1,6 +1,6 @@
 # Handover
 
-State of `open-ai-gateway` as of 2026-08-23, written to be picked up on another
+State of `open-ai-gateway` as of 2026-08-24, written to be picked up on another
 machine with no memory of the session that produced it.
 
 Everything below was verified the way it says it was. Where something was *not*
@@ -16,12 +16,29 @@ product; no payment code, deliberately.
 
 ## Where it stands
 
-Green: 282 tests, clippy clean at `-D warnings`, fmt clean. CI and the release
-workflow both pass on `main`. `ghcr.io/hexuria/open-ai-gateway:main` is published
-for linux/amd64 and linux/arm64 and is publicly pullable.
+Green: 390 tests (`cargo test --workspace -- --list`), clippy clean at
+`-D warnings`, fmt clean. The four no-I/O crates (`oag-core`, `oag-router`,
+`oag-pool`, `oag-proto`) carry 214 of those. `ci` and `k8s` are green on `main` at `5d5ff4f` (the #18 merge) — `k8s` 8 of
+8 streams, 8 ledger rows, as on every stack merge that ran it today. The
+release workflow publishes `ghcr.io/hexuria/open-ai-gateway:main` for
+linux/amd64 and linux/arm64; it is publicly pullable.
 
-All work is on `main` — there is no open branch and no PR to merge. That was the
-pattern from the start, when the repo was published straight to `hexuria`.
+`main` is clear. There is no open PR. Every 2026-08-23/24 stack is merged:
+
+| Stack | PRs | What landed |
+|---|---|---|
+| catalog | #19 | `services` table, admin Services panel, `docs/05-services.md` |
+| edge | #14 | Caddy no longer publishes admin on the catch-all |
+| admit | #10 #11 #13 | Gemini panic (C2), auth before the body (S2), Redis auth-cache HMAC (S1) |
+| money | #1 #2 | dialect-aware collect + meter (C1/H2); charge only the written ledger row |
+| avail | #5 #6 #8 #9 | breaker probe, escalate on context reject, RAII lease, upstream 401 not the client's |
+| api | #15 #16 #18 | SSE death + buffer cap, proto renderer names, `tool_choice` / `response_format` / `stop` carried or refused |
+
+Leftover remotes with those stack names still exist. They are already in `main`.
+Do not reopen them.
+
+These are **shipped**. They are not pickup. The first live credential is still
+the first pickup; nothing below invents a live-provider story.
 
 ```bash
 just verify        # request path end to end vs a mock upstream, ~1 min, no credentials
@@ -34,7 +51,8 @@ just dev-serve     # local gateway; also what the editor run button launches
 touching `crates/`, `deploy/` or `migrations/`, on PRs, and nightly. As of
 2026-08-23 it passes: 8 of 8 streams complete across a full `rollout restart`
 and all 8 reach the ledger. That claim used to be an anecdote from one manual
-check; it is now checked by a runner.
+check; it is now checked by a runner. It still only proves drain — not
+breakers. See pickup #3.
 
 `just verify` is the one to run first on a new machine. It passes today with:
 
@@ -43,10 +61,73 @@ anthropic/claude-haiku-4.5 on 'cheap': in=100 out=18,
 $0.00019000 vs $0.00285000 frontier — 93% saved, ttft 998ms
 ```
 
+That figure is against the mock. Nothing has talked to a real provider.
+
+## What landed — keep as shipped
+
+### Catalog — #19
+
+`migrations/0002_services.sql` is the capability-service catalog. The admin
+dashboard has a Services panel. `docs/05-services.md` is the slice: register a
+row, health-check it, deep-link to the service's own UI. The gateway does not
+become the sandbox. Do not delete that doc.
+
+**0002 is the catalog.** It is not the money migration.
+
+### Edge — #14
+
+Caddy proxies the inference paths and 404s everything else. The admin listener
+is not on the catch-all. Documented in `docs/01-deployment.md`. Cloud Run and
+Container Apps still force `single_listener: true`; that caveat is unchanged.
+
+### Admit — #10 / #11 / #13
+
+- **C2 / #10**: a non-object Gemini body no longer panics the replica.
+  `catch_panic` is insurance; the request path answers first.
+- **S2 / #11**: inference `route_layer` authenticates from headers before a
+  handler's `Bytes` extractor runs. An anonymous POST is 401, not a 256 MiB
+  allocation. Default `max_body_bytes` is 32 MiB.
+- **S1 / #13**: the Redis auth cache is HMAC'd with `signing_secret`. A
+  replica with a different secret ignores the others' entries and reads
+  Postgres. Rotation needs no flush.
+
+### Money — #1 / #2
+
+Dialect-aware collect on the non-streamed path, and the abandoned escalation
+attempt is metered instead of thrown away (C1/H2). The key is charged only
+when the ledger row is actually written — a replay or a dropped second
+attempt does not debit.
+
+`migrations/0003_usage_event_attempt.sql` is the expand: column `attempt`,
+unique index on `(request_id, attempt)`. The primary key on `request_id`
+**survives this release**, so a rolling deploy does not 42P10. A later
+release contracts by dropping that PK. Until then a second row for one
+request is still dropped. That is expand/contract, not a bug to reopen.
+
+Do not write that money changes become `0002`. `0002` is already the catalog.
+
+### Avail — #5 / #6 / #8 / #9
+
+Breaker half-open probe is spent on admit and released if the request is not
+sent. A `ContextOverflow` climbs a rung, including on a streamed request that
+was refused before any bytes. A credential's Redis slot is returned on drop.
+An upstream 401 is not mapped to "the client's key is wrong".
+
+Unit-tested. Not e2e in kind — see pickup.
+
+### API — #15 / #16 / #18
+
+A stream that dies mid-flight says so; the SSE buffer is capped. Renderers
+keep the model name and the tool name. `tool_choice`, `response_format`,
+`stop`, and `previous_response_id` are carried where the dialect has a place
+for them, and refused with a 400 naming the field and the dialect where they
+do not.
+
 ## Pick up here
 
-In priority order. Everything here is blocked on credentials or on a decision —
-the local and CI verification is done.
+In priority order. Local and CI verification of the stacks above is done.
+Everything here is still blocked on credentials, a real cloud account, or a
+decision.
 
 ### 1. Point it at one real credential
 
@@ -73,6 +154,8 @@ unblocks three things that cannot move without it:
   real work.
 
 ### 2. Run `deploy/tofu/verify-migration-gate.sh` once per cloud
+
+This script has never been run against a real cloud.
 
 Migrations run on all three clouds, by three different mechanisms, because the
 providers expose three different things — `docs/04-cloud.md` has the table and
@@ -101,9 +184,12 @@ to run after each apply. Documented, not hidden.
 
 ### 3. Smaller, all self-contained
 
-- **Circuit breakers** are wired and unit-tested but never exercised end to end.
-  The mock has `MOCK_FAIL_STATUS` and `MOCK_FAIL_FIRST` for exactly this, and
-  `deploy/test/kind-verify.sh` is now a working template for that kind of test.
+- **Circuit breakers** are wired and unit-tested (`oag-pool`, `oag-server`)
+  but not exercised end to end in kind. Rechecked 2026-08-24:
+  `deploy/test/kind-verify.sh` still only proves drain — no `MOCK_FAIL_*`,
+  no breaker assertion. The mock has `MOCK_FAIL_STATUS` and `MOCK_FAIL_FIRST`
+  for exactly this, and `kind-verify.sh` is a working template for that kind
+  of test. Do not treat #5 as having closed this.
 - **In-cluster Postgres** is a single StatefulSet with no operator, no PITR and
   no pooling. Fine for kind; wrong for the credential store. Use CloudNativePG
   with `data.mode=external`.
@@ -112,10 +198,13 @@ to run after each apply. Documented, not hidden.
   documented seeding path is LiteLLM's table, which is >1000 entries. Memoise
   against the catalog `Arc` if that bites — do not cap the list, which would
   make the answer wrong rather than large.
-- **`route_providers` alias asymmetry**: `Provider::from_str` accepts aliases but
-  `select::lease` queries the canonical spelling, so an account row spelled
-  `moonshot` is advertised by `/v1/models` and never actually selectable.
-  Normalise on write or filter the listing.
+- **`route_providers` alias asymmetry**: still true as of 2026-08-24.
+  `Provider::from_str` accepts `moonshot` / `glm` / `grok`. `oag admin
+  add-account` parses and stores `provider.as_str()`, so the CLI path is
+  fine. `select::lease` → `candidates` queries `a.provider = $2` with the
+  canonical spelling. A row written as `moonshot` (SQL, or any path that
+  skips the parse) is advertised by `/v1/models` and never actually
+  selectable. Normalise on write or filter the listing.
 
 ## Things that will bite if you do not know them
 
@@ -126,11 +215,17 @@ to run after each apply. Documented, not hidden.
 - **Migrations must be expand/contract.** In all three clouds the migration lands
   while the previous release is still serving — on AWS for up to the 1800s
   deregistration delay.
-- **`migrations/0001_baseline.sql` is edited in place**, not appended to. That is
-  only safe while no database anyone cares about has applied it. The moment there
-  is a real deployment, stop: sqlx checksums applied migrations and `oag migrate`
-  will fail closed, permanently, against a database that ran an earlier version
-  of `0001`. Changes become `0002` from then on.
+- **The migration chain is no longer "changes become 0002".** There are three
+  files:
+  - `migrations/0001_baseline.sql` — still edited in place, and that is only
+    safe while no database anyone cares about has applied it.
+  - `migrations/0002_services.sql` — the capability catalog. Shipped.
+  - `migrations/0003_usage_event_attempt.sql` — the ledger expand. Shipped.
+    PK on `request_id` still present; contract is a later release.
+  sqlx checksums applied migrations and `oag migrate` will fail closed,
+  permanently, against a database that ran an earlier version of a file.
+  The moment there is a real deployment, stop editing `0001`. Changes become
+  `0004` from then on.
 - **Admin authority is on the key, not the principal** (`api_key.admin`). Mint one
   with `oag admin key --admin`. An ordinary inference key from an admin's own
   principal is deliberately refused — it gets pasted into SDK configs.
