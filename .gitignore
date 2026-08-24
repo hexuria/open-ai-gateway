@@ -12,3 +12,6 @@
 .terraform.lock.hcl
 *.tfstate
 *.tfstate.*
+
+# Local deploy answers (holds secrets) written by deploy/tofu/deploy-gcp.sh
+deploy/tofu/gcp-deploy.local.env
