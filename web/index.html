@@ -85,15 +85,12 @@
 
     <section id="subs" hidden>
       <h2>Subscriptions</h2>
-      <p class="note">Flat-rate seats are billed monthly, not per token, so their
-        requests cost $0 at the margin and inflate the frontier figure above.
-        This nets what they displaced in pay-per-token spend against what they
-        cost — the honest test of whether a seat earns its fee.</p>
-      <div class="grid">
-        <div class="card"><div class="label">API spend displaced</div><div class="big good" id="sub-avoided">—</div></div>
-        <div class="card"><div class="label">Seat fees (window)</div><div class="big" id="sub-cost">—</div></div>
-        <div class="card"><div class="label">Net</div><div class="big" id="sub-net">—</div></div>
-      </div>
+      <p class="note">Each seat is flat-rate — billed monthly, not per token — so
+        it is metered on its own line: what its traffic would have cost billed
+        per token, against the fixed fee that displaced that bill. Saved is the
+        difference; it reads red until a seat's use earns its fee back. Metered
+        API traffic is the headline above; this is a separate track.</p>
+      <div class="scroll"><table id="seats"></table></div>
     </section>
 
     <h2>Services</h2>
@@ -201,20 +198,26 @@ async function load() {
     $('pct').textContent   = s.saved_pct + '%';
     $('cache').textContent = s.cache_hit_rate + '%';
 
-    // Subscriptions: only shown once at least one seat carries a price, so an
-    // empty section never implies "seats saved nothing" when the truth is
-    // "no seat fees were recorded".
-    const sub = s.subscription;
-    if (sub && sub.priced_seats > 0) {
+    // Subscriptions: one row per seat, shown only once at least one seat
+    // exists, so an empty section never appears on an all-API deployment.
+    const seats = s.subscriptions || [];
+    if (seats.length) {
       $('subs').hidden = false;
-      $('sub-avoided').textContent = '$' + sub.avoided_api_usd;
-      $('sub-cost').textContent    = '$' + sub.seat_cost_usd;
-      const net = $('sub-net');
-      net.textContent = '$' + sub.net_usd;
-      // Net is the one figure here that can go either way, so it carries the
-      // colour: green when the seats have earned their fee back, red when the
-      // traffic has not yet justified them.
-      net.className = 'big ' + (parseFloat(sub.net_usd) >= 0 ? 'good' : 'bad');
+      table($('seats'), [
+        { h:'Seat',        f:r => esc(r.name) },
+        { h:'Requests',    f:r => r.requests, num:true },
+        { h:'If per-token',f:r => '$' + esc(r.api_value_usd), num:true },
+        // An unpriced seat shows a dash for cost and saving, not a zero: no
+        // fee was recorded, so its saving is unknown, not nil.
+        { h:'Plan cost',   f:r => r.plan_cost_usd == null ? '—' : '$' + esc(r.plan_cost_usd), num:true },
+        { h:'Saved',       f:r => {
+            if (r.saved_usd == null) return '—';
+            // Saved is the figure that can go either way, so it carries the
+            // colour: green once the seat has earned its fee back, red before.
+            const cls = parseFloat(r.saved_usd) >= 0 ? 'good' : 'bad';
+            return `<span class="${cls}">$${esc(r.saved_usd)}</span>`;
+          }, num:true },
+      ], seats);
     } else {
       $('subs').hidden = true;
     }
