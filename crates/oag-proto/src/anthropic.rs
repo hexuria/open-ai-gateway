@@ -6,15 +6,20 @@
 //! with either OpenAI dialect — that mismatch is why translation needs a state
 //! machine and not a map.
 
-use crate::canonical::{CacheControl, CanonicalRequest, ContentBlock, Message, Role, Tool};
+use crate::canonical::{
+    CacheControl, CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
+};
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
-use oag_core::Result;
+use oag_core::provider::Dialect;
+use oag_core::{Error, Result};
 use oag_router::Usage;
 use serde_json::{Value, json};
 
 /// The API version header value. Anthropic requires it on every request and
 /// changes behaviour without it.
 pub const API_VERSION: &str = "2023-06-01";
+
+const DIALECT: Dialect = Dialect::AnthropicMessages;
 
 /// Canonical → Anthropic wire JSON.
 pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Value> {
@@ -36,6 +41,39 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     }
     if let Some(budget) = req.thinking_budget {
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+    }
+
+    // Two fields this dialect simply does not have. Structured output is not
+    // available on Messages at all — prompting for JSON is not the same
+    // promise — and there is no stored-response id to continue from.
+    if req
+        .response_format
+        .as_ref()
+        .is_some_and(ResponseFormat::constrains_output)
+    {
+        return Err(Error::UnsupportedField {
+            field: "response_format",
+            dialect: DIALECT,
+        });
+    }
+    if req.previous_response_id.is_some() {
+        return Err(Error::UnsupportedField {
+            field: "previous_response_id",
+            dialect: DIALECT,
+        });
+    }
+
+    if let Some(choice) = &req.tool_choice {
+        body["tool_choice"] = match choice {
+            ToolChoice::Auto => json!({ "type": "auto" }),
+            // `any` here, `required` everywhere else.
+            ToolChoice::Required => json!({ "type": "any" }),
+            ToolChoice::None => json!({ "type": "none" }),
+            ToolChoice::Tool { name } => json!({ "type": "tool", "name": name }),
+        };
+    }
+    if !req.stop.is_empty() {
+        body["stop_sequences"] = json!(req.stop);
     }
     Ok(body)
 }
@@ -159,7 +197,31 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         temperature: body["temperature"].as_f64().map(|t| t as f32),
         thinking_budget,
         client_session,
+        tool_choice: parse_tool_choice(&body["tool_choice"]),
+        // Neither exists in this dialect, so a client speaking it never set one.
+        response_format: None,
+        stop: body["stop_sequences"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(std::borrow::ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        previous_response_id: None,
     })
+}
+
+fn parse_tool_choice(v: &Value) -> Option<ToolChoice> {
+    match v["type"].as_str()? {
+        "auto" => Some(ToolChoice::Auto),
+        "any" => Some(ToolChoice::Required),
+        "none" => Some(ToolChoice::None),
+        "tool" => Some(ToolChoice::Tool {
+            name: v["name"].as_str()?.to_owned(),
+        }),
+        _ => None,
+    }
 }
 
 fn parse_message(v: &Value) -> Option<Message> {
@@ -441,9 +503,7 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
 
     match event {
         StreamEvent::Start { model, usage } => {
-            if !model.is_empty() {
-                st.model.clone_from(model);
-            }
+            crate::stream::adopt_model(&mut st.model, model);
             st.usage.merge(usage);
             st.ensure_started(&mut out);
         }
@@ -846,6 +906,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tool_choice_and_stop_sequences_survive_a_round_trip() {
+        // `any` here is `required` everywhere else, which is exactly why it goes
+        // through a canonical form instead of being forwarded verbatim.
+        let wire = serde_json::json!({
+            "model": "m", "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "any"},
+            "stop_sequences": ["\n\nHuman:"],
+        });
+        let c = parse_request(&wire).expect("parses");
+        assert_eq!(c.tool_choice, Some(ToolChoice::Required));
+        assert_eq!(c.stop, vec!["\n\nHuman:".to_owned()]);
+
+        let back = render_request(&c, "m").expect("renders");
+        assert_eq!(back["tool_choice"]["type"], "any", "not `required`");
+        assert_eq!(back["stop_sequences"], serde_json::json!(["\n\nHuman:"]));
+    }
+
+    #[test]
+    fn a_named_tool_choice_keeps_this_dialects_spelling() {
+        let c = crate::openai::parse_request(&serde_json::json!({
+            "model": "m", "messages": [],
+            "tool_choice": {"type": "function", "function": {"name": "read_file"}}
+        }))
+        .expect("parses");
+        let back = render_request(&c, "m").expect("renders");
+        assert_eq!(back["tool_choice"]["type"], "tool");
+        assert_eq!(back["tool_choice"]["name"], "read_file");
+    }
+
+    #[test]
+    fn a_response_format_this_dialect_cannot_express_is_refused_not_dropped() {
+        // Messages has no structured-output field. Dropping it sends a client
+        // that is about to call `JSON.parse` a paragraph of prose, and nothing
+        // in the response says the constraint was removed — so the client
+        // blames the model for something the gateway did.
+        let c = crate::openai::parse_request(&serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+        }))
+        .expect("parses");
+
+        let err = render_request(&c, "claude-opus-5").expect_err("must not be dropped");
+        assert!(matches!(
+            err,
+            Error::UnsupportedField {
+                field: "response_format",
+                dialect: Dialect::AnthropicMessages,
+            }
+        ));
+    }
+
+    #[test]
+    fn asking_explicitly_for_plain_text_is_not_a_failure() {
+        // `{"type": "text"}` names the behaviour this dialect already has, so
+        // refusing it would 400 a request that is perfectly servable.
+        let c = crate::openai::parse_request(&serde_json::json!({
+            "model": "m", "messages": [], "response_format": {"type": "text"},
+        }))
+        .expect("parses");
+        assert_eq!(c.response_format, Some(ResponseFormat::Text));
+        let back = render_request(&c, "m").expect("plain text is expressible");
+        assert!(back.get("response_format").is_none());
+    }
+
+    #[test]
+    fn a_stored_response_id_this_dialect_cannot_express_is_refused() {
+        let c = crate::responses::parse_request(&serde_json::json!({
+            "model": "gpt-5", "input": "go on", "previous_response_id": "resp_abc",
+        }))
+        .expect("parses");
+        let err = render_request(&c, "claude-opus-5").expect_err("must not be dropped");
+        assert!(matches!(
+            err,
+            Error::UnsupportedField {
+                field: "previous_response_id",
+                ..
+            }
+        ));
+    }
+
     /// Drive canonical events through the Anthropic renderer and return the
     /// `event:` names in order, plus the reassembled text.
     fn render_all(events: &[StreamEvent]) -> (Vec<String>, String) {
@@ -1024,6 +1166,10 @@ mod tests {
             temperature: None,
             thinking_budget: None,
             client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
         };
         let out = render_request(&req, "m").expect("renders");
         assert_eq!(out["messages"][0]["content"][0]["signature"], sig);

@@ -16,11 +16,16 @@
 //! - Usage is `usageMetadata`, and its prompt count *includes* the cached
 //!   prefix, like Chat Completions and unlike Anthropic.
 
-use crate::canonical::{CanonicalRequest, ContentBlock, Message, Role, Tool};
+use crate::canonical::{
+    CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
+};
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
-use oag_core::Result;
+use oag_core::provider::Dialect;
+use oag_core::{Error, Result};
 use oag_router::Usage;
 use serde_json::{Value, json};
+
+const DIALECT: Dialect = Dialect::GeminiGenerateContent;
 
 /// Canonical → Gemini wire JSON.
 ///
@@ -63,6 +68,46 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
     }
     if let Some(budget) = req.thinking_budget {
         body["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": budget });
+    }
+
+    // Nothing here corresponds to a stored response: this dialect replays the
+    // whole conversation in `contents` every turn.
+    if req.previous_response_id.is_some() {
+        return Err(Error::UnsupportedField {
+            field: "previous_response_id",
+            dialect: DIALECT,
+        });
+    }
+
+    if let Some(choice) = &req.tool_choice {
+        // Its own top-level `toolConfig`, not part of `generationConfig`, and a
+        // named tool is expressed as "call something, from this list of one".
+        body["toolConfig"] = json!({ "functionCallingConfig": match choice {
+            ToolChoice::Auto => json!({ "mode": "AUTO" }),
+            ToolChoice::Required => json!({ "mode": "ANY" }),
+            ToolChoice::None => json!({ "mode": "NONE" }),
+            ToolChoice::Tool { name } => json!({
+                "mode": "ANY", "allowedFunctionNames": [name],
+            }),
+        }});
+    }
+    if let Some(format) = &req.response_format {
+        // A MIME type rather than a format object, with the schema alongside it.
+        let cfg = &mut body["generationConfig"];
+        match format {
+            ResponseFormat::Text => cfg["responseMimeType"] = json!("text/plain"),
+            ResponseFormat::JsonObject => cfg["responseMimeType"] = json!("application/json"),
+            // The schema's label and `strict` flag have no field here, and
+            // neither loses the constraint: this dialect always enforces a
+            // `responseSchema`, which is at worst stricter than was asked.
+            ResponseFormat::JsonSchema { schema, .. } => {
+                cfg["responseMimeType"] = json!("application/json");
+                cfg["responseSchema"] = schema.clone();
+            }
+        }
+    }
+    if !req.stop.is_empty() {
+        body["generationConfig"]["stopSequences"] = json!(req.stop);
     }
 
     Ok(body)
@@ -162,7 +207,62 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
             .as_u64()
             .and_then(|v| u32::try_from(v).ok()),
         client_session: None,
+        tool_choice: parse_tool_choice(&body["toolConfig"]["functionCallingConfig"]),
+        response_format: parse_response_format(cfg),
+        stop: cfg["stopSequences"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(std::borrow::ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // This dialect has no stored responses; the conversation is `contents`.
+        previous_response_id: None,
     })
+}
+
+fn parse_tool_choice(cfg: &Value) -> Option<ToolChoice> {
+    let mode = cfg["mode"].as_str()?;
+    // A single allowed name is how this dialect says "call this one", so it
+    // parses back to the named form rather than to a bare `Required`.
+    if let Some(name) = cfg["allowedFunctionNames"]
+        .as_array()
+        .filter(|names| names.len() == 1)
+        .and_then(|names| names[0].as_str())
+        && mode != "NONE"
+    {
+        return Some(ToolChoice::Tool {
+            name: name.to_owned(),
+        });
+    }
+    match mode {
+        "AUTO" => Some(ToolChoice::Auto),
+        "ANY" => Some(ToolChoice::Required),
+        "NONE" => Some(ToolChoice::None),
+        _ => None,
+    }
+}
+
+fn parse_response_format(cfg: &Value) -> Option<ResponseFormat> {
+    let json = cfg["responseMimeType"].as_str() == Some("application/json");
+    match &cfg["responseSchema"] {
+        Value::Null => {
+            if json {
+                Some(ResponseFormat::JsonObject)
+            } else if cfg["responseMimeType"].is_string() {
+                Some(ResponseFormat::Text)
+            } else {
+                None
+            }
+        }
+        schema => Some(ResponseFormat::JsonSchema {
+            // Unnamed on this wire; the label is an OpenAI-side detail.
+            name: "response".to_owned(),
+            schema: schema.clone(),
+            strict: true,
+        }),
+    }
 }
 
 fn parse_content(v: &Value) -> Option<Message> {
@@ -591,6 +691,86 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_response_format_and_stop_survive_a_round_trip() {
+        // Every one of the three has a different home here: a top-level
+        // `toolConfig`, a MIME type plus a schema, and a `generationConfig`
+        // list. None of them is where any other dialect keeps it.
+        let schema = json!({"type": "object", "properties": {"n": {"type": "number"}}});
+        let wire = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+            "generationConfig": {
+                "maxOutputTokens": 512,
+                "responseMimeType": "application/json",
+                "responseSchema": schema.clone(),
+                "stopSequences": ["END"],
+            },
+        });
+
+        let c = parse_request(&wire).expect("parses");
+        assert_eq!(c.tool_choice, Some(ToolChoice::Required));
+        assert!(matches!(
+            c.response_format,
+            Some(ResponseFormat::JsonSchema { .. })
+        ));
+        assert_eq!(c.stop, vec!["END".to_owned()]);
+
+        let back = render_request(&c).expect("renders");
+        assert_eq!(
+            back["toolConfig"]["functionCallingConfig"]["mode"], "ANY",
+            "`ANY`, not `required`"
+        );
+        assert_eq!(
+            back["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
+        assert_eq!(back["generationConfig"]["responseSchema"], schema);
+        assert_eq!(back["generationConfig"]["stopSequences"], json!(["END"]));
+    }
+
+    #[test]
+    fn a_named_tool_choice_becomes_a_one_entry_allow_list() {
+        // The only way this dialect says "call this specific tool".
+        let c = crate::openai::parse_request(&json!({
+            "model": "m", "messages": [],
+            "tool_choice": {"type": "function", "function": {"name": "read_file"}}
+        }))
+        .expect("parses");
+
+        let back = render_request(&c).expect("renders");
+        let cfg = &back["toolConfig"]["functionCallingConfig"];
+        assert_eq!(cfg["mode"], "ANY");
+        assert_eq!(cfg["allowedFunctionNames"], json!(["read_file"]));
+
+        // And it comes back as the named form rather than a bare `Required`.
+        assert_eq!(
+            parse_request(&back).expect("parses").tool_choice,
+            Some(ToolChoice::Tool {
+                name: "read_file".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn a_stored_response_id_this_dialect_cannot_express_is_refused() {
+        // This dialect replays the whole conversation in `contents`; there is
+        // nothing for a stored-response id to attach to.
+        let c = crate::responses::parse_request(&json!({
+            "model": "gpt-5", "input": "go on", "previous_response_id": "resp_abc",
+        }))
+        .expect("parses");
+
+        let err = render_request(&c).expect_err("must not be dropped");
+        assert!(matches!(
+            err,
+            Error::UnsupportedField {
+                field: "previous_response_id",
+                dialect: Dialect::GeminiGenerateContent,
+            }
+        ));
+    }
+
+    #[test]
     fn rendering_produces_frames_this_dialect_can_parse_back() {
         // The round-trip property the hub rests on: whatever we emit, our own
         // parser must recover the same content and counts from it.
@@ -693,6 +873,10 @@ mod tests {
             temperature: None,
             thinking_budget: None,
             client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
         };
         let back = render_request(&c).expect("renders");
         let parts = back["contents"][0]["parts"].as_array().expect("parts");

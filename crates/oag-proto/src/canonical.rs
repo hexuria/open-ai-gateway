@@ -72,6 +72,62 @@ pub struct Tool {
     pub cache_control: Option<CacheControl>,
 }
 
+/// How the client constrained the model's use of tools.
+///
+/// Every dialect can express all four, but each spells them differently —
+/// `required` here is `any` in Anthropic and `ANY` in Gemini — which is exactly
+/// why it needs a canonical form rather than being forwarded verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// The model decides whether to call a tool.
+    Auto,
+    /// The model must call at least one tool.
+    Required,
+    /// The model must not call a tool.
+    None,
+    /// The model must call this one.
+    Tool { name: String },
+}
+
+/// The shape the client demanded of the answer.
+///
+/// Load-bearing in a way `temperature` is not: a client that asked for a JSON
+/// object is going to run `JSON.parse` on whatever comes back, so quietly
+/// downgrading this to free text does not degrade the answer, it breaks the
+/// caller. Anthropic Messages has no field for it, so translation to that
+/// dialect fails rather than dropping it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Free text. Every dialect's default, so asking for it explicitly costs
+    /// nothing and constrains nobody.
+    Text,
+    /// Any valid JSON object.
+    JsonObject,
+    /// JSON conforming to a schema.
+    JsonSchema {
+        name: String,
+        schema: serde_json::Value,
+        /// Whether the provider must reject output that leaves the schema
+        /// rather than doing its best.
+        #[serde(default)]
+        strict: bool,
+    },
+}
+
+impl ResponseFormat {
+    /// Whether this actually narrows what the model may return.
+    ///
+    /// `Text` does not: it names the behaviour every dialect already has. So a
+    /// dialect with no structured-output field can still honour it, and a
+    /// client that sets it explicitly is not worth a 400.
+    #[must_use]
+    pub const fn constrains_output(&self) -> bool {
+        !matches!(self, Self::Text)
+    }
+}
+
 /// A request, dialect-independent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalRequest {
@@ -94,6 +150,24 @@ pub struct CanonicalRequest {
     /// A session identifier the client supplied, if any.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub client_session: Option<String>,
+    /// How the client constrained tool use, if it said anything about it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_choice: Option<ToolChoice>,
+    /// The shape the client demanded of the answer.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub response_format: Option<ResponseFormat>,
+    /// Sequences whose appearance ends generation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+    /// The stored response this turn continues.
+    ///
+    /// Only OpenAI Responses has this, and it is the whole conversation history
+    /// rather than a hint: sending the turn without it asks the model to answer
+    /// a follow-up with no idea what it is following up on. So it is the one
+    /// carried field where a silent drop changes the *prompt*, not just the
+    /// constraints on the answer.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub previous_response_id: Option<String>,
 }
 
 impl CanonicalRequest {
@@ -295,6 +369,10 @@ mod tests {
             temperature: None,
             thinking_budget: None,
             client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
         }
     }
 
@@ -413,6 +491,10 @@ mod count_tests {
             temperature: None,
             thinking_budget: None,
             client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
         }
     }
 

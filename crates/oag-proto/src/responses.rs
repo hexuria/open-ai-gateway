@@ -19,12 +19,23 @@
 //!   bare string delta, rather than a chunk with a choices array.
 //! - Usage is `input_tokens`/`output_tokens`, and the input count includes the
 //!   cached prefix.
+//! - Structured output is `text.format`, nested, rather than a top-level
+//!   `response_format`.
+//! - There is no `stop`. It is the one carried request field this dialect has
+//!   no home for, so a client that set stop sequences cannot be served here.
+//! - Conversations continue by `previous_response_id`, which no other dialect
+//!   has, because no other dialect stores the turn.
 
-use crate::canonical::{CanonicalRequest, ContentBlock, Message, Role, Tool};
+use crate::canonical::{
+    CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
+};
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
-use oag_core::Result;
+use oag_core::provider::Dialect;
+use oag_core::{Error, Result};
 use oag_router::Usage;
 use serde_json::{Value, json};
+
+const DIALECT: Dialect = Dialect::OpenAIResponses;
 
 /// Canonical → Responses wire JSON.
 pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Value> {
@@ -76,6 +87,41 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     if req.thinking_budget.is_some() {
         // No token budget in this dialect; effort is the closest thing it has.
         body["reasoning"] = json!({ "effort": "medium" });
+    }
+
+    // The one field this dialect cannot take. Chat Completions has `stop`,
+    // Anthropic has `stop_sequences`, Gemini has `stopSequences`; Responses
+    // dropped the concept, so a request that relies on it has to be refused
+    // rather than silently allowed to run past its stopping point.
+    if !req.stop.is_empty() {
+        return Err(Error::UnsupportedField {
+            field: "stop",
+            dialect: DIALECT,
+        });
+    }
+
+    if let Some(choice) = &req.tool_choice {
+        body["tool_choice"] = match choice {
+            ToolChoice::Auto => json!("auto"),
+            ToolChoice::Required => json!("required"),
+            ToolChoice::None => json!("none"),
+            // Flat, unlike Chat Completions' nested `function` wrapper.
+            ToolChoice::Tool { name } => json!({ "type": "function", "name": name }),
+        };
+    }
+    if let Some(format) = &req.response_format {
+        // Nested under `text`, and the schema fields are flat inside it rather
+        // than wrapped in a `json_schema` object as in Chat Completions.
+        body["text"] = json!({ "format": match format {
+            ResponseFormat::Text => json!({ "type": "text" }),
+            ResponseFormat::JsonObject => json!({ "type": "json_object" }),
+            ResponseFormat::JsonSchema { name, schema, strict } => json!({
+                "type": "json_schema", "name": name, "schema": schema, "strict": strict,
+            }),
+        }});
+    }
+    if let Some(id) = &req.previous_response_id {
+        body["previous_response_id"] = json!(id);
     }
     Ok(body)
 }
@@ -198,7 +244,42 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         // the classifier sees that reasoning was asked for.
         thinking_budget: body["reasoning"]["effort"].as_str().map(|_| 4096),
         client_session: body["user"].as_str().map(std::borrow::ToOwned::to_owned),
+        tool_choice: parse_tool_choice(&body["tool_choice"]),
+        response_format: parse_response_format(&body["text"]["format"]),
+        // No such field in this dialect.
+        stop: Vec::new(),
+        previous_response_id: body["previous_response_id"]
+            .as_str()
+            .map(std::borrow::ToOwned::to_owned),
     })
+}
+
+fn parse_tool_choice(v: &Value) -> Option<ToolChoice> {
+    if let Some(s) = v.as_str() {
+        return match s {
+            "auto" => Some(ToolChoice::Auto),
+            "required" => Some(ToolChoice::Required),
+            "none" => Some(ToolChoice::None),
+            _ => None,
+        };
+    }
+    Some(ToolChoice::Tool {
+        name: v["name"].as_str()?.to_owned(),
+    })
+}
+
+fn parse_response_format(v: &Value) -> Option<ResponseFormat> {
+    match v["type"].as_str()? {
+        "text" => Some(ResponseFormat::Text),
+        "json_object" => Some(ResponseFormat::JsonObject),
+        // Flat here: no `json_schema` wrapper around the name and schema.
+        "json_schema" => Some(ResponseFormat::JsonSchema {
+            name: v["name"].as_str().unwrap_or("response").to_owned(),
+            schema: v["schema"].clone(),
+            strict: v["strict"].as_bool().unwrap_or(false),
+        }),
+        _ => None,
+    }
 }
 
 /// Fold one `input` item into the canonical message list.
@@ -440,10 +521,29 @@ pub struct RenderState {
     message: Option<(usize, String)>,
     /// Text accumulated in the open message, needed for its `done` events.
     text: String,
-    /// Open tool calls: call id → (item index, item id, accumulated arguments).
-    tools: Vec<(String, usize, String, String)>,
+    /// Open tool calls, in the order they were opened.
+    tools: Vec<ToolCall>,
     usage: Usage,
     finished: bool,
+}
+
+/// An open `function_call` output item.
+///
+/// Named fields rather than a tuple: four of the five are strings, and the
+/// positional form is what let the function name go missing — there was no
+/// obvious slot for it, so the closing frame shipped a literal `""` instead.
+#[derive(Debug, Clone)]
+struct ToolCall {
+    call_id: String,
+    /// This item's index in the output list.
+    index: usize,
+    item_id: String,
+    /// Kept from the opening event because this dialect repeats the function
+    /// name on the item's `done` frame, and that frame is where clients read it
+    /// from — an empty one there leaves them with a call they cannot dispatch.
+    name: String,
+    /// Arguments accumulated across this call's deltas.
+    args: String,
 }
 
 impl RenderState {
@@ -559,9 +659,7 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
 
     match event {
         StreamEvent::Start { model, usage } => {
-            if !model.is_empty() {
-                st.model.clone_from(model);
-            }
+            crate::stream::adopt_model(&mut st.model, model);
             st.usage.merge(usage);
             st.ensure_created(&mut out);
         }
@@ -640,15 +738,41 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
             ));
         }
 
-        StreamEvent::Error { message } => {
-            out.push_str(&RenderState::frame(
-                "error",
-                &json!({ "type": "error", "message": message }),
-            ));
-        }
+        StreamEvent::Error { message } => render_failure(st, &mut out, message)?,
     }
 
     (!out.is_empty()).then_some(out)
+}
+
+/// Terminate the response as failed.
+///
+/// `response.failed`, not a bare `error` event: a client in this dialect waits
+/// for a terminal `response.*` frame and an `error` event is not one, so an SDK
+/// that dispatches on the response lifecycle keeps waiting after it — which is
+/// the stall this is meant to end.
+fn render_failure(st: &mut RenderState, out: &mut String, message: &str) -> Option<()> {
+    if st.finished {
+        return None;
+    }
+    st.finished = true;
+    st.ensure_created(out);
+    st.close_message(out);
+    out.push_str(&RenderState::frame(
+        "response.failed",
+        &json!({
+            "type": "response.failed",
+            "response": {
+                "id": st.id,
+                "object": "response",
+                "created_at": 0,
+                "status": "failed",
+                "model": st.model,
+                "error": { "code": "server_error", "message": message },
+                "usage": usage_json(&st.usage),
+            }
+        }),
+    ));
+    Some(())
 }
 
 /// Open a `function_call` item, closing any open message item first.
@@ -660,8 +784,13 @@ fn render_tool_start(st: &mut RenderState, out: &mut String, id: &str, name: &st
     let index = st.next_index;
     st.next_index += 1;
     let item_id = format!("fc_{index}");
-    st.tools
-        .push((id.to_owned(), index, item_id.clone(), String::new()));
+    st.tools.push(ToolCall {
+        call_id: id.to_owned(),
+        index,
+        item_id: item_id.clone(),
+        name: name.to_owned(),
+        args: String::new(),
+    });
 
     out.push_str(&RenderState::frame(
         "response.output_item.added",
@@ -683,9 +812,9 @@ fn render_tool_delta(
     id: &str,
     partial_json: &str,
 ) -> Option<()> {
-    let (_, index, item_id, args) = st.tools.iter_mut().find(|(call, ..)| call == id)?;
-    args.push_str(partial_json);
-    let (index, item_id) = (*index, item_id.clone());
+    let call = st.tools.iter_mut().find(|t| t.call_id == id)?;
+    call.args.push_str(partial_json);
+    let (index, item_id) = (call.index, call.item_id.clone());
     out.push_str(&RenderState::frame(
         "response.function_call_arguments.delta",
         &json!({
@@ -697,23 +826,32 @@ fn render_tool_delta(
 }
 
 /// Close a tool call, emitting its assembled arguments.
+///
+/// Takes the call out of the open list rather than reading it in place, so a
+/// second end for the same id finds nothing and renders nothing. Upstreams do
+/// send one: Anthropic closes every content block with the same event, and a
+/// text block that follows a tool block reparses as an end for the tool. The
+/// frames this emits carry the function name and the complete arguments —
+/// everything a client needs to dispatch — so emitting them twice dispatches a
+/// side-effecting tool twice.
 fn render_tool_end(st: &mut RenderState, out: &mut String, id: &str) -> Option<()> {
-    let (call_id, index, item_id, args) = st.tools.iter().find(|(call, ..)| call == id)?.clone();
+    let pos = st.tools.iter().position(|t| t.call_id == id)?;
+    let call = st.tools.remove(pos);
     out.push_str(&RenderState::frame(
         "response.function_call_arguments.done",
         &json!({
             "type": "response.function_call_arguments.done",
-            "item_id": item_id, "output_index": index, "arguments": args,
+            "item_id": call.item_id, "output_index": call.index, "arguments": call.args,
         }),
     ));
     out.push_str(&RenderState::frame(
         "response.output_item.done",
         &json!({
             "type": "response.output_item.done",
-            "output_index": index,
+            "output_index": call.index,
             "item": {
-                "id": item_id, "type": "function_call", "status": "completed",
-                "call_id": call_id, "name": "", "arguments": args,
+                "id": call.item_id, "type": "function_call", "status": "completed",
+                "call_id": call.call_id, "name": call.name, "arguments": call.args,
             }
         }),
     ));
@@ -993,6 +1131,10 @@ mod tests {
             temperature: None,
             thinking_budget: None,
             client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
         };
         let back = render_request(&c, "m").expect("renders");
         assert_eq!(back["input"][0]["content"][0]["type"], "input_text");
@@ -1007,6 +1149,85 @@ mod tests {
             c.messages[0].content.first(),
             Some(ContentBlock::Text { text, .. }) if text == "hello"
         ));
+    }
+
+    #[test]
+    fn previous_response_id_survives_a_round_trip() {
+        // The only dialect that has it, and the field that makes a follow-up
+        // turn make sense at all.
+        let c = parse_request(&json!({
+            "model": "gpt-5", "input": "and the second one?",
+            "previous_response_id": "resp_abc",
+        }))
+        .expect("parses");
+        assert_eq!(c.previous_response_id.as_deref(), Some("resp_abc"));
+
+        let back = render_request(&c, "gpt-5").expect("renders");
+        assert_eq!(back["previous_response_id"], "resp_abc");
+    }
+
+    #[test]
+    fn a_json_schema_round_trips_through_text_format() {
+        // Nested under `text` and flat inside it, where Chat Completions nests
+        // the same fields one level deeper under `json_schema`.
+        let schema = json!({"type": "object", "properties": {"n": {"type": "number"}}});
+        let c = parse_request(&json!({
+            "model": "gpt-5", "input": "hi",
+            "text": {"format": {
+                "type": "json_schema", "name": "answer",
+                "schema": schema.clone(), "strict": true,
+            }},
+            "tool_choice": "required",
+        }))
+        .expect("parses");
+        assert!(matches!(
+            c.response_format,
+            Some(ResponseFormat::JsonSchema { ref name, strict: true, .. }) if name == "answer"
+        ));
+        assert_eq!(c.tool_choice, Some(ToolChoice::Required));
+
+        let back = render_request(&c, "gpt-5").expect("renders");
+        assert_eq!(back["text"]["format"]["type"], "json_schema");
+        assert_eq!(back["text"]["format"]["name"], "answer");
+        assert_eq!(back["text"]["format"]["schema"], schema);
+        assert!(
+            back["text"]["format"].get("json_schema").is_none(),
+            "that wrapper belongs to Chat Completions"
+        );
+        assert_eq!(back["tool_choice"], "required");
+    }
+
+    #[test]
+    fn stop_sequences_are_refused_rather_than_dropped() {
+        // This dialect has no `stop` at all. Dropping it lets generation run
+        // straight past the point the client said to stop, and the client has
+        // no way to tell that from a model that ignored a stop sequence.
+        let c = crate::openai::parse_request(&json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "stop": ["\n\n"],
+        }))
+        .expect("parses");
+
+        let err = render_request(&c, "gpt-5").expect_err("must not be dropped");
+        assert!(matches!(
+            err,
+            Error::UnsupportedField {
+                field: "stop",
+                dialect: Dialect::OpenAIResponses,
+            }
+        ));
+    }
+
+    #[test]
+    fn a_named_tool_choice_renders_flat() {
+        let c = crate::openai::parse_request(&json!({
+            "model": "m", "messages": [],
+            "tool_choice": {"type": "function", "function": {"name": "read_file"}}
+        }))
+        .expect("parses");
+        let back = render_request(&c, "gpt-5").expect("renders");
+        assert_eq!(back["tool_choice"]["name"], "read_file");
+        assert!(back["tool_choice"].get("function").is_none(), "flat here");
     }
 
     // ── rendering ────────────────────────────────────────────────────────────
@@ -1108,6 +1329,126 @@ mod tests {
         assert!(
             first_done < second_added,
             "the message item must close before the tool item opens: {names:?}"
+        );
+    }
+
+    #[test]
+    fn responses_output_item_done_carries_function_name() {
+        // Clients in this dialect read the function name off the item's `done`
+        // frame — it is the one that reports the item complete — so dropping it
+        // there hands them a finished call they cannot dispatch, even though
+        // the `added` frame minutes earlier had the name.
+        let mut st = RenderState::new("r", "m");
+        let raw: String = [
+            StreamEvent::ToolUseStart {
+                id: "call_1".into(),
+                name: "read_file".into(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_1".into(),
+                partial_json: r#"{"path":"a.rs"}"#.into(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_1".into(),
+            },
+        ]
+        .iter()
+        .filter_map(|e| render_event(e, &mut st))
+        .collect();
+
+        let items: Vec<Value> = raw
+            .split("\n\n")
+            .filter(|f| !f.trim().is_empty())
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .map(|d| serde_json::from_str(d).expect("valid json"))
+            .filter(|v: &Value| v["type"] == "response.output_item.done")
+            .collect();
+
+        assert_eq!(items.len(), 1, "the tool item closes exactly once");
+        let item = &items[0]["item"];
+        assert_eq!(item["name"], "read_file");
+        assert_eq!(item["call_id"], "call_1");
+        assert_eq!(item["arguments"], r#"{"path":"a.rs"}"#);
+        assert_eq!(item["status"], "completed");
+    }
+
+    /// An Anthropic stream that uses a tool and then keeps talking.
+    ///
+    /// Anthropic closes every content block with the same `content_block_stop`,
+    /// and the accumulator keeps naming the last tool id after that tool has
+    /// ended — so the *text* block's stop parses as a second `ToolUseEnd` for a
+    /// call that is already closed.
+    const TOOL_THEN_TEXT: &[&str] = &[
+        r#"{"type":"message_start","message":{"id":"msg_1","model":"claude-opus-5","usage":{"input_tokens":10}}}"#,
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_abc","name":"read_file","input":{}}}"#,
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#,
+        r#"{"type":"content_block_stop","index":0}"#,
+        r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+        r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Done."}}"#,
+        r#"{"type":"content_block_stop","index":1}"#,
+        r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#,
+    ];
+
+    /// Anthropic upstream events, parsed and rendered into this dialect, as the
+    /// `data:` payload of each frame.
+    fn anthropic_into_responses(lines: &[&str]) -> Vec<Value> {
+        let mut acc = StreamAccumulator::new();
+        let mut st = RenderState::new("r", "claude-opus-5");
+        let mut raw = String::new();
+        for line in lines {
+            for e in crate::anthropic::parse_event(line, &mut acc).expect("parses") {
+                acc.observe(&e);
+                if let Some(frames) = render_event(&e, &mut st) {
+                    raw.push_str(&frames);
+                }
+            }
+        }
+        raw.split("\n\n")
+            .filter(|f| !f.trim().is_empty())
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .map(|d| serde_json::from_str(d).expect("valid json"))
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_tool_call_is_not_closed_again_by_a_later_block_stop() {
+        // A duplicate `output_item.done` is not cosmetic here: it carries the
+        // function name and complete arguments, which is everything a client
+        // needs to dispatch — so a second one is a second dispatch, and a tool
+        // that writes something writes it twice.
+        let frames = anthropic_into_responses(TOOL_THEN_TEXT);
+
+        let closes: Vec<&Value> = frames
+            .iter()
+            .filter(|v| v["type"] == "response.output_item.done")
+            .filter(|v| v["item"]["type"] == "function_call")
+            .collect();
+
+        assert_eq!(
+            closes.len(),
+            1,
+            "the function-call item closes exactly once: {frames:#?}"
+        );
+        let item = &closes[0]["item"];
+        assert_eq!(item["call_id"], "toolu_abc");
+        assert_eq!(item["name"], "read_file", "and it names the function");
+        assert_eq!(item["arguments"], r#"{"path":"a.rs"}"#);
+
+        let arg_dones = frames
+            .iter()
+            .filter(|v| v["type"] == "response.function_call_arguments.done")
+            .count();
+        assert_eq!(
+            arg_dones, 1,
+            "the arguments are reported final exactly once: {frames:#?}"
+        );
+
+        // The text that followed must land in a message item of its own, not
+        // reopen the closed call.
+        assert!(
+            frames
+                .iter()
+                .any(|v| v["type"] == "response.output_text.delta" && v["delta"] == "Done.")
         );
     }
 

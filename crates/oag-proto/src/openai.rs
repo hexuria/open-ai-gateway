@@ -15,11 +15,16 @@
 //! 3. **Tool results.** A `tool` role message; canonical has a content block
 //!    inside a user turn.
 
-use crate::canonical::{CanonicalRequest, ContentBlock, Message, Role, Tool};
+use crate::canonical::{
+    CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
+};
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
-use oag_core::Result;
+use oag_core::provider::Dialect;
+use oag_core::{Error, Result};
 use oag_router::Usage;
 use serde_json::{Value, json};
+
+const DIALECT: Dialect = Dialect::OpenAIChatCompletions;
 
 /// Canonical → Chat Completions wire JSON.
 pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Value> {
@@ -77,7 +82,53 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
+
+    // A stored-response id is the conversation itself in the dialect that
+    // issued it, and there is nothing here to hang it on. Continuing without it
+    // would answer a follow-up question with the follow-up alone.
+    if req.previous_response_id.is_some() {
+        return Err(Error::UnsupportedField {
+            field: "previous_response_id",
+            dialect: DIALECT,
+        });
+    }
+
+    if let Some(choice) = &req.tool_choice {
+        body["tool_choice"] = render_tool_choice(choice);
+    }
+    if let Some(format) = &req.response_format {
+        body["response_format"] = render_response_format(format);
+    }
+    if !req.stop.is_empty() {
+        body["stop"] = json!(req.stop);
+    }
     Ok(body)
+}
+
+fn render_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Auto => json!("auto"),
+        ToolChoice::Required => json!("required"),
+        ToolChoice::None => json!("none"),
+        // The nested `function` wrapper is this dialect's; Responses flattens
+        // it and Anthropic spells the whole thing differently.
+        ToolChoice::Tool { name } => json!({ "type": "function", "function": { "name": name } }),
+    }
+}
+
+fn render_response_format(format: &ResponseFormat) -> Value {
+    match format {
+        ResponseFormat::Text => json!({ "type": "text" }),
+        ResponseFormat::JsonObject => json!({ "type": "json_object" }),
+        ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => json!({
+            "type": "json_schema",
+            "json_schema": { "name": name, "schema": schema, "strict": strict },
+        }),
+    }
 }
 
 /// One canonical message becomes one or more wire messages.
@@ -198,7 +249,61 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         // No equivalent field in this dialect.
         thinking_budget: None,
         client_session: body["user"].as_str().map(std::borrow::ToOwned::to_owned),
+        tool_choice: parse_tool_choice(&body["tool_choice"]),
+        response_format: parse_response_format(&body["response_format"]),
+        stop: parse_stop(&body["stop"]),
+        // Stored responses are a Responses-only concept.
+        previous_response_id: None,
     })
+}
+
+/// `"auto"` and friends, or the object form naming one tool.
+fn parse_tool_choice(v: &Value) -> Option<ToolChoice> {
+    if let Some(s) = v.as_str() {
+        return match s {
+            "auto" => Some(ToolChoice::Auto),
+            "required" | "any" => Some(ToolChoice::Required),
+            "none" => Some(ToolChoice::None),
+            _ => None,
+        };
+    }
+    // The name sits under `function` here. Some OpenAI-compatible providers
+    // send it flat, as Responses does, so accept both rather than losing the
+    // constraint to a spelling.
+    let name = v["function"]["name"]
+        .as_str()
+        .or_else(|| v["name"].as_str())?;
+    Some(ToolChoice::Tool {
+        name: name.to_owned(),
+    })
+}
+
+fn parse_response_format(v: &Value) -> Option<ResponseFormat> {
+    match v["type"].as_str()? {
+        "text" => Some(ResponseFormat::Text),
+        "json_object" => Some(ResponseFormat::JsonObject),
+        "json_schema" => {
+            let s = &v["json_schema"];
+            Some(ResponseFormat::JsonSchema {
+                name: s["name"].as_str().unwrap_or("response").to_owned(),
+                schema: s["schema"].clone(),
+                strict: s["strict"].as_bool().unwrap_or(false),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `stop` is a bare string or an array of them; both are in the wild.
+fn parse_stop(v: &Value) -> Vec<String> {
+    match v {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|i| i.as_str().map(std::borrow::ToOwned::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Fold one wire message into the canonical system prompt or message list.
@@ -537,9 +642,7 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
     let frame = match event {
         // Announces the model, and carries the role the rest of the chunks omit.
         StreamEvent::Start { model, usage } => {
-            if !st.model.is_empty() {
-                st.model.clone_from(model);
-            }
+            crate::stream::adopt_model(&mut st.model, model);
             st.usage.merge(usage);
             st.role_sent = true;
             st.chunk(&json!({ "role": "assistant", "content": "" }), None)
@@ -879,6 +982,113 @@ mod tests {
         assert_eq!(url, "data:image/png;base64,AAAA");
     }
 
+    // ── the fields a client sets and the gateway used to forget ──────────────
+
+    #[test]
+    fn openai_parse_keeps_tool_choice() {
+        // The canonical form used to have nowhere to put this, so `"required"`
+        // was read off the wire and thrown away: the client asked the model to
+        // call a tool and the upstream was left free to answer in prose.
+        let forms = [
+            (json!("auto"), ToolChoice::Auto),
+            (json!("required"), ToolChoice::Required),
+            (json!("none"), ToolChoice::None),
+            (
+                json!({"type": "function", "function": {"name": "read_file"}}),
+                ToolChoice::Tool {
+                    name: "read_file".to_owned(),
+                },
+            ),
+        ];
+        for (wire, expected) in forms {
+            let c = parse_request(&json!({
+                "model": "m", "messages": [], "tool_choice": wire.clone()
+            }))
+            .expect("parses");
+            assert_eq!(c.tool_choice, Some(expected), "from {wire}");
+        }
+    }
+
+    #[test]
+    fn response_format_and_stop_survive_a_round_trip() {
+        let wire = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "answer",
+                "schema": {"type": "object", "properties": {"n": {"type": "number"}}},
+                "strict": true,
+            }},
+            "stop": ["\n\n", "END"],
+        });
+
+        let c = parse_request(&wire).expect("parses");
+        assert!(matches!(
+            c.response_format,
+            Some(ResponseFormat::JsonSchema { ref name, strict: true, .. }) if name == "answer"
+        ));
+        assert_eq!(c.stop, vec!["\n\n".to_owned(), "END".to_owned()]);
+
+        let back = render_request(&c, "m").expect("renders");
+        assert_eq!(back["response_format"]["type"], "json_schema");
+        assert_eq!(back["response_format"]["json_schema"]["name"], "answer");
+        assert_eq!(back["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(back["stop"], json!(["\n\n", "END"]));
+    }
+
+    #[test]
+    fn a_bare_string_stop_is_accepted_alongside_the_array() {
+        // Both forms are in the wild, and the string one is what a hand-written
+        // request usually carries.
+        let c =
+            parse_request(&json!({"model": "m", "messages": [], "stop": "###"})).expect("parses");
+        assert_eq!(c.stop, vec!["###".to_owned()]);
+    }
+
+    #[test]
+    fn a_named_tool_choice_renders_nested_under_function() {
+        // Flat here is a different dialect's spelling, and this one rejects it.
+        let c = parse_request(&json!({
+            "model": "m", "messages": [],
+            "tool_choice": {"type": "function", "function": {"name": "f"}}
+        }))
+        .expect("parses");
+        let back = render_request(&c, "m").expect("renders");
+        assert_eq!(back["tool_choice"]["function"]["name"], "f");
+    }
+
+    #[test]
+    fn a_stored_response_id_cannot_be_continued_in_this_dialect() {
+        // `previous_response_id` *is* the conversation in the dialect that
+        // issued it. Rendering the turn without it here would ask the model to
+        // answer a follow-up with no idea what it followed.
+        let c = crate::responses::parse_request(&json!({
+            "model": "gpt-5", "input": "and the second one?",
+            "previous_response_id": "resp_abc",
+        }))
+        .expect("parses");
+
+        let err = render_request(&c, "kimi-k2").expect_err("must not silently drop it");
+        assert!(matches!(
+            err,
+            oag_core::Error::UnsupportedField {
+                field: "previous_response_id",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_field_the_client_omitted_is_not_an_error_and_not_emitted() {
+        // The other half of the contract: only a field the client actually set
+        // can fail, and an untouched one must not appear on the wire either.
+        let c = parse_request(&json!({"model": "m", "messages": []})).expect("parses");
+        let back = render_request(&c, "m").expect("renders");
+        assert!(back.get("tool_choice").is_none());
+        assert!(back.get("response_format").is_none());
+        assert!(back.get("stop").is_none());
+    }
+
     // ── cross-dialect: an OpenAI client reaching an Anthropic upstream ────────
 
     #[test]
@@ -984,6 +1194,57 @@ mod tests {
         };
         assert_eq!(idx(&a), 0);
         assert_eq!(idx(&b), 1);
+    }
+
+    #[test]
+    fn openai_start_does_not_overwrite_gateway_model() {
+        // Upstreams that omit the model in their opening frame parse to a
+        // `Start` carrying an empty name, and both the Anthropic and Responses
+        // parsers do exactly that. Guarding on the render state's model rather
+        // than the incoming one inverts the test — the state is built with the
+        // model the client routed on, so it is never empty — and the response
+        // goes out with `"model": ""` on every chunk.
+        let body = |f: &str| -> Value {
+            let raw = f
+                .strip_prefix("data: ")
+                .and_then(|s| s.strip_suffix("\n\n"))
+                .expect("body");
+            serde_json::from_str(raw).expect("json")
+        };
+
+        let mut st = RenderState::new("r", "anthropic/haiku");
+        let frame = render_event(
+            &StreamEvent::Start {
+                model: String::new(),
+                usage: Usage::default(),
+            },
+            &mut st,
+        )
+        .expect("frame");
+        assert_eq!(body(&frame)["model"], "anthropic/haiku");
+
+        // And a subsequent chunk, which reads the same state, agrees.
+        let next = render_event(
+            &StreamEvent::TextDelta {
+                text: "hi".to_owned(),
+            },
+            &mut st,
+        )
+        .expect("frame");
+        assert_eq!(body(&next)["model"], "anthropic/haiku");
+
+        // An upstream that does announce a model is still adopted, matching
+        // the other two dialects.
+        let mut named = RenderState::new("r", "anthropic/haiku");
+        let frame = render_event(
+            &StreamEvent::Start {
+                model: "claude-3-5-haiku-20241022".to_owned(),
+                usage: Usage::default(),
+            },
+            &mut named,
+        )
+        .expect("frame");
+        assert_eq!(body(&frame)["model"], "claude-3-5-haiku-20241022");
     }
 
     #[test]

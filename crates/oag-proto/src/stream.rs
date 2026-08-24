@@ -73,6 +73,23 @@ pub enum StopReason {
     Refusal,
 }
 
+/// Take the model name a `Start` event announced, keeping the current one when
+/// it announced none.
+///
+/// The guard belongs on the incoming name. A render state is built with the
+/// model the client routed on, so its own field is never empty, and testing
+/// that one instead assigns unconditionally — blanking the model for every
+/// upstream that opens a stream without naming one, which the Anthropic and
+/// Responses parsers both default to empty. Shared rather than written out per
+/// dialect because it was written out per dialect, and one of the three copies
+/// had the test the wrong way round.
+pub(crate) fn adopt_model(current: &mut String, announced: &str) {
+    if !announced.is_empty() {
+        current.clear();
+        current.push_str(announced);
+    }
+}
+
 /// State carried across the events of one response.
 #[derive(Debug, Clone, Default)]
 pub struct StreamAccumulator {

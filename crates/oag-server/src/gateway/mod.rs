@@ -674,16 +674,20 @@ fn egress_for(
     framing: oag_upstream::Framing,
 ) -> Result<sse::Egress> {
     let upstream = decision.model.provider.native_dialect();
+    let model = decision.model.id.as_str().to_owned();
+    let request_id = request_id.to_string();
 
     // Matching dialects are not sufficient: passthrough forwards the upstream's
     // *bytes*, so it also requires that those bytes are already SSE. Bedrock's
     // dialect is Anthropic and its framing is binary — passing that through
     // would hand a client expecting `data:` lines a length-prefixed envelope.
     if ingress == upstream && framing == oag_upstream::Framing::Sse {
-        return Ok(sse::Egress::Passthrough);
+        return Ok(sse::Egress::Passthrough {
+            dialect: ingress,
+            request_id,
+            model,
+        });
     }
-    let model = decision.model.id.as_str().to_owned();
-    let request_id = request_id.to_string();
     Ok(match ingress {
         Dialect::OpenAIChatCompletions => sse::Egress::ChatCompletions { request_id, model },
         Dialect::AnthropicMessages => sse::Egress::AnthropicMessages { request_id, model },
@@ -1326,6 +1330,12 @@ pub(crate) fn error_response(e: &Error) -> Response {
             e.to_string(),
         ),
         Error::NoViableModel => (StatusCode::BAD_REQUEST, "no_viable_model", e.to_string()),
+        // The client's own request is the thing that cannot be served, and the
+        // message names the field and the dialect — enough to either drop the
+        // field or pin the request to a provider that has it.
+        Error::UnsupportedField { .. } => {
+            (StatusCode::BAD_REQUEST, "unsupported_field", e.to_string())
+        }
         // The message is ours; the provider's is nested below rather than
         // substituted for it.
         Error::Upstream { status, .. } => {
@@ -1636,7 +1646,13 @@ mod tests {
             oag_upstream::Framing::Sse,
         )
         .expect("supported");
-        assert!(matches!(e, sse::Egress::Passthrough));
+        assert!(matches!(
+            e,
+            sse::Egress::Passthrough {
+                dialect: Dialect::OpenAIChatCompletions,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -2005,6 +2021,18 @@ security:
             error_response(&Error::Unauthenticated).status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    #[test]
+    fn a_field_the_target_dialect_cannot_express_is_the_client_s_error() {
+        // Not a 500: nothing is broken here, the request simply asked for
+        // something the model it routed to has no way to do. And not a silent
+        // success either — the whole point is that the caller is told.
+        let r = error_response(&Error::UnsupportedField {
+            field: "response_format",
+            dialect: Dialect::AnthropicMessages,
+        });
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
