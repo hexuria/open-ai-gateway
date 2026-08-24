@@ -5,10 +5,17 @@
 //! burst of database reads, a moment of sloppy concurrency accounting, and an
 //! unthrottled minute. It never loses money or credentials, because those are
 //! in Postgres.
+//!
+//! Expendable cuts both ways: nothing read back out of Redis is trusted on its
+//! own authority. The auth cache is the one entry here that names an identity,
+//! so it is authenticated with [`AuthMac`] — see that type for why a plain
+//! JSON value was a privilege-escalation primitive.
 
+use hmac::{Hmac, Mac};
 use oag_core::{AccountId, Error, Result};
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
+use sha2::Sha256;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -259,27 +266,130 @@ impl Cache {
 
 // ── auth cache (L2) ───────────────────────────────────────────────────────────
 
-impl Cache {
-    /// Read a cached auth context.
+/// Domain separation, so a tag minted for an auth entry cannot be replayed as
+/// anything else that might one day be signed with the same secret.
+const AUTH_MAC_DOMAIN: &[u8] = b"oag:auth-cache:v1";
+/// Envelope prefix. Versioned so a future format change is a miss on the old
+/// entries rather than a garbled parse of them.
+const AUTH_ENVELOPE_PREFIX: &str = "v1.";
+
+/// Authenticates auth-cache entries with `security.signing_secret`.
+///
+/// The L2 auth cache used to hold a bare JSON `AuthContext` keyed by the hash
+/// of the inbound key, and a hit was taken as proof of identity. Redis is not
+/// proof of anything: anyone who can `SET` — a shared or unauthenticated Redis,
+/// a compromised sidecar, another tenant of the same instance — could write
+/// `oag:auth:{sha256(their own key)}` and choose which principal, route and
+/// budget it named, `admin: true` included. Nothing downstream re-checked,
+/// because the tiers exist precisely so that a hit skips Postgres.
+///
+/// So every entry carries an HMAC-SHA256 tag, and the key hash is part of the
+/// signed message. Signing only the JSON would still let someone copy a
+/// legitimately-signed admin entry sideways onto their own key's slot, which is
+/// the same attack with an extra step.
+///
+/// A tag that does not verify is a **miss**, not an error: the caller falls
+/// through to Postgres and gets the right answer. That is also what makes this
+/// deployable — entries written by an older binary are unsigned, so they are
+/// simply ignored until they expire.
+#[derive(Clone)]
+pub struct AuthMac {
+    key: Box<[u8]>,
+}
+
+impl std::fmt::Debug for AuthMac {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthMac")
+    }
+}
+
+impl AuthMac {
+    /// Keyed with `security.signing_secret`, which is already required at boot
+    /// and already required to be identical on every replica — which is exactly
+    /// the property a fleet-wide cache MAC needs.
+    #[must_use]
+    pub fn new(signing_secret: &str) -> Self {
+        Self {
+            key: signing_secret.as_bytes().into(),
+        }
+    }
+
+    /// The tag is over `domain ‖ hash ‖ json`, NUL-separated. `serde_json`
+    /// escapes control characters, and the hash is hex, so no NUL can appear
+    /// inside a field and the framing stays unambiguous.
+    fn primed(&self, hash: &str, json: &str) -> Option<Hmac<Sha256>> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).ok()?;
+        mac.update(AUTH_MAC_DOMAIN);
+        mac.update(&[0]);
+        mac.update(hash.as_bytes());
+        mac.update(&[0]);
+        mac.update(json.as_bytes());
+        Some(mac)
+    }
+
+    /// Serialise and tag a context for storage under `hash`.
+    #[must_use]
+    pub fn seal(&self, hash: &str, ctx: &crate::rows::AuthContext) -> Option<String> {
+        let json = serde_json::to_string(ctx).ok()?;
+        let tag = self.primed(hash, &json)?.finalize().into_bytes();
+        Some(format!("{AUTH_ENVELOPE_PREFIX}{}.{json}", hex::encode(tag)))
+    }
+
+    /// Verify and parse an entry stored under `hash`.
     ///
-    /// Returns `None` on any failure, including Redis being down. A cache is an
-    /// optimisation: if it cannot answer, the caller falls through to Postgres.
-    /// Propagating an error here would turn a Redis blip into an outage.
-    pub async fn auth_get(&self, hash: &str) -> Option<crate::rows::AuthContext> {
+    /// `None` for an unsigned, forged, tampered, misfiled or truncated entry —
+    /// every one of them indistinguishable from a cache miss to the caller.
+    #[must_use]
+    pub fn open(&self, hash: &str, sealed: &str) -> Option<crate::rows::AuthContext> {
+        // The tag is hex, so the first `.` after it is the separator; the JSON
+        // may well contain more of them inside decimal amounts.
+        let (tag, json) = sealed.strip_prefix(AUTH_ENVELOPE_PREFIX)?.split_once('.')?;
+        let tag = hex::decode(tag).ok()?;
+        // `verify_slice` compares in constant time.
+        self.primed(hash, json)?.verify_slice(&tag).ok()?;
+        serde_json::from_str(json).ok()
+    }
+}
+
+impl Cache {
+    /// Read a cached auth context, if one is there and it is ours.
+    ///
+    /// Returns `None` on any failure, including Redis being down and including
+    /// a bad MAC. A cache is an optimisation: if it cannot answer, the caller
+    /// falls through to Postgres. Propagating an error here would turn a Redis
+    /// blip into an outage — and, for the MAC case, would turn a forged entry
+    /// into a way to make requests fail rather than a way to make them pass.
+    pub async fn auth_get(&self, hash: &str, mac: &AuthMac) -> Option<crate::rows::AuthContext> {
         let mut conn = self.conn().await.ok()?;
         let raw: Option<String> = conn.get(auth_key(hash)).await.ok()?;
-        serde_json::from_str(&raw?).ok()
+        let raw = raw?;
+        let ctx = mac.open(hash, &raw);
+        if ctx.is_none() {
+            // Worth a line: the only innocent explanation is an entry written
+            // before this binary, or a `signing_secret` that has just changed.
+            // Otherwise someone is writing to our key space. The hash is a
+            // digest of a live credential, so it is not logged.
+            tracing::warn!("discarding an auth cache entry that failed authentication");
+        }
+        ctx
     }
 
     /// Cache an auth context. Best-effort for the same reason.
-    pub async fn auth_set(&self, hash: &str, ctx: &crate::rows::AuthContext, ttl: Duration) {
+    pub async fn auth_set(
+        &self,
+        hash: &str,
+        ctx: &crate::rows::AuthContext,
+        ttl: Duration,
+        mac: &AuthMac,
+    ) {
         let Ok(mut conn) = self.conn().await else {
             return;
         };
-        let Ok(json) = serde_json::to_string(ctx) else {
+        let Some(sealed) = mac.seal(hash, ctx) else {
             return;
         };
-        let _: std::result::Result<(), _> = conn.set_ex(auth_key(hash), json, ttl.as_secs()).await;
+        let _: std::result::Result<(), _> =
+            conn.set_ex(auth_key(hash), sealed, ttl.as_secs()).await;
     }
 
     /// Evict a cached auth context, fleet-wide.
@@ -402,6 +512,124 @@ fn rate_and_burst(rpm: u32) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rows::AuthContext;
+    use rust_decimal::Decimal;
+
+    const SECRET: &str = "an-adequately-long-test-signing-secret-000000";
+
+    fn ctx(admin: bool) -> AuthContext {
+        AuthContext {
+            api_key_id: Uuid::new_v4(),
+            principal_id: Uuid::new_v4(),
+            route_id: Uuid::new_v4(),
+            key_floor_tier: None,
+            admin,
+            quota_usd: None,
+            spent_usd: Decimal::ZERO,
+            principal_budget_usd: None,
+            principal_hard_stop_multiple: Decimal::ONE,
+            principal_spent_usd: Decimal::ZERO,
+        }
+    }
+
+    /// The MAC, without Redis in the way. Everything the Redis test asserts
+    /// about a hit reduces to these, and these run on a bare `cargo test`.
+    #[test]
+    fn only_an_entry_we_signed_for_this_key_opens() {
+        let mac = AuthMac::new(SECRET);
+        let hash = crate::repo::hash_key("sk-victim");
+        let sealed = mac.seal(&hash, &ctx(true)).expect("seal");
+
+        assert!(
+            mac.open(&hash, &sealed).expect("round trip").admin,
+            "our own entry must open, admin flag intact"
+        );
+
+        // The original bug: a bare JSON value was accepted as an identity, so
+        // anyone able to SET could mint one.
+        let bare = serde_json::to_string(&ctx(true)).expect("json");
+        assert!(
+            mac.open(&hash, &bare).is_none(),
+            "an unsigned entry must not open"
+        );
+
+        // Tampering: keep our tag, swap the payload for a more generous one.
+        let (tag, _) = sealed
+            .strip_prefix(AUTH_ENVELOPE_PREFIX)
+            .expect("prefix")
+            .split_once('.')
+            .expect("tag");
+        let tampered = format!("{AUTH_ENVELOPE_PREFIX}{tag}.{bare}");
+        assert!(
+            mac.open(&hash, &tampered).is_none(),
+            "a payload swapped under a valid-looking tag must not open"
+        );
+
+        // Sideways replay: our own signed admin entry, refiled under the
+        // attacker's key hash. This is why the hash is inside the MAC and not
+        // just the Redis key name.
+        assert!(
+            mac.open(&crate::repo::hash_key("sk-attacker"), &sealed)
+                .is_none(),
+            "an entry signed for another key hash must not open"
+        );
+
+        // A replica configured with a different secret is not us.
+        assert!(
+            AuthMac::new("a-completely-different-but-long-enough-secret")
+                .open(&hash, &sealed)
+                .is_none(),
+            "another secret must not open our entry"
+        );
+
+        // Garbage in the envelope is a miss, never a panic.
+        for junk in ["", "v1.", "v1.zz.{}", "v2.00.{}", "not-an-envelope"] {
+            assert!(mac.open(&hash, junk).is_none(), "{junk:?} must not open");
+        }
+    }
+
+    /// The same forgery against a real Redis, through the accessor the auth
+    /// path actually calls. Skipped without `OAG_TEST_REDIS_URL`; the unit test
+    /// above covers the logic when it is unset.
+    #[tokio::test]
+    async fn forged_unsigned_auth_cache_entry_is_ignored() {
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let cache = Cache::connect(&url).expect("cache");
+        let mac = AuthMac::new(SECRET);
+        let hash = crate::repo::hash_key(&format!("sk-attacker-{}", Uuid::new_v4()));
+
+        // Exactly what an attacker with SET access would write: the format this
+        // cache used to accept, naming an admin identity of their choosing.
+        let forged = serde_json::to_string(&ctx(true)).expect("json");
+        let mut conn = cache.conn().await.expect("conn");
+        let _: () = conn
+            .set_ex(auth_key(&hash), forged, 60)
+            .await
+            .expect("plant");
+
+        assert!(
+            cache.auth_get(&hash, &mac).await.is_none(),
+            "an unsigned Redis entry must read as a cache miss, not as an identity"
+        );
+
+        // And the honest path still works, so the check is not simply refusing
+        // everything.
+        let real = ctx(false);
+        cache
+            .auth_set(&hash, &real, Duration::from_mins(1), &mac)
+            .await;
+        let got = cache
+            .auth_get(&hash, &mac)
+            .await
+            .expect("our own entry must come back");
+        assert_eq!(got.api_key_id, real.api_key_id);
+        assert!(!got.admin);
+
+        cache.auth_invalidate(&hash).await;
+    }
 
     #[test]
     fn rpm_becomes_a_per_second_rate_and_a_full_minute_of_burst() {

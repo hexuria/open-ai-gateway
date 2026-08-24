@@ -113,6 +113,8 @@ terminationGracePeriodSeconds: 1845
 preStopDelaySeconds: 15
 
 resources:
+  # `server.max_body_bytes` is buffered per in-flight request. At its 32 MiB
+  # default this limit absorbs a burst of large POSTs; raise both together.
   requests: { cpu: 200m, memory: 256Mi }
   limits:   { memory: 1Gi }
 

@@ -8,7 +8,7 @@
 //! 2. **L2** — Redis, longer TTL. Absorbs a cold replica and a restart.
 //! 3. **Postgres** — the truth.
 //!
-//! Two details that matter more than the tiers:
+//! Three details that matter more than the tiers:
 //!
 //! **Negative caching.** A miss is cached too. Without it, a scan of random
 //! keys reaches Postgres on every request and an attacker gets a free
@@ -18,7 +18,13 @@
 //! coalesce into one load. Without it, a popular key expiring means every
 //! in-flight request for it hits Postgres simultaneously — a stampede that is
 //! worst exactly when traffic is highest.
+//!
+//! **Only Postgres is authoritative.** L2 is a shared, network-reachable store
+//! that a tier below the gateway can write to, so an entry from it is believed
+//! only if it carries our own [`AuthMac`] tag. L1 is in-process and is
+//! therefore only ever populated from a verified L2 entry or from Postgres.
 
+use crate::cache::AuthMac;
 use crate::rows::AuthContext;
 use crate::{Cache, Db, repo};
 use oag_core::Result;
@@ -40,6 +46,9 @@ pub struct AuthCache {
     l1: moka::future::Cache<String, Option<Arc<AuthContext>>>,
     db: Db,
     cache: Cache,
+    /// `Arc` so that the per-request clone into the single-flight closure does
+    /// not copy the secret.
+    mac: Arc<AuthMac>,
 }
 
 impl std::fmt::Debug for AuthCache {
@@ -51,8 +60,11 @@ impl std::fmt::Debug for AuthCache {
 }
 
 impl AuthCache {
+    /// `signing_secret` is `security.signing_secret`: it authenticates the L2
+    /// entries, and every replica must pass the same one or they will ignore
+    /// each other's cache writes.
     #[must_use]
-    pub fn new(db: Db, cache: Cache, max_entries: u64) -> Self {
+    pub fn new(db: Db, cache: Cache, max_entries: u64, signing_secret: &str) -> Self {
         Self {
             l1: moka::future::Cache::builder()
                 .max_capacity(max_entries)
@@ -60,6 +72,7 @@ impl AuthCache {
                 .build(),
             db,
             cache,
+            mac: Arc::new(AuthMac::new(signing_secret)),
         }
     }
 
@@ -73,16 +86,17 @@ impl AuthCache {
         // key await one load rather than each starting their own.
         let db = self.db.clone();
         let cache = self.cache.clone();
+        let mac = Arc::clone(&self.mac);
         let key = hash.clone();
 
         self.l1
             .try_get_with(hash, async move {
-                if let Some(ctx) = cache.auth_get(&key).await {
+                if let Some(ctx) = cache.auth_get(&key, &mac).await {
                     return Ok::<_, oag_core::Error>(Some(Arc::new(ctx)));
                 }
                 let found = repo::authenticate(&db, raw_key).await?;
                 if let Some(ctx) = &found {
-                    cache.auth_set(&key, ctx, L2_TTL).await;
+                    cache.auth_set(&key, ctx, L2_TTL, &mac).await;
                 }
                 Ok(found.map(Arc::new))
             })

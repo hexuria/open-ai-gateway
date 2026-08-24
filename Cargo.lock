@@ -1557,6 +1557,7 @@ dependencies = [
  "futures-util",
  "http",
  "http-body-util",
+ "hyper-util",
  "metrics",
  "metrics-exporter-prometheus",
  "oag-core",
@@ -1585,6 +1586,8 @@ dependencies = [
 name = "oag-store"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "hmac 0.12.1",
  "moka",
  "oag-core",
  "oag-pool",
