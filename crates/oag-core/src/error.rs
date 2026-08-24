@@ -79,6 +79,18 @@ pub enum Error {
         account: AccountId,
         status: u16,
         body: String,
+        /// The provider's own `Retry-After`, when it sent one.
+        ///
+        /// Carried on the error because the response it came from is long gone
+        /// by the time either consumer needs it: the credential's cooldown and
+        /// the client's own `Retry-After` are both guesses without it, and a
+        /// 429 answered with a guess is a 429 answered badly.
+        ///
+        /// Must already be bounded by whoever builds this. It is added to the
+        /// clock and persisted as a credential's `rate_limited_until`, so an
+        /// unvalidated one either benches a working credential for decades or
+        /// overflows the addition outright. See `upstream_retry_after`.
+        retry_after: Option<Duration>,
     },
 
     #[error("upstream stream stalled after {0:?} with no data")]
@@ -124,22 +136,40 @@ impl Error {
         const COOLDOWN: Duration = Duration::from_mins(10);
 
         match self {
-            Self::Upstream { status, .. } => match status {
+            Self::Upstream {
+                status,
+                body,
+                retry_after,
+                ..
+            } => match status {
                 401 | 403 => Disposition::FailoverAccount { cooldown: COOLDOWN },
                 402 => Disposition::FailoverAccount {
                     cooldown: Duration::from_hours(1),
                 },
                 408 | 409 | 425 => Disposition::RetrySameAccount,
-                429 => Disposition::RateLimited { retry_after: None },
+                // The provider's own `Retry-After` when it sent one. This was
+                // hard-coded `None`, which meant every upstream throttle got
+                // the same flat one-minute sit-out — twelve times too long for
+                // a five-second limit, and far too short for an hourly quota.
+                429 => Disposition::RateLimited {
+                    retry_after: *retry_after,
+                },
                 // 529 is Anthropic's "overloaded". Not our credential's fault,
                 // but hammering it makes things worse for everyone.
                 500 | 502 | 503 | 504 | 529 => Disposition::FailoverAccount {
                     cooldown: Duration::from_secs(30),
                 },
-                // A 400 usually means we built a bad request, which another
-                // credential will not fix — but a context-length or capability
-                // rejection is exactly what a bigger model solves.
-                400 | 413 | 422 => Disposition::EscalateTier,
+                // A well-formed request this model could not take: exactly what
+                // a bigger model solves.
+                413 | 422 => Disposition::EscalateTier,
+                // A 400 usually means we built a bad request, which neither
+                // another credential nor a bigger model will fix — so only the
+                // ones whose body says otherwise climb a rung. This used to be
+                // lumped in with 413, which was harmless while `EscalateTier`
+                // meant "fail" and is not now that it retries: a malformed
+                // request would be sent to the most expensive model on the
+                // ladder to be rejected a second time.
+                400 if names_a_capability_limit(body) => Disposition::EscalateTier,
                 _ => Disposition::Fatal,
             },
             Self::StreamIdle(_) => Disposition::FailoverAccount {
@@ -153,16 +183,45 @@ impl Error {
     }
 }
 
+/// Whether an upstream body says the request was too big for *this* model
+/// rather than malformed.
+///
+/// The providers disagree about the status code for a context-length rejection:
+/// Anthropic and Gemini answer 400, OpenAI answers 400 with a typed code, and
+/// only some return 413. The status alone therefore cannot separate "too long"
+/// from "your JSON is wrong", and the body is the cheapest thing that can.
+///
+/// Matched case-insensitively on substrings because these messages are prose
+/// that providers reword; a false negative costs one un-escalated request,
+/// which is the old behaviour, while a false positive costs one wasted call.
+fn names_a_capability_limit(body: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "context_length_exceeded",
+        "context length",
+        "context window",
+        "prompt is too long",
+        "token count",
+        "too many tokens",
+    ];
+    let body = body.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| body.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn upstream(status: u16) -> Error {
+        upstream_saying(status, "")
+    }
+
+    fn upstream_saying(status: u16, body: &str) -> Error {
         Error::Upstream {
             provider: Provider::Anthropic,
             account: AccountId::new(),
             status,
-            body: String::new(),
+            body: body.to_owned(),
+            retry_after: None,
         }
     }
 
@@ -190,6 +249,40 @@ mod tests {
     #[test]
     fn context_overflow_escalates_instead_of_failing() {
         assert_eq!(upstream(413).disposition(), Disposition::EscalateTier);
+        assert_eq!(upstream(422).disposition(), Disposition::EscalateTier);
+    }
+
+    #[test]
+    fn a_context_rejection_dressed_as_a_400_still_escalates() {
+        // Anthropic and Gemini answer 400 for a prompt that does not fit, so
+        // reading the status alone would fail the very request a bigger model
+        // was going to serve.
+        for body in [
+            r#"{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#,
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+            r#"{"error":{"message":"The input token count (1048576) exceeds the maximum"}}"#,
+        ] {
+            assert_eq!(
+                upstream_saying(400, body).disposition(),
+                Disposition::EscalateTier,
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_request_is_not_sent_to_a_bigger_model() {
+        // Escalation costs real money, and the frontier rung will reject bad
+        // JSON exactly as the cheap one did.
+        assert_eq!(
+            upstream_saying(
+                400,
+                r#"{"error":{"type":"invalid_request_error","message":"messages: at least one message is required"}}"#
+            )
+            .disposition(),
+            Disposition::Fatal
+        );
+        assert_eq!(upstream(400).disposition(), Disposition::Fatal);
     }
 
     #[test]
@@ -211,5 +304,28 @@ mod tests {
             upstream(429).disposition(),
             Disposition::RateLimited { .. }
         ));
+    }
+
+    #[test]
+    fn a_providers_retry_after_decides_how_long_the_credential_sits_out() {
+        // It used to be discarded and replaced with a flat minute, so a
+        // credential throttled for five seconds was benched for sixty and one
+        // throttled for an hour came back to be refused again.
+        let Disposition::RateLimited { retry_after } = Error::Upstream {
+            provider: Provider::Anthropic,
+            account: AccountId::new(),
+            status: 429,
+            body: String::new(),
+            retry_after: Some(Duration::from_secs(30)),
+        }
+        .disposition() else {
+            panic!("429 is a rate limit");
+        };
+        assert_eq!(retry_after, Some(Duration::from_secs(30)));
+        // And with no hint the caller still has to pick a default.
+        assert_eq!(
+            upstream(429).disposition(),
+            Disposition::RateLimited { retry_after: None }
+        );
     }
 }

@@ -11,6 +11,7 @@ pub mod sse;
 pub use authn::{Caller, require_key_layer};
 
 use crate::AppState;
+use crate::breakers::{Breakers, Dispatch};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -310,31 +311,32 @@ async fn run_with_escalation(
                 }
             };
 
-        let (body, accumulator, lease) = match attempt {
+        // An answer to judge, or a refusal to escalate on. Both ask the same
+        // question — is a rung up worth trying — so they share the one loop
+        // below rather than growing a second escalation path.
+        let answer = match attempt {
             // Streaming: the bytes are already on their way to the client, so
             // there is nothing left to judge. See the note on MAX_ESCALATIONS.
             Attempt::Streaming { response, lease } => {
-                return Ok(stream_response(
-                    state,
-                    response,
-                    state.adapter(decision.model.provider)?,
-                    &lease,
-                    auth,
-                    &decision,
-                    request_id,
-                    started,
-                    ingress,
-                    guard,
-                ));
+                return stream_response(
+                    state, response, lease, auth, &decision, request_id, started, ingress, guard,
+                );
             }
+            Attempt::Rejected(e) => Err(e),
             Attempt::Collected {
                 body,
                 accumulator,
                 lease,
-            } => (body, accumulator, lease),
+            } => Ok((body, accumulator, lease)),
         };
 
-        let gate = accumulator.quality_gate();
+        let gate = match &answer {
+            // The model would not take the request at all. Nothing was billed
+            // and nothing reached the client, so this is the one escalation a
+            // streaming request can also take.
+            Err(_) => Some(oag_router::QualityGate::ContextOverflow),
+            Ok((_, accumulator, _)) => accumulator.quality_gate(),
+        };
 
         // Retry one rung up when the answer was unusable and a rung is left.
         //
@@ -354,7 +356,7 @@ async fn run_with_escalation(
         {
             tracing::info!(
                 %request_id, from = %decision.tier, to = %next.tier, ?gate,
-                "escalating: the cheaper model produced an unusable answer"
+                "escalating: this rung could not answer the request"
             );
             metrics::counter!(
                 "oag_escalations_total",
@@ -363,21 +365,24 @@ async fn run_with_escalation(
             )
             .increment(1);
 
-            // The abandoned attempt is not free. The provider generated those
-            // tokens and will invoice them long before our quality gate had an
-            // opinion, so it is owed a row against the model that produced it —
-            // otherwise escalation looks costless and the number that would
-            // justify moving a rung never appears anywhere. Captured now, while
-            // its usage and latency are still its own, and written after the
-            // answer we serve.
-            abandoned = Some(meter::abandon(
-                meter_context(auth, &decision, &lease, request_id, started, escalations),
-                &accumulator,
-                gate,
-            ));
-
-            select::release(state, lease.account.account_id(), &lease.request_id).await;
-
+            // A rejection released its lease on the way out and was never
+            // generated, so it is not owed a ledger row. A collected answer
+            // still holds a lease, and the provider already invoiced those
+            // tokens — capture the abandoned attempt now and write it after
+            // the served row, so the surviving primary key keeps the answer
+            // the client actually got.
+            //
+            // Released here rather than left to the drop, and awaited: the
+            // rung above may pick this same credential, and a release still
+            // in flight would look like a credential with no room.
+            if let Ok((_, accumulator, lease)) = &answer {
+                abandoned = Some(meter::abandon(
+                    meter_context(auth, &decision, lease, request_id, started, escalations),
+                    accumulator,
+                    gate,
+                ));
+                lease.release().await;
+            }
             canonical.model.clone_from(&next.model.upstream_name);
             decision = next;
             escalations += 1;
@@ -394,11 +399,16 @@ async fn run_with_escalation(
             metrics::counter!("oag_escalations_suppressed_total").increment(1);
         }
 
+        // No rung left to try. A refusal is now the caller's error — the same
+        // one they used to get before the first attempt was allowed to climb.
+        let (body, accumulator, lease) = answer?;
+
         // Either it was fine, or nothing better exists. Record the gate either
         // way: a gate we could not act on is exactly the signal that a rung is
         // mis-set for this workload.
         let ctx = meter_context(auth, &decision, &lease, request_id, started, escalations);
-        select::release(state, lease.account.account_id(), &lease.request_id).await;
+        // Before the ledger write, which is ours rather than the credential's.
+        lease.release().await;
         // `triggering_gate` when we escalated, otherwise whatever this attempt
         // tripped — so the ledger always names the reason, never nothing.
         meter::record_collected(state, &ctx, &accumulator, triggering_gate.or(gate)).await;
@@ -627,6 +637,10 @@ async fn plan_request(
 /// Streamed responses still have their gate recorded, so an operator can see
 /// how often a rung produces unusable answers and move the rung — which is the
 /// durable fix anyway.
+///
+/// A *rejected* request is the exception, streamed or not: the upstream refused
+/// it before sending anything, so there is no half-delivered answer to protect
+/// and the client has seen nothing to contradict.
 const MAX_ESCALATIONS: u8 = 1;
 
 /// What one forwarding attempt produced.
@@ -642,6 +656,10 @@ enum Attempt {
         accumulator: oag_proto::StreamAccumulator,
         lease: select::Lease,
     },
+    /// The model refused the request itself — too long, or beyond what it can
+    /// do. No credential can help and the lease is already released, but a
+    /// rung up can, so this is carried back rather than returned as an error.
+    Rejected(Error),
 }
 
 /// A complete, non-streamed response.
@@ -808,13 +826,20 @@ async fn forward_with_failover(
             }
             // Nothing about another credential would help.
             Outcome::Fatal(e) => {
-                select::release(state, account, &lease.request_id).await;
+                lease.release().await;
                 return Err(e);
+            }
+            // The credential did its job; the *model* would not take the
+            // request. Every other credential reaches the same model, so
+            // failing over is pointless — hand it up to escalation instead.
+            Outcome::Escalate(e) => {
+                lease.release().await;
+                return Ok(Attempt::Rejected(e));
             }
             Outcome::Switch(e) => {
                 tracing::warn!(%request_id, %account, error = %e, "switching credential");
                 last_error = e;
-                select::release(state, account, &lease.request_id).await;
+                lease.release().await;
                 excluded.insert(account);
             }
         }
@@ -832,8 +857,39 @@ enum Outcome {
     Ok(Box<Attempt>),
     /// Try a different credential.
     Switch(Error),
+    /// Stop switching credentials and try a better model instead.
+    Escalate(Error),
     /// Stop: another credential cannot help.
     Fatal(Error),
+}
+
+/// What a rejected attempt says to do next.
+///
+/// Split out of [`try_credential`] as a pure function because it is the point
+/// where a context-length rejection either climbs the ladder or fails the
+/// caller, and that decision should be testable without a transport, a lease,
+/// and a database behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Same credential, after a backoff.
+    Retry,
+    /// A bigger model.
+    Escalate,
+    /// A different credential.
+    Switch,
+    /// Nothing.
+    Fatal,
+}
+
+fn step_for(disposition: Disposition, retries_left: bool) -> Step {
+    match disposition {
+        Disposition::RetrySameAccount if retries_left => Step::Retry,
+        Disposition::EscalateTier => Step::Escalate,
+        Disposition::Fatal => Step::Fatal,
+        // Rate limited, unhealthy, or out of same-credential retries: all of
+        // them are answered by somebody else's credential.
+        _ => Step::Switch,
+    }
 }
 
 /// Try one credential, with bounded same-credential retries.
@@ -867,6 +923,16 @@ async fn try_credential(
 
     let mut last = Error::NoCredential { provider };
 
+    // Claim the breaker here rather than in selection. Selection reads, so a
+    // recovering credential keeps its half-open probe until something is
+    // actually about to be sent to it; the guard hands the probe back if we
+    // return before reaching the wire.
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let Some(mut dispatch) = Dispatch::claim(&state.breakers, account, now) else {
+        // Raced: another request took the probe between the filter and here.
+        return Outcome::Switch(last);
+    };
+
     for attempt in 0..=state.config.gateway.same_account_retries {
         let request = match adapter.build(&oag_upstream::UpstreamRequest {
             canonical,
@@ -891,44 +957,24 @@ async fn try_credential(
             Err(e) => return Outcome::Switch(e),
         };
 
+        dispatch.sent();
         match transport.execute(request).await {
             Ok(response) if response.status().is_success() => {
-                let _ = oag_store::repo::touch_account(&state.db, account).await;
-                state.breakers.record_success(account);
-                metrics::counter!(
-                    "oag_requests_total",
-                    "outcome" => "ok",
-                    "provider" => provider.as_str(),
-                )
-                .increment(1);
-
-                return if canonical.stream {
-                    Outcome::Ok(Box::new(Attempt::Streaming {
-                        response,
-                        lease: lease.clone(),
-                    }))
-                } else {
-                    // The upstream's dialect, which is what its body is in —
-                    // not the client's, which `json_response` converts to.
-                    match sse::collect(response, provider.native_dialect()).await {
-                        Ok((body, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
-                            body,
-                            accumulator,
-                            lease: lease.clone(),
-                        })),
-                        Err(e) => Outcome::Switch(e),
-                    }
-                };
+                return succeeded(state, provider, lease, response, canonical.stream).await;
             }
 
             Ok(response) => {
                 let status = response.status().as_u16();
+                // Read before the body is consumed: `text()` takes the whole
+                // response, headers included.
+                let retry_after = upstream_retry_after(response.headers());
                 let body = response.text().await.unwrap_or_default();
                 let err = Error::Upstream {
                     provider,
                     account,
                     status,
                     body: truncate(&body, 512),
+                    retry_after,
                 };
                 let disposition = err.disposition();
                 tracing::warn!(%request_id, status, ?disposition, "upstream rejected");
@@ -936,20 +982,24 @@ async fn try_credential(
                 apply_disposition(state, account, disposition).await;
                 last = err;
 
-                match disposition {
-                    Disposition::RetrySameAccount
-                        if attempt < state.config.gateway.same_account_retries =>
-                    {
-                        tokio::time::sleep(backoff(attempt)).await;
-                    }
-                    Disposition::Fatal | Disposition::EscalateTier => return Outcome::Fatal(last),
-                    _ => return Outcome::Switch(last),
+                let retries_left = attempt < state.config.gateway.same_account_retries;
+                match step_for(disposition, retries_left) {
+                    Step::Retry => tokio::time::sleep(backoff(attempt)).await,
+                    Step::Escalate => return Outcome::Escalate(last),
+                    Step::Switch => return Outcome::Switch(last),
+                    Step::Fatal => return Outcome::Fatal(last),
                 }
             }
 
+            // Nothing came back at all: connect, TLS, DNS, or a timeout.
             Err(e) => {
                 last = e;
-                if attempt < state.config.gateway.same_account_retries {
+                let retrying = attempt < state.config.gateway.same_account_retries;
+                tracing::warn!(%request_id, %account, error = %last, retrying, "upstream unreachable");
+                if let Some(d) = transport_failure(&state.breakers, account, retrying) {
+                    apply_disposition(state, account, d).await;
+                }
+                if retrying {
                     tokio::time::sleep(backoff(attempt)).await;
                 } else {
                     return Outcome::Switch(last);
@@ -962,55 +1012,60 @@ async fn try_credential(
 }
 
 /// Hand the upstream stream to the client.
+///
+/// Takes the lease by value, and resolves everything that can still fail before
+/// committing it to the pump task. Both of those failures used to happen with
+/// the lease held by somebody else: the adapter lookup `?`d out of the caller
+/// and the renderer returned a response from here, and neither released the
+/// credential's slot — so the slot sat there for the full `SLOT_TTL` while
+/// nothing was in flight. Now they are two `?`s over an owned lease, and the
+/// lease's guard hands the slot back on the way out.
 #[allow(clippy::too_many_arguments)]
 fn stream_response(
     state: &Arc<AppState>,
     response: reqwest::Response,
-    adapter: Arc<dyn oag_upstream::ProviderAdapter>,
-    lease: &select::Lease,
+    lease: select::Lease,
     auth: &oag_store::AuthContext,
     decision: &RoutingDecision,
     request_id: RequestId,
     started: Instant,
     ingress: Dialect,
     guard: crate::shutdown::InFlightGuard,
-) -> Response {
+) -> Result<Response> {
+    let adapter = state.adapter(decision.model.provider)?;
+    let egress = egress_for(ingress, decision, request_id, adapter.framing())?;
+
     // Bounded: a slow client parks the reader instead of buffering the whole
     // response in memory.
     let (tx, rx) = mpsc::channel::<sse::Chunk>(64);
 
     let idle = state.config.gateway.stream_idle_timeout;
     let max = state.config.gateway.max_stream_duration;
-    let account = lease.account.account_id();
-
-    let egress = match egress_for(ingress, decision, request_id, adapter.framing()) {
-        Ok(e) => e,
-        Err(e) => return error_response(&e),
-    };
 
     // A streamed response is delivered as it arrives, so it is never abandoned
     // and never retried: there is only ever one attempt.
-    let ctx = meter_context(auth, decision, lease, request_id, started, 0);
+    let ctx = meter_context(auth, decision, &lease, request_id, started, 0);
 
     let state2 = Arc::clone(state);
-    let lease_id = lease.request_id.clone();
 
     // The pump runs as its own task so it outlives the client's connection.
     // If the client hangs up, this keeps draining and still records what the
     // provider is going to bill us for.
     tokio::spawn(async move {
-        // The guard rides along and is dropped here, when the stream is
-        // genuinely finished — which is what makes the shutdown drain wait for
-        // it rather than exiting out from under it.
+        // Both the guard and the lease ride along and finish here, when the
+        // stream genuinely ends. The guard is what makes the shutdown drain
+        // wait for the stream rather than exiting out from under it; the lease
+        // is what keeps the credential's slot held for exactly as long as it is
+        // really in use.
         let _guard = guard;
         let outcome = sse::pump(response, adapter, tx, idle, max, egress).await;
-        select::release(&state2, account, &lease_id).await;
+        lease.release().await;
         meter::record(&state2, &ctx, &outcome).await;
     });
 
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
 
-    Response::builder()
+    Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
@@ -1021,7 +1076,81 @@ fn stream_response(
         .header("x-oag-tier", decision.tier.name.as_str())
         .header("x-oag-request-id", request_id.to_string())
         .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+}
+
+/// Turn a successful response into the attempt the caller returns.
+///
+/// The body is collected here unless the client asked for a stream: only a
+/// streaming client can be handed the upstream body as it arrives.
+async fn succeeded(
+    state: &Arc<AppState>,
+    provider: oag_core::Provider,
+    lease: &select::Lease,
+    response: reqwest::Response,
+    stream: bool,
+) -> Outcome {
+    let account = lease.account.account_id();
+    let _ = oag_store::repo::touch_account(&state.db, account).await;
+    state.breakers.record_success(account);
+    metrics::counter!(
+        "oag_requests_total",
+        "outcome" => "ok",
+        "provider" => provider.as_str(),
+    )
+    .increment(1);
+
+    if stream {
+        return Outcome::Ok(Box::new(Attempt::Streaming {
+            response,
+            lease: lease.clone(),
+        }));
+    }
+    // The upstream's dialect, which is what its body is in —
+    // not the client's, which `json_response` converts to.
+    match sse::collect(response, provider.native_dialect()).await {
+        Ok((body, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
+            body,
+            accumulator,
+            lease: lease.clone(),
+        })),
+        Err(e) => Outcome::Switch(e),
+    }
+}
+
+/// How long a credential sits out after the transport itself failed.
+///
+/// The same thirty seconds a 5xx gets, for the same reason: the credential is
+/// probably fine and something between us and the provider is not, so the pause
+/// wants to be long enough to stop hammering and short enough to come back.
+const TRANSPORT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Account for a failure that never produced an HTTP status — connect, TLS,
+/// DNS, timeout.
+///
+/// [`Error::disposition`] cannot classify these: all it sees is `Internal`, so
+/// it says fatal, and this path used to skip the breaker entirely as a result.
+/// The consequence is backwards. A credential behind a dead proxy fails
+/// *fastest*, so it always carries the lowest in-flight count, so the
+/// least-loaded stage prefers it over every healthy credential — and it never
+/// trips, because nothing ever records the failures.
+///
+/// Returns the disposition to persist, or `None` while same-credential retries
+/// remain: a cooldown written between two attempts on the same credential would
+/// only be contradicted by the next one.
+fn transport_failure(
+    breakers: &Breakers,
+    account: AccountId,
+    retrying: bool,
+) -> Option<Disposition> {
+    breakers.record_failure(account);
+    if retrying {
+        None
+    } else {
+        Some(Disposition::FailoverAccount {
+            cooldown: TRANSPORT_COOLDOWN,
+        })
+    }
 }
 
 /// Persist what a failure says about a credential.
@@ -1039,6 +1168,50 @@ async fn apply_disposition(state: &AppState, account: AccountId, d: Disposition)
         }
         _ => {}
     }
+}
+
+/// The longest a provider's own `Retry-After` may bench one of our credentials.
+///
+/// An hour, and the ceiling matters more than the number. A genuinely day-long
+/// quota costs at most one refused request per hour past this, which the breaker
+/// and the cooldown then absorb — whereas trusting the provider's arithmetic
+/// costs a credential nobody can get back.
+const MAX_RETRY_AFTER: u64 = 3_600;
+
+/// How long the provider asked us to wait, if it said — and if the answer is
+/// usable.
+///
+/// Only the delta-seconds form. The HTTP-date form is equally legal and no
+/// provider we speak to sends it, and a date read wrongly is worse than no hint
+/// at all — the caller has a sane default and a misparsed one would override it.
+///
+/// Anything outside one second to [`MAX_RETRY_AFTER`] is treated as no header at
+/// all, and that validation is not decoration: this value is *persisted* as
+/// `rate_limited_until`, and `repo::clear_cooldown` deliberately does not clear
+/// that column, so a number we accept here cannot be undone from the admin
+/// surface at all. Somebody has to reach for psql. Two values in the wild:
+///
+/// - **`0`**, which Cloudflare sends in front of several providers. Taken
+///   literally it means "wait no time", so the credential the provider has just
+///   throttled becomes immediately selectable again — strictly worse than the
+///   one-minute default it replaced.
+/// - **an epoch timestamp**, from confusing `Retry-After` with a reset time. In
+///   seconds it benches the credential until the 2080s. In milliseconds it
+///   overflows the `OffsetDateTime` addition in [`apply_disposition`] and takes
+///   the request down with it.
+fn upstream_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    // A negative or fractional value fails this parse and is thereby rejected
+    // too, which is the right answer for both.
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (1..=MAX_RETRY_AFTER)
+        .contains(&secs)
+        .then(|| std::time::Duration::from_secs(secs))
 }
 
 /// Exponential backoff, capped.
@@ -1085,11 +1258,45 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// The status a client should see for a failure that came from a provider.
+///
+/// Three upstream statuses mean something else entirely at *our* edge, and
+/// forwarding them verbatim tells the client the opposite of what happened:
+///
+/// - **401** is "your gateway key is wrong". An SDK handed one deletes the key
+///   the operator just issued and asks the user to re-authenticate — while the
+///   real fault is that our own provider credentials have expired.
+/// - **402** is [`Error::BudgetExhausted`], i.e. "you are out of money", which
+///   sends the caller to top up an account that is fine.
+/// - **403** is "this key may not use this route".
+/// - **407** asks the *client* to authenticate to a proxy it does not know
+///   exists. Ours is the only proxy in the path, configured per credential, so
+///   this is our own configuration failing.
+///
+/// All four are ours to fix, and by the time one reaches here every credential in
+/// the pool has already been tried and failed over. So the honest answer is the
+/// one that says the gateway cannot reach a working upstream: 502. Not 503 —
+/// that is [`Error::NoCredential`] and [`Error::AtCapacity`], both of which mean
+/// "come back shortly" and neither of which is true of a pool whose keys are all
+/// dead.
+///
+/// Everything else keeps the provider's status, because everything else is
+/// already about the right party: 400, 413 and 422 are the client's own request,
+/// and 5xx already reads as ours.
+fn client_status_for(upstream: u16) -> StatusCode {
+    match upstream {
+        401..=403 | 407 => StatusCode::BAD_GATEWAY,
+        other => StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_GATEWAY),
+    }
+}
+
 /// Map an error to a response.
 ///
-/// Upstream bodies are passed through so a client sees the provider's own
-/// message rather than a generic 502 it cannot act on. Internal errors are not:
-/// they can carry connection strings and file paths.
+/// The provider's own body is still surfaced, so a client sees more than a bare
+/// 502 — but under `error.upstream`, beside our error rather than as it. Its
+/// *status* is deliberately not always ours: see [`client_status_for`].
+/// Internal errors are surfaced as nothing at all: they can carry connection
+/// strings and file paths.
 pub(crate) fn error_response(e: &Error) -> Response {
     let (status, kind, message) = match e {
         Error::Unauthenticated => (
@@ -1119,11 +1326,11 @@ pub(crate) fn error_response(e: &Error) -> Response {
             e.to_string(),
         ),
         Error::NoViableModel => (StatusCode::BAD_REQUEST, "no_viable_model", e.to_string()),
-        Error::Upstream { status, body, .. } => (
-            StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY),
-            "upstream_error",
-            body.clone(),
-        ),
+        // The message is ours; the provider's is nested below rather than
+        // substituted for it.
+        Error::Upstream { status, .. } => {
+            (client_status_for(*status), "upstream_error", e.to_string())
+        }
         Error::Serde(_) => (StatusCode::BAD_REQUEST, "invalid_request", e.to_string()),
         Error::StreamIdle(_) => (StatusCode::GATEWAY_TIMEOUT, "stream_idle", e.to_string()),
         _ => {
@@ -1136,20 +1343,48 @@ pub(crate) fn error_response(e: &Error) -> Response {
         }
     };
 
-    let mut response = (
-        status,
-        axum::Json(serde_json::json!({
-            "type": "error",
-            "error": { "type": kind, "message": message }
-        })),
-    )
-        .into_response();
+    let mut payload = serde_json::json!({
+        "type": "error",
+        "error": { "type": kind, "message": message }
+    });
+
+    // The provider's error as a *value*, next to ours. It used to be our
+    // `error.message`, which meant an SDK reading `error.message` found a whole
+    // JSON document encoded into a string — so every parser that looked for a
+    // message read one and reported gibberish, and anything looking deeper found
+    // nothing. The provider's status goes with it, since it is no longer
+    // necessarily the status line.
+    if let Error::Upstream { status, body, .. } = e {
+        payload["error"]["upstream_status"] = serde_json::json!(*status);
+        if !body.is_empty() {
+            // Truncated bodies stop being valid JSON, so a string is the
+            // fallback rather than the failure.
+            payload["error"]["upstream"] = serde_json::from_str(body)
+                .unwrap_or_else(|_| serde_json::Value::String(body.clone()));
+        }
+    }
+
+    let mut response = (status, axum::Json(payload)).into_response();
 
     // A 429 without Retry-After leaves every client to guess, and they guess
-    // badly — usually by retrying immediately, which is the one thing the
-    // limit exists to prevent. Rounded up, and never zero.
-    if let Error::RateLimited { retry_after } = e {
-        let secs = retry_after.as_secs_f64().ceil().max(1.0);
+    // badly — usually by retrying immediately, which is the one thing the limit
+    // exists to prevent. Rounded up, and never zero.
+    //
+    // A forwarded upstream throttle needs this every bit as much as our own
+    // inbound one, and used to get nothing: the header was set for
+    // `RateLimited` alone, so the 429s a client is most likely to see arrived
+    // bare.
+    let wait = match e {
+        Error::RateLimited { retry_after } => Some(*retry_after),
+        Error::Upstream {
+            status: 429,
+            retry_after,
+            ..
+        } => Some(retry_after.unwrap_or(std::time::Duration::from_secs(1))),
+        _ => None,
+    };
+    if let Some(wait) = wait {
+        let secs = wait.as_secs_f64().ceil().max(1.0);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let secs = secs as u64;
         if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
@@ -1252,6 +1487,118 @@ mod tests {
         assert_eq!(truncate("brief", 512), "brief");
     }
 
+    #[test]
+    fn transport_error_records_breaker_failure() {
+        // A credential behind a dead proxy never returns a status, so nothing
+        // on the HTTP path records anything against it. Left unrecorded it
+        // fails fastest, looks idlest, and the least-loaded stage keeps picking
+        // it — for ever, because it never trips.
+        let breakers = Breakers::new();
+        let account = AccountId::new();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+
+        for _ in 0..64 {
+            transport_failure(&breakers, account, true);
+        }
+        assert!(
+            !breakers.permits(account, now),
+            "a run of unreachable attempts must trip the breaker"
+        );
+        assert_eq!(breakers.open_count(now), 1);
+    }
+
+    #[test]
+    fn a_transport_failure_cools_the_credential_down_once_retries_are_spent() {
+        // Only at the end: a cooldown written between two attempts on the same
+        // credential is contradicted by the very next attempt.
+        let breakers = Breakers::new();
+        let account = AccountId::new();
+
+        assert_eq!(transport_failure(&breakers, account, true), None);
+        assert_eq!(
+            transport_failure(&breakers, account, false),
+            Some(Disposition::FailoverAccount {
+                cooldown: TRANSPORT_COOLDOWN
+            }),
+            "the same failover the HTTP path applies"
+        );
+    }
+
+    fn upstream(status: u16, body: &str) -> Error {
+        Error::Upstream {
+            provider: oag_core::Provider::Anthropic,
+            account: AccountId::new(),
+            status,
+            body: body.to_owned(),
+            retry_after: None,
+        }
+    }
+
+    /// What the client actually parses. A status assertion alone would have
+    /// missed the double-encoded body this file used to send.
+    async fn json_body(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a complete body");
+        serde_json::from_slice(&bytes).expect("an error envelope is JSON")
+    }
+
+    fn retry_after_of(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+    }
+
+    #[test]
+    fn upstream_413_is_outcome_escalate_not_fatal() {
+        // A 413 from a 128k rung used to end the request: `EscalateTier` was
+        // mapped to `Fatal` here and never reached `policy.escalate`, so the
+        // client got the provider's rejection while the rung that could have
+        // held the prompt sat one step up, untried.
+        assert_eq!(
+            step_for(upstream(413, "").disposition(), false),
+            Step::Escalate
+        );
+        assert_eq!(
+            step_for(
+                upstream(400, "prompt is too long: 210000 tokens").disposition(),
+                false
+            ),
+            Step::Escalate
+        );
+    }
+
+    #[test]
+    fn a_bad_request_still_fails_the_caller() {
+        // The other half of the same decision: escalation costs money, so only
+        // a capability rejection buys a rung.
+        assert_eq!(
+            step_for(upstream(400, "messages: required").disposition(), false),
+            Step::Fatal
+        );
+    }
+
+    #[test]
+    fn an_unhealthy_credential_is_switched_rather_than_escalated() {
+        // Escalating here would migrate the fleet onto expensive models every
+        // time a provider had a bad afternoon.
+        assert_eq!(
+            step_for(upstream(503, "").disposition(), false),
+            Step::Switch
+        );
+        assert_eq!(
+            step_for(upstream(429, "").disposition(), false),
+            Step::Switch
+        );
+        // Transient, and the retry budget decides which of the two it is.
+        assert_eq!(step_for(upstream(408, "").disposition(), true), Step::Retry);
+        assert_eq!(
+            step_for(upstream(408, "").disposition(), false),
+            Step::Switch
+        );
+    }
+
     fn decision_for(provider: oag_core::Provider) -> RoutingDecision {
         use oag_router::{Capabilities, ModelId, ModelSpec, Pricing};
         RoutingDecision {
@@ -1324,6 +1671,99 @@ mod tests {
         assert!(matches!(e, sse::Egress::ChatCompletions { .. }));
     }
 
+    /// A state that dials nothing: `Db::connect` builds a lazy pool and
+    /// `Cache::connect` only opens a redis client, so the adapter lookup these
+    /// tests are about runs long before any backend would.
+    fn state() -> Arc<AppState> {
+        let src = r#"
+database:
+  url: "postgres://oag:oag@127.0.0.1:1/oag"
+redis:
+  url: "redis://127.0.0.1:1"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+"#;
+        let config = oag_core::config::Config::from_yaml(src).expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        Arc::new(AppState::new(config, db, cache).expect("state"))
+    }
+
+    fn auth_context() -> oag_store::AuthContext {
+        oag_store::AuthContext {
+            api_key_id: uuid::Uuid::nil(),
+            principal_id: uuid::Uuid::nil(),
+            route_id: uuid::Uuid::nil(),
+            key_floor_tier: None,
+            admin: false,
+            quota_usd: None,
+            spent_usd: rust_decimal::Decimal::ZERO,
+            principal_budget_usd: None,
+            principal_hard_stop_multiple: rust_decimal::Decimal::ONE,
+            principal_spent_usd: rust_decimal::Decimal::ZERO,
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_adapter_or_egress_error_releases_slot() {
+        // `vertex` is a routable provider with no adapter registered, so the
+        // streaming arm fails *after* a credential has been leased — the same
+        // shape as a dialect pair with no renderer. Both used to return past
+        // every release, stranding the slot for the whole SLOT_TTL; eight of
+        // those on one credential and it answers AtCapacity with nothing in
+        // flight.
+        let state = state();
+        let slots = Arc::new(select::testing::CountingSlots::default());
+
+        let result = stream_response(
+            &state,
+            reqwest::Response::from(http::Response::new("stub")),
+            select::testing::lease(&slots),
+            &auth_context(),
+            &decision_for(oag_core::Provider::Vertex),
+            RequestId::new(),
+            Instant::now(),
+            Dialect::AnthropicMessages,
+            state.lifecycle.track(),
+        );
+
+        assert!(result.is_err(), "there is no adapter for vertex");
+        assert_eq!(slots.settled().await, 1, "and the slot came back");
+    }
+
+    #[tokio::test]
+    async fn a_live_stream_keeps_its_slot_until_the_pump_is_done() {
+        // The other half of it. The lease is moved into the pump task rather
+        // than dropped when the handler returns, because a handler returns as
+        // soon as the headers are decided — releasing there would hand back a
+        // slot that is still streaming, which oversubscribes the credential
+        // rather than merely leaking from it.
+        let state = state();
+        let slots = Arc::new(select::testing::CountingSlots::default());
+
+        // A body that never yields, so the pump is still running when the
+        // assertion below looks.
+        let body = reqwest::Body::wrap_stream(futures_util::stream::pending::<
+            std::result::Result<bytes::Bytes, std::io::Error>,
+        >());
+
+        let result = stream_response(
+            &state,
+            reqwest::Response::from(http::Response::new(body)),
+            select::testing::lease(&slots),
+            &auth_context(),
+            &decision_for(oag_core::Provider::Anthropic),
+            RequestId::new(),
+            Instant::now(),
+            Dialect::AnthropicMessages,
+            state.lifecycle.track(),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(slots.settled().await, 0, "still in flight");
+    }
+
     #[test]
     fn an_empty_ladder_is_rejected_rather_than_serving_nothing() {
         assert!(parse_ladder(&serde_json::json!([])).is_err());
@@ -1333,11 +1773,221 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn internal_errors_do_not_leak_their_message() {
+        // They can carry connection strings and file paths. Asserting on the
+        // status alone never checked the thing the test is named for.
+        let response = error_response(&Error::Internal("postgres://user:pw@host/db".to_owned()));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "internal_error");
+        assert_eq!(body["error"]["message"], "internal error");
+        assert!(
+            !body.to_string().contains("postgres://"),
+            "nothing from the error may reach the client: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_401_maps_to_502() {
+        // The collision: 401 is *our* "your gateway key is wrong". A 401 here
+        // means the provider credentials are expired, and every one has already
+        // been tried — but an SDK reading the status deletes the gateway key the
+        // operator just issued and sends the user to re-authenticate against a
+        // key that was never the problem.
+        let response = error_response(&upstream(
+            401,
+            r#"{"error":{"type":"authentication_error","message":"OAuth token has expired"}}"#,
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "upstream_error");
+        // Still diagnosable: the provider's status is reported, just not as ours.
+        assert_eq!(body["error"]["upstream_status"], 401);
+        // And its body is a value a parser can walk into, not a string that
+        // happens to hold JSON.
+        assert_eq!(
+            body["error"]["upstream"]["error"]["message"],
+            "OAuth token has expired"
+        );
+        // Above all, not something the client mistakes for its own auth failure.
+        assert_ne!(body["error"]["type"], "authentication_error");
+    }
+
     #[test]
-    fn internal_errors_do_not_leak_their_message() {
-        // They can carry connection strings and file paths.
-        let r = error_response(&Error::Internal("postgres://user:pw@host/db".to_owned()));
-        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    fn our_own_credential_failures_are_never_dressed_as_the_clients() {
+        // 402 is BudgetExhausted, 403 is a route this key may not use, and 407
+        // asks the client to authenticate to our proxy. Every one of them sends
+        // the caller to fix something on their side that is already fine.
+        for status in [401u16, 402, 403, 407] {
+            let response = error_response(&upstream(status, ""));
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "upstream {status} must not become the client's {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_the_client_can_fix_keeps_the_providers_status() {
+        // The other half. These are about the bytes the client sent, so the
+        // client is the only party who can act on them — and 413 in particular
+        // is what the ladder failed to escalate past, which is worth saying
+        // plainly rather than collapsing into "bad gateway".
+        for status in [400u16, 413, 422] {
+            let response = error_response(&upstream(status, ""));
+            assert_eq!(response.status().as_u16(), status);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_429_forwards_retry_after() {
+        // The provider told us how long to wait and we dropped it on the floor:
+        // the header was only ever set for our own inbound throttle, so a
+        // forwarded 429 reached the client with nothing to back off by.
+        let response = error_response(&Error::Upstream {
+            provider: oag_core::Provider::Anthropic,
+            account: AccountId::new(),
+            status: 429,
+            body: r#"{"error":{"message":"rate limit"}}"#.to_owned(),
+            retry_after: Some(std::time::Duration::from_secs(30)),
+        });
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(retry_after_of(&response), Some("30"));
+        assert_eq!(
+            json_body(response).await["error"]["upstream"]["error"]["message"],
+            "rate limit"
+        );
+    }
+
+    #[test]
+    fn an_upstream_429_without_a_hint_still_names_a_wait() {
+        // No header from the provider is not licence to omit ours: a 429 with
+        // no Retry-After is an invitation to retry immediately.
+        assert_eq!(
+            retry_after_of(&error_response(&upstream(429, ""))),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn a_providers_retry_after_is_read_from_the_response() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        let mut h = HeaderMap::new();
+        h.insert(RETRY_AFTER, HeaderValue::from_static("42"));
+        assert_eq!(
+            upstream_retry_after(&h),
+            Some(std::time::Duration::from_secs(42))
+        );
+
+        // The HTTP-date form is legal and unparsed on purpose: the caller's
+        // default beats a date read wrongly.
+        h.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(upstream_retry_after(&h), None);
+        assert_eq!(upstream_retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn an_unusable_retry_after_is_treated_as_no_header_at_all() {
+        // This number is persisted as `rate_limited_until`, and
+        // `repo::clear_cooldown` deliberately leaves that column alone — so
+        // anything accepted here is a credential no operator can get back
+        // without psql. It used to be accepted verbatim.
+        for (value, why) in [
+            (
+                "0",
+                "Cloudflare sends it, and it un-benches the credential the \
+                 provider just throttled",
+            ),
+            (
+                "1756000000",
+                "an epoch timestamp in seconds holds the credential out until the 2080s",
+            ),
+            (
+                "1756000000000",
+                "the same mistake in milliseconds overflowed the clock and panicked",
+            ),
+            ("-5", "a negative wait is not a wait"),
+            (
+                "86400",
+                "a day is longer than we will hold a credential out on a provider's word",
+            ),
+            ("3601", "one second past the ceiling is still past it"),
+            ("", "no value"),
+            ("later", "not a number"),
+        ] {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(value).expect("a valid header value"),
+            );
+            assert_eq!(
+                upstream_retry_after(&h),
+                None,
+                "Retry-After: {value} — {why}"
+            );
+        }
+
+        // And the edges of what is accepted, so the bound is pinned from both
+        // sides rather than only rejected from one.
+        for secs in [1u64, MAX_RETRY_AFTER] {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(&secs.to_string()).expect("value"),
+            );
+            assert_eq!(
+                upstream_retry_after(&h),
+                Some(std::time::Duration::from_secs(secs))
+            );
+        }
+    }
+
+    #[test]
+    fn no_provider_header_can_bench_a_credential_past_the_ceiling() {
+        // The arithmetic `apply_disposition` performs, without a database
+        // behind it. The millisecond case used to panic on this very addition
+        // and take the request task with it; the second case landed in 2081,
+        // and 0 released the credential immediately.
+        let now = time::OffsetDateTime::now_utc();
+        let ceiling = now + std::time::Duration::from_secs(MAX_RETRY_AFTER);
+
+        for value in [
+            "1756000000000",
+            "1756000000",
+            "0",
+            "-5",
+            "99999999999999999999",
+            "86400",
+            "30",
+        ] {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(value).expect("a valid header value"),
+            );
+
+            // Exactly what `apply_disposition` computes for a rate limit, and
+            // it panics here rather than returning if the wait is absurd.
+            let wait = upstream_retry_after(&h).unwrap_or(std::time::Duration::from_mins(1));
+            let until = now + wait;
+
+            assert!(
+                until > now,
+                "Retry-After: {value} must still hold the credential out for something"
+            );
+            assert!(
+                until <= ceiling,
+                "Retry-After: {value} must not outlast the ceiling"
+            );
+        }
     }
 
     #[test]
