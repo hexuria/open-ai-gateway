@@ -83,6 +83,16 @@
     <h2>By tier</h2>
     <div class="scroll"><table id="tiers"></table></div>
 
+    <section id="subs" hidden>
+      <h2>Subscriptions</h2>
+      <p class="note">Each seat is flat-rate — billed monthly, not per token — so
+        it is metered on its own line: what its traffic would have cost billed
+        per token, against the fixed fee that displaced that bill. Saved is the
+        difference; it reads red until a seat's use earns its fee back. Metered
+        API traffic is the headline above; this is a separate track.</p>
+      <div class="scroll"><table id="seats"></table></div>
+    </section>
+
     <h2>Services</h2>
     <p class="note">Capability backends. The gateway registers a row and health-checks it;
       it does not run the sandbox, tool, guard, or browser.</p>
@@ -187,6 +197,30 @@ async function load() {
     $('saved').textContent = '$' + s.saved_usd;
     $('pct').textContent   = s.saved_pct + '%';
     $('cache').textContent = s.cache_hit_rate + '%';
+
+    // Subscriptions: one row per seat, shown only once at least one seat
+    // exists, so an empty section never appears on an all-API deployment.
+    const seats = s.subscriptions || [];
+    if (seats.length) {
+      $('subs').hidden = false;
+      table($('seats'), [
+        { h:'Seat',        f:r => esc(r.name) },
+        { h:'Requests',    f:r => r.requests, num:true },
+        { h:'If per-token',f:r => '$' + esc(r.api_value_usd), num:true },
+        // An unpriced seat shows a dash for cost and saving, not a zero: no
+        // fee was recorded, so its saving is unknown, not nil.
+        { h:'Plan cost',   f:r => r.plan_cost_usd == null ? '—' : '$' + esc(r.plan_cost_usd), num:true },
+        { h:'Saved',       f:r => {
+            if (r.saved_usd == null) return '—';
+            // Saved is the figure that can go either way, so it carries the
+            // colour: green once the seat has earned its fee back, red before.
+            const cls = parseFloat(r.saved_usd) >= 0 ? 'good' : 'bad';
+            return `<span class="${cls}">$${esc(r.saved_usd)}</span>`;
+          }, num:true },
+      ], seats);
+    } else {
+      $('subs').hidden = true;
+    }
     $('reqs').textContent  = s.requests;
 
     table($('tiers'), [
