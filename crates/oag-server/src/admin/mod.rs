@@ -161,6 +161,35 @@ pub struct Summary {
     pub saved_pct: String,
     pub by_tier: Vec<TierRow>,
     pub cache_hit_rate: String,
+    /// One row per subscription seat, metered individually — three Grok seats
+    /// are three rows, so each subscription's own cost and subsidy is legible
+    /// rather than blurred into a fleet total. Separate from the frontier
+    /// figures above, which describe only metered per-token traffic.
+    pub subscriptions: Vec<SeatRow>,
+}
+
+/// One subscription seat's economics over the window.
+///
+/// The headline figures above are per-token traffic; a seat is flat-rate, so it
+/// gets its own row here answering a different question — what its usage would
+/// have cost billed per token, against the fixed fee that displaced that bill.
+#[derive(Debug, Serialize)]
+pub struct SeatRow {
+    pub name: String,
+    /// Requests this seat served in the window.
+    pub requests: i64,
+    /// What this seat's usage would have cost at the served models' list API
+    /// prices: `SUM(counterfactual_api_usd)` for its rows. The bill the flat
+    /// fee displaced.
+    pub api_value_usd: String,
+    /// The seat's own flat fee, prorated to the window. `None` when no monthly
+    /// price was recorded — an unpriced seat is not a free one, so its saving
+    /// cannot be computed rather than being shown as the whole API value.
+    pub plan_cost_usd: Option<String>,
+    /// `api_value_usd - plan_cost_usd`: what this one subscription saved, net of
+    /// its fee. `None` when the seat is unpriced. Negative means this seat's
+    /// traffic has not yet earned its fee back.
+    pub saved_usd: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,9 +211,77 @@ pub struct Window {
     pub days: Option<i32>,
 }
 
+/// One row per subscription seat, each metered on its own.
+///
+/// Each flat-rate account (`kind='oauth'`) is its own row so three Grok seats
+/// read as three lines, not one blur. A `LEFT JOIN` keeps a seat with no
+/// traffic this window visible at zero rather than vanishing, and the seat-row
+/// predicate on the join (`cost_usd = 0 AND counterfactual_api_usd > 0`) counts
+/// only what the seat actually served. Failures degrade to an empty list — a
+/// missing subscriptions table should not take down the whole summary.
+async fn seat_summaries(db: &oag_store::Db, days: i32) -> Vec<SeatRow> {
+    let seats: Vec<(
+        String,
+        i64,
+        rust_decimal::Decimal,
+        Option<rust_decimal::Decimal>,
+    )> = sqlx::query_as(
+        r"
+            SELECT a.name,
+                   COUNT(u.request_id),
+                   COALESCE(SUM(u.counterfactual_api_usd), 0),
+                   a.monthly_cost_usd
+            FROM account a
+            LEFT JOIN usage_event u
+                   ON u.account_id = a.id
+                  AND u.occurred_at > now() - make_interval(days => $1)
+                  AND u.cost_usd = 0
+                  AND u.counterfactual_api_usd > 0
+            WHERE a.kind = 'oauth'
+            GROUP BY a.id, a.name, a.monthly_cost_usd
+            ORDER BY COALESCE(SUM(u.counterfactual_api_usd), 0) DESC, a.name
+            ",
+    )
+    .bind(days)
+    .fetch_all(db.pool())
+    .await
+    .unwrap_or_default();
+
+    let day_frac = rust_decimal::Decimal::from(days) / rust_decimal::Decimal::from(30);
+    seats
+        .into_iter()
+        .map(|(name, requests, api_value, monthly)| {
+            // Prorate each seat's own fee to the window. An unpriced seat yields
+            // None for both cost and saving — its API value is still shown, but
+            // a saving cannot be invented from a fee nobody entered.
+            let (plan_cost_usd, saved_usd) = match monthly {
+                Some(m) => {
+                    let plan = m * day_frac;
+                    (
+                        Some(format!("{plan:.4}")),
+                        Some(format!("{:.4}", api_value - plan)),
+                    )
+                }
+                None => (None, None),
+            };
+            SeatRow {
+                name,
+                requests,
+                api_value_usd: format!("{api_value:.4}"),
+                plan_cost_usd,
+                saved_usd,
+            }
+        })
+        .collect()
+}
+
 pub async fn summary(State(state): State<Arc<AppState>>, Query(window): Query<Window>) -> Response {
     let days = window.days.unwrap_or(30).clamp(1, 3650);
 
+    // The headline is per-token traffic only. A seat row (cost 0, real
+    // API-equivalent price) is flat-rate, so folding it in here would let its
+    // zero marginal cost inflate the frontier saving — the subscription's worth
+    // is a separate question, answered per seat below.
     let totals: Result<SummaryTotals, _> = sqlx::query_as(
         r"
             -- Explicit ::bigint on the token sums: SUM over a bigint column
@@ -196,6 +293,7 @@ pub async fn summary(State(state): State<Arc<AppState>>, Query(window): Query<Wi
                    COALESCE(SUM(input_tokens + cache_read_tokens), 0)::bigint
             FROM usage_event
             WHERE occurred_at > now() - make_interval(days => $1)
+              AND NOT (cost_usd = 0 AND counterfactual_api_usd > 0)
             ",
     )
     .bind(days)
@@ -217,6 +315,7 @@ pub async fn summary(State(state): State<Arc<AppState>>, Query(window): Query<Wi
                    COALESCE(SUM(counterfactual_usd), 0)
             FROM usage_event
             WHERE occurred_at > now() - make_interval(days => $1)
+              AND NOT (cost_usd = 0 AND counterfactual_api_usd > 0)
             GROUP BY tier ORDER BY SUM(counterfactual_usd - cost_usd) DESC
             ",
     )
@@ -231,6 +330,9 @@ pub async fn summary(State(state): State<Arc<AppState>>, Query(window): Query<Wi
     } else {
         rust_decimal::Decimal::ZERO
     };
+
+    let subscriptions = seat_summaries(&state.db, days).await;
+
     let hit_rate = if prompt > 0 {
         rust_decimal::Decimal::from(cached) / rust_decimal::Decimal::from(prompt)
             * rust_decimal::Decimal::from(100)
@@ -245,6 +347,7 @@ pub async fn summary(State(state): State<Arc<AppState>>, Query(window): Query<Wi
         saved_usd: format!("{saved:.4}"),
         saved_pct: format!("{pct:.1}"),
         cache_hit_rate: format!("{hit_rate:.1}"),
+        subscriptions,
         by_tier: by_tier
             .into_iter()
             .map(|(tier, requests, spent, cf)| TierRow {
