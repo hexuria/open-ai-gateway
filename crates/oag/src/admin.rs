@@ -91,6 +91,11 @@ pub enum AdminCommand {
         /// default for `--from-grok` is per-principal binding.
         #[arg(long, requires = "from_grok", conflicts_with = "owner_email")]
         shared: bool,
+        /// The seat's flat monthly price in USD. Lets the dashboard net a
+        /// subscription's saved API spend against what it costs. Applies per
+        /// imported seat with `--from-grok`.
+        #[arg(long)]
+        monthly_cost: Option<Decimal>,
     },
     /// Load model pricing into the catalog.
     SeedCatalog {
@@ -156,6 +161,7 @@ pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Resu
             priority,
             owner_email,
             shared,
+            monthly_cost,
         } => {
             if from_grok {
                 import_grok(
@@ -168,6 +174,7 @@ pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Resu
                     priority,
                     owner_email.as_deref(),
                     shared,
+                    monthly_cost,
                 )
                 .await
             } else {
@@ -188,6 +195,7 @@ pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Resu
                     max_concurrency,
                     priority,
                     owner_email.as_deref(),
+                    monthly_cost,
                 )
                 .await
             }
@@ -346,6 +354,7 @@ async fn add_account(
     max_concurrency: i32,
     priority: i16,
     owner_email: Option<&str>,
+    monthly_cost: Option<Decimal>,
 ) -> Result<()> {
     // Validate before storing, so a typo fails here rather than on the first
     // request with an opaque upstream 404.
@@ -371,6 +380,7 @@ async fn add_account(
         max_concurrency,
         priority,
         owner_id,
+        monthly_cost,
     )
     .await?;
 
@@ -398,6 +408,7 @@ async fn import_grok(
     priority: i16,
     owner_email: Option<&str>,
     shared: bool,
+    monthly_cost: Option<Decimal>,
 ) -> Result<()> {
     // A subscription seat is sanctioned for its holder's own use, so binding
     // to a principal is the default and pooling is the explicit choice —
@@ -455,6 +466,7 @@ async fn import_grok(
             max_concurrency,
             priority,
             owner_id,
+            monthly_cost,
         )
         .await?;
         println!("account {row_name} (xai, oauth) -> {id}");
@@ -508,6 +520,7 @@ async fn insert_account(
     max_concurrency: i32,
     priority: i16,
     owner_id: Option<Uuid>,
+    monthly_cost: Option<Decimal>,
 ) -> Result<Uuid> {
     let sealed = kek.seal_json(material)?;
     // Denormalised so the scheduler can skip expired credentials without
@@ -521,8 +534,9 @@ async fn insert_account(
         r"
         INSERT INTO account (
             id, name, provider, kind, credentials_sealed, credentials_nonce,
-            token_expires_at, owner_principal_id, priority, max_concurrency
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            token_expires_at, owner_principal_id, priority, max_concurrency,
+            monthly_cost_usd
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
         ",
     )
     .bind(id)
@@ -535,6 +549,7 @@ async fn insert_account(
     .bind(owner_id)
     .bind(priority)
     .bind(max_concurrency)
+    .bind(monthly_cost)
     .execute(db.pool())
     .await
     .map_err(|e| oag_core::Error::Internal(format!("creating account: {e}")))?;

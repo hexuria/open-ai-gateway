@@ -236,6 +236,10 @@ pub struct UsageWrite {
     pub cost_usd: Decimal,
     pub counterfactual_usd: Decimal,
     pub counterfactual_model_id: Option<String>,
+    /// What these tokens would have cost at the served model's list API price.
+    /// Equals `cost_usd` for a metered account; for a flat-rate seat it is the
+    /// pay-per-token bill the subscription displaced, while `cost_usd` is zero.
+    pub counterfactual_api_usd: Decimal,
     pub status: i16,
     pub latency_ms: Option<i32>,
     pub ttft_ms: Option<i32>,

@@ -338,9 +338,9 @@ pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
                 request_id, attempt, principal_id, api_key_id, route_id, account_id,
                 model_id, tier, selection_reason, escalated_from_tier, escalation_gate,
                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-                cost_usd, counterfactual_usd, counterfactual_model_id,
+                cost_usd, counterfactual_usd, counterfactual_model_id, counterfactual_api_usd,
                 status, latency_ms, ttft_ms, streamed
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
             ON CONFLICT DO NOTHING
             RETURNING api_key_id, cost_usd
         )
@@ -372,6 +372,7 @@ pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
     .bind(w.cost_usd)
     .bind(w.counterfactual_usd)
     .bind(&w.counterfactual_model_id)
+    .bind(w.counterfactual_api_usd)
     .bind(w.status)
     .bind(w.latency_ms)
     .bind(w.ttft_ms)
@@ -1152,6 +1153,7 @@ mod tests {
             cost_usd: cost.parse().expect("decimal"),
             counterfactual_usd: Decimal::ZERO,
             counterfactual_model_id: None,
+            counterfactual_api_usd: Decimal::ZERO,
             status: 200,
             latency_ms: Some(10),
             ttft_ms: None,
@@ -1236,6 +1238,7 @@ mod tests {
             cost_usd: cost.parse().expect("decimal"),
             counterfactual_usd: Decimal::ZERO,
             counterfactual_model_id: None,
+            counterfactual_api_usd: Decimal::ZERO,
             status: 200,
             latency_ms: Some(10),
             ttft_ms: None,

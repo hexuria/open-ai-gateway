@@ -26,6 +26,15 @@ pub struct Context {
     /// Recorded now, load-bearing after the ledger's primary key contracts onto
     /// `(request_id, attempt)`. Until then the second row is dropped.
     pub attempt: i16,
+    /// Whether the credential that served this request is a flat-rate seat.
+    ///
+    /// A subscription seat has already been paid for by its monthly fee, so the
+    /// marginal dollar cost of one more request is zero — and recording the
+    /// model's list price as `cost_usd` would put money in the ledger that no
+    /// invoice will ever match. The list price is still worth knowing, as the
+    /// pay-per-token bill the subscription displaced; it goes to
+    /// `counterfactual_api_usd` instead.
+    pub flat_rate: bool,
 }
 
 /// What became of the attempt being recorded.
@@ -88,7 +97,19 @@ fn usage_write(
     fate: Fate,
 ) -> UsageWrite {
     let usage = *outcome.accumulator.usage();
-    let cost = ctx.decision.model.pricing.cost(&usage);
+
+    // What these tokens list for at the served model's own API price. For a
+    // metered credential this *is* the cost; for a flat-rate seat it is the
+    // pay-per-token bill the subscription displaced, and the actual marginal
+    // cost is zero. Recorded on every row so a SUM across mixed traffic is
+    // meaningful: metered rows contribute nothing to (api - cost), seat rows
+    // contribute exactly what the seat saved.
+    let api_equivalent = ctx.decision.model.pricing.cost(&usage);
+    let cost = if ctx.flat_rate {
+        Decimal::ZERO
+    } else {
+        api_equivalent
+    };
 
     // What the same tokens would have cost on the route's top rung. The
     // difference, summed, is the number that justifies the gateway — which is
@@ -143,6 +164,7 @@ fn usage_write(
         cost_usd: cost,
         counterfactual_usd: counterfactual,
         counterfactual_model_id: counterfactual_model,
+        counterfactual_api_usd: api_equivalent,
         status: if outcome.error.is_some() { 502 } else { 200 },
         latency_ms: i32::try_from(outcome.total.as_millis()).ok(),
         ttft_ms: outcome.ttft.and_then(|d| i32::try_from(d.as_millis()).ok()),
@@ -401,6 +423,7 @@ mod tests {
             account: oag_core::AccountId::from_uuid(Uuid::new_v4()),
             started: Instant::now(),
             attempt,
+            flat_rate: false,
         }
     }
 
@@ -424,6 +447,48 @@ mod tests {
             client_gone: false,
             error: None,
         }
+    }
+
+    #[test]
+    fn a_metered_row_prices_actual_and_api_equivalent_identically() {
+        // The invariant that keeps a mixed-traffic SUM honest: on a metered
+        // credential the API-equivalent price *is* the cost, so (api - cost)
+        // is zero and contributes nothing to the subscription-savings figure.
+        let ctx = context(0); // flat_rate: false
+        let row = usage_write(&ctx, &outcome(300), None, false, Fate::Served);
+        assert!(row.cost_usd > Decimal::ZERO);
+        assert_eq!(
+            row.counterfactual_api_usd, row.cost_usd,
+            "a metered row must not look like it saved anything against API pricing"
+        );
+    }
+
+    #[test]
+    fn a_seat_row_costs_nothing_and_books_the_avoided_api_bill() {
+        // A flat-rate seat: the tokens are paid for by the monthly fee, so the
+        // marginal cost is zero, and what would have been the cost becomes the
+        // pay-per-token bill the subscription displaced.
+        let mut ctx = context(0);
+        ctx.flat_rate = true;
+        let row = usage_write(&ctx, &outcome(300), None, false, Fate::Served);
+
+        assert_eq!(
+            row.cost_usd,
+            Decimal::ZERO,
+            "no invoice will match a per-request charge on a flat-rate seat"
+        );
+        assert!(
+            row.counterfactual_api_usd > Decimal::ZERO,
+            "the API bill the seat displaced is the whole point of recording it"
+        );
+        // The subscription's worth on this row is exactly what it displaced.
+        assert_eq!(
+            row.counterfactual_api_usd - row.cost_usd,
+            row.counterfactual_api_usd
+        );
+        // The frontier baseline is still recorded; it is a different question
+        // (what the top rung would have cost) and stays on its own column.
+        assert!(row.counterfactual_usd > Decimal::ZERO);
     }
 
     #[test]
