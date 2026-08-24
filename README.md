@@ -117,6 +117,7 @@ deployment fact rather than a routing rule someone has to remember.
 | | |
 |---|---|
 | [00-architecture.md](docs/00-architecture.md) | The tiers and the request path |
+| [07-running-locally.md](docs/07-running-locally.md) | The three local run modes, and minting the inference vs admin key |
 | [01-deployment.md](docs/01-deployment.md) | Topology, **the seven things that break streaming**, scaling |
 | [02-cost-routing.md](docs/02-cost-routing.md) | Tiers, classification, escalation, budgets |
 | [03-providers.md](docs/03-providers.md) | The adapter contract |
