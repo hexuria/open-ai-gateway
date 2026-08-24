@@ -73,6 +73,22 @@ bootstrap:
       sh -c 'cargo run --quiet -p oag -- admin init --email dev@localhost && \
              cargo run --quiet -p oag -- admin seed-catalog'
 
+# Mint an inference key — for sending requests to :29080. `just key` or
+# `just key name=codex`. This is the key that goes in an SDK / client config.
+key name="cli":
+    @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
+      OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
+      OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
+      cargo run --quiet -p oag -- admin key --email dev@localhost --name {{name}}
+
+# Mint an admin key — for the dashboard and admin API on :29081. `just admin-key`.
+# Deliberately separate from an inference key: an SDK key must not reach admin.
+admin-key name="admin":
+    @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
+      OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
+      OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
+      cargo run --quiet -p oag -- admin key --email dev@localhost --name {{name}} --admin
+
 # Run the gateway against the dev infrastructure.
 serve:
     @set -- $(just _free-ports); pub=$1; adm=$2; \
