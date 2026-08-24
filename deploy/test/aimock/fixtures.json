@@ -1,0 +1,20 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": "hello" },
+      "response": {
+        "content": "dialect mock",
+        "usage": {
+          "input_tokens": 100,
+          "output_tokens": 12,
+          "prompt_tokens": 100,
+          "completion_tokens": 12,
+          "promptTokenCount": 100,
+          "candidatesTokenCount": 12
+        }
+      },
+      "chunkSize": 8,
+      "latency": 0
+    }
+  ]
+}

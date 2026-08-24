@@ -5,8 +5,8 @@ default:
 
 compose := "docker compose -f deploy/compose/dev.yml"
 stack   := "docker compose -f deploy/compose/stack.yml"
-dev_db  := "postgres://oag:oag@127.0.0.1:5452/oag"
-dev_rd  := "redis://127.0.0.1:6399"
+dev_db  := env("OAG_DATABASE__URL", "postgres://oag:oag@127.0.0.1:5452/oag")
+dev_rd  := env("OAG_REDIS__URL", "redis://127.0.0.1:6399")
 
 # Local dev ports. Deliberately not 8080/8081, which collide with roughly every
 # other dev server, and deliberately in the 1024–32768 band: macOS hands out
@@ -163,6 +163,25 @@ verify:
 # A rolling restart severing no live stream, and every drained stream metered.
 verify-k8s:
     @./deploy/test/kind-verify.sh
+
+# Circuit breaker end to end against the Python mock. Two 408s trip it; the
+# third request is refused without another upstream call. No credentials.
+verify-breakers:
+    @./deploy/test/breaker-verify.sh
+
+# OpenAI and Gemini adapters against aimock. Needs Node (`npx`). Dummy keys.
+verify-dialects:
+    @./deploy/test/dialects-verify.sh
+
+# Bedrock event-stream against VidaiMock's independent encoder. Needs Docker.
+verify-bedrock:
+    @./deploy/test/bedrock-verify.sh
+
+# OpenAI Chat Completions client over the Anthropic Python mock. The hub, not
+# a native adapter: `just verify` is Anthropic-to-Anthropic and `verify-dialects`
+# is OpenAI-to-OpenAI. No extra runtime.
+verify-translate:
+    @./deploy/test/translate-verify.sh
 
 # Used by local-verify.sh. Kept here so there is one definition of the dev
 # environment rather than a second copy inside a shell script.
