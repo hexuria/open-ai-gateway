@@ -1,0 +1,44 @@
+# Local "GCP" for the gcp-cloudrun stack, via floci (https://floci.io).
+#
+# floci-gcp runs Cloud Run containers for real (Docker-backed), so `terraform
+# apply` of stacks/gcp-cloudrun against it actually starts the OAG image and
+# serves traffic — a full deploy rehearsal with no cloud account. Postgres and
+# Redis run here because floci is Docker-backed for Cloud SQL but not for
+# Memorystore, and the OAG container reaches them by name on this network.
+#
+# Driven by deploy/floci/deploy.sh — see deploy/floci/README.md.
+name: oag-floci
+
+services:
+  floci-gcp:
+    image: floci/floci-gcp:latest
+    ports: ["4588:4588"]
+    volumes:
+      # Real Cloud Run execution: floci spawns the OAG container itself.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      FLOCI_GCP_HOSTNAME: floci-gcp
+      FLOCI_GCP_BASE_URL: http://floci-gcp:4588
+      # The Cloud Run container floci spawns joins THIS compose network, so it
+      # resolves postgres/redis by name.
+      FLOCI_GCP_SERVICES_DOCKER_NETWORK: oag-floci_default
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: oag
+      POSTGRES_PASSWORD: oag
+      POSTGRES_DB: oag
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "oag"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:8-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
