@@ -89,13 +89,17 @@ impl ProviderAdapter for OpenAICompatAdapter {
         &self,
         credential: &oag_core::credential::SecretMaterial,
     ) -> Result<Option<oag_core::credential::SecretMaterial>> {
-        // Of the five providers this adapter serves, only xAI issues
-        // subscription OAuth tokens. The others hold static keys, for which
-        // "nothing to refresh" is the correct answer.
-        if self.provider == Provider::XAI {
-            crate::xai_oauth::refresh(credential, &self.auth_base).await
-        } else {
-            Ok(None)
+        // Two of these providers issue subscription OAuth tokens; the rest hold
+        // static keys, for which "nothing to refresh" is the correct answer.
+        // Both OAuth paths no-op on a credential with no refresh token, so a
+        // plain OpenAI or xAI API key falls through them safely.
+        match self.provider {
+            Provider::XAI => crate::xai_oauth::refresh(credential, &self.auth_base).await,
+            Provider::OpenAI => {
+                crate::openai_oauth::refresh(credential, crate::openai_oauth::DEFAULT_TOKEN_URL)
+                    .await
+            }
+            _ => Ok(None),
         }
     }
 }
@@ -156,6 +160,7 @@ mod tests {
             expires_at: None,
             version: 0,
             client_id: None,
+            account_id: None,
         }
     }
 

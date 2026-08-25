@@ -233,6 +233,7 @@ mod tests {
             expires_at: None,
             version: 0,
             client_id: None,
+            account_id: None,
         }
     }
 

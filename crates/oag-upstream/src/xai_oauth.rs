@@ -40,6 +40,7 @@ impl GrokSession {
             expires_at: self.expires_at,
             version: 0,
             client_id: self.client_id,
+            account_id: None,
         }
     }
 }
@@ -220,6 +221,7 @@ pub async fn refresh(
         // The caller owns the version bump; see `refresh_locked`.
         version: credential.version,
         client_id: credential.client_id.clone(),
+        account_id: credential.account_id.clone(),
     }))
 }
 
@@ -308,6 +310,7 @@ mod tests {
             expires_at: None,
             version: 0,
             client_id: None,
+            account_id: None,
         };
         let refreshed = refresh(&material, "http://127.0.0.1:9").await.expect("ok");
         assert!(
@@ -324,6 +327,7 @@ mod tests {
             expires_at: None,
             version: 0,
             client_id: None,
+            account_id: None,
         };
         let err = refresh(&material, "http://127.0.0.1:9").await.unwrap_err();
         assert!(err.to_string().contains("--from-grok"), "{err}");
@@ -383,6 +387,7 @@ mod tests {
             expires_at: Some(0),
             version: 3,
             client_id: Some("client-abc".to_owned()),
+            account_id: None,
         }
     }
 
