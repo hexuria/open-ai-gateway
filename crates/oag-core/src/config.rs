@@ -234,6 +234,21 @@ pub struct GatewayConfig {
     /// seat is on a route ladder.
     #[serde(default)]
     pub codex: CodexConfig,
+    /// Advertise every model a second time under an `anthropic/`-prefixed id.
+    ///
+    /// Claude Code's gateway model discovery
+    /// (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) caches `/v1/models` and
+    /// then drops every id that does not match `/^(claude|anthropic)/i`. A route
+    /// serving `xai/grok-4.6` and `oag/auto` therefore populates an *empty*
+    /// picker, with nothing anywhere saying why. The prefixed twin is what
+    /// survives that filter; `display_name` carries the readable truth.
+    ///
+    /// Off by default because it doubles the list for every other client, which
+    /// is a change no existing consumer asked for. Turning it off again is
+    /// safe: the aliases are accepted on inference regardless, so a cache
+    /// written while it was on does not start failing.
+    #[serde(default)]
+    pub claude_code_model_aliases: bool,
 }
 
 impl Default for GatewayConfig {
@@ -249,6 +264,7 @@ impl Default for GatewayConfig {
             bedrock_region: default_bedrock_region(),
             provider_base_urls: std::collections::BTreeMap::new(),
             codex: CodexConfig::default(),
+            claude_code_model_aliases: false,
         }
     }
 }

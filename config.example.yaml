@@ -80,6 +80,13 @@ gateway:
   # codex:
   #   instructions_path: deploy/codex-instructions.txt
   #   user_agent: "codex_cli_rs/0.147.0"
+  # Advertise every model a second time under an `anthropic/`-prefixed id.
+  # Claude Code's gateway model discovery caches /v1/models and then drops
+  # every id that does not match /^(claude|anthropic)/i, so without this its
+  # picker is empty on any route that is not serving Anthropic models. Off by
+  # default because it doubles the listing for every other client. See
+  # docs/03-providers.md.
+  # claude_code_model_aliases: true
 
 telemetry:
   log_filter: "info"

@@ -1,5 +1,6 @@
 //! The inference request path.
 
+pub mod alias;
 pub mod authn;
 pub mod count_tokens;
 pub mod meter;
@@ -215,7 +216,22 @@ async fn handle(
         _ => anthropic::parse_request(&wire)?,
     };
 
-    let plan = plan_request(state, auth, &canonical, headers).await?;
+    // One snapshot, taken here rather than inside `plan_request`, because the
+    // normalisation below and the routing that follows it must agree about what
+    // the catalog holds: a refresh landing between two snapshots could strip a
+    // name down to a model the router then cannot find.
+    let catalog = state.catalog().await;
+
+    // The single place an inbound model name is normalised. Claude Code only
+    // keeps discovered ids that start with `anthropic`, so the listing offers
+    // prefixed twins and this is where one comes back. Everything downstream —
+    // `virtual_tier`, the passthrough lookup, the ledger — sees the canonical
+    // name and none of them needs to know the alias exists. See [`alias`].
+    if let Some(canonical_name) = alias::canonicalise(&canonical.model, &catalog) {
+        canonical.model = canonical_name;
+    }
+
+    let plan = plan_request(state, auth, &canonical, headers, catalog).await?;
 
     tracing::info!(
         %request_id,
@@ -517,11 +533,12 @@ async fn plan_request(
     auth: &oag_store::AuthContext,
     canonical: &oag_proto::CanonicalRequest,
     headers: &HeaderMap,
+    catalog: Arc<oag_router::Catalog>,
 ) -> Result<Plan> {
     let (route, policy) = policy_for(state, auth).await?;
 
     // Throttle before doing any of the expensive work below — classification,
-    // catalog lookup, credential selection. A request that is going to be
+    // model selection, credential selection. A request that is going to be
     // refused should be refused cheaply.
     if let Some(rpm) = route.rpm_limit
         && let Ok(rpm) = u32::try_from(rpm)
@@ -529,8 +546,6 @@ async fn plan_request(
     {
         return Err(Error::RateLimited { retry_after });
     }
-
-    let catalog = state.catalog().await;
 
     let mut signal = canonical.signal();
 

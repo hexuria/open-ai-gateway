@@ -179,6 +179,51 @@ Get capabilities right. They are used to *reject* a rung before sending, so a
 vision request never reaches a text-only model — a decision that is free to make
 correctly and costs a round trip and a 400 to get wrong.
 
+## Claude Code model discovery
+
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` makes the CLI GET the gateway's
+`/v1/models`, cache it at `~/.claude/cache/gateway-models.json`, and build its
+picker from that. Two details of the cache builder decide whether any of this
+works:
+
+- It **discards every id that does not match `/^(claude|anthropic)/i`**. Silently.
+  A gateway whose ids are `xai/grok-4.6` and `oag/auto` populates an empty
+  picker and says nothing.
+- It only uses the cache when the cached `baseUrl` is byte-identical to
+  `ANTHROPIC_BASE_URL`, and only refreshes it while holding a credential.
+
+So `gateway.claude_code_model_aliases` advertises each entitled model a *second*
+time under `anthropic/<canonical-id>` — `xai/grok-4.6` becomes
+`anthropic/xai/grok-4.6`, `oag/auto` becomes `anthropic/oag/auto`. A model whose
+canonical id already passes the filter is left alone rather than becoming
+`anthropic/anthropic/claude-opus-5`. The readable name lives in `display_name`
+("xAI: grok-4.6"), and `oag.alias_of` on the twin names the canonical id so a
+dashboard does not count one model twice.
+
+Setup:
+
+```yaml
+gateway:
+  claude_code_model_aliases: true
+```
+
+```sh
+export ANTHROPIC_BASE_URL=https://gateway.example.com
+export ANTHROPIC_AUTH_TOKEN=oag_live_...
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+```
+
+Off by default: it doubles the listing for every other client, and nobody else
+asked for it. `?claude_code=1` forces the aliases on for one call, so you can
+`curl` exactly what the CLI would cache without flipping the flag for everyone.
+
+The aliases are **accepted on inference whether or not the flag is on** — a
+cache written while it was on must not start failing when it is turned off. An
+inbound name is resolved as-is first and only stripped when the full string
+names nothing, so the real `anthropic/claude-opus-5` still resolves to itself
+and an unknown model is still reported as unknown. The ledger records the
+canonical id either way.
+
 ## Testing one
 
 Record real request/response pairs as fixtures and assert the round trip through
