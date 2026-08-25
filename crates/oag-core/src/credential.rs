@@ -96,6 +96,12 @@ pub struct SecretMaterial {
     /// token presented by a different client, so it travels with the pair.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub client_id: Option<String>,
+    /// The provider's account identifier, sent as a request header on some
+    /// subscription APIs (Codex's `ChatGPT-Account-Id`). Not a secret, but it
+    /// is bound to this credential, so it lives with it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[zeroize(skip)]
+    pub account_id: Option<String>,
 }
 
 impl fmt::Debug for SecretMaterial {
@@ -109,6 +115,7 @@ impl fmt::Debug for SecretMaterial {
             .field("expires_at", &self.expires_at)
             .field("version", &self.version)
             .field("client_id", &self.client_id)
+            .field("account_id", &self.account_id)
             .finish()
     }
 }

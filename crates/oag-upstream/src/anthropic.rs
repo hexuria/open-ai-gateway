@@ -125,6 +125,7 @@ mod tests {
             expires_at: None,
             version: 0,
             client_id: None,
+            account_id: None,
         }
     }
 
@@ -135,6 +136,7 @@ mod tests {
             expires_at: Some(9_999_999_999),
             version: 1,
             client_id: None,
+            account_id: None,
         }
     }
 

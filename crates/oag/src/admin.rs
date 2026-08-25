@@ -55,8 +55,8 @@ pub enum AdminCommand {
     AddAccount {
         #[arg(long)]
         name: String,
-        /// Not needed with `--from-grok`, which knows its provider.
-        #[arg(long, required_unless_present = "from_grok")]
+        /// Not needed with `--from-grok`/`--from-codex`, which know their provider.
+        #[arg(long, required_unless_present_any = ["from_grok", "from_codex"])]
         provider: Option<String>,
         /// The provider API key. Read from `OAG_ACCOUNT_SECRET` if omitted, so it
         /// need not appear in shell history or the process table.
@@ -64,17 +64,21 @@ pub enum AdminCommand {
             long,
             env = "OAG_ACCOUNT_SECRET",
             hide_env_values = true,
-            required_unless_present = "from_grok",
-            conflicts_with = "from_grok"
+            required_unless_present_any = ["from_grok", "from_codex"],
+            conflicts_with_all = ["from_grok", "from_codex"]
         )]
         secret: Option<String>,
         /// Import every signed-in Grok CLI session as an xAI OAuth credential.
         /// Reads `~/.grok/auth.json` (or `--auth-file`), never writes it.
         #[arg(long)]
         from_grok: bool,
-        /// Where to read Grok CLI sessions from. Repeatable; the first file a
-        /// token appears in wins.
-        #[arg(long, requires = "from_grok")]
+        /// Import the signed-in Codex CLI session as an OpenAI OAuth credential.
+        /// Reads `~/.codex/auth.json` (or `--auth-file`), never writes it.
+        #[arg(long, conflicts_with = "from_grok")]
+        from_codex: bool,
+        /// Where to read CLI sessions from. Repeatable; the first file a token
+        /// appears in wins.
+        #[arg(long)]
         auth_file: Vec<String>,
         #[arg(long, default_value = "default")]
         route: String,
@@ -88,12 +92,12 @@ pub enum AdminCommand {
         owner_email: Option<String>,
         /// Put an OAuth seat in the shared pool anyway. Deliberate opt-in:
         /// subscription seats are sanctioned for the holder's own use, so the
-        /// default for `--from-grok` is per-principal binding.
-        #[arg(long, requires = "from_grok", conflicts_with = "owner_email")]
+        /// default for an imported seat is per-principal binding.
+        #[arg(long, conflicts_with = "owner_email")]
         shared: bool,
         /// The seat's flat monthly price in USD. Lets the dashboard net a
         /// subscription's saved API spend against what it costs. Applies per
-        /// imported seat with `--from-grok`.
+        /// imported seat.
         #[arg(long)]
         monthly_cost: Option<Decimal>,
     },
@@ -155,6 +159,7 @@ pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Resu
             provider,
             secret,
             from_grok,
+            from_codex,
             auth_file,
             route,
             max_concurrency,
@@ -165,6 +170,20 @@ pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Resu
         } => {
             if from_grok {
                 import_grok(
+                    db,
+                    kek,
+                    &name,
+                    &auth_file,
+                    &route,
+                    max_concurrency,
+                    priority,
+                    owner_email.as_deref(),
+                    shared,
+                    monthly_cost,
+                )
+                .await
+            } else if from_codex {
+                import_codex(
                     db,
                     kek,
                     &name,
@@ -366,6 +385,7 @@ async fn add_account(
         expires_at: None,
         version: 0,
         client_id: None,
+        account_id: None,
     };
 
     let owner_id = find_owner(db, owner_email).await?;
@@ -480,6 +500,109 @@ async fn import_grok(
     );
     println!("  auth.json was read, not written; the Grok CLI stays signed in");
     Ok(())
+}
+
+/// Import the signed-in Codex CLI session as an OpenAI OAuth credential.
+///
+/// The mirror of `import_grok` for a ChatGPT/Codex subscription: reads the
+/// CLI's `auth.json` and never writes it, storing the OAuth pair (and the
+/// account id Codex sends as a header) sealed in the `account` row, where
+/// `ensure_fresh` rotates it.
+#[allow(clippy::too_many_arguments)]
+async fn import_codex(
+    db: &Db,
+    kek: &Kek,
+    name: &str,
+    auth_files: &[String],
+    route: &str,
+    max_concurrency: i32,
+    priority: i16,
+    owner_email: Option<&str>,
+    shared: bool,
+    monthly_cost: Option<Decimal>,
+) -> Result<()> {
+    // Same stance as a Grok seat: sanctioned for the holder's own use, so it
+    // binds to a principal by default and pooling is the explicit choice.
+    if owner_email.is_none() && !shared {
+        return Err(oag_core::Error::Config(
+            "a subscription seat binds to one principal by default: pass \
+             --owner-email <email>, or --shared to pool it deliberately"
+                .to_owned(),
+        ));
+    }
+
+    let paths: Vec<String> = if auth_files.is_empty() {
+        codex_auth_paths()?
+    } else {
+        auth_files.to_vec()
+    };
+
+    // The first path that carries a usable OAuth session wins; an API-key-only
+    // auth.json parses to None and is skipped.
+    let mut session = None;
+    let mut tried = Vec::new();
+    for path in &paths {
+        let Ok(json) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        tried.push(path.clone());
+        if let Some(s) = oag_upstream::openai_oauth::session_from_json(&json)
+            .map_err(|e| oag_core::Error::Config(format!("{path}: {e}")))?
+        {
+            session = Some(s);
+            break;
+        }
+    }
+    let Some(session) = session else {
+        return Err(oag_core::Error::Config(format!(
+            "no signed-in Codex OAuth session in {}; run `codex` and log in with ChatGPT first",
+            if tried.is_empty() {
+                paths.join(", ")
+            } else {
+                tried.join(", ")
+            }
+        )));
+    };
+
+    let owner_id = find_owner(db, owner_email).await?;
+    let id = insert_account(
+        db,
+        kek,
+        name,
+        oag_core::Provider::OpenAI,
+        "oauth",
+        &session.into_material(),
+        route,
+        max_concurrency,
+        priority,
+        owner_id,
+        monthly_cost,
+    )
+    .await?;
+
+    println!("account {name} (openai, oauth) -> {id}");
+    println!(
+        "  sealed at rest, attached to route '{route}', {}",
+        scope_of(owner_id)
+    );
+    println!("  auth.json was read, not written; the Codex CLI stays signed in");
+    Ok(())
+}
+
+/// The default places a Codex CLI session lives, in the order the CLI itself
+/// resolves them: `$CODEX_HOME`, then `~/.codex`, then `~/.config/codex`.
+fn codex_auth_paths() -> Result<Vec<String>> {
+    if let Ok(home) = std::env::var("CODEX_HOME")
+        && !home.is_empty()
+    {
+        return Ok(vec![format!("{home}/auth.json")]);
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| oag_core::Error::Config("HOME is not set; pass --auth-file".to_owned()))?;
+    Ok(vec![
+        format!("{home}/.codex/auth.json"),
+        format!("{home}/.config/codex/auth.json"),
+    ])
 }
 
 async fn find_owner(db: &Db, owner_email: Option<&str>) -> Result<Option<Uuid>> {
