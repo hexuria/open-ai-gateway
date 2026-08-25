@@ -120,7 +120,7 @@ deployment fact rather than a routing rule someone has to remember.
 | [07-running-locally.md](docs/07-running-locally.md) | The three local run modes, and minting the inference vs admin key |
 | [01-deployment.md](docs/01-deployment.md) | Topology, **the seven things that break streaming**, scaling |
 | [02-cost-routing.md](docs/02-cost-routing.md) | Tiers, classification, escalation, budgets |
-| [03-providers.md](docs/03-providers.md) | The adapter contract |
+| [03-providers.md](docs/03-providers.md) | **Which provider takes a key, a subscription, or both** — and the adapter contract |
 | [04-cloud.md](docs/04-cloud.md) | **Cloud deployment** — Kubernetes, Cloud Run, Fargate, Container Apps, Cloudflare |
 | [05-services.md](docs/05-services.md) | Capability-service catalog — register, health-check, deep-link |
 | [compliance.md](docs/compliance.md) | Credential kinds and their standing |
