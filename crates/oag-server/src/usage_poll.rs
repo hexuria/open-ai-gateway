@@ -48,6 +48,12 @@ async fn poll_once(state: &AppState) {
         let Ok(provider) = row.provider.parse() else {
             continue;
         };
+        // The kind, not just the provider, decides whether there is a quota to
+        // read: a Codex seat and an ordinary OpenAI API key are both
+        // `Provider::OpenAI`, and only the first has an allowance.
+        let Some(kind) = oag_core::credential::CredentialKind::from_column(&row.kind) else {
+            continue;
+        };
         // Reuse the same fleet-safe refresh the request path uses, so polling a
         // seat with a near-expiry token refreshes it once rather than 401ing.
         let material = match ensure_fresh(state, &row).await {
@@ -58,7 +64,7 @@ async fn poll_once(state: &AppState) {
             }
         };
 
-        match oag_upstream::usage::fetch(provider, &material).await {
+        match oag_upstream::usage::fetch(provider, kind, &material).await {
             Ok(Some(snap)) => {
                 let resets = snap
                     .resets_at
@@ -87,7 +93,10 @@ async fn poll_once(state: &AppState) {
                 }
                 tracing::debug!(%account, remaining = snap.remaining_pct, "usage polled");
             }
-            // No usage API wired for this provider — nothing to record.
+            // Either no usage API for this credential, or a body we could not
+            // read a percentage out of. Both leave the account's usage columns
+            // exactly as they were: NULL means "unknown", and inventing a 0%
+            // would bench a working seat while a 100% would hide a spent one.
             Ok(None) => {}
             Err(e) => tracing::debug!(%account, error = %e, "usage poll: provider read failed"),
         }

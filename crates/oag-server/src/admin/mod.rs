@@ -18,11 +18,13 @@
 
 pub mod auth;
 pub mod models;
+pub mod period;
 pub mod services;
 pub mod write;
 
 pub use auth::{AdminActor, require_admin_layer};
 pub use models::{list_models, update_model};
+pub use period::{Window, WindowView};
 pub use services::{
     check_service, create_service, disable_service, enable_service, list_services, update_service,
 };
@@ -150,7 +152,7 @@ type UsageRowTuple = (
 
 type SummaryTotals = (i64, rust_decimal::Decimal, rust_decimal::Decimal, i64, i64);
 
-// name, requests, api-value, monthly-fee, remaining-pct, window-label.
+// name, requests, api-value, monthly-fee, remaining-pct, window-label, created.
 type SeatTuple = (
     String,
     i64,
@@ -158,6 +160,7 @@ type SeatTuple = (
     Option<rust_decimal::Decimal>,
     Option<rust_decimal::Decimal>,
     Option<String>,
+    time::OffsetDateTime,
 );
 
 type TierTotals = (String, i64, rust_decimal::Decimal, rust_decimal::Decimal);
@@ -165,6 +168,11 @@ type TierTotals = (String, i64, rust_decimal::Decimal, rust_decimal::Decimal);
 /// The headline numbers: what was spent, and what it would have cost.
 #[derive(Debug, Serialize)]
 pub struct Summary {
+    /// Which window these numbers were computed over, resolved to instants.
+    /// Every figure below is meaningless without it, and a caller that has to
+    /// reconstruct the window from the parameters it *thinks* it sent will
+    /// eventually get that wrong — so the answer carries its own question.
+    pub window: WindowView,
     pub requests: i64,
     pub spent_usd: String,
     pub counterfactual_usd: String,
@@ -194,9 +202,16 @@ pub struct SeatRow {
     /// prices: `SUM(counterfactual_api_usd)` for its rows. The bill the flat
     /// fee displaced.
     pub api_value_usd: String,
-    /// The seat's own flat fee, prorated to the window. `None` when no monthly
-    /// price was recorded — an unpriced seat is not a free one, so its saving
-    /// cannot be computed rather than being shown as the whole API value.
+    /// The seat's own flat fee, prorated to the window in **calendar months**:
+    /// a full calendar month costs one month's fee whether it has 28 days or
+    /// 31, and a partial month the fraction of that month's own length. Only
+    /// counted from `account.created_at`, because a fee for a window in which
+    /// the gateway did not yet know the seat would be booked as a loss the
+    /// subscription never made.
+    ///
+    /// `None` when no monthly price was recorded — an unpriced seat is not a
+    /// free one, so its saving cannot be computed rather than being shown as
+    /// the whole API value.
     pub plan_cost_usd: Option<String>,
     /// `api_value_usd - plan_cost_usd`: what this one subscription saved, net of
     /// its fee. `None` when the seat is unpriced. Negative means this seat's
@@ -224,12 +239,6 @@ pub struct TierRow {
     pub saved_usd: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct Window {
-    /// Days to look back. Defaults to the current month.
-    pub days: Option<i32>,
-}
-
 /// One row per subscription seat, each metered on its own.
 ///
 /// Each flat-rate account (`kind='oauth'`) is its own row so three Grok seats
@@ -238,7 +247,7 @@ pub struct Window {
 /// predicate on the join (`cost_usd = 0 AND counterfactual_api_usd > 0`) counts
 /// only what the seat actually served. Failures degrade to an empty list — a
 /// missing subscriptions table should not take down the whole summary.
-async fn seat_summaries(db: &oag_store::Db, days: i32) -> Vec<SeatRow> {
+async fn seat_summaries(db: &oag_store::Db, window: &period::Resolved) -> Vec<SeatRow> {
     let seats: Vec<SeatTuple> = sqlx::query_as(
         r"
             SELECT a.name,
@@ -246,55 +255,73 @@ async fn seat_summaries(db: &oag_store::Db, days: i32) -> Vec<SeatRow> {
                    COALESCE(SUM(u.counterfactual_api_usd), 0),
                    a.monthly_cost_usd,
                    a.usage_remaining_pct,
-                   a.usage_window_label
+                   a.usage_window_label,
+                   a.created_at
             FROM account a
             LEFT JOIN usage_event u
                    ON u.account_id = a.id
-                  AND u.occurred_at > now() - make_interval(days => $1)
+                  AND ($1::timestamptz IS NULL OR u.occurred_at >= $1)
+                  AND ($2::timestamptz IS NULL OR u.occurred_at <  $2)
                   AND u.cost_usd = 0
                   AND u.counterfactual_api_usd > 0
             WHERE a.kind = 'oauth'
-            GROUP BY a.id, a.name, a.monthly_cost_usd, a.usage_remaining_pct, a.usage_window_label
+            GROUP BY a.id, a.name, a.monthly_cost_usd, a.usage_remaining_pct,
+                     a.usage_window_label, a.created_at
             ORDER BY COALESCE(SUM(u.counterfactual_api_usd), 0) DESC, a.name
             ",
     )
-    .bind(days)
+    .bind(window.start)
+    .bind(window.end)
     .fetch_all(db.pool())
     .await
     .unwrap_or_default();
 
-    let day_frac = rust_decimal::Decimal::from(days) / rust_decimal::Decimal::from(30);
     seats
         .into_iter()
-        .map(|(name, requests, api_value, monthly, remaining, window)| {
-            // Prorate each seat's own fee to the window. An unpriced seat yields
-            // None for both cost and saving — its API value is still shown, but
-            // a saving cannot be invented from a fee nobody entered.
-            let (plan_cost_usd, saved_usd) = match monthly {
-                Some(m) => {
-                    let plan = m * day_frac;
-                    (
-                        Some(format!("{plan:.4}")),
-                        Some(format!("{:.4}", api_value - plan)),
-                    )
+        .map(
+            |(name, requests, api_value, monthly, remaining, label, created_at)| {
+                // Prorate each seat's own fee over the calendar months the window
+                // actually covers for *this* seat. An unpriced seat yields None for
+                // both cost and saving — its API value is still shown, but a saving
+                // cannot be invented from a fee nobody entered.
+                let (plan_cost_usd, saved_usd) = match (monthly, window.seat_months(created_at)) {
+                    (Some(m), Some(months)) => {
+                        let plan = m * months;
+                        (
+                            Some(format!("{plan:.4}")),
+                            // Derived here from the exact Decimals rather than from
+                            // the rounded strings, so the row's own three figures
+                            // agree with each other to the cent.
+                            Some(format!("{:.4}", api_value - plan)),
+                        )
+                    }
+                    _ => (None, None),
+                };
+                SeatRow {
+                    name,
+                    requests,
+                    api_value_usd: format!("{api_value:.4}"),
+                    plan_cost_usd,
+                    saved_usd,
+                    remaining_pct: remaining.map(|r| format!("{r:.0}")),
+                    usage_window: label,
                 }
-                None => (None, None),
-            };
-            SeatRow {
-                name,
-                requests,
-                api_value_usd: format!("{api_value:.4}"),
-                plan_cost_usd,
-                saved_usd,
-                remaining_pct: remaining.map(|r| format!("{r:.0}")),
-                usage_window: window,
-            }
-        })
+            },
+        )
         .collect()
 }
 
-pub async fn summary(State(state): State<Arc<AppState>>, Query(window): Query<Window>) -> Response {
-    let days = window.days.unwrap_or(30).clamp(1, 3650);
+pub async fn summary(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<period::Window>,
+) -> Response {
+    let window = match period::resolve(&query, time::OffsetDateTime::now_utc()) {
+        Ok(w) => w,
+        // A window nobody can name is not a window to guess at: an operator who
+        // typed `period=quarter` and silently got a rolling 30 days would trust
+        // the answer to a question they did not ask.
+        Err(message) => return invalid(&message),
+    };
 
     // The headline is per-token traffic only. A seat row (cost 0, real
     // API-equivalent price) is flat-rate, so folding it in here would let its
@@ -304,17 +331,21 @@ pub async fn summary(State(state): State<Arc<AppState>>, Query(window): Query<Wi
         r"
             -- Explicit ::bigint on the token sums: SUM over a bigint column
             -- returns numeric in Postgres, which will not decode into i64.
+            -- Half-open bounds, either side NULL for unbounded: see
+            -- `admin::period` for why a closed end double-counts a boundary row.
             SELECT COUNT(*),
                    COALESCE(SUM(cost_usd), 0),
                    COALESCE(SUM(counterfactual_usd), 0),
                    COALESCE(SUM(cache_read_tokens), 0)::bigint,
                    COALESCE(SUM(input_tokens + cache_read_tokens), 0)::bigint
             FROM usage_event
-            WHERE occurred_at > now() - make_interval(days => $1)
+            WHERE ($1::timestamptz IS NULL OR occurred_at >= $1)
+              AND ($2::timestamptz IS NULL OR occurred_at <  $2)
               AND NOT (cost_usd = 0 AND counterfactual_api_usd > 0)
             ",
     )
-    .bind(days)
+    .bind(window.start)
+    .bind(window.end)
     .fetch_one(state.db.pool())
     .await;
 
@@ -332,12 +363,14 @@ pub async fn summary(State(state): State<Arc<AppState>>, Query(window): Query<Wi
                    COALESCE(SUM(cost_usd), 0),
                    COALESCE(SUM(counterfactual_usd), 0)
             FROM usage_event
-            WHERE occurred_at > now() - make_interval(days => $1)
+            WHERE ($1::timestamptz IS NULL OR occurred_at >= $1)
+              AND ($2::timestamptz IS NULL OR occurred_at <  $2)
               AND NOT (cost_usd = 0 AND counterfactual_api_usd > 0)
             GROUP BY tier ORDER BY SUM(counterfactual_usd - cost_usd) DESC
             ",
     )
-    .bind(days)
+    .bind(window.start)
+    .bind(window.end)
     .fetch_all(state.db.pool())
     .await
     .unwrap_or_default();
@@ -349,7 +382,7 @@ pub async fn summary(State(state): State<Arc<AppState>>, Query(window): Query<Wi
         rust_decimal::Decimal::ZERO
     };
 
-    let subscriptions = seat_summaries(&state.db, days).await;
+    let subscriptions = seat_summaries(&state.db, &window).await;
 
     let hit_rate = if prompt > 0 {
         rust_decimal::Decimal::from(cached) / rust_decimal::Decimal::from(prompt)
@@ -359,6 +392,7 @@ pub async fn summary(State(state): State<Arc<AppState>>, Query(window): Query<Wi
     };
 
     Json(Summary {
+        window: window.view(),
         requests,
         spent_usd: format!("{spent:.4}"),
         counterfactual_usd: format!("{counterfactual:.4}"),
