@@ -9,6 +9,10 @@ floci   := "docker compose -f deploy/floci/docker-compose.yml"
 dev_db  := env("OAG_DATABASE__URL", "postgres://oag:oag@127.0.0.1:5452/oag")
 dev_rd  := env("OAG_REDIS__URL", "redis://127.0.0.1:6399")
 
+# LiteLLM's published pricing table, straight from main. Pin a tag here if a
+# reproducible catalog matters more than a current one.
+litellm := "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+
 # Local dev ports. Deliberately not 8080/8081, which collide with roughly every
 # other dev server, and deliberately in the 1024–32768 band: macOS hands out
 # 49152+ for outbound sockets and Linux 32768+, so anything above those can be
@@ -73,6 +77,22 @@ bootstrap:
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
       sh -c 'cargo run --quiet -p oag -- admin init --email dev@localhost && \
              cargo run --quiet -p oag -- admin seed-catalog'
+
+# Refresh the catalog from LiteLLM's live table. Needs network; ~2MB.
+catalog-update:
+    @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
+      OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
+      OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
+      cargo run --quiet -p oag -- admin seed-catalog --from "{{litellm}}"
+
+# A provider's own prices beat LiteLLM's and arrive without a context window,
+# so this writes prices and nothing else: an existing row keeps its window.
+# Overlay a provider's authoritative prices. Needs a credential for it.
+catalog-prices provider="xai":
+    @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
+      OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
+      OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
+      cargo run --quiet -p oag -- admin sync-prices --provider {{provider}}
 
 # Mint an inference key — for sending requests to :29080. `just key` or
 # `just key name=codex`. This is the key that goes in an SDK / client config.

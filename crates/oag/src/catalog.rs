@@ -2,17 +2,23 @@
 //!
 //! The authoritative source is LiteLLM's `model_prices_and_context_window.json`
 //! — the most complete public pricing table, and the one sub2api uses too.
-//! Point `--from` at a downloaded copy.
+//! Point `--from` at a downloaded copy or straight at the published URL.
 //!
 //! The built-in set exists so a fresh install works offline, and is deliberately
 //! small. **Verify the prices before trusting a savings figure**: they are a
 //! starting point, they go stale, and the whole value of the counterfactual
 //! column is that the numbers in it are real.
+//!
+//! A provider that publishes its own price list beats LiteLLM on money and
+//! knows nothing about context windows; `plan_price_sync` is where those two
+//! facts are reconciled.
 
-use oag_core::{Error, Result};
+use oag_core::{Error, Provider, Result};
 use oag_store::ModelRow;
+use oag_upstream::pricing::ModelPrice;
 use rust_decimal::Decimal;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::str::FromStr;
 
 /// One built-in entry, before it becomes a row.
@@ -108,6 +114,63 @@ pub fn builtin() -> Vec<ModelRow> {
         .collect()
 }
 
+/// Load a LiteLLM pricing table from wherever `--from` points.
+///
+/// A path and a URL are the same table; the only difference is who fetches it,
+/// and asking an operator to curl the file into place first was never the
+/// interesting part of the job.
+pub async fn from_litellm(source: &str) -> Result<Vec<ModelRow>> {
+    if is_url(source) {
+        let raw = fetch_text(source).await?;
+        from_litellm_str(&raw, source)
+    } else {
+        from_litellm_file(source)
+    }
+}
+
+/// Whether `--from` names a URL rather than a file.
+///
+/// A scheme prefix and nothing cleverer: `--from` was a path for as long as it
+/// has existed, and a heuristic that sniffs for dots or slashes would turn a
+/// file called `https` — or a relative path on a machine whose files are not
+/// where the operator thought — into an outbound request.
+fn is_url(source: &str) -> bool {
+    source.starts_with("https://") || source.starts_with("http://")
+}
+
+/// GET the pricing table.
+///
+/// A minute is generous for ~2MB over a slow link and still bounded: an
+/// operator watching a seed that has hung has no way to tell it apart from one
+/// that is merely slow, so it must end on its own.
+async fn fetch_text(url: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_mins(1))
+        .build()
+        .map_err(|e| Error::Config(format!("building http client: {e}")))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| Error::Config(format!("fetching {url}: {e}")))?;
+
+    // Named status, because the usual failure is a moved raw.githubusercontent
+    // path answering 404 with a page of HTML, and "expected value at line 1"
+    // sends the operator looking in the wrong place entirely.
+    if !response.status().is_success() {
+        return Err(Error::Config(format!(
+            "fetching {url}: returned {}",
+            response.status()
+        )));
+    }
+
+    response
+        .text()
+        .await
+        .map_err(|e| Error::Config(format!("reading {url}: {e}")))
+}
+
 /// Parse a LiteLLM pricing file.
 ///
 /// Its prices are per *token* rather than per million, which is the one thing
@@ -116,7 +179,15 @@ pub fn builtin() -> Vec<ModelRow> {
 pub fn from_litellm_file(path: &str) -> Result<Vec<ModelRow>> {
     let raw =
         std::fs::read_to_string(path).map_err(|e| Error::Config(format!("reading {path}: {e}")))?;
-    let doc: Value = serde_json::from_str(&raw)?;
+    from_litellm_str(&raw, path)
+}
+
+/// The parser itself, over the bytes, whoever fetched them.
+///
+/// `origin` is only ever printed: an error that does not say which file or URL
+/// was empty of usable models is an error an operator cannot act on.
+fn from_litellm_str(raw: &str, origin: &str) -> Result<Vec<ModelRow>> {
+    let doc: Value = serde_json::from_str(raw)?;
     let Some(map) = doc.as_object() else {
         return Err(Error::Config(
             "pricing file is not a JSON object".to_owned(),
@@ -183,10 +254,93 @@ pub fn from_litellm_file(path: &str) -> Result<Vec<ModelRow>> {
 
     if out.is_empty() {
         return Err(Error::Config(format!(
-            "no models in {path} matched a provider this gateway has an adapter for"
+            "no models in {origin} matched a provider this gateway has an adapter for"
         )));
     }
     Ok(out)
+}
+
+/// What a model no catalog seed has ever described is assumed to hold.
+///
+/// A provider price API states no context window, and xAI's
+/// `long_context_threshold` is a price tier rather than a window, so a new row
+/// has to guess. Understating is the safe direction: `ModelSpec::satisfies`
+/// only ever *rejects* a model whose window is too small, so a low guess costs
+/// a routing opportunity while a high guess costs a 400 from upstream on the
+/// one request that mattered. 131072 is the smallest window any current Grok
+/// model has. A LiteLLM seed replaces it with the real number, and a later
+/// price sync leaves that number alone.
+const ASSUMED_CONTEXT_WINDOW: i32 = 131_072;
+
+/// Likewise conservative. Only the `/v1/models` listing reads this field — the
+/// router takes its output budget from the request — so an understatement is
+/// visible to a client and dangerous to nothing.
+const ASSUMED_MAX_OUTPUT_TOKENS: i32 = 8_192;
+
+/// One catalog write a native price sync wants to make.
+#[derive(Debug)]
+pub enum PriceSync {
+    /// The catalog already knows this model: change the prices and nothing
+    /// else. Everything a price API cannot see — the context window above all —
+    /// is already right in that row and must survive the sync.
+    Reprice {
+        id: String,
+        input_per_mtok: Decimal,
+        output_per_mtok: Decimal,
+        cache_read_per_mtok: Option<Decimal>,
+    },
+    /// New to the catalog, so there is a whole row to invent around the prices.
+    Insert(ModelRow),
+}
+
+/// Decide what a provider's stated prices should do to the catalog.
+///
+/// Pure, and separate from the writes, because the interesting property here is
+/// not that it talks to Postgres: it is that a model the catalog already has
+/// comes back as `Reprice`, which cannot touch a context window, no matter what
+/// the price payload did or did not say.
+#[must_use]
+pub fn plan_price_sync(
+    provider: Provider,
+    prices: &[ModelPrice],
+    known: &HashSet<String>,
+) -> Vec<PriceSync> {
+    prices
+        .iter()
+        .map(|p| {
+            let id = format!("{provider}/{}", p.upstream_name);
+            if known.contains(&id) {
+                return PriceSync::Reprice {
+                    id,
+                    input_per_mtok: p.input_per_mtok,
+                    output_per_mtok: p.output_per_mtok,
+                    cache_read_per_mtok: p.cache_read_per_mtok,
+                };
+            }
+            PriceSync::Insert(ModelRow {
+                id,
+                provider: provider.as_str().to_owned(),
+                upstream_name: p.upstream_name.clone(),
+                input_per_mtok: p.input_per_mtok,
+                output_per_mtok: p.output_per_mtok,
+                cache_read_per_mtok: p.cache_read_per_mtok,
+                // Nobody quotes a cache *write* price here; a derived one would
+                // be a number the ledger cannot defend.
+                cache_write_per_mtok: None,
+                context_window: ASSUMED_CONTEXT_WINDOW,
+                max_output_tokens: ASSUMED_MAX_OUTPUT_TOKENS,
+                supports_vision: p.supports_vision,
+                // Only what the payload proves. A price list does not mention
+                // tools or reasoning, and claiming them makes the router pick a
+                // model that then refuses the request; claiming a prompt cache
+                // the model lacks makes the ledger bill cache reads that never
+                // happened. A LiteLLM seed fills these in for real.
+                supports_tools: false,
+                supports_reasoning: false,
+                supports_prompt_cache: p.cache_read_per_mtok.is_some(),
+            })
+        })
+        .collect()
 }
 
 /// Read a JSON number as an exact `Decimal`.
@@ -319,6 +473,123 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].upstream_name, "real-thing");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_from_value_with_a_scheme_is_fetched_and_anything_else_is_opened() {
+        // The two failures this guards: a path that turns into a network call
+        // (and a confusing DNS error), and a URL handed to the filesystem (and
+        // a "no such file" naming something that was never a file).
+        assert!(is_url(
+            "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
+        ));
+        assert!(is_url("http://localhost:8080/prices.json"));
+        assert!(!is_url("./model_prices.json"));
+        assert!(!is_url("/etc/oag/model_prices.json"));
+        assert!(!is_url("https"));
+        // Not a scheme, just a file whose name starts with one.
+        assert!(!is_url("https-prices.json"));
+    }
+
+    #[test]
+    fn a_url_and_a_file_parse_to_the_same_rows() {
+        // The split into a fetcher and a parser must not have changed what the
+        // parser does; the file path is the behaviour that already shipped.
+        let file = serde_json::json!({
+            "claude-opus-5": {
+                "litellm_provider": "anthropic",
+                "input_cost_per_token": 0.000_015,
+                "output_cost_per_token": 0.000_075,
+                "max_input_tokens": 400_000
+            }
+        })
+        .to_string();
+        let path = std::env::temp_dir().join("oag-litellm-origin.json");
+        std::fs::write(&path, &file).expect("write");
+
+        let from_disk = from_litellm_file(path.to_str().expect("path")).expect("parses");
+        let from_wire = from_litellm_str(&file, "https://example.invalid/x.json").expect("parses");
+
+        assert_eq!(from_disk.len(), from_wire.len());
+        assert_eq!(from_disk[0].id, from_wire[0].id);
+        assert_eq!(from_disk[0].input_per_mtok, from_wire[0].input_per_mtok);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_empty_url_import_names_the_url_it_came_from() {
+        // "no models in ." would send the operator hunting through their disk
+        // for a table that came off the network.
+        let body = serde_json::json!({
+            "some-model": { "litellm_provider": "a-provider-we-have-no-adapter-for" }
+        })
+        .to_string();
+        let err = from_litellm_str(&body, "https://example.invalid/x.json")
+            .expect_err("no importable models");
+        assert!(err.to_string().contains("https://example.invalid/x.json"));
+    }
+
+    #[test]
+    fn a_native_price_sync_never_touches_a_known_model_s_context_window() {
+        // The crux of the whole feature: xAI states no context window, so the
+        // only safe thing to do to a model the catalog already holds is change
+        // its prices. A `Reprice` structurally cannot carry a window; an
+        // `Insert` here would silently replace 500k with a guess.
+        let prices = vec![ModelPrice {
+            upstream_name: "grok-4.6".to_owned(),
+            input_per_mtok: rust_decimal::dec!(2),
+            output_per_mtok: rust_decimal::dec!(6),
+            cache_read_per_mtok: Some(rust_decimal::dec!(0.5)),
+            supports_vision: true,
+        }];
+        let known: HashSet<String> = ["xai/grok-4.6".to_owned()].into_iter().collect();
+
+        let plan = plan_price_sync(Provider::XAI, &prices, &known);
+        assert_eq!(plan.len(), 1);
+        match &plan[0] {
+            PriceSync::Reprice {
+                id,
+                input_per_mtok,
+                cache_read_per_mtok,
+                ..
+            } => {
+                assert_eq!(id, "xai/grok-4.6");
+                assert_eq!(*input_per_mtok, rust_decimal::dec!(2));
+                assert_eq!(*cache_read_per_mtok, Some(rust_decimal::dec!(0.5)));
+            }
+            PriceSync::Insert(m) => {
+                panic!("a known model must be repriced, not rewritten: {}", m.id)
+            }
+        }
+    }
+
+    #[test]
+    fn a_model_the_catalog_has_never_seen_gets_a_window_that_understates() {
+        // A new row has to guess, and the guess must be low: a small window
+        // only ever costs a routing opportunity, while a large one costs a 400
+        // from upstream on the request that overflowed it.
+        let prices = vec![ModelPrice {
+            upstream_name: "grok-9-unheard-of".to_owned(),
+            input_per_mtok: rust_decimal::dec!(3),
+            output_per_mtok: rust_decimal::dec!(15),
+            cache_read_per_mtok: None,
+            supports_vision: false,
+        }];
+
+        let plan = plan_price_sync(Provider::XAI, &prices, &HashSet::new());
+        let PriceSync::Insert(row) = &plan[0] else {
+            panic!("an unknown model has no prices to update in place");
+        };
+        assert_eq!(row.id, "xai/grok-9-unheard-of");
+        assert_eq!(row.provider, "xai");
+        assert_eq!(row.context_window, ASSUMED_CONTEXT_WINDOW);
+        // 200000 is xAI's long-context *price* threshold; a window inferred
+        // from it would be a made-up number wearing an authoritative one's
+        // clothes.
+        assert!(row.context_window < 200_000);
+        // Nothing in a price list proves a model can call tools.
+        assert!(!row.supports_tools);
+        assert!(!row.supports_prompt_cache, "no cache price, no cache");
     }
 
     #[test]

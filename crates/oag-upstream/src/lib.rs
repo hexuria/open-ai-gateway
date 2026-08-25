@@ -10,6 +10,7 @@ pub mod eventstream;
 pub mod gemini;
 pub mod openai;
 pub mod openai_oauth;
+pub mod pricing;
 pub mod sigv4;
 pub mod transport;
 pub mod usage;
