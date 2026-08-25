@@ -1478,6 +1478,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "oag-core",
+ "oag-pool",
  "oag-router",
  "oag-server",
  "oag-store",
@@ -1519,6 +1520,7 @@ name = "oag-pool"
 version = "0.1.0"
 dependencies = [
  "oag-core",
+ "rust_decimal",
  "serde",
  "sha2 0.10.9",
  "tracing",
@@ -3150,6 +3152,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

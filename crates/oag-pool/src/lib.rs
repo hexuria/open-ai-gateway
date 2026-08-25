@@ -13,5 +13,5 @@ pub mod schedule;
 pub mod sticky;
 
 pub use breaker::{Admission, Breaker, BreakerState};
-pub use schedule::{Candidate, Selection, select};
+pub use schedule::{Candidate, Selection, held_by_reserve, select};
 pub use sticky::SessionKey;

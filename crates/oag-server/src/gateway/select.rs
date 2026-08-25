@@ -170,14 +170,6 @@ pub async fn lease(
     request_id: &str,
     channel: Option<CredentialKind>,
 ) -> Result<Lease> {
-    // What "nothing left to try" means, given the pin. A seat that exists and
-    // is cooling down is a wait; an operator told only "no credential for xai"
-    // goes and stares at three API keys that are working perfectly.
-    let none_left = || match channel {
-        Some(kind) => Error::NoCredentialOfKind { provider, kind },
-        None => Error::NoCredential { provider },
-    };
-
     // The pin narrows the pool *before* the sticky branch and the cascade both
     // read it, which is the whole of honouring it: filtering only inside the
     // cascade would leave a conversation already pinned to an API key served
@@ -191,6 +183,26 @@ pub async fn lease(
         repo::candidates(&state.db, route_id, provider.as_str(), principal_id).await?,
         channel,
     );
+
+    // What "nothing left to try" means, given the pin and the reserves. A seat
+    // that exists and is cooling down is a wait; an operator told only "no
+    // credential for xai" goes and stares at three API keys that are working
+    // perfectly. A reserve is worse still, because the pool it sends them to
+    // stare at is healthy and deliberately parked.
+    //
+    // Computed from `rows` rather than from the candidates, because by the time
+    // there is nothing to select the candidates are gone — and this is the one
+    // moment the reason matters.
+    let reserved = reserve_holding_back(&rows);
+    let none_left = || match (reserved, channel) {
+        (Some(reserve_pct), _) => Error::ReserveHeld {
+            provider,
+            reserve_pct,
+        },
+        (None, Some(kind)) => Error::NoCredentialOfKind { provider, kind },
+        (None, None) => Error::NoCredential { provider },
+    };
+
     if rows.is_empty() {
         if let Some(kind) = channel {
             metrics::counter!(
@@ -366,7 +378,33 @@ fn is_eligible(c: &Candidate, now: i64) -> bool {
     c.schedulable
         && c.cooldown_until.is_none_or(|t| t <= now)
         && c.rate_limited_until.is_none_or(|t| t <= now)
+        // Beside the cooldown for a reason: a conversation pinned to a seat
+        // that has since crossed its reserve has to fall through to the
+        // cascade, exactly as it does when the seat starts cooling down.
+        // Honouring the pin regardless would leave the reserve protecting
+        // everyone except the traffic already drinking from the seat, which is
+        // all of the traffic that matters.
+        && !oag_pool::held_by_reserve(c.usage_remaining_pct, c.usage_reserve_pct)
         && c.in_flight < c.max_concurrency
+}
+
+/// The reserve to name when a request finds nothing to run on, if a reserve is
+/// what is holding the pool back.
+///
+/// `None` unless *every* candidate is reserved out, so the message can say
+/// "every credential" and be telling the truth. A pool where one seat is parked
+/// and another is merely cooling down is not a reserve problem: it resolves on
+/// its own, and pointing an operator at a policy they set would send them to
+/// change a setting that was not the cause.
+///
+/// The largest of the reserves when they differ, because every credential is at
+/// or below its own — and therefore below the largest — while the smallest
+/// would make the sentence false for the seat with the roomiest line.
+fn reserve_holding_back(rows: &[AccountRow]) -> Option<i16> {
+    if rows.is_empty() || !rows.iter().all(AccountRow::held_by_reserve) {
+        return None;
+    }
+    rows.iter().filter_map(|r| r.usage_reserve_pct).max()
 }
 
 /// A cheap non-cryptographic random.
@@ -441,6 +479,8 @@ pub(crate) mod testing {
             cooldown_until: None,
             rate_limited_until: None,
             window_resets_at: None,
+            usage_remaining_pct: None,
+            usage_reserve_pct: None,
             last_used_at: time::OffsetDateTime::UNIX_EPOCH,
         }
     }
@@ -464,6 +504,8 @@ pub(crate) mod testing {
             cooldown_until: None,
             rate_limited_until: None,
             window_resets_at: None,
+            usage_remaining_pct: None,
+            usage_reserve_pct: None,
             last_used_at: time::OffsetDateTime::UNIX_EPOCH,
         };
         Lease {
@@ -538,6 +580,8 @@ mod tests {
             cooldown_until: None,
             rate_limited_until: None,
             window_resets_at: None,
+            usage_remaining_pct: None,
+            usage_reserve_pct: None,
             last_used_at: 0,
         };
         assert!(is_eligible(&base, 100));
@@ -631,6 +675,105 @@ mod tests {
             .to_string()
             .contains("API key")
         );
+    }
+
+    /// A credential row with a usage reading and a floor under it.
+    fn reserved(name: &str, remaining: i64, reserve: i16) -> AccountRow {
+        let mut row = super::testing::account(name, "oauth");
+        row.usage_remaining_pct = Some(rust_decimal::Decimal::from(remaining));
+        row.usage_reserve_pct = Some(reserve);
+        row
+    }
+
+    #[test]
+    fn a_pinned_conversation_lets_go_of_a_seat_that_has_crossed_its_reserve() {
+        // The sticky pin is the traffic doing the draining. A reserve that held
+        // for new conversations and not for the ones already on the seat would
+        // protect nothing.
+        let mut candidate = Candidate {
+            account: AccountId::new(),
+            provider: Provider::XAI,
+            priority: 0,
+            max_concurrency: 4,
+            in_flight: 0,
+            waiting: 0,
+            schedulable: true,
+            cooldown_until: None,
+            rate_limited_until: None,
+            window_resets_at: None,
+            usage_remaining_pct: Some(rust_decimal::Decimal::from(40)),
+            usage_reserve_pct: Some(rust_decimal::Decimal::from(10)),
+            last_used_at: 0,
+        };
+        assert!(is_eligible(&candidate, 100), "still has headroom");
+
+        candidate.usage_remaining_pct = Some(rust_decimal::Decimal::from(10));
+        assert!(!is_eligible(&candidate, 100), "at the line");
+
+        // And an unread percentage is unknown, never exhausted: the pin holds.
+        candidate.usage_remaining_pct = None;
+        assert!(is_eligible(&candidate, 100));
+    }
+
+    #[test]
+    fn a_pool_parked_by_its_reserves_names_the_reserve_rather_than_the_pool() {
+        // "no credential available for xai" sends an operator to look at a pool
+        // of enabled, un-cooled, perfectly healthy seats. The reserve is the
+        // whole content of this failure, and its three fixes are nothing like
+        // the fix for an empty pool.
+        assert_eq!(reserve_holding_back(&[reserved("seat", 5, 10)]), Some(10));
+
+        let message = Error::ReserveHeld {
+            provider: Provider::XAI,
+            reserve_pct: 10,
+        }
+        .to_string();
+        assert!(message.contains("10%"), "{message}");
+        assert!(message.contains("reserve"), "{message}");
+        assert!(message.contains("set-reserve"), "{message}");
+    }
+
+    #[test]
+    fn several_reserves_are_reported_by_the_one_every_seat_is_under() {
+        // The message says "every credential is at or below its N%". Naming the
+        // smallest would make that sentence false for the seat with the
+        // roomiest line, which is the seat an operator would go and look at.
+        let rows = [reserved("a", 5, 10), reserved("b", 20, 50)];
+        assert_eq!(reserve_holding_back(&rows), Some(50));
+    }
+
+    #[test]
+    fn an_unpolled_seat_is_never_reported_as_reserved_out() {
+        // NULL is unknown, not empty. This row is schedulable, so blaming the
+        // reserve for a failed request would be a lie with a fix attached.
+        let mut unread = super::testing::account("seat", "oauth");
+        unread.usage_reserve_pct = Some(10);
+        assert_eq!(reserve_holding_back(&[unread]), None);
+    }
+
+    #[test]
+    fn a_seat_with_no_reserve_never_produces_the_reserve_error() {
+        // Today's behaviour, unchanged: an empty seat with no reserve set is
+        // stopped by the provider's 429, and that is not this error.
+        let mut spent = super::testing::account("seat", "oauth");
+        spent.usage_remaining_pct = Some(rust_decimal::Decimal::ZERO);
+        assert_eq!(reserve_holding_back(&[spent]), None);
+        assert_eq!(
+            reserve_holding_back(&[]),
+            None,
+            "an empty pool is not a reserve"
+        );
+    }
+
+    #[test]
+    fn a_pool_that_is_only_partly_reserved_out_is_not_blamed_on_the_reserve() {
+        // One seat parked and another merely cooling down is a wait, not a
+        // policy problem — and it resolves without anybody changing a setting.
+        let rows = [
+            reserved("parked", 5, 10),
+            super::testing::account("key", "api_key"),
+        ];
+        assert_eq!(reserve_holding_back(&rows), None);
     }
 
     #[test]

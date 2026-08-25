@@ -11,6 +11,27 @@
 //! every stage is testable without Redis, Postgres, or a real credential.
 
 use oag_core::{AccountId, Provider};
+use rust_decimal::Decimal;
+
+/// Whether a credential has fallen to or below the reserve an operator set on
+/// it — the slice of a subscription's allowance the gateway is told to leave
+/// alone rather than spend down to a 429.
+///
+/// NULL on either side is "no", and the two NULLs mean different things. An
+/// unset reserve is every fleet that predates the column, so it has to schedule
+/// exactly as it did. An unread `remaining` is a seat whose provider has no
+/// usage endpoint, or one the poller has not reached yet: unknown, not empty.
+/// Benching a working credential because nobody has measured it would take out
+/// the whole pool the first time polling broke — a far worse failure than
+/// draining one seat, which is all this exists to prevent.
+///
+/// A free function rather than a method because both liveness filters need it
+/// and so does the message the caller builds when nothing is left, and a rule
+/// with this much reasoning behind it must not be written down three times.
+#[must_use]
+pub fn held_by_reserve(remaining_pct: Option<Decimal>, reserve_pct: Option<Decimal>) -> bool {
+    matches!((remaining_pct, reserve_pct), (Some(left), Some(floor)) if left <= floor)
+}
 
 /// One credential, as the scheduler sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,16 +54,30 @@ pub struct Candidate {
     /// Unix seconds when this credential's usage window resets. Drives the
     /// "use it or lose it" stage.
     pub window_resets_at: Option<i64>,
+    /// How much of the subscription's allowance the provider says is left,
+    /// 0..100. `None` is unknown — no usage endpoint, or not polled yet.
+    pub usage_remaining_pct: Option<Decimal>,
+    /// The floor an operator set under that allowance, 0..100. `None` is no
+    /// reserve, which is how every credential behaved before the column existed.
+    pub usage_reserve_pct: Option<Decimal>,
     /// Unix seconds of last use. Drives LRU.
     pub last_used_at: i64,
 }
 
 impl Candidate {
     /// Whether this credential can take a request right now.
+    ///
+    /// The reserve sits here beside the cooldown and the rate limit rather than
+    /// anywhere upstream of them, so it composes with them for nothing: a seat
+    /// held back by its reserve simply is not eligible, and every path that
+    /// already copes with an ineligible credential — the cascade, the sticky
+    /// pin falling through, failover to the next credential — copes with this
+    /// one too without knowing the reserve exists.
     fn eligible(&self, now: i64) -> bool {
         self.schedulable
             && self.cooldown_until.is_none_or(|t| t <= now)
             && self.rate_limited_until.is_none_or(|t| t <= now)
+            && !held_by_reserve(self.usage_remaining_pct, self.usage_reserve_pct)
             && self.in_flight < self.max_concurrency
     }
 
@@ -182,8 +217,18 @@ mod tests {
             cooldown_until: None,
             rate_limited_until: None,
             window_resets_at: None,
+            usage_remaining_pct: None,
+            usage_reserve_pct: None,
             last_used_at: NOW - 100,
         }
+    }
+
+    /// A seat with a reading and a floor under it, both in whole percent.
+    fn seat(remaining: i64, reserve: i64) -> Candidate {
+        let mut c = candidate(0);
+        c.usage_remaining_pct = Some(Decimal::from(remaining));
+        c.usage_reserve_pct = Some(Decimal::from(reserve));
+        c
     }
 
     #[test]
@@ -214,6 +259,70 @@ mod tests {
         c.rate_limited_until = Some(NOW + 30);
         assert!(select(std::slice::from_ref(&c), NOW, 0).is_none());
         assert!(select(&[c], NOW + 31, 0).is_some());
+    }
+
+    #[test]
+    fn a_seat_still_above_its_reserve_is_a_candidate() {
+        // The reserve is a floor, not a ceiling. A seat with headroom left
+        // above it has to keep serving, or setting one would take the seat out
+        // of the pool the moment it was set.
+        assert!(select(&[seat(20, 10)], NOW, 0).is_some());
+    }
+
+    #[test]
+    fn a_seat_at_or_below_its_reserve_is_not_scheduled() {
+        // The whole feature: stop at the line rather than at the provider's
+        // 429, so what is left is there when the window is nearly up and
+        // somebody needs it.
+        assert!(select(&[seat(10, 10)], NOW, 0).is_none(), "at the line");
+        assert!(select(&[seat(4, 10)], NOW, 0).is_none(), "below it");
+    }
+
+    #[test]
+    fn a_seat_nobody_has_measured_is_never_treated_as_exhausted() {
+        // NULL is unknown, not empty. A provider with no usage endpoint, or a
+        // poller that has been down since boot, leaves every reading NULL — and
+        // benching the fleet over an absence of information would be a far
+        // bigger outage than the one the reserve prevents.
+        let mut unread = candidate(0);
+        unread.usage_reserve_pct = Some(Decimal::from(10));
+        assert!(select(&[unread], NOW, 0).is_some());
+    }
+
+    #[test]
+    fn a_credential_with_no_reserve_schedules_exactly_as_it_always_did() {
+        // Every fleet that predates the column has NULL here, down to a seat
+        // reading zero percent — which the poller already benches by its own
+        // route, and which this filter must not start second-guessing.
+        let mut spent = candidate(0);
+        spent.usage_remaining_pct = Some(Decimal::ZERO);
+        assert!(select(&[spent], NOW, 0).is_some());
+    }
+
+    #[test]
+    fn a_reserved_out_seat_loses_to_one_with_headroom_rather_than_failing_the_request() {
+        // Failing over is not re-implemented for the reserve: an ineligible
+        // candidate is one the cascade already skips, so the request lands on
+        // the other seat with nothing extra written to make it.
+        let live = seat(80, 10);
+        let picked = select(&[seat(5, 10), live.clone()], NOW, 0).expect("selects");
+        assert_eq!(picked.account, live.account);
+    }
+
+    #[test]
+    fn a_fractional_reading_is_compared_exactly() {
+        // `usage_remaining_pct` is numeric(5,2). Rounding 10.01 down to the
+        // reserve would park a seat that still has room, and rounding 9.99 up
+        // would spend past the line — so the comparison stays in decimal.
+        let mut just_above = candidate(0);
+        just_above.usage_remaining_pct = Some(Decimal::new(1001, 2));
+        just_above.usage_reserve_pct = Some(Decimal::from(10));
+        assert!(select(&[just_above], NOW, 0).is_some());
+
+        let mut just_below = candidate(0);
+        just_below.usage_remaining_pct = Some(Decimal::new(999, 2));
+        just_below.usage_reserve_pct = Some(Decimal::from(10));
+        assert!(select(&[just_below], NOW, 0).is_none());
     }
 
     #[test]

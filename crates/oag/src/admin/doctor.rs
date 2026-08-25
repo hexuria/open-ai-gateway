@@ -4,7 +4,17 @@ use oag_core::config::Config;
 use oag_core::{Provider, Result};
 use oag_store::Db;
 
-const EXPECTED_MIGRATIONS: usize = 5;
+/// Bumped with 0008. 0007 added `account.usage_reserve_pct`, which every
+/// credential query now selects, so a binary on the old schema selects no
+/// candidate at all — a failure that reads as an empty pool unless something
+/// says the schema is behind, which is this. 0008 added `usage_event.origin`,
+/// which the reporting queries group on and the importer writes.
+///
+/// Raise this with every migration that existing queries depend on. The test
+/// below counts the files rather than trusting this line, because the number
+/// that matters is the one on disk and a constant is exactly the thing that
+/// gets forgotten.
+const EXPECTED_MIGRATIONS: usize = 8;
 
 pub async fn run(db: &Db, config: &Config, route: &str) -> Result<()> {
     let mut failed = 0u32;
@@ -19,6 +29,7 @@ pub async fn run(db: &Db, config: &Config, route: &str) -> Result<()> {
     failed += report_accounts(&accounts);
     failed += check_ladder(&rungs, &accounts, route);
     failed += check_seat_prices(&accounts);
+    failed += check_reserves(&accounts);
     failed += check_codex(config, &accounts);
     conclude(failed)
 }
@@ -107,6 +118,11 @@ struct Seat {
     /// The seat's flat monthly price. `None` is not a free seat — it is a seat
     /// nobody has told the gateway the price of, which is why it is checked.
     monthly_cost_usd: Option<rust_decimal::Decimal>,
+    /// The provider's last reading of the allowance left, and the floor an
+    /// operator put under it. Together they decide whether the seat is being
+    /// held back right now, which is a live reason a request would fail.
+    usage_remaining_pct: Option<rust_decimal::Decimal>,
+    usage_reserve_pct: Option<i16>,
 }
 
 impl Seat {
@@ -114,6 +130,19 @@ impl Seat {
         self.schedulable
             && self.cooldown_until.is_none_or(|t| t <= now)
             && self.rate_limited_until.is_none_or(|t| t <= now)
+            && !self.reserved_out()
+    }
+
+    /// Whether the reserve is holding this seat out of the pool right now.
+    ///
+    /// The scheduler's own rule, borrowed rather than restated: a doctor that
+    /// disagreed with the scheduler about which credentials are live would be
+    /// worse than no doctor at all.
+    fn reserved_out(&self) -> bool {
+        oag_pool::held_by_reserve(
+            self.usage_remaining_pct,
+            self.usage_reserve_pct.map(rust_decimal::Decimal::from),
+        )
     }
 
     fn state(&self, now: time::OffsetDateTime) -> &'static str {
@@ -123,6 +152,8 @@ impl Seat {
             "cooling down"
         } else if self.rate_limited_until.is_some_and(|t| t > now) {
             "rate limited"
+        } else if self.reserved_out() {
+            "held back"
         } else {
             "ready"
         }
@@ -140,11 +171,14 @@ async fn load_accounts(db: &Db, route: &str) -> Result<Vec<Seat>> {
             Option<time::OffsetDateTime>,
             Option<time::OffsetDateTime>,
             Option<rust_decimal::Decimal>,
+            Option<rust_decimal::Decimal>,
+            Option<i16>,
         ),
     >(
         r"
         SELECT a.name, a.provider, a.kind, a.schedulable, a.cooldown_until,
-               a.rate_limited_until, a.monthly_cost_usd
+               a.rate_limited_until, a.monthly_cost_usd,
+               a.usage_remaining_pct, a.usage_reserve_pct
         FROM account a
         JOIN account_route ar ON ar.account_id = a.id
         JOIN route r ON r.id = ar.route_id
@@ -167,6 +201,8 @@ async fn load_accounts(db: &Db, route: &str) -> Result<Vec<Seat>> {
                     cooldown_until,
                     rate_limited_until,
                     monthly_cost_usd,
+                    usage_remaining_pct,
+                    usage_reserve_pct,
                 )| Seat {
                     name,
                     provider,
@@ -175,6 +211,8 @@ async fn load_accounts(db: &Db, route: &str) -> Result<Vec<Seat>> {
                     cooldown_until,
                     rate_limited_until,
                     monthly_cost_usd,
+                    usage_remaining_pct,
+                    usage_reserve_pct,
                 },
             )
             .collect()
@@ -271,6 +309,37 @@ fn check_seat_prices(accounts: &[Seat]) -> u32 {
     0
 }
 
+/// A seat sitting at or below its reserve, which is a request that will fail
+/// today rather than a reporting gap.
+///
+/// Reported as a failure, unlike the unpriced-seat warning: the seat is out of
+/// the pool for as long as its window lasts, and `check_ladder` above will
+/// already have failed any rung that has nothing else to fall back on. Silence
+/// here would leave an operator reading "no live xai credential" while
+/// `account list` shows a healthy, enabled, un-cooled seat — the exact
+/// confusion the reserve's own error message exists to prevent.
+fn check_reserves(accounts: &[Seat]) -> u32 {
+    let held: Vec<&Seat> = accounts.iter().filter(|a| a.reserved_out()).collect();
+    if held.is_empty() {
+        return 0;
+    }
+    for seat in &held {
+        let reserve = seat.usage_reserve_pct.unwrap_or_default();
+        let remaining = seat
+            .usage_remaining_pct
+            .map_or_else(|| "unknown".to_owned(), |r| format!("{r:.0}%"));
+        println!(
+            "FAIL reserve     {} is at {remaining} of its allowance, at or below its {reserve}% reserve",
+            seat.name
+        );
+    }
+    println!(
+        "     fix: oag admin account set-reserve {} --pct <lower> (or wait for the window to reset)",
+        held[0].name
+    );
+    u32::try_from(held.len()).unwrap_or(u32::MAX)
+}
+
 fn check_codex(config: &Config, accounts: &[Seat]) -> u32 {
     let has_codex = accounts
         .iter()
@@ -320,6 +389,25 @@ fn check_codex(config: &Config, accounts: &[Seat]) -> u32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_expected_migration_count_matches_the_migrations_on_disk() {
+        // This constant is the thing that gets forgotten: a migration lands,
+        // the queries start depending on its column, and the check still passes
+        // a schema that is one behind — it uses `>=`, so being stale never
+        // fails loudly, it just stops catching the case it exists for.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrations");
+        let on_disk = std::fs::read_dir(dir)
+            .expect("migrations directory")
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "sql"))
+            .count();
+        assert_eq!(
+            EXPECTED_MIGRATIONS, on_disk,
+            "a migration was added without raising EXPECTED_MIGRATIONS, so doctor \
+             would call a one-behind schema healthy"
+        );
+    }
+
     fn seat(name: &str, kind: &str, cost: Option<i64>) -> Seat {
         Seat {
             name: name.to_owned(),
@@ -329,7 +417,17 @@ mod tests {
             cooldown_until: None,
             rate_limited_until: None,
             monthly_cost_usd: cost.map(rust_decimal::Decimal::from),
+            usage_remaining_pct: None,
+            usage_reserve_pct: None,
         }
+    }
+
+    /// A seat with a reading and a floor under it, both in whole percent.
+    fn reserved(name: &str, remaining: i64, reserve: i16) -> Seat {
+        let mut s = seat(name, "oauth", Some(300));
+        s.usage_remaining_pct = Some(rust_decimal::Decimal::from(remaining));
+        s.usage_reserve_pct = Some(reserve);
+        s
     }
 
     #[test]
@@ -358,5 +456,61 @@ mod tests {
         // non-zero over a reporting gap would make `doctor` unusable in CI.
         let seats = [seat("a", "oauth", None), seat("b", "oauth", None)];
         assert_eq!(check_seat_prices(&seats), 0, "a warning, never a failure");
+    }
+
+    #[test]
+    fn a_seat_held_back_by_its_reserve_is_reported_as_a_live_failure() {
+        // Doctor exists to answer "why would a request fail right now". A seat
+        // parked by its own reserve is enabled, un-cooled and not rate limited,
+        // so every other line in this report calls it healthy.
+        assert_eq!(check_reserves(&[reserved("grok", 4, 10)]), 1);
+        assert_eq!(
+            check_reserves(&[reserved("grok", 10, 10)]),
+            1,
+            "at the line"
+        );
+    }
+
+    #[test]
+    fn a_seat_with_headroom_above_its_reserve_is_not_reported() {
+        assert_eq!(check_reserves(&[reserved("grok", 45, 10)]), 0);
+    }
+
+    #[test]
+    fn a_seat_nobody_has_polled_is_never_reported_as_held_back() {
+        // NULL is unknown, not empty, and the scheduler will happily use this
+        // seat — so calling it a failure would send an operator to lower a
+        // reserve that is not stopping anything.
+        let mut unread = seat("grok", "oauth", Some(300));
+        unread.usage_reserve_pct = Some(10);
+        assert_eq!(check_reserves(&[unread]), 0);
+    }
+
+    #[test]
+    fn a_seat_with_no_reserve_is_never_reported_however_little_is_left() {
+        // Today's behaviour, unchanged: without a reserve the seat is drained
+        // to empty and the provider's 429 is what stops it.
+        let mut spent = seat("grok", "oauth", Some(300));
+        spent.usage_remaining_pct = Some(rust_decimal::Decimal::ZERO);
+        assert_eq!(check_reserves(&[spent]), 0);
+    }
+
+    #[test]
+    fn a_reserved_out_seat_is_not_counted_as_a_live_credential_for_a_rung() {
+        // The ladder check asks each rung for a live credential. A seat the
+        // scheduler will refuse must not answer that question, or doctor
+        // reports a healthy ladder for requests that all fail.
+        let rungs = vec![oag_router::ladder::Rung {
+            name: oag_core::TierName::new("cheap"),
+            models: vec![oag_router::ModelId::new("xai/grok-4.6")],
+        }];
+        assert_eq!(
+            check_ladder(&rungs, &[reserved("grok", 2, 10)], "default"),
+            1
+        );
+        assert_eq!(
+            check_ladder(&rungs, &[reserved("grok", 80, 10)], "default"),
+            0
+        );
     }
 }
