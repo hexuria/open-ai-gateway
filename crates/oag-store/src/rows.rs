@@ -155,9 +155,30 @@ pub struct ModelRow {
     pub supports_tools: bool,
     pub supports_reasoning: bool,
     pub supports_prompt_cache: bool,
+    /// What an operator named this model. `None` means nobody has, and the
+    /// label is derived — see [`ModelRow::derived_label`].
+    pub display_label: Option<String>,
 }
 
 impl ModelRow {
+    /// What a picker shows when no operator has named this model.
+    ///
+    /// The same derivation the router does, reached through the same function,
+    /// because this one feeds the placeholder in the rename box: a placeholder
+    /// that disagreed with the listing would make an operator "fix" a name that
+    /// was already right.
+    ///
+    /// `provider` is free text with no CHECK constraint, so a row nobody can
+    /// parse falls back to its own spelling rather than losing the label.
+    #[must_use]
+    pub fn derived_label(&self) -> String {
+        let vendor = self.provider.parse::<oag_core::Provider>().map_or_else(
+            |_| self.provider.clone(),
+            |p| p.support().display_name.to_owned(),
+        );
+        oag_router::derive_label(&vendor, &self.upstream_name)
+    }
+
     /// Convert into what the router consumes.
     #[must_use]
     pub fn to_spec(&self) -> Option<oag_router::ModelSpec> {
@@ -179,6 +200,7 @@ impl ModelRow {
                 reasoning: self.supports_reasoning,
                 prompt_cache: self.supports_prompt_cache,
             },
+            display_label: self.display_label.clone(),
         })
     }
 }

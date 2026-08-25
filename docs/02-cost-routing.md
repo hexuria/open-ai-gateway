@@ -58,6 +58,50 @@ otherwise silently downgrade every request that carried it.
 Both are first-class. A team can adopt the gateway in passthrough mode for
 visibility alone, then move workloads to managed once they trust the routing.
 
+## Naming a channel
+
+A model id may carry a qualifier that pins the request to a credential kind:
+
+    <provider>/<model>[@api|@sub]
+
+| id | means |
+|---|---|
+| `xai/grok-4.6` | the model. The router picks the cheapest live credential — three seats and an API key are four paths to one model, and choosing among them is the product. |
+| `xai/grok-4.6@api` | the same model, restricted to an API-key credential. |
+| `xai/grok-4.6@sub` | the same model, restricted to a subscription seat. |
+| `cursor/gemini-flash-3.7` | not a qualifier at all. A reseller is a different base URL, adapter, auth and bill, so it is a different **provider** with an id of its own. |
+
+`@api` and `@sub` are the whole vocabulary, and the rule behind it is that one:
+a different upstream is a different provider, and the same upstream reached by
+two credential kinds is the only case a qualifier is for.
+
+Unqualified stays the default. A qualifier is an override for the caller who
+has a reason — pinning a seat's flat rate, or keeping a workload off one.
+
+A qualifier nobody can parse is a 400 naming the ones that work, and so is one
+the provider cannot offer at all (`gemini/...@sub`: Gemini takes an API key and
+nothing else). Neither is ignored — dropping a pin silently would send the
+request to exactly the credential the caller wrote it to exclude. A pin nobody
+on the route can honour is a 503 that names the kind: "no subscription
+credential for xai on this route", not the generic no-credential message.
+
+`/v1/models` advertises `@api` and `@sub` for a model only where the route
+holds **both** kinds; with one kind the plain id already goes there. The ledger
+always records the canonical id, so a model's spend never splits across its
+spellings — which credential served it is `usage_event.account_id`.
+
+## Naming a model
+
+An id is an address and a label is a name. `PATCH /admin/api/models/{id}` sets
+`display_label`, which is what `/v1/models` shows as `display_name`; the
+dashboard's Models table edits it in place. Clearing it restores the derived
+default — the provider's own spelling of its name plus the model's upstream
+name, e.g. `xAI: grok-4.6`.
+
+Nothing automated ever writes that column: `seed-catalog` and `sync-prices`
+both leave it exactly where it was, the same way they leave an operator's
+`is_override`'d prices alone.
+
 ## Classification
 
 Heuristics, deliberately. The obvious alternative — ask a cheap model to grade

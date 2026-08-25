@@ -1,6 +1,7 @@
 //! Picking a credential: sticky pin first, then the cascade.
 
 use crate::AppState;
+use oag_core::credential::CredentialKind;
 use oag_core::{AccountId, Error, Provider, Result};
 use oag_pool::{Candidate, SessionKey};
 use oag_store::{AccountRow, repo};
@@ -153,6 +154,12 @@ fn leased(state: &AppState, account: AccountRow, request_id: &str, via_sticky: b
 ///
 /// `excluded` carries credentials that already failed this request, so failover
 /// does not hand back the one that just broke.
+///
+/// `channel` is the `@api` / `@sub` pin off the model name. It narrows the pool
+/// before anything else looks at it — including the sticky pin, which would
+/// otherwise hand a conversation that started unqualified straight back to an
+/// API key on the turn the caller asked for a seat.
+#[allow(clippy::too_many_arguments)]
 pub async fn lease(
     state: &AppState,
     route_id: uuid::Uuid,
@@ -161,10 +168,39 @@ pub async fn lease(
     session: &SessionKey,
     excluded: &HashSet<AccountId, impl std::hash::BuildHasher>,
     request_id: &str,
+    channel: Option<CredentialKind>,
 ) -> Result<Lease> {
-    let rows = repo::candidates(&state.db, route_id, provider.as_str(), principal_id).await?;
+    // What "nothing left to try" means, given the pin. A seat that exists and
+    // is cooling down is a wait; an operator told only "no credential for xai"
+    // goes and stares at three API keys that are working perfectly.
+    let none_left = || match channel {
+        Some(kind) => Error::NoCredentialOfKind { provider, kind },
+        None => Error::NoCredential { provider },
+    };
+
+    // The pin narrows the pool *before* the sticky branch and the cascade both
+    // read it, which is the whole of honouring it: filtering only inside the
+    // cascade would leave a conversation already pinned to an API key served
+    // from that key on the turn the caller asked for a seat.
+    //
+    // Filtered here rather than in `repo::candidates`, where the predicate
+    // would sit comfortably beside the owner check, because an empty result
+    // from SQL cannot tell "this route has no xai credentials" from "it has
+    // three and none is a subscription" — and those need opposite answers.
+    let rows = of_kind(
+        repo::candidates(&state.db, route_id, provider.as_str(), principal_id).await?,
+        channel,
+    );
     if rows.is_empty() {
-        return Err(Error::NoCredential { provider });
+        if let Some(kind) = channel {
+            metrics::counter!(
+                "oag_channel_unavailable_total",
+                "provider" => provider.as_str(),
+                "kind" => kind.to_string(),
+            )
+            .increment(1);
+        }
+        return Err(none_left());
     }
 
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -212,7 +248,7 @@ pub async fn lease(
         // snapshot at the same instant picks the same credential and stampedes.
         let tie_breaker = fastrand_u64();
         let Some(selection) = oag_pool::select(&candidates, now, tie_breaker) else {
-            return Err(Error::NoCredential { provider });
+            return Err(none_left());
         };
 
         let Some(row) = remaining
@@ -220,7 +256,7 @@ pub async fn lease(
             .find(|r| r.account_id() == selection.account)
             .copied()
         else {
-            return Err(Error::NoCredential { provider });
+            return Err(none_left());
         };
 
         let limit = u32::try_from(row.max_concurrency).unwrap_or(0);
@@ -255,7 +291,23 @@ pub async fn lease(
             candidates: exhausted,
         });
     }
-    Err(Error::NoCredential { provider })
+    Err(none_left())
+}
+
+/// The candidates a channel pin leaves standing. No pin leaves all of them.
+///
+/// A row whose `kind` column parses to nothing is dropped by a pin and kept
+/// without one — the safe direction both times. `account.kind` is free text, so
+/// a misspelling must not silently satisfy `@sub`: a request that asked for a
+/// seat and got something unrecognised is billed as though it were metered, and
+/// the caller is never told.
+fn of_kind(rows: Vec<AccountRow>, channel: Option<CredentialKind>) -> Vec<AccountRow> {
+    let Some(kind) = channel else {
+        return rows;
+    };
+    rows.into_iter()
+        .filter(|r| CredentialKind::from_column(&r.kind) == Some(kind))
+        .collect()
 }
 
 /// Reuse this conversation's pinned credential, if it is still usable.
@@ -367,6 +419,29 @@ pub(crate) mod testing {
     impl SlotStore for CountingSlots {
         async fn release(&self, _account: AccountId, _request_id: &str) {
             self.released.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A credential row with nothing but its identity and its kind set.
+    pub(crate) fn account(name: &str, kind: &str) -> oag_store::AccountRow {
+        oag_store::AccountRow {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_owned(),
+            provider: "xai".to_owned(),
+            kind: kind.to_owned(),
+            credentials_sealed: Vec::new(),
+            credentials_nonce: Vec::new(),
+            token_version: 0,
+            token_expires_at: None,
+            owner_principal_id: None,
+            proxy_url: None,
+            priority: 0,
+            max_concurrency: 1,
+            schedulable: true,
+            cooldown_until: None,
+            rate_limited_until: None,
+            window_resets_at: None,
+            last_used_at: time::OffsetDateTime::UNIX_EPOCH,
         }
     }
 
@@ -487,6 +562,75 @@ mod tests {
         // stampede one credential.
         let draws: std::collections::HashSet<u64> = (0..32).map(|_| fastrand_u64()).collect();
         assert!(draws.len() > 24, "expected mostly distinct draws");
+    }
+
+    #[test]
+    fn a_sub_pinned_request_never_sees_an_api_key_credential() {
+        // The pin is worthless unless it reaches selection. Asserting on the
+        // surviving rows' kinds rather than on a count: a filter that kept the
+        // right *number* of credentials and the wrong ones would bill a
+        // subscription request to a metered key and say nothing.
+        let rows = vec![
+            super::testing::account("key-a", "api_key"),
+            super::testing::account("seat", "oauth"),
+            super::testing::account("key-b", "api_key"),
+        ];
+
+        let subs = of_kind(rows.clone(), Some(CredentialKind::OAuth));
+        assert_eq!(
+            subs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["seat"]
+        );
+
+        let keys = of_kind(rows.clone(), Some(CredentialKind::ApiKey));
+        assert_eq!(
+            keys.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["key-a", "key-b"]
+        );
+
+        // And with no pin the pool is untouched — the cheapest live credential
+        // is the default, and that is what makes the router worth having.
+        assert_eq!(of_kind(rows.clone(), None).len(), rows.len());
+    }
+
+    #[test]
+    fn a_credential_kind_nobody_can_parse_does_not_satisfy_a_pin() {
+        // `account.kind` is free text with no CHECK constraint. A typo that
+        // counted as a subscription would serve a seat-pinned request from
+        // something else and meter it as though it had not.
+        let rows = vec![super::testing::account("typo", "0auth")];
+        assert!(of_kind(rows.clone(), Some(CredentialKind::OAuth)).is_empty());
+        assert_eq!(
+            of_kind(rows, None).len(),
+            1,
+            "unpinned, it is still a candidate"
+        );
+    }
+
+    #[test]
+    fn a_pin_with_no_matching_credential_names_the_kind_it_wanted() {
+        // "no credential available for xai" sends an operator to look at a pool
+        // holding three healthy keys. The missing thing is the channel, and the
+        // message has to be the thing that says so.
+        let missing = Error::NoCredentialOfKind {
+            provider: Provider::XAI,
+            kind: CredentialKind::OAuth,
+        };
+        let message = missing.to_string();
+        assert!(message.contains("subscription"), "{message}");
+        assert!(message.contains("xai"), "{message}");
+        // Not the wire spelling of the column: the person reading this bought a
+        // subscription, not an oauth.
+        assert!(!message.contains("oauth"), "{message}");
+
+        assert!(
+            Error::NoCredentialOfKind {
+                provider: Provider::XAI,
+                kind: CredentialKind::ApiKey,
+            }
+            .to_string()
+            .contains("API key")
+        );
     }
 
     #[test]

@@ -224,14 +224,17 @@ async fn handle(
 
     // The single place an inbound model name is normalised. Claude Code only
     // keeps discovered ids that start with `anthropic`, so the listing offers
-    // prefixed twins and this is where one comes back. Everything downstream —
-    // `virtual_tier`, the passthrough lookup, the ledger — sees the canonical
-    // name and none of them needs to know the alias exists. See [`alias`].
-    if let Some(canonical_name) = alias::canonicalise(&canonical.model, &catalog) {
+    // prefixed twins and this is where one comes back; an `@api` / `@sub`
+    // qualifier comes off here too. Everything downstream — `virtual_tier`, the
+    // passthrough lookup, the ledger — sees the canonical name, and the pin
+    // travels beside it as a value rather than inside the string. See
+    // [`alias`].
+    let alias::Normalised { model, channel } = alias::normalise(&canonical.model, &catalog)?;
+    if let Some(canonical_name) = model {
         canonical.model = canonical_name;
     }
 
-    let plan = plan_request(state, auth, &canonical, headers, catalog).await?;
+    let plan = plan_request(state, auth, &canonical, headers, catalog, channel).await?;
 
     tracing::info!(
         %request_id,
@@ -292,6 +295,7 @@ async fn run_with_escalation(
         signal,
         catalog,
         pressure,
+        channel,
     } = plan;
     //
     // Escalation sits *outside* failover, and the nesting is the point:
@@ -310,22 +314,23 @@ async fn run_with_escalation(
     let mut abandoned: Option<meter::Abandoned> = None;
 
     loop {
-        let attempt =
-            match forward_with_failover(state, auth, &decision, canonical, session, request_id)
-                .await
-            {
-                Ok(attempt) => attempt,
-                // The retry died, so there is no served row to come — but the
-                // attempt we abandoned to make it was still generated and
-                // invoiced. Failing the request does not make that spend go
-                // away, and this is the last chance to record it.
-                Err(e) => {
-                    if let Some(abandoned) = &abandoned {
-                        meter::record_abandoned(state, abandoned).await;
-                    }
-                    return Err(e);
+        let attempt = match forward_with_failover(
+            state, auth, &decision, canonical, session, request_id, channel,
+        )
+        .await
+        {
+            Ok(attempt) => attempt,
+            // The retry died, so there is no served row to come — but the
+            // attempt we abandoned to make it was still generated and
+            // invoiced. Failing the request does not make that spend go
+            // away, and this is the last chance to record it.
+            Err(e) => {
+                if let Some(abandoned) = &abandoned {
+                    meter::record_abandoned(state, abandoned).await;
                 }
-            };
+                return Err(e);
+            }
+        };
 
         // An answer to judge, or a refusal to escalate on. Both ask the same
         // question — is a rung up worth trying — so they share the one loop
@@ -474,6 +479,15 @@ struct Plan {
     signal: oag_router::RequestSignal,
     catalog: Arc<oag_router::Catalog>,
     pressure: oag_router::BudgetPressure,
+    /// The credential kind the request pinned, from the `@api` / `@sub`
+    /// qualifier on the model name.
+    ///
+    /// Decided at normalisation rather than by routing, and carried here
+    /// anyway: its only consumer is credential selection, two calls further
+    /// down, and a plan is what already makes that journey. Threading a tenth
+    /// argument through the same two frames would be the same coupling written
+    /// less visibly.
+    channel: Option<oag_core::credential::CredentialKind>,
 }
 
 /// Load the caller's route and build the policy it implies.
@@ -534,6 +548,7 @@ async fn plan_request(
     canonical: &oag_proto::CanonicalRequest,
     headers: &HeaderMap,
     catalog: Arc<oag_router::Catalog>,
+    channel: Option<oag_core::credential::CredentialKind>,
 ) -> Result<Plan> {
     let (route, policy) = policy_for(state, auth).await?;
 
@@ -640,6 +655,7 @@ async fn plan_request(
         signal,
         catalog,
         pressure: budget.pressure(),
+        channel,
     })
 }
 
@@ -808,6 +824,7 @@ async fn forward_with_failover(
     canonical: &oag_proto::CanonicalRequest,
     session: &SessionKey,
     request_id: RequestId,
+    channel: Option<oag_core::credential::CredentialKind>,
 ) -> Result<Attempt> {
     let provider = decision.model.provider;
     let mut excluded: HashSet<AccountId> = HashSet::new();
@@ -822,6 +839,7 @@ async fn forward_with_failover(
             session,
             &excluded,
             &request_id.to_string(),
+            channel,
         )
         .await
         {
@@ -1354,6 +1372,22 @@ pub(crate) fn error_response(e: &Error) -> Response {
             "no_credential",
             e.to_string(),
         ),
+        // The caller's own string is what is wrong, and the message names the
+        // qualifiers that would have worked, so they can fix it from the
+        // response alone.
+        Error::UnknownModelChannel { .. } | Error::ChannelNotOffered { .. } => (
+            StatusCode::BAD_REQUEST,
+            "invalid_model_qualifier",
+            e.to_string(),
+        ),
+        // Not the generic `no_credential`: an operator reading that goes and
+        // looks at a pool with three healthy keys in it. The kind is the whole
+        // content of this failure.
+        Error::NoCredentialOfKind { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_credential_of_kind",
+            e.to_string(),
+        ),
         Error::AtCapacity { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "at_capacity",
@@ -1655,6 +1689,7 @@ mod tests {
                 context_window: 1000,
                 max_output_tokens: 100,
                 capabilities: Capabilities::default(),
+                display_label: None,
             },
             tier: oag_core::Tier::new("cheap", 0),
             reason: oag_router::SelectionReason::Classified,

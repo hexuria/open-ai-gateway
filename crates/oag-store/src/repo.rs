@@ -155,17 +155,27 @@ pub async fn account_by_id(db: &Db, id: AccountId) -> Result<Option<AccountRow>>
     .map_err(|e| Error::Internal(format!("loading account: {e}")))
 }
 
-/// Providers this route holds usable credentials for, for one principal.
+/// Providers this route holds usable credentials for, and by which credential
+/// kind, for one principal.
+///
+/// The kind rides along rather than being a second query because the listing
+/// needs both answers about the same instant: it offers `<model>@sub` only
+/// where a subscription is actually reachable, and two queries could disagree
+/// about that across a credential being disabled between them.
 ///
 /// Mirrors the personal-credential predicate in `candidates`: a credential
 /// bound to another principal must never appear in this principal's view. Adds
 /// `a.schedulable`, which `candidates` leaves to the scheduler — correct here
 /// because a disabled credential is an operator decision, not a transient
 /// state, and advertising a model nobody can reach is worse than omitting it.
-pub async fn route_providers(db: &Db, route_id: Uuid, principal_id: Uuid) -> Result<Vec<String>> {
-    sqlx::query_scalar::<_, String>(
+pub async fn route_channels(
+    db: &Db,
+    route_id: Uuid,
+    principal_id: Uuid,
+) -> Result<Vec<(String, String)>> {
+    sqlx::query_as::<_, (String, String)>(
         r"
-        SELECT DISTINCT a.provider
+        SELECT DISTINCT a.provider, a.kind
         FROM account a
         JOIN account_route ar ON ar.account_id = a.id
         WHERE ar.route_id = $1
@@ -451,13 +461,39 @@ pub async fn catalog(db: &Db) -> Result<Vec<ModelRow>> {
         SELECT id, provider, upstream_name, input_per_mtok, output_per_mtok,
                cache_read_per_mtok, cache_write_per_mtok, context_window,
                max_output_tokens, supports_vision, supports_tools,
-               supports_reasoning, supports_prompt_cache
+               supports_reasoning, supports_prompt_cache, display_label
         FROM model_catalog
         ",
     )
     .fetch_all(db.pool())
     .await
     .map_err(|e| Error::Internal(format!("loading catalog: {e}")))
+}
+
+/// Name a model, or hand it back to the derived default.
+///
+/// `None` clears the column, which is not the same as writing the derived
+/// string into it: a cleared row keeps following the provider's spelling, while
+/// a stored copy of today's derivation would go stale the moment the catalog is
+/// refreshed.
+///
+/// No `is_override` guard here, unlike every other write to this table. That
+/// flag protects an operator's numbers from an automated refresh, and this *is*
+/// the operator — refusing their rename because they had once edited a price
+/// would be the guard firing at the person it exists for.
+///
+/// Returns the id when a row was renamed, `None` when there is no such model,
+/// which is the caller's 404.
+pub async fn set_model_label(db: &Db, id: &str, label: Option<&str>) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>(
+        "UPDATE model_catalog SET display_label = $2, updated_at = now() \
+         WHERE id = $1 RETURNING id",
+    )
+    .bind(id)
+    .bind(label)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("labelling model: {e}")))
 }
 
 const LIST_SERVICES_SQL: &str = concat!(
@@ -621,16 +657,15 @@ fn map_service_write_error(what: &str, e: &sqlx::Error) -> Error {
     Error::Internal(format!("{what}: {e}"))
 }
 
-/// Insert or update a catalog entry, never clobbering an operator override.
-pub async fn upsert_model(db: &Db, m: &ModelRow, is_override: bool) -> Result<()> {
-    sqlx::query(
-        r"
+/// The upsert, as a named constant so a test can read what the conflict branch
+/// does and does not touch. The columns it leaves out are the point of it.
+const UPSERT_MODEL_SQL: &str = r"
         INSERT INTO model_catalog (
             id, provider, upstream_name, input_per_mtok, output_per_mtok,
             cache_read_per_mtok, cache_write_per_mtok, context_window, max_output_tokens,
             supports_vision, supports_tools, supports_reasoning, supports_prompt_cache,
-            is_override
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            is_override, display_label
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
         ON CONFLICT (id) DO UPDATE SET
             provider = EXCLUDED.provider,
             upstream_name = EXCLUDED.upstream_name,
@@ -645,28 +680,39 @@ pub async fn upsert_model(db: &Db, m: &ModelRow, is_override: bool) -> Result<()
             supports_reasoning = EXCLUDED.supports_reasoning,
             supports_prompt_cache = EXCLUDED.supports_prompt_cache,
             updated_at = now()
+        -- `display_label` is missing from that list on purpose, exactly as
+        -- `is_override` is: a seed carries no label and would write NULL over
+        -- whatever the operator called the model. The name is theirs, so only
+        -- `set_model_label` writes it, and a re-seed leaves it where it was.
+        --
         -- An operator who edited a price meant it. A catalog refresh from
         -- upstream pricing data must not silently undo that.
         WHERE model_catalog.is_override = false
-        ",
-    )
-    .bind(&m.id)
-    .bind(&m.provider)
-    .bind(&m.upstream_name)
-    .bind(m.input_per_mtok)
-    .bind(m.output_per_mtok)
-    .bind(m.cache_read_per_mtok)
-    .bind(m.cache_write_per_mtok)
-    .bind(m.context_window)
-    .bind(m.max_output_tokens)
-    .bind(m.supports_vision)
-    .bind(m.supports_tools)
-    .bind(m.supports_reasoning)
-    .bind(m.supports_prompt_cache)
-    .bind(is_override)
-    .execute(db.pool())
-    .await
-    .map_err(|e| Error::Internal(format!("upserting model: {e}")))?;
+        ";
+
+/// Insert or update a catalog entry, never clobbering an operator override.
+pub async fn upsert_model(db: &Db, m: &ModelRow, is_override: bool) -> Result<()> {
+    sqlx::query(UPSERT_MODEL_SQL)
+        .bind(&m.id)
+        .bind(&m.provider)
+        .bind(&m.upstream_name)
+        .bind(m.input_per_mtok)
+        .bind(m.output_per_mtok)
+        .bind(m.cache_read_per_mtok)
+        .bind(m.cache_write_per_mtok)
+        .bind(m.context_window)
+        .bind(m.max_output_tokens)
+        .bind(m.supports_vision)
+        .bind(m.supports_tools)
+        .bind(m.supports_reasoning)
+        .bind(m.supports_prompt_cache)
+        .bind(is_override)
+        // Only ever reaches an INSERT: a seed builds rows with no label, and the
+        // conflict branch above does not name the column.
+        .bind(m.display_label.as_deref())
+        .execute(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("upserting model: {e}")))?;
     Ok(())
 }
 
@@ -897,7 +943,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_providers_hides_what_the_caller_cannot_use() {
+    async fn route_channels_hides_what_the_caller_cannot_use() {
         let Some(db) = test_db() else {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
             return;
@@ -906,15 +952,16 @@ mod tests {
         let (principal, route, account) = seed(&db).await;
 
         assert_eq!(
-            route_providers(&db, route, principal).await.expect("list"),
-            vec!["anthropic".to_owned()]
+            route_channels(&db, route, principal).await.expect("list"),
+            vec![("anthropic".to_owned(), "api_key".to_owned())],
+            "the kind rides along, so the listing knows which qualifiers to offer"
         );
 
         // Disabled is an operator decision, not a transient state: advertising
         // a model nobody can reach moves the failure away from its cause.
         set_schedulable(&db, account, false).await.expect("disable");
         assert!(
-            route_providers(&db, route, principal)
+            route_channels(&db, route, principal)
                 .await
                 .expect("list")
                 .is_empty()
@@ -937,7 +984,7 @@ mod tests {
             .await
             .expect("bind");
         assert!(
-            route_providers(&db, route, principal)
+            route_channels(&db, route, principal)
                 .await
                 .expect("list")
                 .is_empty(),
@@ -1439,5 +1486,151 @@ mod tests {
             dec!(1.75),
             "only the attempt that made it into the ledger may debit the key"
         );
+    }
+
+    /// A catalog row as a seed builds one: no label, because a seed has no
+    /// opinion about what to call anything.
+    fn seed_model(id: &str, input: Decimal) -> ModelRow {
+        ModelRow {
+            id: id.to_owned(),
+            provider: "xai".to_owned(),
+            upstream_name: "grok-4.6".to_owned(),
+            input_per_mtok: input,
+            output_per_mtok: input * Decimal::from(4),
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: None,
+            context_window: 131_072,
+            max_output_tokens: 8_192,
+            supports_vision: false,
+            supports_tools: false,
+            supports_reasoning: false,
+            supports_prompt_cache: false,
+            display_label: None,
+        }
+    }
+
+    #[test]
+    fn the_upsert_refreshes_prices_without_naming_the_label_column() {
+        // The guard against the whole failure, readable without a database:
+        // `display_label` may appear in the INSERT, never in the conflict
+        // branch. The moment it joins that list, every re-seed writes NULL over
+        // whatever an operator called the model — and a nightly price sync
+        // makes renaming look like it silently stopped working.
+        let conflict = UPSERT_MODEL_SQL
+            .split_once("DO UPDATE SET")
+            .expect("the upsert has a conflict branch")
+            .1;
+        // The assignments alone: comments stripped, because the one above the
+        // WHERE clause explains this very rule and names the column while doing
+        // it, and cut at the WHERE, which reads `is_override` on purpose.
+        let assignments: String = conflict
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with("WHERE"))
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !assignments.contains("display_label"),
+            "a refresh must not carry a label: {assignments}"
+        );
+        assert!(
+            !assignments.contains("is_override"),
+            "nor the override flag it is modelled on: {assignments}"
+        );
+        assert!(
+            assignments.contains("input_per_mtok"),
+            "the prices really are refreshed: {assignments}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operators_label_outlives_a_reseed_and_a_price_sync() {
+        // The reason the column is not in the conflict branch, end to end. An
+        // operator renames a model once; a nightly LiteLLM seed and a provider
+        // price sync both run over it afterwards, and neither knows the name
+        // exists. If either carried the column, the rename would last until the
+        // next tick and nobody would connect the two.
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+
+        let id = format!("xai/grok-{}", Uuid::new_v4());
+        upsert_model(&db, &seed_model(&id, dec!(3)), false)
+            .await
+            .expect("seed");
+
+        let labelled = set_model_label(&db, &id, Some("Grok, the fast one"))
+            .await
+            .expect("label");
+        assert_eq!(labelled.as_deref(), Some(id.as_str()));
+
+        // A second seed, exactly as `oag admin seed-catalog` runs it.
+        upsert_model(&db, &seed_model(&id, dec!(5)), false)
+            .await
+            .expect("reseed");
+        // And a native price sync, which takes the other write path.
+        assert!(
+            update_model_prices(&db, &id, dec!(7), dec!(28), Some(dec!(0.7)))
+                .await
+                .expect("reprice")
+        );
+
+        let row = catalog(&db)
+            .await
+            .expect("catalog")
+            .into_iter()
+            .find(|m| m.id == id)
+            .expect("the row is still there");
+        assert_eq!(
+            row.display_label.as_deref(),
+            Some("Grok, the fast one"),
+            "a seed and a sync both know nothing about names"
+        );
+        // The prices did move, so this is not a row nothing touched.
+        assert_eq!(row.input_per_mtok, dec!(7));
+
+        // And clearing it is a distinct state from naming it the derived
+        // default: the row goes back to following the provider's spelling.
+        set_model_label(&db, &id, None).await.expect("clear");
+        let row = catalog(&db)
+            .await
+            .expect("catalog")
+            .into_iter()
+            .find(|m| m.id == id)
+            .expect("row");
+        assert_eq!(row.display_label, None);
+        assert_eq!(row.derived_label(), "xAI: grok-4.6");
+
+        assert_eq!(
+            set_model_label(&db, "xai/not-a-model", Some("x"))
+                .await
+                .expect("query"),
+            None,
+            "renaming a model that does not exist is the caller's 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_catalog_select_matches_the_schema() {
+        // `rows.rs` takes hand-written `FromRow` structs on the grounds that a
+        // column mistake shows up as a runtime error on the first query. That
+        // is only true if something runs the query, and this SELECT grew a
+        // column in this change.
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let id = format!("xai/grok-{}", Uuid::new_v4());
+        upsert_model(&db, &seed_model(&id, dec!(3)), false)
+            .await
+            .expect("seed");
+
+        let rows = catalog(&db)
+            .await
+            .expect("catalog must not fail on a column name");
+        assert!(rows.iter().any(|m| m.id == id));
     }
 }

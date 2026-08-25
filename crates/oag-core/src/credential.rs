@@ -43,6 +43,57 @@ impl CredentialKind {
         matches!(self, Self::OAuth)
     }
 
+    /// The `@` qualifier that pins a model to this kind, for the kinds a client
+    /// may ask for by name.
+    ///
+    /// Two, and deliberately only two. `@api` and `@sub` are the choice a
+    /// caller actually has — the same upstream reached through a metered key or
+    /// through a seat — while Bedrock, Vertex and a service account are
+    /// different upstreams, and a different upstream is a different provider
+    /// with an id of its own. A qualifier for those would be a second way to
+    /// spell something that already has a name.
+    #[must_use]
+    pub const fn qualifier(self) -> Option<&'static str> {
+        match self {
+            Self::ApiKey => Some("api"),
+            Self::OAuth => Some("sub"),
+            Self::Bedrock | Self::Vertex | Self::ServiceAccount => None,
+        }
+    }
+
+    /// Every qualifier a client may write, for an error that names them.
+    pub const QUALIFIED: &'static [Self] = &[Self::ApiKey, Self::OAuth];
+
+    /// Parse the text after the `@` in a model id.
+    ///
+    /// `None` is a client error rather than "unqualified": a caller who wrote
+    /// `@subscription` meant to exclude their API keys, and ignoring the pin
+    /// would send the request to exactly the credential they excluded.
+    #[must_use]
+    pub fn from_qualifier(s: &str) -> Option<Self> {
+        Self::QUALIFIED
+            .iter()
+            .copied()
+            .find(|k| k.qualifier() == Some(s))
+    }
+
+    /// How to name this kind in a sentence a caller reads.
+    ///
+    /// `Display` writes the column value, which is what the schema and the CLI
+    /// speak. "no oauth credential for xai on this route" is that string in a
+    /// place it does not belong: the person reading it bought a subscription,
+    /// not an oauth.
+    #[must_use]
+    pub const fn channel_label(self) -> &'static str {
+        match self {
+            Self::ApiKey => "API key",
+            Self::OAuth => "subscription",
+            Self::Bedrock => "Bedrock",
+            Self::Vertex => "Vertex",
+            Self::ServiceAccount => "service account",
+        }
+    }
+
     /// Parse the discriminator as stored in `account.kind`. Unknown strings map
     /// to `None` rather than erroring: the caller decides what an unrecognised
     /// kind means, and for flat-rate classification the safe answer is "metered".
@@ -127,5 +178,53 @@ impl SecretMaterial {
     pub fn expires_within(&self, now_unix: i64, skew_secs: i64) -> bool {
         self.expires_at
             .is_some_and(|exp| exp - skew_secs <= now_unix)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_qualifier_round_trips_to_the_kind_it_names() {
+        // The pin is only worth anything if the two directions agree: the
+        // listing advertises `@sub` from the kind, and the inference path reads
+        // `@sub` back into it.
+        for kind in CredentialKind::QUALIFIED.iter().copied() {
+            let q = kind.qualifier().expect("a qualified kind names one");
+            assert_eq!(CredentialKind::from_qualifier(q), Some(kind));
+        }
+        assert_eq!(
+            CredentialKind::from_qualifier("api"),
+            Some(CredentialKind::ApiKey)
+        );
+        assert_eq!(
+            CredentialKind::from_qualifier("sub"),
+            Some(CredentialKind::OAuth)
+        );
+    }
+
+    #[test]
+    fn a_kind_that_is_a_provider_of_its_own_has_no_qualifier() {
+        // Bedrock is a different base URL, adapter, auth and bill, so it is a
+        // different provider with an id of its own. A qualifier for it would be
+        // a second spelling of something already named.
+        for kind in [
+            CredentialKind::Bedrock,
+            CredentialKind::Vertex,
+            CredentialKind::ServiceAccount,
+        ] {
+            assert_eq!(kind.qualifier(), None, "{kind} should not be addressable");
+            assert_eq!(CredentialKind::from_qualifier(&kind.to_string()), None);
+        }
+    }
+
+    #[test]
+    fn an_unknown_qualifier_parses_to_nothing_rather_than_a_default() {
+        // Falling back to "unqualified" would send a request to the very
+        // credential the caller wrote the pin to exclude.
+        for bogus in ["bogus", "subscription", "apikey", "oauth", ""] {
+            assert_eq!(CredentialKind::from_qualifier(bogus), None, "{bogus}");
+        }
     }
 }

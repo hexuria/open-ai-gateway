@@ -93,9 +93,48 @@ pub struct ModelSpec {
     pub max_output_tokens: u32,
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// What an operator named this model, if anyone has.
+    ///
+    /// An id is an address — clients send it, rungs name it, the ledger records
+    /// it — so renaming one breaks all three. A label is a name and renaming a
+    /// name is free. Keeping them as one string is why renaming has felt
+    /// dangerous, so this is deliberately a second field rather than a
+    /// mutable id.
+    ///
+    /// `None` is the common case and means "derive it": see [`ModelSpec::label`].
+    /// `#[serde(default)]` because a serialised catalog written before this
+    /// field existed must still load.
+    #[serde(default)]
+    pub display_label: Option<String>,
+}
+
+/// What a human should read for a model, as opposed to what the router needs.
+///
+/// The vendor's own spelling plus the name on the wire. Derived, not invented:
+/// a marketing name we made up would disagree with the provider's own console
+/// the first time they rename something. Public and shared so the listing, the
+/// admin API and the dashboard placeholder all show the same string — three
+/// copies of one format is three chances for a rename to look like it did
+/// nothing.
+#[must_use]
+pub fn derive_label(vendor: &str, name: &str) -> String {
+    format!("{vendor}: {name}")
 }
 
 impl ModelSpec {
+    /// What a picker should show for this model.
+    ///
+    /// The operator's label when there is one, the derived default otherwise.
+    /// Falling back rather than backfilling the column means an unnamed model
+    /// follows the provider's own spelling forever, and a named one is exactly
+    /// what someone typed.
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.display_label.clone().unwrap_or_else(|| {
+            derive_label(self.provider.support().display_name, &self.upstream_name)
+        })
+    }
+
     /// Whether this model can serve a request with these requirements.
     #[must_use]
     pub fn satisfies(&self, need: &Requirements) -> bool {
@@ -215,6 +254,7 @@ mod tests {
                 reasoning: false,
                 prompt_cache: true,
             },
+            display_label: None,
         }
     }
 

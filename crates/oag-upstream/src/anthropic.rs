@@ -91,6 +91,7 @@ mod tests {
                 reasoning: true,
                 prompt_cache: true,
             },
+            display_label: None,
         }
     }
 

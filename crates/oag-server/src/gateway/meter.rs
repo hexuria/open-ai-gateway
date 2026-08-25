@@ -399,6 +399,7 @@ mod tests {
                     context_window: 1_000,
                     max_output_tokens: 100,
                     capabilities: Capabilities::default(),
+                    display_label: None,
                 },
                 tier: oag_core::Tier::new("cheap", 0),
                 reason: SelectionReason::Classified,
@@ -418,6 +419,7 @@ mod tests {
                     context_window: 1_000,
                     max_output_tokens: 100,
                     capabilities: Capabilities::default(),
+                    display_label: None,
                 }),
             },
             account: oag_core::AccountId::from_uuid(Uuid::new_v4()),
@@ -447,6 +449,23 @@ mod tests {
             client_gone: false,
             error: None,
         }
+    }
+
+    #[test]
+    fn the_ledger_records_the_model_the_router_chose_whatever_the_client_typed() {
+        // `usage_event.model_id` is a join key: every cost report, every
+        // per-model rollup and every catalog join reads it. It has to be the
+        // canonical id, never a decorated spelling of it — a `@sub` or an
+        // `anthropic/` prefix reaching this column would split one model's
+        // spend across three names that no query knows are the same model.
+        //
+        // Which channel actually served the request is already recorded, in
+        // `account_id`, which is the same information without the split.
+        let ctx = context(0);
+        let row = usage_write(&ctx, &outcome(300), None, false, Fate::Served);
+        assert_eq!(row.model_id, ctx.decision.model.id.as_str());
+        assert!(!row.model_id.contains('@'), "{}", row.model_id);
+        assert!(row.account_id.is_some(), "the channel is recorded here");
     }
 
     #[test]
