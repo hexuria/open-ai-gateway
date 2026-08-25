@@ -1483,6 +1483,7 @@ dependencies = [
  "oag-store",
  "oag-upstream",
  "rand 0.8.7",
+ "reqwest",
  "rust_decimal",
  "serde_json",
  "serde_yaml_ng",

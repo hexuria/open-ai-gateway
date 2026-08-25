@@ -103,10 +103,29 @@ pub enum AdminCommand {
     },
     /// Load model pricing into the catalog.
     SeedCatalog {
-        /// A LiteLLM-format `model_prices_and_context_window.json`. Omit to use
-        /// the small built-in set.
+        /// A LiteLLM-format `model_prices_and_context_window.json`: a local
+        /// path or an http(s) URL. Omit to use the small built-in set.
         #[arg(long)]
         from: Option<String>,
+    },
+    /// Overlay a provider's own prices onto the catalog.
+    ///
+    /// A separate command rather than another `seed-catalog --from`: that loads
+    /// a whole catalog — prices, context windows, capabilities — from a table
+    /// anyone can fetch, while this needs a stored credential, and its source
+    /// is authoritative about money and silent about everything else. So it
+    /// writes prices and refuses to touch a context window; folding the two
+    /// together would put that refusal one forgotten flag away from a catalog
+    /// full of guessed windows.
+    SyncPrices {
+        #[arg(long, default_value = "xai")]
+        provider: String,
+        /// Which credential to authenticate with. Defaults to the first
+        /// schedulable one for the provider — the price list is the same for
+        /// every seat, so the choice only matters when one seat's token is
+        /// stale.
+        #[arg(long)]
+        account: Option<String>,
     },
     /// Choose whether a concrete model name is honoured or overridden.
     SetMode {
@@ -220,6 +239,9 @@ pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Resu
             }
         }
         AdminCommand::SeedCatalog { from } => seed_catalog(db, from.as_deref()).await,
+        AdminCommand::SyncPrices { provider, account } => {
+            sync_prices(db, kek, &provider, account.as_deref()).await
+        }
         AdminCommand::SetMode { route, mode } => set_mode(db, &route, &mode).await,
         AdminCommand::SetTiers { route, tiers } => set_tiers(db, &route, &tiers).await,
         AdminCommand::RevokeKey { prefix } => revoke_key(db, redis_url, &prefix).await,
@@ -744,7 +766,7 @@ async fn set_tiers(db: &Db, route: &str, tiers: &str) -> Result<()> {
 
 async fn seed_catalog(db: &Db, from: Option<&str>) -> Result<()> {
     let entries = match from {
-        Some(path) => crate::catalog::from_litellm_file(path)?,
+        Some(source) => crate::catalog::from_litellm(source).await?,
         None => crate::catalog::builtin(),
     };
     let n = entries.len();
@@ -753,6 +775,108 @@ async fn seed_catalog(db: &Db, from: Option<&str>) -> Result<()> {
     }
     println!("catalog: {n} models");
     Ok(())
+}
+
+async fn sync_prices(db: &Db, kek: &Kek, provider: &str, account: Option<&str>) -> Result<()> {
+    let known: oag_core::Provider = provider.parse()?;
+    let row = price_account(db, known, account).await?;
+    let material: SecretMaterial = kek.open_json(&row.sealed())?;
+
+    let Some(prices) = oag_upstream::pricing::fetch(known, &material).await? else {
+        return Err(oag_core::Error::Config(format!(
+            "{known} publishes no price API; seed it from LiteLLM instead"
+        )));
+    };
+
+    // The whole catalog, not one lookup per model: this is a handful of rows
+    // against a table with a few thousand in it, and the ids are the only part
+    // that matters.
+    let existing: std::collections::HashSet<String> =
+        repo::catalog(db).await?.into_iter().map(|m| m.id).collect();
+
+    let (mut repriced, mut added, mut overridden) = (0u32, 0u32, 0u32);
+    for change in crate::catalog::plan_price_sync(known, &prices, &existing) {
+        match change {
+            crate::catalog::PriceSync::Reprice {
+                id,
+                input_per_mtok,
+                output_per_mtok,
+                cache_read_per_mtok,
+            } => {
+                if repo::update_model_prices(
+                    db,
+                    &id,
+                    input_per_mtok,
+                    output_per_mtok,
+                    cache_read_per_mtok,
+                )
+                .await?
+                {
+                    repriced += 1;
+                } else {
+                    // The row exists — it came out of the catalog a moment ago
+                    // — so the only thing that can have skipped it is the
+                    // operator override guard.
+                    overridden += 1;
+                }
+            }
+            crate::catalog::PriceSync::Insert(m) => {
+                repo::upsert_model(db, &m, false).await?;
+                added += 1;
+            }
+        }
+    }
+
+    println!(
+        "{known} via {}: {repriced} repriced, {added} added, {overridden} left to the operator",
+        row.name
+    );
+    if added > 0 {
+        println!(
+            "  new rows carry a conservative context window until a LiteLLM seed \
+             fills in the real one"
+        );
+    }
+    Ok(())
+}
+
+/// Pick the credential a price fetch authenticates with.
+///
+/// Any credential for the provider returns the same price list, so this takes
+/// the first rather than making the operator name one; schedulable first,
+/// because a disabled seat is usually disabled for a reason that will also stop
+/// this call. There is no refresh here — the CLI has no `AppState` to hold the
+/// fleet-wide lock — so a seat whose token has expired since the server last
+/// touched it surfaces as a 401, and `--account` is the way past it.
+async fn price_account(
+    db: &Db,
+    provider: oag_core::Provider,
+    name: Option<&str>,
+) -> Result<oag_store::AccountRow> {
+    let row: Option<oag_store::AccountRow> = sqlx::query_as(
+        r"
+        SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
+               token_version, token_expires_at, owner_principal_id, proxy_url,
+               priority, max_concurrency, schedulable, cooldown_until,
+               rate_limited_until, window_resets_at, last_used_at
+        FROM account
+        WHERE provider = $1 AND ($2::text IS NULL OR name = $2)
+        ORDER BY schedulable DESC, priority DESC, name
+        LIMIT 1
+        ",
+    )
+    .bind(provider.as_str())
+    .bind(name)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| oag_core::Error::Internal(format!("finding a {provider} credential: {e}")))?;
+
+    row.ok_or_else(|| {
+        oag_core::Error::Config(match name {
+            Some(n) => format!("no {provider} credential named {n}"),
+            None => format!("no {provider} credential; add one with `oag admin add-account`"),
+        })
+    })
 }
 
 async fn revoke_key(db: &Db, redis_url: &str, prefix: &str) -> Result<()> {

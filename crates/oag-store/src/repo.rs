@@ -662,6 +662,49 @@ pub async fn upsert_model(db: &Db, m: &ModelRow, is_override: bool) -> Result<()
     Ok(())
 }
 
+/// Refresh only the prices of an existing catalog entry.
+///
+/// Deliberately not `upsert_model` with a rebuilt row. A provider's own price
+/// API is authoritative about money and silent about context windows, so an
+/// upsert would carry whatever the caller guessed into `context_window` and
+/// `max_output_tokens` — and a window that shrinks from 500k to a guess is a
+/// router that quietly stops offering the one model a long request fits in.
+/// The columns not named here keep whatever a LiteLLM seed or an operator put
+/// there.
+///
+/// A `None` cache price means the provider did not state one, which is not the
+/// same as stating zero, so the existing value survives.
+///
+/// Returns false when nothing was updated: either no such id, or an operator
+/// override, which is left alone for the same reason `upsert_model` leaves it.
+pub async fn update_model_prices(
+    db: &Db,
+    id: &str,
+    input_per_mtok: Decimal,
+    output_per_mtok: Decimal,
+    cache_read_per_mtok: Option<Decimal>,
+) -> Result<bool> {
+    let done = sqlx::query(
+        r"
+        UPDATE model_catalog SET
+            input_per_mtok = $2,
+            output_per_mtok = $3,
+            cache_read_per_mtok = COALESCE($4, cache_read_per_mtok),
+            updated_at = now()
+        WHERE id = $1 AND is_override = false
+        ",
+    )
+    .bind(id)
+    .bind(input_per_mtok)
+    .bind(output_per_mtok)
+    .bind(cache_read_per_mtok)
+    .execute(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("repricing model: {e}")))?;
+
+    Ok(done.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
