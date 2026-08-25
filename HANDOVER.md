@@ -171,7 +171,7 @@ tokenizer.
 
 ```bash
 just dev-serve
-oag admin add-account --name anthropic-1 --provider anthropic --secret sk-...
+oag admin account add --name anthropic-1 --provider anthropic --secret sk-...
 ```
 
 Then send a request through `oag/auto` and read the ledger row. This also
@@ -278,7 +278,7 @@ to run after each apply. Documented, not hidden.
   The moment there is a real deployment, stop editing `0001`. Changes become
   `0004` from then on.
 - **Admin authority is on the key, not the principal** (`api_key.admin`). Mint one
-  with `oag admin key --admin`. An ordinary inference key from an admin's own
+  with `oag admin key create --admin`. An ordinary inference key from an admin's own
   principal is deliberately refused — it gets pasted into SDK configs.
 - **Local dev binds 29080/29081**, not 8080/8081, which collide with everything.
   `just serve` walks up to the first free pair and prints what it chose.

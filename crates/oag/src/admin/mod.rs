@@ -2,8 +2,16 @@
 //!
 //! Enough to stand up a working gateway without the UI existing yet, and to
 //! recover one when the UI is the thing that is broken.
+//!
+//! Noun-verb grouping (`account add`, `key create`, `catalog seed`) is the
+//! surface `--help` shows. The old flat spellings remain as hidden clap
+//! aliases so existing scripts keep working without a deprecation line on
+//! every CI call.
 
-use clap::Subcommand;
+mod doctor;
+
+use clap::{Args, Subcommand, ValueEnum};
+use oag_core::config::Config;
 use oag_core::{Kek, Result, credential::SecretMaterial};
 use oag_store::{Db, repo};
 use rand::Rng;
@@ -24,8 +32,195 @@ pub enum AdminCommand {
         #[arg(long)]
         budget_usd: Option<Decimal>,
     },
+    /// Show routes, credentials, and this month's spend.
+    Status,
+    /// Check why a request on this route would fail.
+    Doctor {
+        #[arg(long, default_value = "default")]
+        route: String,
+    },
+    /// Print the provider support matrix.
+    Providers,
+    /// Upstream credentials.
+    #[command(subcommand)]
+    Account(AccountCommand),
+    /// Inbound API keys.
+    Key(KeyCli),
+    /// Routing policy for a named route.
+    #[command(subcommand)]
+    Route(RouteCommand),
+    /// Model catalog: seed, overlay prices, list.
+    #[command(subcommand)]
+    Catalog(CatalogCommand),
+    /// Shared caches.
+    #[command(subcommand)]
+    Cache(CacheCommand),
+
+    // Hidden spellings of the pre-redesign flat commands. `hide = true` keeps
+    // them out of `--help`; clap still parses them so existing scripts do not
+    // break. No deprecation line: these run from CI.
+    /// Register an upstream credential.
+    #[command(hide = true)]
+    AddAccount {
+        #[command(flatten)]
+        args: AccountAddArgs,
+    },
+    /// Load model pricing into the catalog.
+    #[command(hide = true)]
+    SeedCatalog {
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Overlay a provider's own prices onto the catalog.
+    #[command(hide = true)]
+    SyncPrices {
+        #[arg(long, default_value = "xai")]
+        provider: String,
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Choose whether a concrete model name is honoured or overridden.
+    #[command(hide = true)]
+    SetMode {
+        #[arg(long, default_value = "default")]
+        route: String,
+        #[arg(long)]
+        mode: String,
+    },
+    /// Set a route's tier ladder from JSON.
+    #[command(hide = true)]
+    SetTiers {
+        #[arg(long, default_value = "default")]
+        route: String,
+        /// `[{"name":"cheap","models":["kimi/k2"]}, ...]`, cheapest first.
+        #[arg(long)]
+        tiers: String,
+    },
+    /// Revoke an inbound key by its displayed prefix.
+    #[command(hide = true)]
+    RevokeKey {
+        #[arg(long)]
+        prefix: String,
+    },
+    /// Drop the shared auth cache.
+    #[command(hide = true)]
+    FlushCache,
+}
+
+/// A CLI whose session we can import as an OAuth seat.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum AccountSource {
+    /// Grok CLI (`~/.grok/auth.json`).
+    Grok,
+    /// Codex CLI (`~/.codex/auth.json`).
+    Codex,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AccountCommand {
+    /// Register an upstream credential.
+    Add {
+        #[command(flatten)]
+        args: AccountAddArgs,
+    },
+    /// List upstream credentials.
+    List,
+    /// Take a credential out of rotation.
+    Disable {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Put a credential back into rotation.
+    Enable {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct AccountAddArgs {
+    #[arg(long)]
+    name: String,
+    /// Not needed with `--from`, which knows the provider.
+    #[arg(
+        long,
+        required_unless_present_any = ["from", "from_grok", "from_codex"],
+        conflicts_with_all = ["from", "from_grok", "from_codex"]
+    )]
+    provider: Option<String>,
+    /// The provider API key. Read from `OAG_ACCOUNT_SECRET` if omitted, so it
+    /// need not appear in shell history or the process table.
+    #[arg(
+        long,
+        env = "OAG_ACCOUNT_SECRET",
+        hide_env_values = true,
+        required_unless_present_any = ["from", "from_grok", "from_codex"],
+        conflicts_with_all = ["from", "from_grok", "from_codex"]
+    )]
+    secret: Option<String>,
+    /// Import a signed-in CLI session as an OAuth credential.
+    ///
+    /// `grok` reads `~/.grok/auth.json`, `codex` reads `~/.codex/auth.json`.
+    /// Override with `--auth-file`. Never writes the source file.
+    #[arg(long, value_enum)]
+    from: Option<AccountSource>,
+    /// Hidden spelling of `--from grok`.
+    #[arg(long, hide = true, conflicts_with_all = ["from", "from_codex"])]
+    from_grok: bool,
+    /// Hidden spelling of `--from codex`.
+    #[arg(long, hide = true, conflicts_with_all = ["from", "from_grok"])]
+    from_codex: bool,
+    /// Where to read CLI sessions from. Repeatable; the first file a token
+    /// appears in wins.
+    #[arg(long)]
+    auth_file: Vec<String>,
+    #[arg(long, default_value = "default")]
+    route: String,
+    #[arg(long, default_value_t = 8)]
+    max_concurrency: i32,
+    #[arg(long, default_value_t = 0)]
+    priority: i16,
+    /// Bind to one principal instead of the shared pool. See
+    /// docs/compliance.md.
+    #[arg(long)]
+    owner_email: Option<String>,
+    /// Put an OAuth seat in the shared pool anyway. Deliberate opt-in:
+    /// subscription seats are sanctioned for the holder's own use, so the
+    /// default for an imported seat is per-principal binding.
+    #[arg(long, conflicts_with = "owner_email")]
+    shared: bool,
+    /// The seat's flat monthly price in USD. Lets the dashboard net a
+    /// subscription's saved API spend against what it costs. Applies per
+    /// imported seat.
+    #[arg(long)]
+    monthly_cost: Option<Decimal>,
+}
+
+/// `oag admin key` is a group (`create`/`list`/`revoke`) and, with no
+/// subcommand, the old `key --email` form. Flattened flags are hidden so
+/// `--help` only shows the group. Defaults live in the handler rather than
+/// clap: `default_value` on a parent arg makes clap treat it as present, which
+/// then fights the subcommand.
+#[derive(Args, Debug)]
+pub struct KeyCli {
+    #[command(subcommand)]
+    action: Option<KeyAction>,
+    #[arg(long, hide = true)]
+    email: Option<String>,
+    #[arg(long, hide = true)]
+    route: Option<String>,
+    #[arg(long, hide = true)]
+    name: Option<String>,
+    #[arg(long, hide = true)]
+    floor_tier: Option<String>,
+    #[arg(long, hide = true)]
+    admin: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum KeyAction {
     /// Mint an API key for an existing principal and route.
-    Key {
+    Create {
         #[arg(long)]
         email: String,
         #[arg(long, default_value = "default")]
@@ -41,68 +236,67 @@ pub enum AdminCommand {
         #[arg(long)]
         admin: bool,
     },
+    /// List inbound keys (prefix, never the secret).
+    List,
     /// Revoke an inbound key by its displayed prefix.
     ///
     /// The one write that genuinely needs a CLI: during an incident the prefix
     /// is what an operator can actually see (in a log, in the dashboard), and
     /// psql alone cannot evict the shared auth cache, so a row update there
     /// leaves the key working on every replica for up to its cache TTL.
-    RevokeKey {
-        #[arg(long)]
+    Revoke {
+        #[arg(value_name = "PREFIX")]
         prefix: String,
     },
-    /// Register an upstream credential.
-    AddAccount {
-        #[arg(long)]
-        name: String,
-        /// Not needed with `--from-grok`/`--from-codex`, which know their provider.
-        #[arg(long, required_unless_present_any = ["from_grok", "from_codex"])]
-        provider: Option<String>,
-        /// The provider API key. Read from `OAG_ACCOUNT_SECRET` if omitted, so it
-        /// need not appear in shell history or the process table.
-        #[arg(
-            long,
-            env = "OAG_ACCOUNT_SECRET",
-            hide_env_values = true,
-            required_unless_present_any = ["from_grok", "from_codex"],
-            conflicts_with_all = ["from_grok", "from_codex"]
-        )]
-        secret: Option<String>,
-        /// Import every signed-in Grok CLI session as an xAI OAuth credential.
-        /// Reads `~/.grok/auth.json` (or `--auth-file`), never writes it.
-        #[arg(long)]
-        from_grok: bool,
-        /// Import the signed-in Codex CLI session as an OpenAI OAuth credential.
-        /// Reads `~/.codex/auth.json` (or `--auth-file`), never writes it.
-        #[arg(long, conflicts_with = "from_grok")]
-        from_codex: bool,
-        /// Where to read CLI sessions from. Repeatable; the first file a token
-        /// appears in wins.
-        #[arg(long)]
-        auth_file: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RouteCommand {
+    /// Choose whether a concrete model name is honoured or overridden.
+    Mode {
+        /// `passthrough` honours a named model; `managed` applies policy to
+        /// every request. Virtual `oag/*` names are always managed.
+        mode: RouteMode,
         #[arg(long, default_value = "default")]
         route: String,
-        #[arg(long, default_value_t = 8)]
-        max_concurrency: i32,
-        #[arg(long, default_value_t = 0)]
-        priority: i16,
-        /// Bind to one principal instead of the shared pool. See
-        /// docs/compliance.md.
-        #[arg(long)]
-        owner_email: Option<String>,
-        /// Put an OAuth seat in the shared pool anyway. Deliberate opt-in:
-        /// subscription seats are sanctioned for the holder's own use, so the
-        /// default for an imported seat is per-principal binding.
-        #[arg(long, conflicts_with = "owner_email")]
-        shared: bool,
-        /// The seat's flat monthly price in USD. Lets the dashboard net a
-        /// subscription's saved API spend against what it costs. Applies per
-        /// imported seat.
-        #[arg(long)]
-        monthly_cost: Option<Decimal>,
     },
+    /// Set a route's tier ladder.
+    ///
+    /// Positional `cheap=m1,m2 balanced=m3`, cheapest first. The JSON form
+    /// lives on the hidden `set-tiers` spelling.
+    Tiers {
+        #[arg(long, default_value = "default")]
+        route: String,
+        /// `cheap=xai/grok-4.3 balanced=xai/grok-4.5`, cheapest first.
+        #[arg(value_name = "RUNG", required = true, num_args = 1..)]
+        rungs: Vec<String>,
+    },
+    /// Show a route's mode and ladder.
+    Show {
+        #[arg(long, default_value = "default")]
+        route: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RouteMode {
+    Passthrough,
+    Managed,
+}
+
+impl RouteMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::Managed => "managed",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CatalogCommand {
     /// Load model pricing into the catalog.
-    SeedCatalog {
+    Seed {
         /// A LiteLLM-format `model_prices_and_context_window.json`: a local
         /// path or an http(s) URL. Omit to use the small built-in set.
         #[arg(long)]
@@ -110,7 +304,7 @@ pub enum AdminCommand {
     },
     /// Overlay a provider's own prices onto the catalog.
     ///
-    /// A separate command rather than another `seed-catalog --from`: that loads
+    /// A separate command rather than another `catalog seed --from`: that loads
     /// a whole catalog — prices, context windows, capabilities — from a table
     /// anyone can fetch, while this needs a stored credential, and its source
     /// is authoritative about money and silent about everything else. So it
@@ -127,127 +321,450 @@ pub enum AdminCommand {
         #[arg(long)]
         account: Option<String>,
     },
-    /// Choose whether a concrete model name is honoured or overridden.
-    SetMode {
-        #[arg(long, default_value = "default")]
-        route: String,
-        /// `passthrough` honours a named model; `managed` applies policy to
-        /// every request. Virtual `oag/*` names are always managed.
+    /// List catalog entries.
+    List {
         #[arg(long)]
-        mode: String,
-    },
-    /// Set a route's tier ladder from JSON.
-    SetTiers {
-        #[arg(long, default_value = "default")]
-        route: String,
-        /// `[{"name":"cheap","models":["kimi/k2"]}, ...]`, cheapest first.
+        provider: Option<String>,
         #[arg(long)]
-        tiers: String,
+        limit: Option<usize>,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CacheCommand {
     /// Drop the shared auth cache.
     ///
     /// Budget, quota, and floor-tier changes are read through a cache, so they
     /// take up to five minutes to reach every replica. This clears the shared
     /// tier immediately; each replica's own short-lived cache expires within
     /// fifteen seconds, which bounds the rest.
-    FlushCache,
-    /// Show routes, credentials, and this month's spend.
-    Status,
+    Flush,
 }
 
-pub async fn run(cmd: AdminCommand, db: &Db, kek: &Kek, redis_url: &str) -> Result<()> {
+pub async fn run(
+    cmd: AdminCommand,
+    db: &Db,
+    kek: &Kek,
+    redis_url: &str,
+    config: &Config,
+) -> Result<()> {
     match cmd {
         AdminCommand::Init {
             email,
             route,
             budget_usd,
         } => init(db, &email, &route, budget_usd).await,
-        AdminCommand::Key {
-            email,
-            route,
-            name,
-            floor_tier,
-            admin,
-        } => {
-            let key = mint_key(db, &email, &route, &name, floor_tier.as_deref(), admin).await?;
-            print_key(&key);
-            Ok(())
+        AdminCommand::Status => status(db).await,
+        AdminCommand::Doctor { route } => doctor::run(db, config, &route).await,
+        AdminCommand::Providers => print_providers(db).await,
+        AdminCommand::Account(cmd) => account_cmd(db, kek, cmd).await,
+        AdminCommand::Key(cli) => key_cmd(db, redis_url, cli).await,
+        AdminCommand::Route(cmd) => route_cmd(db, cmd).await,
+        AdminCommand::Catalog(cmd) => catalog_cmd(db, kek, cmd).await,
+        AdminCommand::Cache(CacheCommand::Flush) | AdminCommand::FlushCache => {
+            flush_cache(redis_url).await
         }
-        AdminCommand::AddAccount {
-            name,
-            provider,
-            secret,
-            from_grok,
-            from_codex,
-            auth_file,
-            route,
-            max_concurrency,
-            priority,
-            owner_email,
-            shared,
-            monthly_cost,
-        } => {
-            if from_grok {
-                import_grok(
-                    db,
-                    kek,
-                    &name,
-                    &auth_file,
-                    &route,
-                    max_concurrency,
-                    priority,
-                    owner_email.as_deref(),
-                    shared,
-                    monthly_cost,
-                )
-                .await
-            } else if from_codex {
-                import_codex(
-                    db,
-                    kek,
-                    &name,
-                    &auth_file,
-                    &route,
-                    max_concurrency,
-                    priority,
-                    owner_email.as_deref(),
-                    shared,
-                    monthly_cost,
-                )
-                .await
-            } else {
-                // clap enforces both when --from-grok is absent; this is the
-                // belt to that suspender.
-                let (Some(provider), Some(secret)) = (provider, secret) else {
-                    return Err(oag_core::Error::Config(
-                        "--provider and --secret are required without --from-grok".to_owned(),
-                    ));
-                };
-                add_account(
-                    db,
-                    kek,
-                    &name,
-                    &provider,
-                    &secret,
-                    &route,
-                    max_concurrency,
-                    priority,
-                    owner_email.as_deref(),
-                    monthly_cost,
-                )
-                .await
-            }
-        }
+        AdminCommand::AddAccount { args } => add_account_from_args(db, kek, args).await,
         AdminCommand::SeedCatalog { from } => seed_catalog(db, from.as_deref()).await,
         AdminCommand::SyncPrices { provider, account } => {
             sync_prices(db, kek, &provider, account.as_deref()).await
         }
         AdminCommand::SetMode { route, mode } => set_mode(db, &route, &mode).await,
-        AdminCommand::SetTiers { route, tiers } => set_tiers(db, &route, &tiers).await,
+        AdminCommand::SetTiers { route, tiers } => set_tiers_json(db, &route, &tiers).await,
         AdminCommand::RevokeKey { prefix } => revoke_key(db, redis_url, &prefix).await,
-        AdminCommand::FlushCache => flush_cache(redis_url).await,
-        AdminCommand::Status => status(db).await,
     }
+}
+
+async fn account_cmd(db: &Db, kek: &Kek, cmd: AccountCommand) -> Result<()> {
+    match cmd {
+        AccountCommand::Add { args } => add_account_from_args(db, kek, args).await,
+        AccountCommand::List => list_accounts(db).await,
+        AccountCommand::Disable { name } => set_account_schedulable(db, &name, false).await,
+        AccountCommand::Enable { name } => set_account_schedulable(db, &name, true).await,
+    }
+}
+
+async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddArgs) -> Result<()> {
+    let AccountAddArgs {
+        name,
+        provider,
+        secret,
+        from,
+        from_grok,
+        from_codex,
+        auth_file,
+        route,
+        max_concurrency,
+        priority,
+        owner_email,
+        shared,
+        monthly_cost,
+    } = args;
+    let source = if from_grok {
+        Some(AccountSource::Grok)
+    } else if from_codex {
+        Some(AccountSource::Codex)
+    } else {
+        from
+    };
+    match source {
+        Some(AccountSource::Grok) => {
+            import_grok(
+                db,
+                kek,
+                &name,
+                &auth_file,
+                &route,
+                max_concurrency,
+                priority,
+                owner_email.as_deref(),
+                shared,
+                monthly_cost,
+            )
+            .await
+        }
+        Some(AccountSource::Codex) => {
+            import_codex(
+                db,
+                kek,
+                &name,
+                &auth_file,
+                &route,
+                max_concurrency,
+                priority,
+                owner_email.as_deref(),
+                shared,
+                monthly_cost,
+            )
+            .await
+        }
+        None => {
+            let (Some(provider), Some(secret)) = (provider, secret) else {
+                return Err(oag_core::Error::Config(
+                    "--provider and --secret are required without --from".to_owned(),
+                ));
+            };
+            add_account(
+                db,
+                kek,
+                &name,
+                &provider,
+                &secret,
+                &route,
+                max_concurrency,
+                priority,
+                owner_email.as_deref(),
+                monthly_cost,
+            )
+            .await
+        }
+    }
+}
+
+async fn key_cmd(db: &Db, redis_url: &str, cli: KeyCli) -> Result<()> {
+    match cli.action {
+        Some(KeyAction::Create {
+            email,
+            route,
+            name,
+            floor_tier,
+            admin,
+        }) => {
+            let key = mint_key(db, &email, &route, &name, floor_tier.as_deref(), admin).await?;
+            print_key(&key);
+            Ok(())
+        }
+        Some(KeyAction::List) => list_keys(db).await,
+        Some(KeyAction::Revoke { prefix }) => revoke_key(db, redis_url, &prefix).await,
+        None => {
+            let Some(email) = cli.email else {
+                return Err(oag_core::Error::Config(
+                    "oag admin key needs a subcommand; mint one with `oag admin key create --email <email>`"
+                        .to_owned(),
+                ));
+            };
+            let key = mint_key(
+                db,
+                &email,
+                cli.route.as_deref().unwrap_or("default"),
+                cli.name.as_deref().unwrap_or("cli"),
+                cli.floor_tier.as_deref(),
+                cli.admin,
+            )
+            .await?;
+            print_key(&key);
+            Ok(())
+        }
+    }
+}
+
+async fn route_cmd(db: &Db, cmd: RouteCommand) -> Result<()> {
+    match cmd {
+        RouteCommand::Mode { mode, route } => set_mode(db, &route, mode.as_str()).await,
+        RouteCommand::Tiers { route, rungs } => {
+            let parsed = parse_ladder_rungs(&rungs)?;
+            set_rungs(db, &route, parsed).await
+        }
+        RouteCommand::Show { route } => show_route(db, &route).await,
+    }
+}
+
+async fn catalog_cmd(db: &Db, kek: &Kek, cmd: CatalogCommand) -> Result<()> {
+    match cmd {
+        CatalogCommand::Seed { from } => seed_catalog(db, from.as_deref()).await,
+        CatalogCommand::SyncPrices { provider, account } => {
+            sync_prices(db, kek, &provider, account.as_deref()).await
+        }
+        CatalogCommand::List { provider, limit } => {
+            list_catalog(db, provider.as_deref(), limit).await
+        }
+    }
+}
+
+fn parse_ladder_rungs(specs: &[String]) -> Result<Vec<oag_router::ladder::Rung>> {
+    if specs.is_empty() {
+        return Err(oag_core::Error::Config(
+            "pass rungs as name=model[,model] cheapest first, e.g. cheap=xai/grok-4.3".to_owned(),
+        ));
+    }
+    let mut rungs = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let Some((name, models)) = spec.split_once('=') else {
+            return Err(oag_core::Error::Config(format!(
+                "expected name=model[,model], got '{spec}'"
+            )));
+        };
+        let models: Vec<oag_router::ModelId> = models
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(oag_router::ModelId::new)
+            .collect();
+        if models.is_empty() {
+            return Err(oag_core::Error::Config(format!(
+                "rung '{name}' has no models"
+            )));
+        }
+        rungs.push(oag_router::ladder::Rung {
+            name: oag_core::TierName::from(name),
+            models,
+        });
+    }
+    Ok(rungs)
+}
+
+async fn set_rungs(db: &Db, route: &str, rungs: Vec<oag_router::ladder::Rung>) -> Result<()> {
+    if oag_router::TierLadder::new(rungs.clone()).is_none() {
+        return Err(oag_core::Error::Config(
+            "a ladder needs at least one rung".to_owned(),
+        ));
+    }
+    let value = serde_json::to_value(&rungs).map_err(oag_core::Error::Serde)?;
+    let n = sqlx::query("UPDATE route SET tiers = $2, updated_at = now() WHERE name = $1")
+        .bind(route)
+        .bind(&value)
+        .execute(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("setting tiers: {e}")))?;
+    if n.rows_affected() == 0 {
+        return Err(oag_core::Error::Config(format!("no route named {route}")));
+    }
+    println!("route '{route}' ladder set: {} rungs", rungs.len());
+    for (i, r) in rungs.iter().enumerate() {
+        println!("  {i}. {} -> {}", r.name, r.models.len());
+    }
+    Ok(())
+}
+
+type AccountListRow = (
+    String,
+    String,
+    String,
+    bool,
+    Option<time::OffsetDateTime>,
+    Option<time::OffsetDateTime>,
+    i16,
+);
+
+async fn list_accounts(db: &Db) -> Result<()> {
+    let rows: Vec<AccountListRow> = sqlx::query_as(
+        r"
+        SELECT name, provider, kind, schedulable, cooldown_until, rate_limited_until, priority
+        FROM account ORDER BY provider, name
+        ",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| oag_core::Error::Internal(format!("listing accounts: {e}")))?;
+
+    if rows.is_empty() {
+        println!("no credentials; add one with `oag admin account add`");
+        return Ok(());
+    }
+    println!("NAME                 PROVIDER     KIND       STATE          PRIORITY");
+    let now = time::OffsetDateTime::now_utc();
+    for (name, provider, kind, schedulable, cooldown, rate_limited, priority) in rows {
+        let state = if !schedulable {
+            "disabled"
+        } else if cooldown.is_some_and(|t| t > now) {
+            "cooling down"
+        } else if rate_limited.is_some_and(|t| t > now) {
+            "rate limited"
+        } else {
+            "ready"
+        };
+        println!("{name:<20} {provider:<12} {kind:<10} {state:<14} {priority}");
+    }
+    Ok(())
+}
+
+async fn set_account_schedulable(db: &Db, name: &str, value: bool) -> Result<()> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "UPDATE account SET schedulable = $2, updated_at = now() WHERE name = $1 RETURNING name",
+    )
+    .bind(name)
+    .bind(value)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| oag_core::Error::Internal(format!("updating account: {e}")))?;
+    if names.is_empty() {
+        return Err(oag_core::Error::Config(format!(
+            "no credential named {name}; see `oag admin account list`"
+        )));
+    }
+    let verb = if value { "enabled" } else { "disabled" };
+    println!("{verb} {name}");
+    Ok(())
+}
+
+async fn list_keys(db: &Db) -> Result<()> {
+    let rows: Vec<(String, String, bool, bool, String, String)> = sqlx::query_as(
+        r"
+        SELECT k.key_prefix, k.name, k.admin, k.active, p.email, r.name
+        FROM api_key k
+        JOIN principal p ON p.id = k.principal_id
+        JOIN route r ON r.id = k.route_id
+        ORDER BY k.created_at
+        ",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| oag_core::Error::Internal(format!("listing keys: {e}")))?;
+
+    if rows.is_empty() {
+        println!("no keys; mint one with `oag admin key create --email <email>`");
+        return Ok(());
+    }
+    println!("PREFIX             NAME         ADMIN    ACTIVE   EMAIL                    ROUTE");
+    for (prefix, name, admin, active, email, route) in rows {
+        println!(
+            "{prefix:<18} {name:<12} {:<8} {:<8} {email:<24} {route}",
+            if admin { "yes" } else { "no" },
+            if active { "yes" } else { "no" },
+        );
+    }
+    Ok(())
+}
+
+async fn show_route(db: &Db, route: &str) -> Result<()> {
+    let row: Option<(String, serde_json::Value, Option<String>, Option<Decimal>)> = sqlx::query_as(
+        "SELECT default_mode, tiers, floor_tier, monthly_budget_usd FROM route WHERE name = $1",
+    )
+    .bind(route)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| oag_core::Error::Internal(format!("loading route: {e}")))?;
+    let Some((mode, tiers, floor, budget)) = row else {
+        return Err(oag_core::Error::Config(format!(
+            "no route named {route}; `oag admin init` creates 'default'"
+        )));
+    };
+    let rungs: Vec<oag_router::ladder::Rung> =
+        serde_json::from_value(tiers).map_err(oag_core::Error::Serde)?;
+    println!("route {route}");
+    println!("  mode    {mode}");
+    println!("  floor   {}", floor.as_deref().unwrap_or("(none)"));
+    println!(
+        "  budget  {}",
+        budget.map_or_else(|| "uncapped".to_owned(), |b| format!("${b}/mo"))
+    );
+    println!("  ladder");
+    for (i, r) in rungs.iter().enumerate() {
+        let models: Vec<&str> = r.models.iter().map(oag_router::ModelId::as_str).collect();
+        println!("    {i}. {} = {}", r.name, models.join(","));
+    }
+    Ok(())
+}
+
+async fn list_catalog(db: &Db, provider: Option<&str>, limit: Option<usize>) -> Result<()> {
+    let mut rows = repo::catalog(db).await?;
+    if let Some(p) = provider {
+        let want: oag_core::Provider = p.parse()?;
+        rows.retain(|m| m.provider == want.as_str());
+    }
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    let total = rows.len();
+    if let Some(n) = limit {
+        rows.truncate(n);
+    }
+    if rows.is_empty() {
+        println!("catalog is empty; seed it with `oag admin catalog seed`");
+        return Ok(());
+    }
+    println!(
+        "{:<36} {:<12} {:>8} {:>8} {:>8}",
+        "ID", "PROVIDER", "IN/MTok", "OUT/MTok", "CTX"
+    );
+    for m in &rows {
+        println!(
+            "{:<36} {:<12} {:>8} {:>8} {:>8}",
+            m.id, m.provider, m.input_per_mtok, m.output_per_mtok, m.context_window
+        );
+    }
+    if rows.len() < total {
+        println!(
+            "({} of {total}; pass --limit to see more or less)",
+            rows.len()
+        );
+    }
+    Ok(())
+}
+
+async fn print_providers(db: &Db) -> Result<()> {
+    let counts: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT provider, kind, COUNT(*) FROM account GROUP BY provider, kind ORDER BY provider, kind",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| oag_core::Error::Internal(format!("counting credentials: {e}")))?;
+
+    println!("PROVIDER     DIALECT                      ACCOUNTS         SUBSCRIPTION");
+    for &p in oag_core::Provider::ALL {
+        let s = p.support();
+        let n: i64 = counts
+            .iter()
+            .filter(|c| c.0 == p.as_str())
+            .map(|c| c.2)
+            .sum();
+        let sub = match s.subscription {
+            oag_core::provider::SubscriptionSupport::Served { import }
+            | oag_core::provider::SubscriptionSupport::CredentialImportOnly { import, .. } => {
+                import
+            }
+            oag_core::provider::SubscriptionSupport::NotOffered { .. } => "no",
+            _ => "unknown",
+        };
+        println!(
+            "{:<12} {:<28} {:<16} {sub}",
+            p.as_str(),
+            s.dialect().as_str(),
+            n,
+        );
+        if let Some(note) = s.note {
+            println!("             {note}");
+        }
+    }
+    Ok(())
 }
 
 async fn init(db: &Db, email: &str, route: &str, budget: Option<Decimal>) -> Result<()> {
@@ -260,16 +777,16 @@ async fn init(db: &Db, email: &str, route: &str, budget: Option<Decimal>) -> Res
     println!("\nNext:");
     println!("  This is an ADMIN key: it can disable credentials and revoke keys.");
     println!("  Do not paste it into a client. Mint a separate one for SDKs:");
-    println!("      oag admin key --email {email} --route {route} --name codex");
+    println!("      oag admin key create --email {email} --route {route} --name codex");
     println!();
-    println!("  oag admin seed-catalog");
-    println!("  oag admin add-account --name <n> --provider anthropic --secret <key>");
+    println!("  oag admin catalog seed");
+    println!("  oag admin account add --name <n> --provider anthropic --secret <key>");
     println!();
     println!("  This route is in passthrough mode: a client that names a concrete");
     println!("  model gets that model. Clients asking for oag/auto are routed by");
     println!("  policy. To apply policy to every request, including ones that name");
     println!("  a model:");
-    println!("      oag admin set-mode --route {route} --mode managed");
+    println!("      oag admin route mode managed --route {route}");
     Ok(())
 }
 
@@ -735,33 +1252,12 @@ async fn set_mode(db: &Db, route: &str, mode: &str) -> Result<()> {
     Ok(())
 }
 
-async fn set_tiers(db: &Db, route: &str, tiers: &str) -> Result<()> {
+async fn set_tiers_json(db: &Db, route: &str, tiers: &str) -> Result<()> {
     // Parse through the real type, so a malformed ladder is rejected here and
     // not on the first request that route serves.
     let rungs: Vec<oag_router::ladder::Rung> =
         serde_json::from_str(tiers).map_err(oag_core::Error::Serde)?;
-    if oag_router::TierLadder::new(rungs.clone()).is_none() {
-        return Err(oag_core::Error::Config(
-            "a ladder needs at least one rung".to_owned(),
-        ));
-    }
-    let value: serde_json::Value = serde_json::from_str(tiers).map_err(oag_core::Error::Serde)?;
-
-    let n = sqlx::query("UPDATE route SET tiers = $2, updated_at = now() WHERE name = $1")
-        .bind(route)
-        .bind(value)
-        .execute(db.pool())
-        .await
-        .map_err(|e| oag_core::Error::Internal(format!("setting tiers: {e}")))?;
-
-    if n.rows_affected() == 0 {
-        return Err(oag_core::Error::Config(format!("no route named {route}")));
-    }
-    println!("route '{route}' ladder set: {} rungs", rungs.len());
-    for (i, r) in rungs.iter().enumerate() {
-        println!("  {i}. {} -> {}", r.name, r.models.len());
-    }
-    Ok(())
+    set_rungs(db, route, rungs).await
 }
 
 async fn seed_catalog(db: &Db, from: Option<&str>) -> Result<()> {
@@ -874,7 +1370,9 @@ async fn price_account(
     row.ok_or_else(|| {
         oag_core::Error::Config(match name {
             Some(n) => format!("no {provider} credential named {n}"),
-            None => format!("no {provider} credential; add one with `oag admin add-account`"),
+            None => format!(
+                "no {provider} credential; add one with `oag admin account add --provider {provider}`"
+            ),
         })
     })
 }
@@ -969,4 +1467,121 @@ async fn status(db: &Db) -> Result<()> {
         println!("  saved            ${:.4}", counterfactual - cost);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser, Debug)]
+    #[command(name = "admin")]
+    struct AdminCli {
+        #[command(subcommand)]
+        cmd: AdminCommand,
+    }
+
+    fn parse(args: &[&str]) -> std::result::Result<AdminCommand, clap::Error> {
+        Ok(AdminCli::try_parse_from(std::iter::once("admin").chain(args.iter().copied()))?.cmd)
+    }
+
+    #[test]
+    fn account_add_accepts_from_space_and_equals() {
+        for args in [
+            &["account", "add", "--name", "n", "--from", "grok"][..],
+            &["account", "add", "--name", "n", "--from=codex"][..],
+        ] {
+            match parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}")) {
+                AdminCommand::Account(AccountCommand::Add { args }) => {
+                    assert!(args.from.is_some(), "{args:?}");
+                }
+                other => panic!("expected account add, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_add_account_and_from_bools_still_parse() {
+        match parse(&["add-account", "--name", "n", "--from-grok"])
+            .unwrap_or_else(|e| panic!("{e}"))
+        {
+            AdminCommand::AddAccount { args } => assert!(args.from_grok),
+            other => panic!("expected hidden add-account, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_create_and_legacy_key_flags_parse() {
+        match parse(&["key", "create", "--email", "a@b.c"]).unwrap_or_else(|e| panic!("{e}")) {
+            AdminCommand::Key(cli) => {
+                assert!(matches!(cli.action, Some(KeyAction::Create { .. })));
+            }
+            other => panic!("expected key create, got {other:?}"),
+        }
+        match parse(&["key", "--email", "a@b.c"]).unwrap_or_else(|e| panic!("{e}")) {
+            AdminCommand::Key(cli) => {
+                assert!(cli.action.is_none());
+                assert_eq!(cli.email.as_deref(), Some("a@b.c"));
+            }
+            other => panic!("expected legacy key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_revoke_is_positional() {
+        match parse(&["key", "revoke", "oag_live_abc"]).unwrap_or_else(|e| panic!("{e}")) {
+            AdminCommand::Key(cli) => {
+                assert!(matches!(
+                    cli.action,
+                    Some(KeyAction::Revoke { ref prefix }) if prefix == "oag_live_abc"
+                ));
+            }
+            other => panic!("expected key revoke, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_tiers_parses_name_equals_models() {
+        match parse(&[
+            "route",
+            "tiers",
+            "cheap=xai/grok-4.3",
+            "balanced=xai/grok-4.5",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"))
+        {
+            AdminCommand::Route(RouteCommand::Tiers { rungs, .. }) => {
+                assert_eq!(rungs.len(), 2);
+                assert_eq!(rungs[0], "cheap=xai/grok-4.3");
+            }
+            other => panic!("expected route tiers, got {other:?}"),
+        }
+        let parsed = parse_ladder_rungs(&[
+            "cheap=xai/grok-4.3,xai/grok-4".to_owned(),
+            "balanced=xai/grok-4.5".to_owned(),
+        ])
+        .expect("rungs");
+        assert_eq!(parsed[0].models.len(), 2);
+        assert_eq!(parsed[1].name.as_str(), "balanced");
+    }
+
+    #[test]
+    fn hidden_flat_spellings_still_parse() {
+        assert!(matches!(
+            parse(&["seed-catalog"]).unwrap_or_else(|e| panic!("{e}")),
+            AdminCommand::SeedCatalog { .. }
+        ));
+        assert!(matches!(
+            parse(&["flush-cache"]).unwrap_or_else(|e| panic!("{e}")),
+            AdminCommand::FlushCache
+        ));
+        assert!(matches!(
+            parse(&["revoke-key", "--prefix", "oag_live_x"]).unwrap_or_else(|e| panic!("{e}")),
+            AdminCommand::RevokeKey { .. }
+        ));
+        assert!(matches!(
+            parse(&["set-mode", "--mode", "managed"]).unwrap_or_else(|e| panic!("{e}")),
+            AdminCommand::SetMode { .. }
+        ));
+    }
 }

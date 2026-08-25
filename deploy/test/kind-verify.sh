@@ -170,8 +170,8 @@ POD="$($KC get pod -l app.kubernetes.io/name=open-ai-gateway -o jsonpath='{.item
 KEY="$($KC exec "$POD" -- oag admin init --email verify@localhost --route default 2>/dev/null \
         | grep -oE 'oag_live_[0-9a-f]+' | head -1)"
 [ -n "$KEY" ] || fail "could not mint an admin key"
-$KC exec "$POD" -- oag admin seed-catalog >/dev/null
-$KC exec "$POD" -- oag admin add-account --name mock --provider anthropic \
+$KC exec "$POD" -- oag admin catalog seed >/dev/null
+$KC exec "$POD" -- oag admin account add --name mock --provider anthropic \
   --secret FAKE-CREDENTIAL-FOR-TESTS --route default >/dev/null
 pass "bootstrapped"
 

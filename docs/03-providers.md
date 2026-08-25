@@ -8,12 +8,12 @@ and most providers take one and not the other.
 | Provider | Canonical (aliases) | Dialect | Credential | Subscription |
 |---|---|---|---|---|
 | Anthropic | `anthropic` | Anthropic Messages | `api_key` | **Prohibited.** Anthropic's terms forbid a third party intermediating Claude.ai credentials — see [compliance.md](compliance.md). |
-| OpenAI | `openai` | OpenAI Chat Completions | `api_key`, `oauth` | **Yes.** `--from-codex` imports a Codex seat, and `CodexAdapter` serves it against the ChatGPT backend. Also needs `gateway.codex.instructions` set, or the backend refuses the request. |
+| OpenAI | `openai` | OpenAI Chat Completions | `api_key`, `oauth` | **Yes.** `--from codex` imports a Codex seat, and `CodexAdapter` serves it against the ChatGPT backend. Also needs `gateway.codex.instructions` set, or the backend refuses the request. |
 | Google Gemini | `gemini` | Gemini generateContent | `api_key` | No importer. |
 | Moonshot Kimi | `kimi` (`moonshot`) | OpenAI Chat Completions | `api_key` | No importer. |
 | DeepSeek | `deepseek` | OpenAI Chat Completions | `api_key` | No importer. |
 | Zhipu GLM | `zhipu` (`glm`) | OpenAI Chat Completions | `api_key` | No importer. |
-| xAI | `xai` (`grok`) | OpenAI Chat Completions | `api_key`, `oauth` | **Yes.** `oag admin add-account --from-grok` imports every signed-in Grok CLI session and requests route through it. |
+| xAI | `xai` (`grok`) | OpenAI Chat Completions | `api_key`, `oauth` | **Yes.** `oag admin account add --from grok` imports every signed-in Grok CLI session and requests route through it. |
 | AWS Bedrock | `bedrock` | Anthropic Messages | `bedrock` (SigV4) | Not a subscription product. |
 | Google Vertex AI | `vertex` | Gemini generateContent | `vertex` (service account) | Not a subscription product. No adapter is registered in this build, so it can be configured and cannot serve. |
 

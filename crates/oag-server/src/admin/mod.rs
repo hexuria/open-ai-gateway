@@ -8,7 +8,7 @@
 //! Authentication reuses the inbound-key path, but authority is a property of
 //! the **key** (`api_key.admin`), not of the principal. An operator's ordinary
 //! inference key gets pasted into SDK configs and CI; it must not also be able
-//! to disable a credential. `oag admin key --admin` mints the one that can.
+//! to disable a credential. `oag admin key create --admin` mints the one that can.
 //!
 //! Every `/admin/api` route is authenticated by one layer applied in
 //! [`crate::admin_routes`] rather than by a call inside each handler, because a
@@ -613,7 +613,7 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
             let s = p.support();
             // A `provider` string the enum does not know has no row here: it
             // cannot be routed either, so the matrix has nothing to say about
-            // it. `oag admin add-account` parses the flag, so producing one
+            // it. `oag admin account add` parses the flag, so producing one
             // takes a hand-written INSERT.
             let mine = counts.iter().filter(|c| c.0 == p.as_str());
             let by_kind: Vec<KindCount> = mine

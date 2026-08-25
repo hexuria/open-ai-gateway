@@ -62,9 +62,9 @@ KEY="$(
     | grep -oE 'oag_live_[0-9a-f]+' | head -1
 )"
 [ -n "$KEY" ] || fail "init produced no key"
-cargo run --quiet -p oag -- admin seed-catalog >/dev/null
-cargo run --quiet -p oag -- admin seed-catalog --from "$REPO_ROOT/deploy/test/vidaimock/catalog.json" >/dev/null
-cargo run --quiet -p oag -- admin add-account --name "bedrock-$ROUTE" --provider bedrock \
+cargo run --quiet -p oag -- admin catalog seed >/dev/null
+cargo run --quiet -p oag -- admin catalog seed --from "$REPO_ROOT/deploy/test/vidaimock/catalog.json" >/dev/null
+cargo run --quiet -p oag -- admin account add --name "bedrock-$ROUTE" --provider bedrock \
   --secret 'AKIATEST:wJalrXUtnFEMI/K7MDENG' --route "$ROUTE" >/dev/null
 
 OAG_GATEWAY__PROVIDER_BASE_URLS__BEDROCK="http://127.0.0.1:$VIDAIMOCK_PORT" \

@@ -64,8 +64,8 @@ KEY="$(
     | grep -oE 'oag_live_[0-9a-f]+' | head -1
 )"
 [ -n "$KEY" ] || fail "init produced no key"
-cargo run --quiet -p oag -- admin seed-catalog >/dev/null
-cargo run --quiet -p oag -- admin add-account --name "breaker-$ROUTE" --provider anthropic \
+cargo run --quiet -p oag -- admin catalog seed >/dev/null
+cargo run --quiet -p oag -- admin account add --name "breaker-$ROUTE" --provider anthropic \
   --secret FAKE-CREDENTIAL-FOR-TESTS --route "$ROUTE" >/dev/null
 
 OAG_GATEWAY__PROVIDER_BASE_URLS__ANTHROPIC="http://127.0.0.1:$MOCK_PORT" \

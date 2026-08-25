@@ -61,11 +61,11 @@ KEY="$(
     | grep -oE 'oag_live_[0-9a-f]+' | head -1
 )"
 [ -n "$KEY" ] || fail "init produced no key"
-cargo run --quiet -p oag -- admin seed-catalog >/dev/null
-cargo run --quiet -p oag -- admin seed-catalog --from "$REPO_ROOT/deploy/test/aimock/catalog.json" >/dev/null
-cargo run --quiet -p oag -- admin add-account --name "openai-$ROUTE" --provider openai \
+cargo run --quiet -p oag -- admin catalog seed >/dev/null
+cargo run --quiet -p oag -- admin catalog seed --from "$REPO_ROOT/deploy/test/aimock/catalog.json" >/dev/null
+cargo run --quiet -p oag -- admin account add --name "openai-$ROUTE" --provider openai \
   --secret sk-mock --route "$ROUTE" >/dev/null
-cargo run --quiet -p oag -- admin add-account --name "gemini-$ROUTE" --provider gemini \
+cargo run --quiet -p oag -- admin account add --name "gemini-$ROUTE" --provider gemini \
   --secret mock --route "$ROUTE" >/dev/null
 
 OAG_GATEWAY__PROVIDER_BASE_URLS__OPENAI="http://127.0.0.1:$AIMOCK_PORT/v1" \
