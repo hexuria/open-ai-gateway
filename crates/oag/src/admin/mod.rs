@@ -135,6 +135,21 @@ pub enum AccountCommand {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Correct a seat's flat monthly price.
+    ///
+    /// The one figure nothing can infer — a provider's API reports how much of
+    /// a plan is left, never what the plan costs you — so it is typed in by
+    /// hand at import, and a hand-typed number is eventually a wrong one. It
+    /// feeds the savings column, so until this existed the only way to fix a
+    /// mistyped price was an UPDATE against the database.
+    SetCost {
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The seat's price per month in USD. Omit to clear it, which makes the
+        /// saving read as unknown rather than as a saving of the whole fee.
+        #[arg(long)]
+        monthly_cost: Option<Decimal>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -381,7 +396,45 @@ async fn account_cmd(db: &Db, kek: &Kek, cmd: AccountCommand) -> Result<()> {
         AccountCommand::List => list_accounts(db).await,
         AccountCommand::Disable { name } => set_account_schedulable(db, &name, false).await,
         AccountCommand::Enable { name } => set_account_schedulable(db, &name, true).await,
+        AccountCommand::SetCost { name, monthly_cost } => {
+            set_account_cost(db, &name, monthly_cost).await
+        }
     }
+}
+
+/// Set or clear a seat's monthly price.
+///
+/// Accepts any account rather than only a flat-rate one: a price on a metered
+/// key is meaningless but harmless, and refusing it would mean explaining the
+/// kinds taxonomy at the moment someone is trying to correct a typo.
+async fn set_account_cost(db: &Db, name: &str, monthly_cost: Option<Decimal>) -> Result<()> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "UPDATE account SET monthly_cost_usd = $2, updated_at = now() \
+         WHERE name = $1 RETURNING name, kind",
+    )
+    .bind(name)
+    .bind(monthly_cost)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| oag_core::Error::Internal(format!("updating account: {e}")))?;
+
+    let Some((_, kind)) = rows.first() else {
+        return Err(oag_core::Error::Config(format!(
+            "no credential named {name}; see `oag admin account list`"
+        )));
+    };
+
+    match monthly_cost {
+        Some(cost) => println!("{name} costs ${cost}/month"),
+        None => println!("{name} has no monthly price; its saving will read as unknown"),
+    }
+    // Worth saying once: the figure only ever surfaces on a flat-rate line, so
+    // setting it on an API key looks like it did nothing.
+    if kind != "oauth" {
+        println!("  note: {name} is a {kind} credential, and only subscription");
+        println!("  seats are metered against a monthly price");
+    }
+    Ok(())
 }
 
 async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddArgs) -> Result<()> {
@@ -1038,7 +1091,21 @@ async fn import_grok(
         scope_of(owner_id)
     );
     println!("  auth.json was read, not written; the Grok CLI stays signed in");
+    warn_if_unpriced(name, monthly_cost);
     Ok(())
+}
+
+/// Say so when a seat has no price.
+///
+/// The saving column nets a seat's fee against what its traffic would have cost,
+/// and with no fee it can only show a dash. Import is the moment the operator
+/// knows the number, so it is the moment to ask — a dash discovered weeks later
+/// looks like a broken report rather than an unanswered question.
+fn warn_if_unpriced(name: &str, monthly_cost: Option<Decimal>) {
+    if monthly_cost.is_none() {
+        println!("  no monthly price set, so this seat's saving will read as unknown");
+        println!("    set it with: oag admin account set-cost {name} --monthly-cost <price>");
+    }
 }
 
 /// Import the signed-in Codex CLI session as an OpenAI OAuth credential.
@@ -1125,6 +1192,7 @@ async fn import_codex(
         scope_of(owner_id)
     );
     println!("  auth.json was read, not written; the Codex CLI stays signed in");
+    warn_if_unpriced(name, monthly_cost);
     Ok(())
 }
 
