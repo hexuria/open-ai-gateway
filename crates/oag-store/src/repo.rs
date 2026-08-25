@@ -171,6 +171,14 @@ pub async fn route_providers(db: &Db, route_id: Uuid, principal_id: Uuid) -> Res
         WHERE ar.route_id = $1
           AND a.schedulable
           AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $2)
+          -- Exhausted for a while, not merely busy. A seat whose weekly pool is
+          -- spent cannot serve a request today, so offering its models lists
+          -- something that is certain to fail. The breaker's own cooldown is
+          -- deliberately NOT consulted: it lasts seconds, while a client can
+          -- cache this list for far longer, so hiding a model mid-blip removes
+          -- it until the client next refreshes -- worse than briefly offering
+          -- one that fails over to another credential anyway.
+          AND (a.rate_limited_until IS NULL OR a.rate_limited_until <= now())
         ",
     )
     .bind(route_id)
