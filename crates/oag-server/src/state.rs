@@ -26,6 +26,10 @@ pub struct AppState {
     /// most one attempt at the fleet-wide refresh lock between them.
     refresh_gates: Arc<std::sync::Mutex<HashMap<oag_core::AccountId, Arc<tokio::sync::Mutex<()>>>>>,
     adapters: Arc<HashMap<Provider, Arc<dyn ProviderAdapter>>>,
+    /// The Codex/`ChatGPT` subscription adapter. Held apart from `adapters`
+    /// because it shares OpenAI's provider key but not its dialect — it is
+    /// selected per-account for an OpenAI OAuth seat, in the gateway.
+    codex: Arc<dyn ProviderAdapter>,
     /// Swapped wholesale on refresh rather than mutated in place, so a request
     /// that started with one catalog finishes with it — a price changing
     /// halfway through a request would make the ledger disagree with itself.
@@ -94,6 +98,26 @@ impl AppState {
             adapters.insert(p, Arc::new(oag_upstream::OpenAICompatAdapter::new(p, url)));
         }
 
+        // The Codex adapter shares OpenAI's provider key, so it lives outside
+        // the provider map and is chosen per-account. Instructions come from a
+        // file when a path is given, else inline; the adapter default is
+        // pass-through, which the Codex backend will reject.
+        let cx = &config.gateway.codex;
+        let instructions = match &cx.instructions_path {
+            Some(path) => Some(std::fs::read_to_string(path).map_err(|e| {
+                Error::Config(format!("reading codex instructions from {path}: {e}"))
+            })?),
+            None => cx.instructions.clone(),
+        };
+        let codex: Arc<dyn ProviderAdapter> = Arc::new(
+            oag_upstream::CodexAdapter::new()
+                .with_base_url(cx.base_url.clone())
+                .with_instructions(instructions)
+                .with_beta(cx.beta.clone())
+                .with_originator(cx.originator.clone())
+                .with_user_agent(cx.user_agent.clone()),
+        );
+
         Ok(Self {
             auth: AuthCache::new(
                 db.clone(),
@@ -110,6 +134,7 @@ impl AppState {
             breakers: Arc::new(Breakers::new()),
             refresh_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             adapters: Arc::new(adapters),
+            codex,
             catalog: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
         })
     }
@@ -120,6 +145,13 @@ impl AppState {
             .get(&provider)
             .cloned()
             .ok_or_else(|| Error::Internal(format!("no adapter for provider {provider}")))
+    }
+
+    /// The Codex adapter, for an OpenAI subscription seat. Selected in the
+    /// gateway when the leased account is an OpenAI OAuth credential.
+    #[must_use]
+    pub fn codex_adapter(&self) -> Arc<dyn ProviderAdapter> {
+        Arc::clone(&self.codex)
     }
 
     #[must_use]

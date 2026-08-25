@@ -230,6 +230,10 @@ pub struct GatewayConfig {
     /// during testing. Omitted providers use their public API.
     #[serde(default)]
     pub provider_base_urls: std::collections::BTreeMap<String, String>,
+    /// Codex/`ChatGPT` subscription adapter. Only consulted when an OpenAI OAuth
+    /// seat is on a route ladder.
+    #[serde(default)]
+    pub codex: CodexConfig,
 }
 
 impl Default for GatewayConfig {
@@ -244,6 +248,46 @@ impl Default for GatewayConfig {
             usage_poll_interval: Duration::from_mins(5),
             bedrock_region: default_bedrock_region(),
             provider_base_urls: std::collections::BTreeMap::new(),
+            codex: CodexConfig::default(),
+        }
+    }
+}
+
+/// Codex/`ChatGPT` subscription adapter settings.
+///
+/// The Codex subscription backend validates `instructions` against the official
+/// client. OAG does not compile that string in: set `instructions` (or point)
+/// `instructions_path` at a file — `deploy/codex-instructions.txt` is a current
+/// copy for `gpt-5.5`) or the client's own system prompt is passed through,
+/// which the backend will reject. Update the file when the Codex client
+/// version bumps.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CodexConfig {
+    /// Base URL for the subscription backend; `/responses` is appended.
+    pub base_url: String,
+    /// The `instructions` the backend validates against. Empty = pass-through.
+    pub instructions: Option<String>,
+    /// A file to read `instructions` from, instead of inlining it. Takes
+    /// precedence over `instructions` when both are set.
+    pub instructions_path: Option<String>,
+    /// `OpenAI-Beta` header value, if the backend requires one.
+    pub beta: Option<String>,
+    /// `originator` header — how the client identifies itself.
+    pub originator: String,
+    /// `User-Agent` header.
+    pub user_agent: String,
+}
+
+impl Default for CodexConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://chatgpt.com/backend-api/codex".to_owned(),
+            instructions: None,
+            instructions_path: None,
+            beta: None,
+            originator: "codex_cli_rs".to_owned(),
+            user_agent: "codex_cli_rs/unknown".to_owned(),
         }
     }
 }
@@ -420,6 +464,33 @@ security:
         let cfg = Config::from_yaml(MINIMAL).expect("parses");
         assert!(!cfg.gateway.catalog_refresh_interval.is_zero());
         assert!(cfg.gateway.catalog_refresh_interval <= Duration::from_mins(5));
+    }
+
+    #[test]
+    fn the_codex_adapter_is_off_by_default_and_overridable() {
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert_eq!(
+            cfg.gateway.codex.base_url,
+            "https://chatgpt.com/backend-api/codex"
+        );
+        assert_eq!(cfg.gateway.codex.originator, "codex_cli_rs");
+        assert!(cfg.gateway.codex.instructions.is_none());
+        assert!(cfg.gateway.codex.instructions_path.is_none());
+
+        let src = format!(
+            "{MINIMAL}\ngateway:\n  codex:\n    originator: custom_cli\n    user_agent: custom_cli/1\n    instructions_path: /tmp/codex-instructions.txt\n"
+        );
+        let cfg = Config::from_yaml(&src).expect("parses");
+        assert_eq!(cfg.gateway.codex.originator, "custom_cli");
+        assert_eq!(cfg.gateway.codex.user_agent, "custom_cli/1");
+        assert_eq!(
+            cfg.gateway.codex.instructions_path.as_deref(),
+            Some("/tmp/codex-instructions.txt")
+        );
+        assert_eq!(
+            cfg.gateway.codex.base_url, "https://chatgpt.com/backend-api/codex",
+            "sibling kept its default"
+        );
     }
 
     #[test]
