@@ -98,8 +98,9 @@ dashboard's Models table edits it in place. Clearing it restores the derived
 default — the provider's own spelling of its name plus the model's upstream
 name, e.g. `xAI: grok-4.6`.
 
-Nothing automated ever writes that column: `seed-catalog` and `sync-prices`
-both leave it exactly where it was, the same way they leave an operator's
+Nothing automated ever writes that column: `catalog seed` and
+`catalog sync-prices` both leave it exactly where it was — `display_label` is
+absent from `upsert_model`'s conflict list — the same way they leave an operator's
 `is_override`'d prices alone.
 
 ## Classification

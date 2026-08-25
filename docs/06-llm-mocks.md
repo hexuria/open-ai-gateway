@@ -83,7 +83,7 @@ Their count is **not** a calibration source. Our `count_input_tokens("Hello!")` 
 
 `POST https://mockapi.dog/v1/chat/completions` → HTTP 307 to `/en/v1/chat/completions`. Not a drop-in.
 
-## How this maps to HANDOVER.md
+## What each gap still needs
 
 | Gap | Closest mock | Still blocked? |
 |---|---|---|

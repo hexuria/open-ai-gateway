@@ -13,8 +13,9 @@ three-tier topology that streaming AI traffic actually needs.
 > [docs/compliance.md](docs/compliance.md) for which credential kinds each
 > provider sanctions, and why that distinction is one nullable column.
 
-Picking this up on another machine? Start with [HANDOVER.md](HANDOVER.md) — what is
-proven, what is not, and where to continue.
+New here? [docs/08-clients.md](docs/08-clients.md) is the one to read first — how
+to point Claude Code, an OpenAI SDK, or curl at the gateway, and why the model
+that answers may not be the one you named.
 
 ## Why
 
@@ -32,7 +33,7 @@ number you can point at rather than a claim.
 ```bash
 just dev        # Postgres + Redis, migrated
 just bootstrap  # a route, a principal, an API key, the model catalog
-just serve      # :8080 inference, :8081 admin + dashboard
+just serve      # :29080 inference, :29081 admin + dashboard
 ```
 
 Then point any Anthropic- or OpenAI-shaped client at it:
@@ -93,8 +94,8 @@ web/index.html   the dashboard, embedded in the binary
 Four of the eight crates do no I/O at all. That is deliberate and it is the
 main structural bet: routing policy, translation, and credential scheduling are
 the things most worth testing exhaustively and least worth spinning up a
-database for. Those four carry 214 tests and run in well under a second. The
-workspace as a whole is 390.
+database for. Those four carry 226 tests and run in well under a second. The
+workspace as a whole is 495.
 
 The dashboard is a single self-contained HTML file compiled into the binary. A
 build toolchain and `node_modules` for a handful of read views is what "less is
@@ -114,16 +115,20 @@ deployment fact rather than a routing rule someone has to remember.
 
 ## Documentation
 
+Ordered by what you are likely to need, not by number.
+
 | | |
 |---|---|
-| [00-architecture.md](docs/00-architecture.md) | The tiers and the request path |
-| [07-running-locally.md](docs/07-running-locally.md) | The three local run modes, and minting the inference vs admin key |
-| [01-deployment.md](docs/01-deployment.md) | Topology, **the seven things that break streaming**, scaling |
-| [02-cost-routing.md](docs/02-cost-routing.md) | Tiers, classification, escalation, budgets |
-| [03-providers.md](docs/03-providers.md) | **Which provider takes a key, a subscription, or both** — and the adapter contract |
-| [04-cloud.md](docs/04-cloud.md) | **Cloud deployment** — Kubernetes, Cloud Run, Fargate, Container Apps, Cloudflare |
-| [05-services.md](docs/05-services.md) | Capability-service catalog — register, health-check, deep-link |
-| [compliance.md](docs/compliance.md) | Credential kinds and their standing |
+| [08-clients.md](docs/08-clients.md) | **Start here.** How do I point Claude Code, an OpenAI SDK, or curl at this — and why did I get a model I did not ask for? |
+| [07-running-locally.md](docs/07-running-locally.md) | How do I run it on my own machine, and which key goes where? |
+| [00-architecture.md](docs/00-architecture.md) | What happens to a request, end to end, and why the workspace splits the way it does |
+| [02-cost-routing.md](docs/02-cost-routing.md) | How does the gateway decide which model serves a request, and what stops it escalating your budget away? |
+| [03-providers.md](docs/03-providers.md) | **Which provider takes a key, a subscription, or both** — and what it costs to add another |
+| [01-deployment.md](docs/01-deployment.md) | How do I put it behind a proxy without breaking SSE — **the seven things that break streaming** — and run more than one replica? |
+| [04-cloud.md](docs/04-cloud.md) | **Cloud deployment** — Kubernetes, Cloud Run, Fargate, Container Apps, Cloudflare, and which of them has actually been applied |
+| [05-services.md](docs/05-services.md) | How do I register a sandbox, guard or reducer beside the gateway without the gateway becoming one? |
+| [06-llm-mocks.md](docs/06-llm-mocks.md) | Which mock server can stand in for a provider, and which gaps no mock closes |
+| [compliance.md](docs/compliance.md) | Which credential kinds each provider sanctions, and why that distinction is one nullable column |
 
 ## What it does
 

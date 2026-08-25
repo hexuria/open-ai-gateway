@@ -6,18 +6,31 @@ containers **for real** over the Docker socket — so a `terraform apply` of the
 traffic, with no cloud account, project, or billing. It is the fastest way to
 rehearse the GCP deploy end to end.
 
+Two modes, differing only in where the database comes from:
+
+| Command | Data tier | Database |
+|---|---|---|
+| `just floci-up` (`./deploy/floci/deploy.sh`) | neutral | plain Postgres container |
+| `just floci-cloudsql` (`./deploy/floci/deploy-cloudsql.sh`) | managed | a real `google_sql_database_instance`, which floci starts as a Postgres 16 container |
+
+Both need Docker and `terraform` or `tofu`, and both deploy a **published
+image** — `ghcr.io/hexuria/open-ai-gateway:main` — rather than building your
+tree. Point them at a local build with `OAG_IMAGE`. Tear either down with
+`just floci-down`, which also removes the containers floci itself spawned;
+`docker compose ... down` alone leaves those behind.
+
 ```bash
-./deploy/floci/deploy.sh
+just floci-up              # or ./deploy/floci/deploy.sh
 ```
 
 That brings up floci + Postgres + Redis, migrates, applies a floci-patched copy
 of `stacks/gcp-cloudrun`, and health-checks the OAG Cloud Run service floci
-starts. Tear down with `docker compose -f deploy/floci/docker-compose.yml down`.
+starts.
 
 ## Cloud SQL for the database (mirrors GCP more closely)
 
-`deploy.sh` uses the **neutral** data tier — plain Postgres in a container. To
-rehearse the **managed** tier the way a real GCP deploy runs it, with the
+`just floci-up` uses the **neutral** data tier — plain Postgres in a container.
+To rehearse the **managed** tier the way a real GCP deploy runs it, with the
 database as **Cloud SQL**:
 
 ```bash
@@ -72,11 +85,14 @@ The Cloud Run service is single-listener (Cloud Run routes one port), reachable
 at `<container-ip>:8080` from any container on the `oag-floci_default` network —
 the script prints the address and a ready-to-run `oag admin init` for the first
 key. From there it is an ordinary gateway: add accounts, set the route ladder,
-mint an inference key, and POST to `/v1/messages`.
+mint an inference key, and POST to `/v1/messages` — the same sequence as
+`docs/07-running-locally.md`, against this database instead of the dev one.
 
 ## The plain-API emulator (no Cloud Run)
 
 To rehearse only that the terraform *applies* against a GCP-shaped API — faster,
-no container execution — use `deploy/tofu/verify-floci-gcp.sh` instead, which
-applies the secret + data layer against a throwaway floci and asserts the
-secrets landed.
+no container execution, nothing to send a request to — use
+`deploy/tofu/verify-floci-gcp.sh` instead, which applies the secret + data layer
+against a throwaway floci and asserts the secrets landed. It is the narrower of
+the two paths, and predates floci's Cloud Run execution; if something you read
+says floci cannot run the gateway, it is describing this script.

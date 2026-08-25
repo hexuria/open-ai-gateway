@@ -237,21 +237,26 @@ filter is a free-form string and an operator quietening a noisy deployment to
 ## Migrations
 
 `oag migrate` runs them under a Postgres advisory lock; `oag serve` does not run
-them at all. There are three files:
+them at all. There are six files:
 
 | File | What it is |
 |---|---|
 | `migrations/0001_baseline.sql` | The original schema. Still edited in place — only safe while no database anyone cares about has applied it. |
 | `migrations/0002_services.sql` | Capability-service catalog. Shipped. |
 | `migrations/0003_usage_event_attempt.sql` | Ledger expand: `attempt` column and a unique index on `(request_id, attempt)`. The primary key on `request_id` stays for this release so a rolling deploy does not 42P10. |
+| `migrations/0004_seat_accounting.sql` | Subscription-seat accounting: flat-rate cost against the metered counterfactual. |
+| `migrations/0005_subscription_usage.sql` | The seat quota the poller reads, so an exhausted seat parks instead of failing every request. |
+| `migrations/0006_model_display_label.sql` | `display_label` on the catalog, nullable so NULL means "derive one". |
 
 sqlx checksums applied migrations. Against a database that ran an earlier
 version of `0001`, `oag migrate` fails closed with *migration 1 was previously
 applied but has been modified* and applies nothing — including any later
 migration. In development the fix is to recreate the database. In production it
 is a hand-patched `_sqlx_migrations.checksum`, so once this project has a real
-deployment the baseline stops being editable and changes become `0004` and on.
-Do not treat `0002` as the next unused number: `0002` is the catalog.
+deployment the baseline stops being editable and changes become `0007` and on.
+Take the next unused number from `migrations/`, never from this table — a doc is
+the one place that can be out of date, and a reused number is a checksum failure
+on somebody else's database.
 
 ## Verifying it
 
