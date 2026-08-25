@@ -32,7 +32,7 @@ An operator who wants cost policy applied to clients that hardcode an expensive
 model opts in explicitly:
 
 ```bash
-oag admin set-mode --route default --mode managed
+oag admin route mode managed --route default
 ```
 
 Virtual `oag/*` names are always managed, whichever the route says.
@@ -252,4 +252,4 @@ Worth watching alongside it:
   but is also the signal to raise a budget or fix a ladder.
 
 Budget changes are read through the auth cache, so they take up to five minutes
-to reach every replica. `oag admin flush-cache` makes one immediate.
+to reach every replica. `oag admin cache flush` makes one immediate.

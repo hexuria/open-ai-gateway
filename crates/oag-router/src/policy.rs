@@ -293,7 +293,9 @@ impl RoutingPolicy {
         if *mode == RoutingMode::Passthrough
             && let Some(name) = requested_model
         {
-            let spec = catalog.resolve(name).ok_or(Error::NoViableModel)?;
+            let spec = catalog.resolve(name).ok_or_else(|| {
+                Error::NoViableModel("no model on the ladder satisfies the request".to_owned())
+            })?;
             let tier = self
                 .tier_of(&spec.id)
                 .unwrap_or_else(|| self.ladder.floor());
@@ -410,7 +412,9 @@ impl RoutingPolicy {
                 });
             }
             let Some(next) = self.ladder.escalate(&current) else {
-                return Err(Error::NoViableModel);
+                return Err(Error::NoViableModel(
+                    "no model on the ladder satisfies the request".to_owned(),
+                ));
             };
             current = next;
         }

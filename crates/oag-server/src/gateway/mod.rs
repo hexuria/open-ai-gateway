@@ -640,14 +640,24 @@ async fn plan_request(
         "budget and mode"
     );
 
-    let decision = policy.decide(
+    let decision = match policy.decide(
         &mode,
         Some(&canonical.model),
         &signal,
         &budget,
         &catalog,
         canonical.max_tokens,
-    )?;
+    ) {
+        Ok(d) => d,
+        Err(Error::NoViableModel(_)) => {
+            return Err(Error::NoViableModel(no_viable_message(
+                &route.name,
+                &canonical.model,
+                policy.ladder(),
+            )));
+        }
+        Err(e) => return Err(e),
+    };
 
     Ok(Plan {
         policy,
@@ -1393,7 +1403,7 @@ pub(crate) fn error_response(e: &Error) -> Response {
             "at_capacity",
             e.to_string(),
         ),
-        Error::NoViableModel => (StatusCode::BAD_REQUEST, "no_viable_model", e.to_string()),
+        Error::NoViableModel(_) => (StatusCode::BAD_REQUEST, "no_viable_model", e.to_string()),
         // The client's own request is the thing that cannot be served, and the
         // message names the field and the dialect — enough to either drop the
         // field or pin the request to a provider that has it.
@@ -1469,6 +1479,40 @@ pub(crate) fn error_response(e: &Error) -> Response {
     }
 
     response
+}
+
+/// Operator-facing `no_viable_model`: which route, and the command that
+/// puts a serving model on its ladder.
+fn no_viable_message(route: &str, requested: &str, ladder: &TierLadder) -> String {
+    let requested = requested.trim();
+    let on_ladder: Vec<&str> = ladder
+        .rungs()
+        .iter()
+        .flat_map(|r| r.models.iter().map(oag_router::ModelId::as_str))
+        .collect();
+    let ladder_providers: Vec<&str> = on_ladder
+        .iter()
+        .filter_map(|id| id.split_once('/').map(|(p, _)| p))
+        .collect();
+    let provider = requested
+        .split_once('/')
+        .map(|(p, _)| p)
+        .filter(|p| *p != "oag");
+
+    if let Some(provider) = provider {
+        if !ladder_providers.contains(&provider) {
+            return format!(
+                "route '{route}' has no {provider} models on its ladder; add one with: oag admin route tiers --route {route} cheap={requested}"
+            );
+        }
+        return format!(
+            "route '{route}' has no model on its ladder that can serve '{requested}'; set one with: oag admin route tiers --route {route} cheap={requested}"
+        );
+    }
+    let example = on_ladder.first().copied().unwrap_or("provider/model");
+    format!(
+        "route '{route}' has no model on its ladder that can serve this request; add one with: oag admin route tiers --route {route} cheap={example}"
+    )
 }
 
 #[cfg(test)]
@@ -1559,6 +1603,22 @@ mod tests {
     #[test]
     fn short_bodies_are_not_truncated() {
         assert_eq!(truncate("brief", 512), "brief");
+    }
+
+    #[test]
+    fn no_viable_model_names_the_route_and_the_fix() {
+        let ladder = TierLadder::new(vec![oag_router::ladder::Rung {
+            name: oag_core::TierName::from("cheap"),
+            models: vec![oag_router::ModelId::new("anthropic/claude-haiku-4.5")],
+        }])
+        .expect("ladder");
+        let msg = no_viable_message("default", "xai/grok-4.3", &ladder);
+        assert!(msg.contains("route 'default'"), "{msg}");
+        assert!(msg.contains("no xai models"), "{msg}");
+        assert!(
+            msg.contains("oag admin route tiers --route default cheap=xai/grok-4.3"),
+            "{msg}"
+        );
     }
 
     #[test]

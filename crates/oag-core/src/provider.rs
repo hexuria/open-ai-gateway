@@ -129,7 +129,7 @@ impl Provider {
                 // ChatGPT backend. The gateway picks between them per account,
                 // which is why one provider carries two credential kinds.
                 subscription: SubscriptionSupport::Served {
-                    import: "oag admin add-account --from-codex",
+                    import: "oag admin account add --from codex",
                 },
                 // Served, but not by importing alone: the backend checks the
                 // request's `instructions` against what its own client sends,
@@ -188,7 +188,7 @@ impl Provider {
                 aliases: &["grok"],
                 credential_kinds: &[CredentialKind::ApiKey, CredentialKind::OAuth],
                 subscription: SubscriptionSupport::Served {
-                    import: "oag admin add-account --from-grok",
+                    import: "oag admin account add --from grok",
                 },
                 note: Some(
                     "A seat binds to one principal unless --shared is passed: it is sanctioned \
@@ -492,7 +492,7 @@ mod tests {
         assert!(
             served["import"]
                 .as_str()
-                .is_some_and(|s| s.contains("--from-grok"))
+                .is_some_and(|s| s.contains("--from grok"))
         );
 
         // Built here rather than read off a provider: no provider is in this

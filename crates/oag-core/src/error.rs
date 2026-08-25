@@ -86,8 +86,13 @@ pub enum Error {
         candidates: usize,
     },
 
-    #[error("no model on the ladder satisfies the request")]
-    NoViableModel,
+    /// No model on this route's ladder can serve the request.
+    ///
+    /// The string names the route and the command that fixes it; a unit
+    /// variant left operators staring at "no model on the ladder" with no
+    /// idea which ladder or what to type.
+    #[error("{0}")]
+    NoViableModel(String),
 
     #[error("authentication failed")]
     Unauthenticated,
@@ -239,7 +244,7 @@ impl Error {
             Self::StreamIdle(_) => Disposition::FailoverAccount {
                 cooldown: Duration::from_mins(1),
             },
-            Self::NoCredential { .. } | Self::NoViableModel => Disposition::EscalateTier,
+            Self::NoCredential { .. } | Self::NoViableModel(_) => Disposition::EscalateTier,
             // Waiting helps; a bigger model does not.
             Self::AtCapacity { .. } => Disposition::RetrySameAccount,
             _ => Disposition::Fatal,

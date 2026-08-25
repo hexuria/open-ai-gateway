@@ -152,7 +152,7 @@ impl ProviderAdapter for CodexAdapter {
             .header("session_id", uuid::Uuid::new_v4().to_string());
 
         // Account-scoped: the header binds the request to the seat the token
-        // belongs to. A seat imported by `--from-codex` always carries it.
+        // belongs to. A seat imported by `--from codex` always carries it.
         if let Some(account_id) = &cred.account_id {
             builder = builder.header("chatgpt-account-id", account_id.as_str());
         }

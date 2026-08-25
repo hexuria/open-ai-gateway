@@ -76,14 +76,14 @@ bootstrap:
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
       sh -c 'cargo run --quiet -p oag -- admin init --email dev@localhost && \
-             cargo run --quiet -p oag -- admin seed-catalog'
+             cargo run --quiet -p oag -- admin catalog seed'
 
 # Refresh the catalog from LiteLLM's live table. Needs network; ~2MB.
 catalog-update:
     @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
-      cargo run --quiet -p oag -- admin seed-catalog --from "{{litellm}}"
+      cargo run --quiet -p oag -- admin catalog seed --from "{{litellm}}"
 
 # A provider's own prices beat LiteLLM's and arrive without a context window,
 # so this writes prices and nothing else: an existing row keeps its window.
@@ -92,7 +92,7 @@ catalog-prices provider="xai":
     @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
-      cargo run --quiet -p oag -- admin sync-prices --provider {{provider}}
+      cargo run --quiet -p oag -- admin catalog sync-prices --provider {{provider}}
 
 # Mint an inference key — for sending requests to :29080. `just key` or
 # `just key name=codex`. This is the key that goes in an SDK / client config.
@@ -100,7 +100,7 @@ key name="cli":
     @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
-      cargo run --quiet -p oag -- admin key --email dev@localhost --name {{name}}
+      cargo run --quiet -p oag -- admin key create --email dev@localhost --name {{name}}
 
 # Mint an admin key — for the dashboard and admin API on :29081. `just admin-key`.
 # Deliberately separate from an inference key: an SDK key must not reach admin.
@@ -108,7 +108,7 @@ admin-key name="admin":
     @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
-      cargo run --quiet -p oag -- admin key --email dev@localhost --name {{name}} --admin
+      cargo run --quiet -p oag -- admin key create --email dev@localhost --name {{name}} --admin
 
 # Run the gateway against the dev infrastructure.
 serve:
@@ -253,8 +253,12 @@ _verify-bootstrap:
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
       sh -c 'cargo run --quiet -p oag -- admin init --email verify@localhost --route default && \
-             cargo run --quiet -p oag -- admin seed-catalog >/dev/null && \
-             cargo run --quiet -p oag -- admin add-account --name mock --provider anthropic \
+             cargo run --quiet -p oag -- admin catalog seed >/dev/null && \
+             cargo run --quiet -p oag -- admin route tiers --route default \
+               cheap=anthropic/claude-haiku-4.5 \
+               balanced=anthropic/claude-sonnet-4.5 \
+               frontier=anthropic/claude-opus-5 >/dev/null && \
+             cargo run --quiet -p oag -- admin account add --name mock --provider anthropic \
                --secret FAKE-CREDENTIAL-FOR-TESTS --route default >/dev/null'
 
 # The newest row, pipe-separated, for the assertions in local-verify.sh.

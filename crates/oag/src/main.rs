@@ -38,8 +38,10 @@ enum Command {
     /// environment variable I think it is".
     Config,
     /// Operator commands: principals, keys, credentials, catalog.
+    /// Boxed: the nested noun-verb tree is large, and clap only ever holds one
+    /// command. Leaving it inline blew past `large_enum_variant` on this enum.
     #[command(subcommand)]
-    Admin(admin::AdminCommand),
+    Admin(Box<admin::AdminCommand>),
 }
 
 #[tokio::main]
@@ -77,7 +79,7 @@ async fn run() -> Result<()> {
         Command::Admin(cmd) => {
             let db = Db::connect(&config.database.url, config.database.max_connections)?;
             let kek = oag_core::Kek::from_base64(&config.security.credential_kek)?;
-            admin::run(cmd, &db, &kek, &config.redis.url).await
+            admin::run(*cmd, &db, &kek, &config.redis.url, &config).await
         }
         Command::Serve => {
             let handle = oag_server::metrics::install()?;
@@ -93,7 +95,7 @@ async fn run() -> Result<()> {
                 Ok(0) => tracing::warn!(
                     interval_secs = state.config.gateway.catalog_refresh_interval.as_secs(),
                     "model catalog is empty; every request will fail to route until it is \
-                     seeded. Run `oag admin seed-catalog` — the change is picked up on the \
+                     seeded. Run `oag admin catalog seed` — the change is picked up on the \
                      refresh interval, no restart needed."
                 ),
                 Ok(n) => tracing::info!(models = n, "catalog loaded"),

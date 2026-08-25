@@ -195,7 +195,7 @@ so under a principal-based check, every inference key that operator ever minted
 could disable credentials. Mint the admin one explicitly:
 
 ```bash
-oag admin key --email you@example.com --route default --name ops --admin
+oag admin key create --email you@example.com --route default --name ops --admin
 ```
 
 Every `/admin/api` route is authenticated by a single layer applied where the

@@ -115,8 +115,8 @@ fn forbidden_key() -> Response {
     (
         StatusCode::FORBIDDEN,
         Json(json!({
-            "error": "this key was not minted as an admin key",
-            "hint": "mint one with `oag admin key --admin`; an inference key is deliberately not enough",
+            "error": "this key was not minted as an admin key; mint one with `oag admin key create --admin`. An inference key is deliberately not enough",
+            "hint": "oag admin key create --email <you> --admin",
         })),
     )
         .into_response()

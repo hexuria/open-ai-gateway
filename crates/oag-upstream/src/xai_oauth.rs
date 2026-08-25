@@ -151,7 +151,7 @@ pub async fn refresh(
         // that does not say why. Fail with one that does.
         return Err(Error::Config(
             "xai oauth credential has no client_id; re-import it with \
-             `oag admin add-account --from-grok`"
+             `oag admin account add --from grok`"
                 .to_owned(),
         ));
     };
@@ -330,7 +330,7 @@ mod tests {
             account_id: None,
         };
         let err = refresh(&material, "http://127.0.0.1:9").await.unwrap_err();
-        assert!(err.to_string().contains("--from-grok"), "{err}");
+        assert!(err.to_string().contains("--from grok"), "{err}");
     }
 
     /// A minimal OIDC server: a discovery document pointing at itself, and a
