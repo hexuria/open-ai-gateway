@@ -61,9 +61,14 @@ reaches any upstream shape:
 | OpenAI Responses | `/v1/responses` | yes |
 | Gemini | `/v1beta/models/{model}:generateContent` | yes |
 
-No provider declares Responses as its *native* dialect — the adapter registered
-for OpenAI speaks Chat Completions — so reaching an upstream over Responses
-would be a separate adapter, not a change to the hub.
+`Provider::OpenAI`'s registered adapter still speaks Chat Completions, so an
+API-key OpenAI seat takes the passthrough path when the client does too. A
+ChatGPT/Codex **subscription** seat is the same provider key but a different
+dialect and backend: `CodexAdapter` talks Responses at
+`chatgpt.com/backend-api/codex/responses`, and the gateway selects it
+per-account when the leased credential is `kind=oauth`. That is a separate
+adapter, not a change to the hub, and not a change to
+`Provider::native_dialect`.
 
 The Anthropic direction is the harder one: it uses indexed content blocks that
 must be explicitly opened and closed, so the renderer tracks the open block and
@@ -77,7 +82,7 @@ says which one it speaks, and the default is SSE because all but one do:
 
 | Framing | Providers |
 |---|---|
-| `Sse` | Anthropic, OpenAI, Gemini, Kimi, DeepSeek, Zhipu, xAI |
+| `Sse` | Anthropic, OpenAI (Chat Completions and Codex), Gemini, Kimi, DeepSeek, Zhipu, xAI |
 | `AwsEventStream` | Bedrock |
 
 Bedrock streams length-prefixed binary messages whose payload carries the

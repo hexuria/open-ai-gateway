@@ -21,6 +21,7 @@ use std::str::FromStr;
 /// a price ends up in the context-window column.
 struct Builtin {
     id: &'static str,
+    provider: &'static str,
     upstream: &'static str,
     /// USD per million input tokens.
     input: &'static str,
@@ -37,6 +38,7 @@ pub fn builtin() -> Vec<ModelRow> {
     const MODELS: &[Builtin] = &[
         Builtin {
             id: "anthropic/claude-opus-5",
+            provider: "anthropic",
             upstream: "claude-opus-5",
             input: "15",
             output: "75",
@@ -46,6 +48,7 @@ pub fn builtin() -> Vec<ModelRow> {
         },
         Builtin {
             id: "anthropic/claude-sonnet-4.5",
+            provider: "anthropic",
             upstream: "claude-sonnet-4-5",
             input: "3",
             output: "15",
@@ -55,12 +58,27 @@ pub fn builtin() -> Vec<ModelRow> {
         },
         Builtin {
             id: "anthropic/claude-haiku-4.5",
+            provider: "anthropic",
             upstream: "claude-haiku-4-5",
             input: "1",
             output: "5",
             context: 200_000,
             max_output: 32_000,
             reasoning: false,
+        },
+        // A ChatGPT-linked Codex seat can call this; gpt-5.6-sol is rejected
+        // on that path ("not supported when using Codex with a ChatGPT
+        // account"). API list prices are the counterfactual for a flat-rate
+        // OAuth seat.
+        Builtin {
+            id: "openai/gpt-5.5",
+            provider: "openai",
+            upstream: "gpt-5.5",
+            input: "4",
+            output: "20",
+            context: 272_000,
+            max_output: 128_000,
+            reasoning: true,
         },
     ];
 
@@ -70,12 +88,13 @@ pub fn builtin() -> Vec<ModelRow> {
             let input = Decimal::from_str(m.input).ok()?;
             Some(ModelRow {
                 id: m.id.to_owned(),
-                provider: "anthropic".to_owned(),
+                provider: m.provider.to_owned(),
                 upstream_name: m.upstream.to_owned(),
                 input_per_mtok: input,
                 output_per_mtok: Decimal::from_str(m.output).ok()?,
-                // Anthropic's published ratios: a cache read is a tenth of a
-                // fresh input token, a cache write is a quarter more.
+                // Anthropic and OpenAI GPT-5.6 publish the same ratios: a cache
+                // read is a tenth of a fresh input token, a cache write is a
+                // quarter more.
                 cache_read_per_mtok: Some(input / Decimal::from(10)),
                 cache_write_per_mtok: Some(input * Decimal::from_str("1.25").ok()?),
                 context_window: m.context,
@@ -200,6 +219,19 @@ mod tests {
                 "a cache read must beat a fresh token"
             );
         }
+    }
+
+    #[test]
+    fn the_builtin_catalog_includes_the_codex_subscription_model() {
+        let models = builtin();
+        let sol = models
+            .iter()
+            .find(|m| m.id == "openai/gpt-5.5")
+            .expect("codex model");
+        assert_eq!(sol.provider, "openai");
+        assert_eq!(sol.upstream_name, "gpt-5.5");
+        assert!(sol.supports_reasoning);
+        assert!(sol.input_per_mtok > Decimal::ZERO);
     }
 
     #[test]

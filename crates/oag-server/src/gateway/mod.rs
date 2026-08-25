@@ -917,9 +917,19 @@ async fn try_credential(
     let provider = decision.model.provider;
     let account = lease.account.account_id();
 
-    let adapter = match state.adapter(provider) {
-        Ok(a) => a,
-        Err(e) => return Outcome::Fatal(e),
+    // An OpenAI OAuth seat is a Codex subscription: same provider key, a
+    // different dialect and backend, so it takes the Codex adapter rather than
+    // the Chat Completions one. Every other account uses its provider's adapter.
+    let is_codex_seat = matches!(provider, oag_core::Provider::OpenAI)
+        && oag_core::credential::CredentialKind::from_column(&lease.account.kind)
+            .is_some_and(|k| matches!(k, oag_core::credential::CredentialKind::OAuth));
+    let adapter = if is_codex_seat {
+        state.codex_adapter()
+    } else {
+        match state.adapter(provider) {
+            Ok(a) => a,
+            Err(e) => return Outcome::Fatal(e),
+        }
     };
     // Refreshes first if the token is close to expiry. A credential that is
     // merely expiring must not be treated as a credential that is broken.

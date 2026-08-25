@@ -5,6 +5,7 @@
 pub mod adapter;
 pub mod anthropic;
 pub mod bedrock;
+pub mod codex;
 pub mod eventstream;
 pub mod gemini;
 pub mod openai;
@@ -17,6 +18,7 @@ pub mod xai_oauth;
 pub use adapter::{Framing, ProviderAdapter, UpstreamRequest};
 pub use anthropic::AnthropicAdapter;
 pub use bedrock::BedrockAdapter;
+pub use codex::CodexAdapter;
 pub use gemini::GeminiAdapter;
 pub use openai::OpenAICompatAdapter;
 pub use transport::{HttpTransport, Transport, TransportKey, TransportPool};

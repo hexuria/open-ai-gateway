@@ -69,6 +69,17 @@ gateway:
   max_stream_duration: 1800
   same_account_retries: 2
   max_account_switches: 3
+  # Codex/ChatGPT subscription adapter. Selected per-account when an OpenAI
+  # OAuth seat (imported with `oag admin add-account --from-codex`) is leased.
+  # The chatgpt.com backend validates `instructions` against the official
+  # Codex client; a current copy of that string (gpt-5.5, from the installed
+  # Codex/opencodex catalog) lives at deploy/codex-instructions.txt —
+  # Apache-2.0, taken from the installed Codex/opencodex catalog. Keep it
+  # updated when the Codex client version bumps. Left unset, the client's
+  # own system prompt is passed through, which the backend will reject.
+  # codex:
+  #   instructions_path: deploy/codex-instructions.txt
+  #   user_agent: "codex_cli_rs/0.147.0"
 
 telemetry:
   log_filter: "info"
