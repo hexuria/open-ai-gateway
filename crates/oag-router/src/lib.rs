@@ -17,7 +17,7 @@ pub mod cost;
 pub mod ladder;
 pub mod policy;
 
-pub use catalog::{Capabilities, Catalog, ModelId, ModelSpec, Pricing};
+pub use catalog::{Capabilities, Catalog, ModelId, ModelSpec, Pricing, derive_label};
 pub use classify::{Classifier, HeuristicClassifier, RequestSignal};
 pub use cost::{Usage, counterfactual};
 pub use ladder::TierLadder;

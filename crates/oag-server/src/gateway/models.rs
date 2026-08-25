@@ -18,11 +18,20 @@ use super::{Caller, alias, error_response, policy_for};
 use crate::AppState;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
+use oag_core::credential::CredentialKind;
 use oag_core::{Provider, TierName, tier::RoutingMode};
 use oag_router::Entitlement;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
+
+/// Which credential kinds a route can reach each provider through.
+///
+/// The listing offers `<model>@sub` only where a subscription is actually
+/// reachable. Advertising a channel nobody holds a credential for is the same
+/// mistake as listing a model with no provider behind it: the failure moves
+/// away from its cause and turns up as a 503 much later.
+type Channels = BTreeMap<Provider, HashSet<CredentialKind>>;
 
 /// Query parameters on the listing.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -45,13 +54,14 @@ pub async fn list(
 ) -> Response {
     let Resolved {
         policy,
-        providers,
+        channels,
         mode,
     } = match resolve(&state, &auth).await {
         Ok(r) => r,
         Err(response) => return response,
     };
 
+    let providers: BTreeSet<Provider> = channels.keys().copied().collect();
     let catalog = state.catalog().await;
     let concrete = policy.entitled(&mode, &catalog, &providers);
     let aliases = wants_aliases(
@@ -66,7 +76,9 @@ pub async fn list(
         push(&mut data, virtual_entry(rung.as_ref()), aliases);
     }
     for e in &concrete {
-        push(&mut data, concrete_entry(e), aliases);
+        for entry in concrete_entries(e, &channels) {
+            push(&mut data, entry, aliases);
+        }
     }
     envelope(data, &mode, aliases).into_response()
 }
@@ -106,10 +118,20 @@ fn alias_twin(entry: &Value) -> Option<Value> {
     let aliased = alias::discovery_alias(id)?;
     let mut twin = entry.clone();
     twin["id"] = Value::String(aliased);
-    // Which of the two names is the real one. Without it a dashboard reading
-    // this listing has no way to tell a duplicate from a second model, and
-    // would double every count.
-    twin["oag"]["alias_of"] = Value::String(id.to_owned());
+    // Which of the names is the real one. Without it a dashboard reading this
+    // listing has no way to tell a duplicate from a second model, and would
+    // double every count.
+    //
+    // An entry that already names one keeps it rather than being overwritten
+    // with its own id: `anthropic/xai/grok-4.6@sub` is a third spelling of
+    // `xai/grok-4.6`, and pointing it at `xai/grok-4.6@sub` would make the
+    // dedupe take two hops for no gain — `oag.channel` already says which
+    // credential kind it pins.
+    let of = match entry["oag"]["alias_of"].as_str() {
+        Some(canonical) => canonical.to_owned(),
+        None => id.to_owned(),
+    };
+    twin["oag"]["alias_of"] = Value::String(of);
     Some(twin)
 }
 
@@ -123,13 +145,14 @@ fn alias_twin(entry: &Value) -> Option<Value> {
 pub async fn list_gemini(State(state): State<Arc<AppState>>, Caller(auth): Caller) -> Response {
     let Resolved {
         policy,
-        providers,
+        channels,
         mode,
     } = match resolve(&state, &auth).await {
         Ok(r) => r,
         Err(response) => return response,
     };
 
+    let providers: BTreeSet<Provider> = channels.keys().copied().collect();
     let catalog = state.catalog().await;
     let concrete = policy.entitled(&mode, &catalog, &providers);
 
@@ -155,7 +178,7 @@ pub async fn list_gemini(State(state): State<Arc<AppState>>, Caller(auth): Calle
 
 struct Resolved {
     policy: oag_router::RoutingPolicy,
-    providers: BTreeSet<Provider>,
+    channels: Channels,
     mode: RoutingMode,
 }
 
@@ -167,13 +190,13 @@ async fn resolve(
     let (route, policy) = policy_for(state, auth)
         .await
         .map_err(|e| error_response(&e))?;
-    let providers = providers_for(state, route.id, auth.principal_id)
+    let channels = channels_for(state, route.id, auth.principal_id)
         .await
         .map_err(|e| error_response(&e))?;
 
     Ok(Resolved {
         policy,
-        providers,
+        channels,
         mode: if route.default_mode == "managed" {
             RoutingMode::Managed
         } else {
@@ -187,45 +210,89 @@ fn virtual_rungs(policy: &oag_router::RoutingPolicy) -> impl Iterator<Item = Opt
     std::iter::once(None).chain(policy.virtual_names().into_iter().map(Some))
 }
 
-/// Providers the route holds usable credentials for.
+/// Providers the route holds usable credentials for, and through which
+/// credential kinds.
 ///
-/// `account.provider` is free text with no CHECK constraint, so one row nobody
-/// can parse must narrow the answer rather than 500 the whole listing.
-async fn providers_for(
+/// `account.provider` and `account.kind` are both free text with no CHECK
+/// constraint, so a row nobody can parse must narrow the answer rather than 500
+/// the whole listing. An unparseable kind drops that one channel and keeps the
+/// provider: the model is still reachable, it just cannot be addressed by a
+/// qualifier nobody can name.
+async fn channels_for(
     state: &Arc<AppState>,
     route_id: uuid::Uuid,
     principal_id: uuid::Uuid,
-) -> oag_core::Result<BTreeSet<Provider>> {
-    let raw = oag_store::repo::route_providers(&state.db, route_id, principal_id).await?;
-    Ok(raw
-        .into_iter()
-        .filter_map(|name| {
-            let parsed = name.parse::<Provider>().ok();
-            if parsed.is_none() {
-                tracing::warn!(
-                    provider = %name,
-                    "account.provider is not a known provider; not listing its models"
-                );
-            }
-            parsed
-        })
-        .collect())
+) -> oag_core::Result<Channels> {
+    let raw = oag_store::repo::route_channels(&state.db, route_id, principal_id).await?;
+    let mut out = Channels::new();
+    for (name, kind) in raw {
+        let Ok(provider) = name.parse::<Provider>() else {
+            tracing::warn!(
+                provider = %name,
+                "account.provider is not a known provider; not listing its models"
+            );
+            continue;
+        };
+        let entry = out.entry(provider).or_default();
+        if let Some(kind) = CredentialKind::from_column(&kind) {
+            entry.insert(kind);
+        } else {
+            tracing::warn!(
+                provider = %name,
+                kind = %kind,
+                "account.kind is not a known credential kind; not offering a qualified id for it"
+            );
+        }
+    }
+    Ok(out)
 }
 
-/// One concrete model.
+/// One concrete model: its own id, then a qualified id per credential kind
+/// that is worth addressing.
+///
+/// A qualified twin only appears when the route holds **both** kinds for this
+/// provider. With one kind the unqualified id already goes there, so a second
+/// spelling of it is a picker entry that teaches the caller a distinction they
+/// do not have; and a kind they hold no credential for would be an id that
+/// resolves to a 503, which is the failure this listing exists to move earlier.
+fn concrete_entries(e: &Entitlement, channels: &Channels) -> Vec<Value> {
+    let mut out = vec![concrete_entry(e, None)];
+    let Some(held) = channels.get(&e.spec.provider) else {
+        return out;
+    };
+    let addressable: Vec<CredentialKind> = CredentialKind::QUALIFIED
+        .iter()
+        .copied()
+        .filter(|k| held.contains(k))
+        .collect();
+    if addressable.len() > 1 {
+        out.extend(addressable.into_iter().map(|k| concrete_entry(e, Some(k))));
+    }
+    out
+}
+
+/// One concrete model, optionally pinned to a credential kind.
 ///
 /// A superset of the OpenAI and Anthropic shapes, because both dialects are
 /// served from the same base URL and the caller's SDK is not knowable from the
 /// request — `extract_key` accepts all three header spellings from any client,
 /// so auth headers carry no dialect signal.
-fn concrete_entry(e: &Entitlement) -> Value {
-    entry(
-        e.spec.id.as_str(),
+fn concrete_entry(e: &Entitlement, channel: Option<CredentialKind>) -> Value {
+    let canonical = e.spec.id.as_str();
+    let id = channel
+        .and_then(|k| alias::qualified_id(canonical, k))
+        .unwrap_or_else(|| canonical.to_owned());
+    // The operator's name for the model, or the derived one. The suffix says
+    // which channel, because two rows reading `xAI: Grok 4.6` in a picker are
+    // a coin toss.
+    let display = match channel {
+        Some(kind) => format!("{} · {}", e.spec.label(), kind.channel_label()),
+        None => e.spec.label(),
+    };
+    let mut entry = entry(
+        &id,
         e.spec.provider.as_str(),
-        &label(
-            e.spec.provider.support().display_name,
-            &e.spec.upstream_name,
-        ),
+        &display,
         json!({
             "tier": e.tier.as_ref().map(TierName::as_str),
             "provider": e.spec.provider.as_str(),
@@ -239,8 +306,16 @@ fn concrete_entry(e: &Entitlement) -> Value {
                 "reasoning": e.spec.capabilities.reasoning,
                 "prompt_cache": e.spec.capabilities.prompt_cache,
             },
+            "channel": channel.and_then(CredentialKind::qualifier),
         }),
-    )
+    );
+    if channel.is_some() {
+        // Same model, different address. Said here rather than left to the
+        // reader, so a dashboard counting this listing does not report two
+        // models where the organisation has one.
+        entry["oag"]["alias_of"] = Value::String(canonical.to_owned());
+    }
+    entry
 }
 
 /// One virtual name. `None` is `oag/auto`.
@@ -254,7 +329,7 @@ fn virtual_entry(rung: Option<&TierName>) -> Value {
     entry(
         &id,
         "oag",
-        &label("OAG", name),
+        &oag_router::derive_label("OAG", name),
         json!({
             "tier": rung.map(TierName::as_str),
             "provider": "oag",
@@ -263,19 +338,11 @@ fn virtual_entry(rung: Option<&TierName>) -> Value {
             "context_window": Value::Null,
             "max_output_tokens": Value::Null,
             "capabilities": Value::Null,
+            // A virtual name pins no credential kind: choosing among them is
+            // most of what it is for.
+            "channel": Value::Null,
         }),
     )
-}
-
-/// What a human should read, as opposed to what the router needs.
-///
-/// The vendor's own spelling plus the name on the wire — derived, not invented:
-/// a marketing name we made up would disagree with the provider's own console
-/// the first time they rename something. It matters because an aliased id is
-/// `anthropic/xai/grok-4.6`, which reads as an Anthropic model and is the only
-/// thing a Claude Code picker has to go on otherwise.
-fn label(vendor: &str, name: &str) -> String {
-    format!("{vendor}: {name}")
 }
 
 fn entry(id: &str, owned_by: &str, display_name: &str, oag: Value) -> Value {
@@ -373,6 +440,20 @@ mod tests {
                 reasoning: true,
                 prompt_cache: true,
             },
+            display_label: None,
+        }
+    }
+
+    /// A route holding every kind named, for one provider.
+    fn channels(provider: Provider, kinds: &[CredentialKind]) -> Channels {
+        Channels::from([(provider, kinds.iter().copied().collect())])
+    }
+
+    fn entitled(spec: &ModelSpec) -> Entitlement<'_> {
+        Entitlement {
+            spec,
+            tier: None,
+            honoured: true,
         }
     }
 
@@ -392,11 +473,14 @@ mod tests {
         // Virtual entries sort first, so a thin one fails SDK validation on
         // element 0 and breaks models.list() for every model, not just itself.
         let spec = spec();
-        let concrete = concrete_entry(&Entitlement {
-            spec: &spec,
-            tier: Some(TierName::new("frontier")),
-            honoured: true,
-        });
+        let concrete = concrete_entry(
+            &Entitlement {
+                spec: &spec,
+                tier: Some(TierName::new("frontier")),
+                honoured: true,
+            },
+            None,
+        );
         let virtual_auto = virtual_entry(None);
         let virtual_rung = virtual_entry(Some(&TierName::new("cheap")));
 
@@ -439,12 +523,7 @@ mod tests {
         // Cost data belongs on the admin listener, which is where it already
         // lives. A client asking what it may call does not need the rate card.
         let spec = spec();
-        let rendered = concrete_entry(&Entitlement {
-            spec: &spec,
-            tier: None,
-            honoured: true,
-        })
-        .to_string();
+        let rendered = concrete_entry(&entitled(&spec), None).to_string();
         assert!(!rendered.contains("per_mtok"), "{rendered}");
         assert!(!rendered.contains("pricing"), "{rendered}");
     }
@@ -481,15 +560,7 @@ mod tests {
             aliases,
         );
         for spec in [&spec, &grok] {
-            push(
-                &mut out,
-                concrete_entry(&Entitlement {
-                    spec,
-                    tier: None,
-                    honoured: true,
-                }),
-                aliases,
-            );
+            push(&mut out, concrete_entry(&entitled(spec), None), aliases);
         }
         out
     }
@@ -616,5 +687,181 @@ mod tests {
         let (model, action) = path.rsplit_once(':').expect("has an action");
         assert_eq!(model, "anthropic/claude-opus-5");
         assert_eq!(action, "generateContent");
+    }
+
+    fn grok() -> ModelSpec {
+        ModelSpec {
+            id: ModelId::new("xai/grok-4.6"),
+            provider: Provider::XAI,
+            upstream_name: "grok-4.6".to_owned(),
+            ..spec()
+        }
+    }
+
+    fn qualified_ids(spec: &ModelSpec, channels: &Channels) -> Vec<String> {
+        concrete_entries(&entitled(spec), channels)
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn a_qualified_id_is_offered_only_where_both_channels_exist() {
+        // The listing was just narrowed to offer only what can serve, and this
+        // must not walk that back: an `@sub` on a route with no seat is an id
+        // that resolves to a 503, which is the failure the listing exists to
+        // move earlier.
+        let grok = grok();
+
+        let both = channels(
+            Provider::XAI,
+            &[CredentialKind::ApiKey, CredentialKind::OAuth],
+        );
+        assert_eq!(
+            qualified_ids(&grok, &both),
+            ["xai/grok-4.6", "xai/grok-4.6@api", "xai/grok-4.6@sub"]
+        );
+
+        // One kind: the plain id already goes there, so a second spelling of it
+        // teaches a distinction the caller does not have.
+        for only in [CredentialKind::ApiKey, CredentialKind::OAuth] {
+            assert_eq!(
+                qualified_ids(&grok, &channels(Provider::XAI, &[only])),
+                ["xai/grok-4.6"],
+                "{only}"
+            );
+        }
+
+        // And a provider the route holds nothing for is listed as it was.
+        assert_eq!(
+            qualified_ids(&grok, &Channels::new()),
+            ["xai/grok-4.6"],
+            "a model with no channels recorded still lists once"
+        );
+    }
+
+    #[test]
+    fn a_qualified_id_the_listing_offers_is_one_the_inference_path_takes_back() {
+        // Two halves of one feature in two modules. A listing that advertised
+        // `xai/grok-4.6:sub` would populate a picker with ids that 400 on the
+        // first turn.
+        let grok = grok();
+        let both = channels(
+            Provider::XAI,
+            &[CredentialKind::ApiKey, CredentialKind::OAuth],
+        );
+        let catalog = oag_router::Catalog::from_entries([grok.clone()]);
+
+        for id in qualified_ids(&grok, &both) {
+            let n = alias::normalise(&id, &catalog).expect("the listing's own id parses");
+            assert_eq!(
+                n.model.unwrap_or_else(|| id.clone()),
+                "xai/grok-4.6",
+                "{id} named another model"
+            );
+        }
+    }
+
+    #[test]
+    fn a_qualified_entry_says_which_model_it_is_and_which_channel_it_pins() {
+        // Otherwise a dashboard counting this listing reports three models
+        // where the organisation has one, and a picker shows two rows with the
+        // same name and no way to tell them apart.
+        let grok = grok();
+        let both = channels(
+            Provider::XAI,
+            &[CredentialKind::ApiKey, CredentialKind::OAuth],
+        );
+        let entries = concrete_entries(&entitled(&grok), &both);
+
+        let canonical = &entries[0];
+        assert_eq!(canonical["oag"]["alias_of"], Value::Null);
+        assert_eq!(canonical["oag"]["channel"], Value::Null);
+        assert_eq!(canonical["display_name"], "xAI: grok-4.6");
+
+        let sub = entries
+            .iter()
+            .find(|m| m["id"] == "xai/grok-4.6@sub")
+            .expect("subscription variant");
+        assert_eq!(sub["oag"]["alias_of"], "xai/grok-4.6");
+        assert_eq!(sub["oag"]["channel"], "sub");
+        assert_eq!(sub["display_name"], "xAI: grok-4.6 · subscription");
+
+        let api = entries
+            .iter()
+            .find(|m| m["id"] == "xai/grok-4.6@api")
+            .expect("api variant");
+        assert_eq!(api["display_name"], "xAI: grok-4.6 · API key");
+
+        // Every variant carries the field set of the canonical row: an SDK
+        // validates the whole array, not the first element.
+        for e in &entries {
+            assert_eq!(keys_of(e), keys_of(canonical));
+            assert_eq!(keys_of(&e["oag"]), keys_of(&canonical["oag"]));
+        }
+    }
+
+    #[test]
+    fn a_qualified_id_and_the_claude_code_prefix_compose_into_one_reachable_name() {
+        // Claude Code keeps only ids matching /^(claude|anthropic)/i, so
+        // without a twin the pinned variants are simply absent from its picker
+        // — and with a twin that named itself, a dashboard would need two hops
+        // to work out which model it is.
+        let grok = grok();
+        let both = channels(
+            Provider::XAI,
+            &[CredentialKind::ApiKey, CredentialKind::OAuth],
+        );
+        let mut out = Vec::new();
+        for entry in concrete_entries(&entitled(&grok), &both) {
+            push(&mut out, entry, true);
+        }
+        let ids: Vec<&str> = out.iter().filter_map(|m| m["id"].as_str()).collect();
+        assert!(ids.contains(&"anthropic/xai/grok-4.6@sub"), "{ids:?}");
+        assert!(
+            ids.iter()
+                .all(|id| claude_code_keeps(id) || !id.starts_with("anthropic"))
+        );
+
+        let twin = out
+            .iter()
+            .find(|m| m["id"] == "anthropic/xai/grok-4.6@sub")
+            .expect("twinned");
+        assert_eq!(twin["oag"]["alias_of"], "xai/grok-4.6");
+        assert_eq!(twin["oag"]["channel"], "sub");
+    }
+
+    #[test]
+    fn an_operators_label_replaces_the_derived_one_wherever_the_model_appears() {
+        // The point of having a label at all: renaming is free because the id
+        // never moves. Every spelling of the model shows the new name and every
+        // one of them still routes to the same id.
+        let named = ModelSpec {
+            display_label: Some("Grok, the fast one".to_owned()),
+            ..grok()
+        };
+        let both = channels(
+            Provider::XAI,
+            &[CredentialKind::ApiKey, CredentialKind::OAuth],
+        );
+        let entries = concrete_entries(&entitled(&named), &both);
+
+        assert_eq!(entries[0]["display_name"], "Grok, the fast one");
+        assert_eq!(entries[0]["id"], "xai/grok-4.6");
+        let sub = entries
+            .iter()
+            .find(|m| m["id"] == "xai/grok-4.6@sub")
+            .expect("subscription variant");
+        assert_eq!(sub["display_name"], "Grok, the fast one · subscription");
+    }
+
+    #[test]
+    fn a_model_nobody_has_named_still_reads_as_something_in_a_picker() {
+        // NULL is not "no name": it means derive one. `anthropic/xai/grok-4.6`
+        // reads as an Anthropic model, and the display name is the only thing
+        // in a Claude Code picker that says otherwise.
+        assert_eq!(grok().label(), "xAI: grok-4.6");
+        assert_eq!(spec().label(), "Anthropic: claude-opus-5");
     }
 }

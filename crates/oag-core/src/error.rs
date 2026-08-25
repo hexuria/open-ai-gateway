@@ -1,5 +1,6 @@
 //! Errors, and the classification that drives retry and failover.
 
+use crate::credential::CredentialKind;
 use crate::{AccountId, Provider};
 use std::time::Duration;
 use thiserror::Error;
@@ -39,6 +40,39 @@ pub enum Error {
 
     #[error("no credential available for provider {provider} on this route")]
     NoCredential { provider: Provider },
+
+    /// A model id carried an `@` qualifier nobody can parse.
+    ///
+    /// A client error, not something to shrug off. Ignoring the pin would route
+    /// the request through whichever credential is cheapest — which is the one
+    /// the caller wrote the qualifier to exclude — and they would never learn
+    /// that the word they typed meant nothing here.
+    #[error(
+        "unknown model qualifier `@{qualifier}`; use one of {}",
+        model_channel_qualifiers()
+    )]
+    UnknownModelChannel { qualifier: String },
+
+    /// The qualifier parses, and this provider cannot be reached that way at
+    /// all. Distinct from having no such credential *configured*: adding one is
+    /// the fix for that, and there is no fix for this.
+    #[error("{provider} cannot be reached through a {} credential", .kind.channel_label())]
+    ChannelNotOffered {
+        provider: Provider,
+        kind: CredentialKind,
+    },
+
+    /// The route holds credentials for this provider, and none of the kind the
+    /// request pinned.
+    ///
+    /// Deliberately not [`Error::NoCredential`]. "No credential for xai" sends
+    /// an operator to look at a pool that has three healthy keys in it; naming
+    /// the kind says which one is missing.
+    #[error("no {} credential for {provider} on this route", .kind.channel_label())]
+    NoCredentialOfKind {
+        provider: Provider,
+        kind: CredentialKind,
+    },
 
     /// Credentials exist and are healthy — every one of them is simply busy.
     ///
@@ -114,6 +148,23 @@ pub enum Error {
 
     #[error("{0}")]
     Internal(String),
+}
+
+/// The qualifiers a model id may carry, as a client writes them.
+///
+/// Derived from the vocabulary rather than written out beside it, so the
+/// message in [`Error::UnknownModelChannel`] cannot end up naming a qualifier
+/// the parser does not accept — which is the one failure this error exists to
+/// prevent the caller from having.
+fn model_channel_qualifiers() -> String {
+    CredentialKind::QUALIFIED
+        .iter()
+        .filter_map(|k| {
+            k.qualifier()
+                .map(|q| format!("@{q} ({})", k.channel_label()))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// What to do about a failed attempt.

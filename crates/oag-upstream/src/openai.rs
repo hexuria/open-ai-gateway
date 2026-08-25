@@ -126,6 +126,7 @@ mod tests {
             context_window: 128_000,
             max_output_tokens: 8192,
             capabilities: Capabilities::default(),
+            display_label: None,
         }
     }
 

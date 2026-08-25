@@ -57,6 +57,9 @@
   .btn-quiet:hover  { background:var(--line); }
   .btn-danger:hover { background:var(--bad); color:var(--panel); }
   .reason { color:var(--dim); font-size:12px; margin-left:6px; }
+  /* Narrower than the global input width, which is sized for a URL: this one
+     sits in a table cell beside five other columns. */
+  .cell-input { min-width:200px; padding:3px 8px; font-size:13px; }
   code { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--dim); }
 </style>
 </head>
@@ -132,6 +135,12 @@
       terms behind it, not a missing feature; "no" is simply that nobody has
       written an importer.</p>
     <div class="scroll"><table id="providers"></table></div>
+
+    <h2>Models</h2>
+    <p class="note">The id is the address: clients send it, a ladder names it, and the
+      ledger records spend under it, so it never changes. The label is only a name —
+      rename it freely. Leave it empty and the placeholder is what a picker shows.</p>
+    <div class="scroll"><table id="models"></table></div>
 
     <h2>Credentials</h2>
     <div class="scroll"><table id="accounts"></table></div>
@@ -220,10 +229,10 @@ function subscription(s) {
 async function load() {
   $('err').textContent = '';
   try {
-    const [s, accounts, keys, routes, usage, services, providers] = await Promise.all([
+    const [s, accounts, keys, routes, usage, services, providers, models] = await Promise.all([
       get('/admin/api/summary'), get('/admin/api/accounts'), get('/admin/api/keys'),
       get('/admin/api/routes'), get('/admin/api/usage?limit=25'),
-      get('/admin/api/services'), get('/admin/api/providers'),
+      get('/admin/api/services'), get('/admin/api/providers'), get('/admin/api/models'),
     ]);
     localStorage.setItem('oag_key', $('key').value);
 
@@ -317,6 +326,21 @@ async function load() {
       { h:'Note', f:p => p.note ? `<span class="reason">${esc(p.note)}</span>` : '' },
     ], providers);
 
+    // The one editable table on the page. The input carries the model id in a
+    // data attribute rather than in an element id, because a catalog id
+    // contains a slash and a dot and would need escaping to survive a selector.
+    table($('models'), [
+      { h:'Id', f:m => `<code>${esc(m.id)}</code>` },
+      { h:'Provider', f:m => `<span class="pill">${esc(m.provider)}</span>` },
+      { h:'Upstream', f:m => `<code>${esc(m.upstream_name)}</code>` },
+      // The placeholder is the derived default, so an operator can see what an
+      // empty box means without saving to find out.
+      { h:'Label', f:m => `<input class="cell-input" data-label-for="${esc(m.id)}"` +
+          ` value="${esc(m.display_label || '')}" placeholder="${esc(m.derived_label)}">` },
+      { h:'Context', f:m => m.context_window, num:true },
+      { h:'', f:m => btn('model-label', m.id, 'Save', 'btn-quiet') },
+    ], models.models);
+
     table($('accounts'), [
       { h:'Name',     f:a => esc(a.name) },
       { h:'Provider', f:a => esc(a.provider) },
@@ -394,6 +418,33 @@ const ACTIONS = {
   'svc-enable':     id => [`/admin/api/services/${id}/enable`, null],
   'svc-check':      id => [`/admin/api/services/${id}/check`, null],
 };
+
+// Renaming a model is the one write on this page that carries a body, so it
+// takes a branch of its own rather than joining ACTIONS, whose entries are all
+// bodyless verbs against an id.
+//
+// The id is split on '/' and each segment encoded: the route is a wildcard
+// because a catalog id spans two path segments, and encoding the whole string
+// would turn `xai/grok-4.6` into a single segment that matches nothing.
+document.querySelector('main').addEventListener('click', async e => {
+  if (e.target.dataset?.act !== 'model-label') return;
+  const id = e.target.dataset.id;
+  const input = document.querySelector(`[data-label-for="${CSS.escape(id)}"]`);
+  const value = input ? input.value.trim() : '';
+  const path = '/admin/api/models/' + id.split('/').map(encodeURIComponent).join('/');
+  $('err').textContent = '';
+  e.target.disabled = true;
+  try {
+    // An empty box clears the label, which restores the derived default. Sent
+    // as null rather than "" so the intent survives whatever the server does
+    // with blank strings.
+    await send('PATCH', path, { display_label: value || null });
+    await load();
+  } catch (err) {
+    $('err').textContent = err.message;
+    e.target.disabled = false;
+  }
+});
 
 document.querySelector('main').addEventListener('click', async e => {
   const act = e.target.dataset?.act;

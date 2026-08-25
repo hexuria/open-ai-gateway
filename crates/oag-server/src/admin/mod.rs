@@ -17,10 +17,12 @@
 //! catalog is in [`services`].
 
 pub mod auth;
+pub mod models;
 pub mod services;
 pub mod write;
 
 pub use auth::{AdminActor, require_admin_layer};
+pub use models::{list_models, update_model};
 pub use services::{
     check_service, create_service, disable_service, enable_service, list_services, update_service,
 };

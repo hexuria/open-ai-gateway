@@ -199,6 +199,7 @@ mod tests {
             context_window: 256_000,
             max_output_tokens: 16_384,
             capabilities: Capabilities::default(),
+            display_label: None,
         }
     }
 

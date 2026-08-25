@@ -156,6 +156,11 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/services/{id}/enable", post(admin::enable_service))
         .route("/services/{id}/check", post(admin::check_service))
         .route("/catalog/reload", post(admin::reload_catalog))
+        .route("/models", get(admin::list_models))
+        // A wildcard, unlike every other `{id}` here: a catalog id contains a
+        // slash (`xai/grok-4.6`), so a single-segment capture would 404 every
+        // model in the catalog.
+        .route("/models/{*id}", patch(admin::update_model))
         .route("/accounts/{id}/disable", post(admin::disable_account))
         .route("/accounts/{id}/enable", post(admin::enable_account))
         .route("/accounts/{id}/clear-cooldown", post(admin::clear_cooldown))
@@ -351,6 +356,10 @@ server:
         ("GET", "/admin/api/keys"),
         ("GET", "/admin/api/providers"),
         ("POST", "/admin/api/catalog/reload"),
+        ("GET", "/admin/api/models"),
+        // A slashed id, because that is what a catalog id looks like and the
+        // route that takes it is a wildcard for exactly that reason.
+        ("PATCH", "/admin/api/models/xai/grok-4.6"),
         (
             "POST",
             "/admin/api/accounts/00000000-0000-0000-0000-000000000001/disable",
@@ -634,6 +643,64 @@ server:
         for path in ["/", "/metrics"] {
             let got = status(public_router(state(false)), "GET", path).await;
             assert_eq!(got, StatusCode::NOT_FOUND, "{path} leaked onto inference");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_channel_qualified_model_survives_the_gemini_path_in_both_spellings() {
+        // The Gemini dialect carries the model in the URL, so an `@sub`
+        // qualifier has to survive a path segment. `@` is an RFC 3986 sub-delim
+        // and needs no escaping — but a client that escapes it anyway must land
+        // on the same model, or the same request works from curl and fails from
+        // an SDK, with the model name as the only clue.
+        //
+        // Asserted against a synthetic route carrying the *same pattern* rather
+        // than against `gemini_generate`, which authenticates before it parses
+        // anything. What is in doubt here is what axum hands a handler, not
+        // what the handler does with it.
+        async fn echo(axum::extract::Path(captured): axum::extract::Path<String>) -> String {
+            captured
+        }
+        let router: Router = Router::new().route("/v1beta/models/{*model_action}", get(echo));
+
+        for uri in [
+            "/v1beta/models/xai/grok-4.6@sub:generateContent",
+            "/v1beta/models/xai/grok-4.6%40sub:generateContent",
+        ] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request");
+            let response = router.clone().oneshot(request).await.expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{uri} did not route");
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .expect("body")
+                .to_bytes();
+            let captured = String::from_utf8(bytes.to_vec()).expect("utf8");
+            assert_eq!(captured, "xai/grok-4.6@sub:generateContent", "{uri}");
+
+            // And the handler's own split leaves the qualifier alone: it splits
+            // on the last colon, and `@` is not one. A qualifier syntax using
+            // `:` would have collided with the action delimiter here.
+            let (model, action) = captured.rsplit_once(':').expect("has an action");
+            assert_eq!(model, "xai/grok-4.6@sub");
+            assert_eq!(action, "generateContent");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_real_gemini_route_matches_a_qualified_model_rather_than_404ing() {
+        // The other half: the pattern above is the one actually registered, so
+        // a qualified id reaches authentication instead of falling off the
+        // router. 401 is the proof it matched.
+        for path in [
+            "/v1beta/models/xai/grok-4.6@sub:generateContent",
+            "/v1beta/models/xai/grok-4.6%40sub:generateContent",
+        ] {
+            let got = post_status(public_router(state(false)), path, r#"{"contents":[]}"#).await;
+            assert_eq!(got, StatusCode::UNAUTHORIZED, "{path} answered {got}");
         }
     }
 

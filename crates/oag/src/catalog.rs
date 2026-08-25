@@ -109,6 +109,9 @@ pub fn builtin() -> Vec<ModelRow> {
                 supports_tools: true,
                 supports_reasoning: m.reasoning,
                 supports_prompt_cache: true,
+                // Nothing built in is named by hand: a starter row shows the
+                // derived label until an operator decides otherwise.
+                display_label: None,
             })
         })
         .collect()
@@ -230,10 +233,22 @@ fn from_litellm_str(raw: &str, origin: &str) -> Result<Vec<ModelRow>> {
             modes.is_some_and(|m| m.iter().any(|v| v.as_str() == Some("image")))
         });
 
+        // LiteLLM keys a model either bare (`claude-opus-5`) or under its own
+        // provider (`xai/grok-4.6`, `moonshot/kimi-latest-8k`). That prefix is
+        // LiteLLM's namespace, not the provider's model name, so it has to come
+        // off before the name goes on the wire — xAI answers a request for
+        // `xai/grok-4.6` with "Model not found". Only the provider's own prefix
+        // is removed: anything else in the name belongs to the model, and
+        // Bedrock's `anthropic.claude-…` must survive intact.
+        let wire_name = name
+            .strip_prefix(&format!("{provider}/"))
+            .unwrap_or(name)
+            .to_owned();
+
         out.push(ModelRow {
             id: format!("{known}/{}", name.rsplit('/').next().unwrap_or(name)),
             provider: known.as_str().to_owned(),
-            upstream_name: name.clone(),
+            upstream_name: wire_name,
             input_per_mtok: input * million,
             output_per_mtok: output * million,
             cache_read_per_mtok: decimal(&spec["cache_read_input_token_cost"]).map(|d| d * million),
@@ -249,6 +264,9 @@ fn from_litellm_str(raw: &str, origin: &str) -> Result<Vec<ModelRow>> {
             supports_tools: spec["supports_function_calling"].as_bool().unwrap_or(false),
             supports_reasoning: spec["supports_reasoning"].as_bool().unwrap_or(false),
             supports_prompt_cache: spec["supports_prompt_caching"].as_bool().unwrap_or(false),
+            // LiteLLM has no opinion about what to call a model in a picker,
+            // and a seed must never write over what an operator called it.
+            display_label: None,
         });
     }
 
@@ -338,6 +356,10 @@ pub fn plan_price_sync(
                 supports_tools: false,
                 supports_reasoning: false,
                 supports_prompt_cache: p.cache_read_per_mtok.is_some(),
+                // A price API states no name for a picker either, and this is
+                // an INSERT: a model the catalog already knows takes the
+                // `Reprice` arm above, which names no columns but the prices.
+                display_label: None,
             })
         })
         .collect()
@@ -429,6 +451,50 @@ mod tests {
         assert_eq!(rows[0].input_per_mtok, rust_decimal::dec!(15));
         assert_eq!(rows[0].output_per_mtok, rust_decimal::dec!(75));
         assert_eq!(rows[0].cache_read_per_mtok, Some(rust_decimal::dec!(1.5)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn litellms_own_prefix_does_not_travel_to_the_provider() {
+        // LiteLLM keys some models under its own provider namespace. That
+        // prefix is not part of the model's name, and sending it upstream is
+        // not a cosmetic slip: xAI answers a request for `xai/grok-4.6` with
+        // "Model not found", so every model imported this way is unreachable
+        // while looking perfectly correct in the catalog. The id keeps the
+        // prefix because that is OAG's own namespace; only the wire name loses
+        // it. A name that carries no provider prefix must be left alone, and a
+        // Bedrock-style name has to survive whole.
+        let file = serde_json::json!({
+            "xai/grok-4.6":       { "litellm_provider": "xai", "input_cost_per_token": 0.000_002,
+                                    "output_cost_per_token": 0.000_006 },
+            "moonshot/kimi-k2":   { "litellm_provider": "moonshot", "input_cost_per_token": 0.000_000_6,
+                                    "output_cost_per_token": 0.000_002_5 },
+            "claude-opus-5":      { "litellm_provider": "anthropic", "input_cost_per_token": 0.000_015,
+                                    "output_cost_per_token": 0.000_075 },
+            "bedrock/anthropic.claude-sonnet-4-v1:0":
+                                  { "litellm_provider": "bedrock", "input_cost_per_token": 0.000_003,
+                                    "output_cost_per_token": 0.000_015 },
+        });
+        let path = std::env::temp_dir().join("oag-litellm-prefix.json");
+        std::fs::write(&path, file.to_string()).expect("write");
+        let rows = from_litellm_file(path.to_str().expect("path")).expect("parses");
+
+        let wire = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+                .upstream_name
+                .clone()
+        };
+        assert_eq!(wire("xai/grok-4.6"), "grok-4.6");
+        assert_eq!(wire("kimi/kimi-k2"), "kimi-k2");
+        // Never carried a prefix; must be untouched.
+        assert_eq!(wire("anthropic/claude-opus-5"), "claude-opus-5");
+        // Only the provider's own prefix comes off — the rest is the model.
+        assert_eq!(
+            wire("bedrock/anthropic.claude-sonnet-4-v1:0"),
+            "anthropic.claude-sonnet-4-v1:0"
+        );
         let _ = std::fs::remove_file(path);
     }
 
