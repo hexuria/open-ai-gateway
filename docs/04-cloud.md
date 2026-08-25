@@ -217,6 +217,7 @@ makes the job execute; do not silence it with `ignore_changes`, and do not use
 | Request path | streamed through the Service; ledger row exact — `in=1200 cached=18000 out=142`, `$0.004085` against `$0.061275` |
 | Rolling update | 8 of 8 long streams survived a `rollout restart` mid-flight, and all 8 reached the ledger — in CI, on every push (`.github/workflows/k8s.yml`), not by hand |
 | OpenTofu | all modules and all three stacks pass `terraform validate` |
+| GCP stack, applied | `just floci-up` applies `stacks/gcp-cloudrun` against [floci](https://floci.io), a local GCP emulator that starts Cloud Run containers for real: the service comes up and answers `/health/ready`. `just floci-cloudsql` does the same with the managed data tier, and `admin init` writes land in the Cloud SQL instance |
 | Container image | builds; `oag --version` runs; ELF `e_machine` matches the image architecture |
 
 Also unverified, and specific to the migration step: that the Cloud Run provider surfaces a
@@ -234,3 +235,12 @@ above, but nothing here has provisioned a real Cloud SQL instance. `validate`
 checks that a configuration is well-formed against the provider schema; it does
 not check that a quota exists, that an IAM binding is sufficient, or that two
 resources agree at runtime. Expect the first apply to find things.
+
+The floci run does not close that gap either, and `deploy/floci/README.md` says
+exactly where it stops: it applies a **throwaway copy** of the stack with three
+adjustments — plain env instead of Secret Manager `valueSource`, a one-off
+container instead of the migrate Cloud Run job because floci runs services and
+not jobs, and no secret-IAM bindings. So it rehearses the configuration and the
+runtime and proves neither Secret Manager injection nor the migration gate.
+Those need `deploy/tofu/deploy-gcp.sh` against a real project, or
+`deploy/tofu/verify-migration-gate.sh` for the gate on its own.

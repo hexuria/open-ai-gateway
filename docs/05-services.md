@@ -9,6 +9,11 @@ services without becoming them.
 Register a row. Health-check it. Deep-link to the service's own UI. That
 is the whole slice.
 
+One vocabulary rule, because two unrelated things once shared a word: a
+context-compressing service is the **token-reducer** (`kind = reduce`), and
+**headroom** means remaining ratelimit capacity on a credential and nothing
+else. The code uses the word only in that second sense.
+
 ## What a row is
 
 | Field | Meaning |
