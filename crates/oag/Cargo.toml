@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 oag-core.workspace = true
+oag-pool.workspace = true
 oag-server.workspace = true
 oag-store.workspace = true
 oag-upstream.workspace = true

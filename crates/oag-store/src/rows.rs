@@ -32,6 +32,11 @@ pub struct AccountRow {
     pub cooldown_until: Option<OffsetDateTime>,
     pub rate_limited_until: Option<OffsetDateTime>,
     pub window_resets_at: Option<OffsetDateTime>,
+    /// The poller's last reading of how much of a subscription's allowance is
+    /// left. `None` is unknown, which is not the same as spent.
+    pub usage_remaining_pct: Option<Decimal>,
+    /// The floor an operator set under that allowance. `None` is no reserve.
+    pub usage_reserve_pct: Option<i16>,
     pub last_used_at: OffsetDateTime,
 }
 
@@ -67,8 +72,23 @@ impl AccountRow {
             cooldown_until: self.cooldown_until.map(OffsetDateTime::unix_timestamp),
             rate_limited_until: self.rate_limited_until.map(OffsetDateTime::unix_timestamp),
             window_resets_at: self.window_resets_at.map(OffsetDateTime::unix_timestamp),
+            usage_remaining_pct: self.usage_remaining_pct,
+            usage_reserve_pct: self.usage_reserve_pct.map(Decimal::from),
             last_used_at: self.last_used_at.unix_timestamp(),
         })
+    }
+
+    /// Whether this credential is being held out of the pool by its reserve.
+    ///
+    /// Answers from the columns rather than from a [`oag_pool::Candidate`],
+    /// because the caller that needs it most is the one explaining why nothing
+    /// could be selected — and by then there is no candidate to ask.
+    #[must_use]
+    pub fn held_by_reserve(&self) -> bool {
+        oag_pool::held_by_reserve(
+            self.usage_remaining_pct,
+            self.usage_reserve_pct.map(Decimal::from),
+        )
     }
 }
 

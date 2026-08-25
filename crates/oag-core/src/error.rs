@@ -74,6 +74,25 @@ pub enum Error {
         kind: CredentialKind,
     },
 
+    /// Every credential that could have served is sitting at or below the
+    /// quota reserve an operator set on it.
+    ///
+    /// Deliberately not [`Error::NoCredential`]. The reserve is a decision
+    /// somebody made, and it has three different fixes — lower the line, wait
+    /// for the subscription's window to reset, or add another credential —
+    /// none of which occurs to an operator told only that no credential is
+    /// available, because from that message the pool looks empty rather than
+    /// deliberately held back.
+    #[error(
+        "every {provider} credential is at or below its {reserve_pct}% quota reserve; \
+         lower it with `oag admin account set-reserve`, wait for the usage window \
+         to reset, or add another credential"
+    )]
+    ReserveHeld {
+        provider: Provider,
+        reserve_pct: i16,
+    },
+
     /// Credentials exist and are healthy — every one of them is simply busy.
     ///
     /// Distinct from `NoCredential` because the two need opposite responses. No
@@ -244,7 +263,12 @@ impl Error {
             Self::StreamIdle(_) => Disposition::FailoverAccount {
                 cooldown: Duration::from_mins(1),
             },
-            Self::NoCredential { .. } | Self::NoViableModel(_) => Disposition::EscalateTier,
+            // A reserved-out provider is out for as long as its window lasts,
+            // so the only thing that can still serve this request is a rung
+            // naming a different one — the same reasoning as an empty pool.
+            Self::NoCredential { .. } | Self::ReserveHeld { .. } | Self::NoViableModel(_) => {
+                Disposition::EscalateTier
+            }
             // Waiting helps; a bigger model does not.
             Self::AtCapacity { .. } => Disposition::RetrySameAccount,
             _ => Disposition::Fatal,

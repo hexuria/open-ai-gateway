@@ -9,6 +9,7 @@
 //! every CI call.
 
 mod doctor;
+mod usage_import;
 
 use clap::{Args, Subcommand, ValueEnum};
 use oag_core::config::Config;
@@ -52,6 +53,9 @@ pub enum AdminCommand {
     /// Model catalog: seed, overlay prices, list.
     #[command(subcommand)]
     Catalog(CatalogCommand),
+    /// The usage ledger: import traffic that bypassed the gateway.
+    #[command(subcommand)]
+    Usage(UsageCommand),
     /// Shared caches.
     #[command(subcommand)]
     Cache(CacheCommand),
@@ -149,6 +153,20 @@ pub enum AccountCommand {
         /// saving read as unknown rather than as a saving of the whole fee.
         #[arg(long)]
         monthly_cost: Option<Decimal>,
+    },
+    /// Keep part of a subscription's quota back instead of spending it all.
+    ///
+    /// Without one, the gateway drains a seat until the provider answers 429 —
+    /// at which point everybody on that seat is blocked until the window
+    /// resets. A reserve stops scheduling it while there is still something
+    /// left, so whoever needs it at the end of the week finds some.
+    SetReserve {
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// The percentage to leave unspent, 0-100. Omit to clear the reserve,
+        /// which restores the drain-to-empty behaviour.
+        #[arg(long)]
+        pct: Option<i16>,
     },
 }
 
@@ -356,6 +374,51 @@ pub enum CacheCommand {
     Flush,
 }
 
+/// The `origin` an imported Claude Code row carries.
+///
+/// Shared with the importer rather than spelled twice: it is the value the
+/// idempotency key is prefixed with, the value `revert` deletes by, and the
+/// value reporting slices on, so three copies would be three chances for a
+/// typo to make an import unremovable.
+pub(crate) const ORIGIN_CLAUDE_CODE: &str = "claude-code";
+
+#[derive(Subcommand, Debug)]
+pub enum UsageCommand {
+    /// Fold local CLI session transcripts into the ledger.
+    ///
+    /// Reads Claude Code's own transcripts. Codex and the Grok CLI are not
+    /// supported and are not omitted by oversight — see the module docs on
+    /// `usage_import` for what each of them actually records.
+    ///
+    /// Reports and writes nothing unless `--apply` is given. Writing financial
+    /// history into a ledger should take saying so.
+    Import {
+        /// Where the transcripts are. A directory is walked for `*.jsonl`.
+        /// Defaults to `~/.claude/projects`.
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Only import sessions that ended before this instant (RFC 3339).
+        ///
+        /// The one defence against double counting that does not depend on
+        /// inference: set it to the moment you started routing this CLI through
+        /// the gateway and no session it served can be imported, whatever the
+        /// ledger does or does not still contain.
+        #[arg(long, value_name = "RFC3339")]
+        before: Option<String>,
+        /// Write the rows.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Delete every row an importer wrote, leaving gateway traffic alone.
+    Revert {
+        #[arg(long, default_value = ORIGIN_CLAUDE_CODE, value_name = "ORIGIN")]
+        origin: String,
+        /// Actually delete them.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
 pub async fn run(
     cmd: AdminCommand,
     db: &Db,
@@ -376,6 +439,7 @@ pub async fn run(
         AdminCommand::Key(cli) => key_cmd(db, redis_url, cli).await,
         AdminCommand::Route(cmd) => route_cmd(db, cmd).await,
         AdminCommand::Catalog(cmd) => catalog_cmd(db, kek, cmd).await,
+        AdminCommand::Usage(cmd) => usage_cmd(db, cmd).await,
         AdminCommand::Cache(CacheCommand::Flush) | AdminCommand::FlushCache => {
             flush_cache(redis_url).await
         }
@@ -390,6 +454,19 @@ pub async fn run(
     }
 }
 
+async fn usage_cmd(db: &Db, cmd: UsageCommand) -> Result<()> {
+    match cmd {
+        UsageCommand::Import {
+            path,
+            before,
+            apply,
+        } => usage_import::import(db, path.as_deref(), before.as_deref(), apply)
+            .await
+            .map(|_| ()),
+        UsageCommand::Revert { origin, apply } => usage_import::revert(db, &origin, apply).await,
+    }
+}
+
 async fn account_cmd(db: &Db, kek: &Kek, cmd: AccountCommand) -> Result<()> {
     match cmd {
         AccountCommand::Add { args } => add_account_from_args(db, kek, args).await,
@@ -399,6 +476,7 @@ async fn account_cmd(db: &Db, kek: &Kek, cmd: AccountCommand) -> Result<()> {
         AccountCommand::SetCost { name, monthly_cost } => {
             set_account_cost(db, &name, monthly_cost).await
         }
+        AccountCommand::SetReserve { name, pct } => set_account_reserve(db, &name, pct).await,
     }
 }
 
@@ -433,6 +511,65 @@ async fn set_account_cost(db: &Db, name: &str, monthly_cost: Option<Decimal>) ->
     if kind != "oauth" {
         println!("  note: {name} is a {kind} credential, and only subscription");
         println!("  seats are metered against a monthly price");
+    }
+    Ok(())
+}
+
+/// Reject a reserve the column would reject anyway, before it costs a round
+/// trip and comes back as a constraint violation.
+///
+/// The message names the range rather than merely saying "invalid", because
+/// `--pct 0.15` is the mistake somebody makes once: a fraction where a
+/// percentage was wanted parses as 0, and a reserve of 0 is a reserve that
+/// never fires. Separated from the update so the range can be tested without a
+/// database, which is the half of this that is worth testing.
+fn validated_reserve(pct: Option<i16>) -> Result<Option<i16>> {
+    match pct {
+        Some(p) if !(0..=100).contains(&p) => Err(oag_core::Error::Config(format!(
+            "reserve {p} is not a percentage; --pct takes 0-100"
+        ))),
+        other => Ok(other),
+    }
+}
+
+/// Set or clear the share of a subscription's quota to leave unspent.
+///
+/// Accepts any account, on the same reasoning as `set_account_cost`: a reserve
+/// on a metered key is inert — nothing polls it, so its remaining percentage
+/// stays NULL and the scheduler never holds it back — and refusing one would
+/// mean explaining the kinds taxonomy to somebody halfway through protecting a
+/// seat.
+async fn set_account_reserve(db: &Db, name: &str, pct: Option<i16>) -> Result<()> {
+    let pct = validated_reserve(pct)?;
+    let rows: Vec<(String, String, Option<rust_decimal::Decimal>)> = sqlx::query_as(
+        "UPDATE account SET usage_reserve_pct = $2, updated_at = now() \
+         WHERE name = $1 RETURNING name, kind, usage_remaining_pct",
+    )
+    .bind(name)
+    .bind(pct)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| oag_core::Error::Internal(format!("updating account: {e}")))?;
+
+    let Some((_, kind, remaining)) = rows.first() else {
+        return Err(oag_core::Error::Config(format!(
+            "no credential named {name}; see `oag admin account list`"
+        )));
+    };
+
+    match pct {
+        Some(p) => println!("{name} stops being scheduled at {p}% remaining"),
+        None => println!("{name} has no reserve; it will be scheduled until the provider refuses"),
+    }
+    if kind != "oauth" {
+        println!("  note: {name} is a {kind} credential, and only subscription");
+        println!("  seats report how much of an allowance is left");
+    } else if pct.is_some() && remaining.is_none() {
+        // An unknown reading never holds a seat back, so a reserve set before
+        // the first poll silently does nothing. Better said here than
+        // discovered a week later when the seat is empty anyway.
+        println!("  note: nothing has polled {name} yet, so the reserve holds");
+        println!("  nothing back until a reading arrives");
     }
     Ok(())
 }
@@ -637,12 +774,15 @@ type AccountListRow = (
     Option<time::OffsetDateTime>,
     Option<time::OffsetDateTime>,
     i16,
+    Option<rust_decimal::Decimal>,
+    Option<i16>,
 );
 
 async fn list_accounts(db: &Db) -> Result<()> {
     let rows: Vec<AccountListRow> = sqlx::query_as(
         r"
-        SELECT name, provider, kind, schedulable, cooldown_until, rate_limited_until, priority
+        SELECT name, provider, kind, schedulable, cooldown_until, rate_limited_until, priority,
+               usage_remaining_pct, usage_reserve_pct
         FROM account ORDER BY provider, name
         ",
     )
@@ -654,21 +794,39 @@ async fn list_accounts(db: &Db) -> Result<()> {
         println!("no credentials; add one with `oag admin account add`");
         return Ok(());
     }
-    println!("NAME                 PROVIDER     KIND       STATE          PRIORITY");
+    println!("NAME                 PROVIDER     KIND       STATE          PRIORITY  RESERVE");
     let now = time::OffsetDateTime::now_utc();
-    for (name, provider, kind, schedulable, cooldown, rate_limited, priority) in rows {
+    for (name, provider, kind, schedulable, cooldown, rate_limited, priority, remaining, reserve) in
+        rows
+    {
+        // "held back" outranks "ready" and nothing else: a reserved-out seat is
+        // as unschedulable as a rate limited one, and a listing that called it
+        // ready would contradict the request that just failed on it.
         let state = if !schedulable {
             "disabled"
         } else if cooldown.is_some_and(|t| t > now) {
             "cooling down"
         } else if rate_limited.is_some_and(|t| t > now) {
             "rate limited"
+        } else if reserve_holds(remaining, reserve) {
+            "held back"
         } else {
             "ready"
         };
-        println!("{name:<20} {provider:<12} {kind:<10} {state:<14} {priority}");
+        // A dash rather than a blank where no reserve is set: a column that
+        // simply stops has already been read as "the listing is truncated".
+        let reserve = reserve.map_or_else(|| "-".to_owned(), |p| format!("{p}%"));
+        println!("{name:<20} {provider:<12} {kind:<10} {state:<14} {priority:<9} {reserve}");
     }
     Ok(())
+}
+
+/// Whether a reserve is currently holding a credential out of the pool.
+///
+/// Borrowed from the scheduler rather than restated, so a listing can never
+/// call a seat ready that the next request will refuse to use.
+fn reserve_holds(remaining: Option<rust_decimal::Decimal>, reserve: Option<i16>) -> bool {
+    oag_pool::held_by_reserve(remaining, reserve.map(rust_decimal::Decimal::from))
 }
 
 async fn set_account_schedulable(db: &Db, name: &str, value: bool) -> Result<()> {
@@ -1551,6 +1709,71 @@ mod tests {
 
     fn parse(args: &[&str]) -> std::result::Result<AdminCommand, clap::Error> {
         Ok(AdminCli::try_parse_from(std::iter::once("admin").chain(args.iter().copied()))?.cmd)
+    }
+
+    #[test]
+    fn set_reserve_parses_a_percentage_and_a_clear() {
+        match parse(&["account", "set-reserve", "grok", "--pct", "15"])
+            .unwrap_or_else(|e| panic!("{e}"))
+        {
+            AdminCommand::Account(AccountCommand::SetReserve { name, pct }) => {
+                assert_eq!(name, "grok");
+                assert_eq!(pct, Some(15));
+            }
+            other => panic!("expected account set-reserve, got {other:?}"),
+        }
+        // Omitting `--pct` is how a reserve is removed, exactly as omitting
+        // `--monthly-cost` clears a price.
+        match parse(&["account", "set-reserve", "grok"]).unwrap_or_else(|e| panic!("{e}")) {
+            AdminCommand::Account(AccountCommand::SetReserve { pct, .. }) => assert_eq!(pct, None),
+            other => panic!("expected account set-reserve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reserve_outside_the_percentage_range_is_refused_by_naming_the_range() {
+        // `--pct 150` and `--pct -1` are typos, and a database CHECK violation
+        // is not an answer anybody can act on. The range has to be in the text
+        // or the next guess is as blind as the first.
+        for bad in [-1, 101, 1_000] {
+            let e = validated_reserve(Some(bad)).expect_err("out of range");
+            let message = e.to_string();
+            assert!(message.contains("0-100"), "{message}");
+            assert!(message.contains(&bad.to_string()), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_ends_of_the_range_and_a_cleared_reserve_are_accepted() {
+        // 100 is "never schedule this seat", which is a legitimate, if blunt,
+        // way to park one; 0 is a reserve that only fires on a truly empty
+        // pool; None is no reserve at all.
+        assert_eq!(
+            validated_reserve(Some(0)).unwrap_or_else(|e| panic!("{e}")),
+            Some(0)
+        );
+        assert_eq!(
+            validated_reserve(Some(100)).unwrap_or_else(|e| panic!("{e}")),
+            Some(100)
+        );
+        assert_eq!(
+            validated_reserve(None).unwrap_or_else(|e| panic!("{e}")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_listing_calls_a_seat_held_back_only_when_the_scheduler_would_refuse_it() {
+        use rust_decimal::Decimal;
+        assert!(reserve_holds(Some(Decimal::from(5)), Some(10)));
+        assert!(
+            reserve_holds(Some(Decimal::from(10)), Some(10)),
+            "at the line"
+        );
+        assert!(!reserve_holds(Some(Decimal::from(45)), Some(10)));
+        // Unknown is not empty, and no reserve is no policy.
+        assert!(!reserve_holds(None, Some(10)));
+        assert!(!reserve_holds(Some(Decimal::ZERO), None));
     }
 
     #[test]

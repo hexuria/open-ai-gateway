@@ -71,7 +71,9 @@ serde_yaml_ng = "0.10"
 thiserror = "2"
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+# v5 for the usage importer: an imported row's primary key is derived from the
+# external record's identity, so a re-import collides instead of duplicating.
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }
 url = "2"
 # Money is never f64. Every cost in this system is a Decimal.

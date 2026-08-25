@@ -123,6 +123,7 @@ pub async fn candidates(
                a.credentials_sealed, a.credentials_nonce, a.token_version, a.token_expires_at,
                a.owner_principal_id, a.proxy_url, a.priority, a.max_concurrency,
                a.schedulable, a.cooldown_until, a.rate_limited_until, a.window_resets_at,
+               a.usage_remaining_pct, a.usage_reserve_pct,
                a.last_used_at
         FROM account a
         JOIN account_route ar ON ar.account_id = a.id
@@ -145,7 +146,8 @@ pub async fn account_by_id(db: &Db, id: AccountId) -> Result<Option<AccountRow>>
         SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
                token_version, token_expires_at, owner_principal_id, proxy_url,
                priority, max_concurrency, schedulable, cooldown_until,
-               rate_limited_until, window_resets_at, last_used_at
+               rate_limited_until, window_resets_at,
+               usage_remaining_pct, usage_reserve_pct, last_used_at
         FROM account WHERE id = $1
         ",
     )
@@ -189,6 +191,18 @@ pub async fn route_channels(
           -- it until the client next refreshes -- worse than briefly offering
           -- one that fails over to another credential anyway.
           AND (a.rate_limited_until IS NULL OR a.rate_limited_until <= now())
+          -- Held back by its reserve, which the scheduler will not pick either.
+          -- Same reasoning as the line above and the same duration: a reserve
+          -- holds until the window resets, so a model offered on a reserved-out
+          -- seat is one the caller cannot be served from for hours.
+          --
+          -- The NULL handling is the scheduler's, restated in SQL because SQL
+          -- is where this filter has to run: an unset reserve and an unread
+          -- percentage both leave the seat listed, so a provider with no usage
+          -- API never disappears from the catalogue for want of a reading.
+          AND (a.usage_reserve_pct IS NULL
+               OR a.usage_remaining_pct IS NULL
+               OR a.usage_remaining_pct > a.usage_reserve_pct)
         ",
     )
     .bind(route_id)
@@ -305,7 +319,8 @@ pub async fn schedulable_oauth_accounts(db: &Db) -> Result<Vec<AccountRow>> {
         SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
                token_version, token_expires_at, owner_principal_id, proxy_url,
                priority, max_concurrency, schedulable, cooldown_until,
-               rate_limited_until, window_resets_at, last_used_at
+               rate_limited_until, window_resets_at,
+               usage_remaining_pct, usage_reserve_pct, last_used_at
         FROM account WHERE kind = 'oauth' AND schedulable
         ",
     )
@@ -452,6 +467,38 @@ pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
     .map_err(|e| Error::Internal(format!("recording usage: {e}")))?;
 
     Ok(())
+}
+
+/// When each gateway-served row happened, and the four token counts it holds.
+///
+/// The importer's only question of the ledger. It cannot ask "was this session
+/// proxied" directly — a CLI transcript records no base URL, no endpoint and no
+/// upstream request id — so it asks whether a call with these exact counts was
+/// already metered around this time, which is the same question asked of
+/// evidence the ledger does hold.
+///
+/// Imported rows are excluded by `origin`. Including them would make a second
+/// import agree with the first about everything and skip the whole corpus,
+/// which looks identical to a clean re-run and is not.
+pub async fn gateway_fingerprints(
+    db: &Db,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+) -> Result<Vec<(OffsetDateTime, i64, i64, i64, i64)>> {
+    sqlx::query_as::<_, (OffsetDateTime, i64, i64, i64, i64)>(
+        r"
+        SELECT occurred_at, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+        FROM usage_event
+        WHERE origin = 'gateway'
+          AND occurred_at >= $1
+          AND occurred_at <= $2
+        ",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("loading ledger fingerprints: {e}")))
 }
 
 /// The whole model catalog.

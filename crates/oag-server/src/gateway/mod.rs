@@ -1398,6 +1398,14 @@ pub(crate) fn error_response(e: &Error) -> Response {
             "no_credential_of_kind",
             e.to_string(),
         ),
+        // Also not the generic `no_credential`: the pool is not empty, it is
+        // being held back on purpose, and the message names the line and the
+        // three things that move it.
+        Error::ReserveHeld { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "quota_reserve_held",
+            e.to_string(),
+        ),
         Error::AtCapacity { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             "at_capacity",
