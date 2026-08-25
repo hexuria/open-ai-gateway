@@ -1,4 +1,32 @@
-# Adding a provider
+# Providers
+
+## What each provider supports
+
+Two axes, not one: an API key and a subscription seat are different credentials,
+and most providers take one and not the other.
+
+| Provider | Canonical (aliases) | Dialect | Credential | Subscription |
+|---|---|---|---|---|
+| Anthropic | `anthropic` | Anthropic Messages | `api_key` | **Prohibited.** Anthropic's terms forbid a third party intermediating Claude.ai credentials — see [compliance.md](compliance.md). |
+| OpenAI | `openai` | OpenAI Chat Completions | `api_key`, `oauth` | **Yes.** `--from-codex` imports a Codex seat, and `CodexAdapter` serves it against the ChatGPT backend. Also needs `gateway.codex.instructions` set, or the backend refuses the request. |
+| Google Gemini | `gemini` | Gemini generateContent | `api_key` | No importer. |
+| Moonshot Kimi | `kimi` (`moonshot`) | OpenAI Chat Completions | `api_key` | No importer. |
+| DeepSeek | `deepseek` | OpenAI Chat Completions | `api_key` | No importer. |
+| Zhipu GLM | `zhipu` (`glm`) | OpenAI Chat Completions | `api_key` | No importer. |
+| xAI | `xai` (`grok`) | OpenAI Chat Completions | `api_key`, `oauth` | **Yes.** `oag admin add-account --from-grok` imports every signed-in Grok CLI session and requests route through it. |
+| AWS Bedrock | `bedrock` | Anthropic Messages | `bedrock` (SigV4) | Not a subscription product. |
+| Google Vertex AI | `vertex` | Gemini generateContent | `vertex` (service account) | Not a subscription product. No adapter is registered in this build, so it can be configured and cannot serve. |
+
+Three states rather than a bool, because two of them are "no" for reasons you
+plan differently around: a seat that imports but serves nothing is not a seat
+this gateway refuses to hold.
+
+This table is a copy. The original is `Provider::support` in `oag-core`, a total
+match over the enum — adding a provider without an entry does not compile.
+`GET /admin/api/providers` serves it live, with the credentials you have
+actually registered counted beside it, and the dashboard renders that.
+
+## Adding a provider
 
 Two things: a `ProviderAdapter`, and catalog entries for its models.
 

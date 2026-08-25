@@ -146,6 +146,7 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/routes", get(admin::routes))
         .route("/usage", get(admin::usage))
         .route("/keys", get(admin::keys))
+        .route("/providers", get(admin::providers))
         .route(
             "/services",
             get(admin::list_services).post(admin::create_service),
@@ -348,6 +349,7 @@ server:
         ("GET", "/admin/api/routes"),
         ("GET", "/admin/api/usage"),
         ("GET", "/admin/api/keys"),
+        ("GET", "/admin/api/providers"),
         ("POST", "/admin/api/catalog/reload"),
         (
             "POST",

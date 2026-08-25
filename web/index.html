@@ -123,6 +123,16 @@
     </div>
     <div class="scroll"><table id="services"></table></div>
 
+    <h2>Providers</h2>
+    <p class="note">What this build can reach, beside what you have registered.
+      An API key and a subscription seat are different credentials, and most
+      providers take one and not the other. "Import only" means the seat imports
+      and refreshes but nothing serves inference on it — the credential sits
+      stored and idle. "Prohibited" is a policy decision with the provider's own
+      terms behind it, not a missing feature; "no" is simply that nobody has
+      written an importer.</p>
+    <div class="scroll"><table id="providers"></table></div>
+
     <h2>Credentials</h2>
     <div class="scroll"><table id="accounts"></table></div>
 
@@ -182,13 +192,38 @@ function table(el, cols, rows) {
 
 const state = s => `<span class="pill ${s === 'ready' ? 'good' : s === 'disabled' ? 'bad' : 'warn'}">${esc(s)}</span>`;
 
+// The subscription axis is three states, so it gets three renderings rather
+// than a yes/no pill. The distinction the colours carry: green serves traffic,
+// amber holds a credential that serves none, red is refused on the provider's
+// terms and will not be added. A plain pill is the ordinary "nobody wrote one".
+function subscription(s) {
+  const why = (s && s.why) || {};
+  switch (s && s.state) {
+    case 'served':
+      return `<span class="pill good">yes</span><code class="reason">${esc(s.import)}</code>`;
+    case 'credential_import_only':
+      return `<span class="pill warn">import only</span><span class="reason">${esc(s.gap)}</span>`;
+    case 'not_offered':
+      // The quote is the provider's own wording, carried through from
+      // docs/compliance.md so the refusal is checkable rather than asserted.
+      return why.why === 'prohibited_by_terms'
+        ? `<span class="pill bad">prohibited</span><span class="reason">${esc(why.quote)} ` +
+          `<a class="dash" href="${esc(why.source)}" target="_blank" rel="noopener noreferrer">terms</a></span>`
+        : '<span class="pill">no</span><span class="reason">no importer</span>';
+    // A state this page has not been taught yet: say so rather than render an
+    // empty cell that reads as "no".
+    default:
+      return '<span class="pill warn">unknown</span>';
+  }
+}
+
 async function load() {
   $('err').textContent = '';
   try {
-    const [s, accounts, keys, routes, usage, services] = await Promise.all([
+    const [s, accounts, keys, routes, usage, services, providers] = await Promise.all([
       get('/admin/api/summary'), get('/admin/api/accounts'), get('/admin/api/keys'),
       get('/admin/api/routes'), get('/admin/api/usage?limit=25'),
-      get('/admin/api/services'),
+      get('/admin/api/services'), get('/admin/api/providers'),
     ]);
     localStorage.setItem('oag_key', $('key').value);
 
@@ -260,6 +295,27 @@ async function load() {
             : btn('svc-enable', s.id, 'Enable', 'btn-quiet'),
         ].join(' ') },
     ], services);
+
+    table($('providers'), [
+      { h:'Provider', f:p => `${esc(p.display_name)} <code>${esc(p.provider)}</code>` +
+          (p.aliases.length ? `<span class="reason">also ${esc(p.aliases.join(', '))}</span>` : '') +
+          // A provider with a credential kind and no adapter can be registered
+          // and cannot serve. Saying so here is the difference between the
+          // matrix describing the build and describing an intention.
+          (p.adapter ? '' : '<span class="reason">no adapter in this build</span>') },
+      { h:'Dialect', f:p => esc(p.dialect) },
+      // Not every provider takes an API key: the cloud ones take their cloud's
+      // credential instead, so the column shows what it takes rather than 'no'.
+      { h:'API key', f:p => p.api_key
+          ? '<span class="pill good">yes</span>'
+          : p.credential_kinds.map(k => `<span class="pill">${esc(k)}</span>`).join(' ') },
+      { h:'Subscription', f:p => subscription(p.subscription) },
+      { h:'Registered', f:p => p.accounts, num:true },
+      { h:'Kinds', f:p => p.by_kind.length
+          ? p.by_kind.map(k => `<span class="pill">${esc(k.kind)} ${k.accounts}</span>`).join(' ')
+          : '—' },
+      { h:'Note', f:p => p.note ? `<span class="reason">${esc(p.note)}</span>` : '' },
+    ], providers);
 
     table($('accounts'), [
       { h:'Name',     f:a => esc(a.name) },

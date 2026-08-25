@@ -540,6 +540,107 @@ pub async fn routes(State(state): State<Arc<AppState>>) -> Response {
     .into_response()
 }
 
+// provider, kind, accounts.
+type ProviderCountTuple = (String, String, i64);
+
+/// How many credentials of one kind are registered for a provider.
+#[derive(Debug, Serialize)]
+pub struct KindCount {
+    pub kind: String,
+    pub accounts: i64,
+}
+
+/// One row of the support matrix.
+///
+/// Two questions in one row, because answering either alone is misleading:
+/// what this build can do with a provider (from [`oag_core::Provider::support`],
+/// a total match over the enum) and what this deployment has actually
+/// registered against it.
+#[derive(Debug, Serialize)]
+pub struct ProviderView {
+    /// The spelling the CLI, the config, and `account.provider` all use.
+    pub provider: String,
+    pub display_name: String,
+    pub aliases: Vec<String>,
+    pub dialect: String,
+    pub credential_kinds: Vec<String>,
+    pub api_key: bool,
+    /// Tri-state, serialised from the core enum rather than restated here: a
+    /// second copy of "served / import-only / not offered" is a second copy to
+    /// get wrong.
+    pub subscription: oag_core::provider::SubscriptionSupport,
+    pub note: Option<String>,
+    /// Whether this build registers an adapter for the provider. Vertex has a
+    /// credential kind, a dialect, and no adapter — so it can be registered and
+    /// cannot serve, and a matrix that omitted this would say it works.
+    pub adapter: bool,
+    pub accounts: i64,
+    pub by_kind: Vec<KindCount>,
+}
+
+/// The provider support matrix: what is possible, beside what is set up.
+///
+/// The capability half is compiled in and needs no database; the configured
+/// half is one grouped count. They are served together because the question an
+/// operator actually asks — "can I use my Grok subscription, and have I?" — is
+/// answered by neither alone.
+pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
+    let counts: Result<Vec<ProviderCountTuple>, _> = sqlx::query_as(
+        r"
+        SELECT provider, kind, COUNT(*)
+        FROM account GROUP BY provider, kind ORDER BY provider, kind
+        ",
+    )
+    .fetch_all(state.db.pool())
+    .await;
+
+    let counts = match counts {
+        Ok(c) => c,
+        // Deliberately not `.unwrap_or_default()` like the reads above. An
+        // empty result renders as "nothing configured", which is a real and
+        // actionable state — and is exactly the wrong answer to give when the
+        // truth is that the query failed.
+        Err(e) => return failed(&oag_core::Error::Internal(format!("providers: {e}"))),
+    };
+
+    let adapters = state.providers();
+
+    let out: Vec<ProviderView> = oag_core::Provider::ALL
+        .iter()
+        .map(|&p| {
+            let s = p.support();
+            // A `provider` string the enum does not know has no row here: it
+            // cannot be routed either, so the matrix has nothing to say about
+            // it. `oag admin add-account` parses the flag, so producing one
+            // takes a hand-written INSERT.
+            let mine = counts.iter().filter(|c| c.0 == p.as_str());
+            let by_kind: Vec<KindCount> = mine
+                .clone()
+                .map(|c| KindCount {
+                    kind: c.1.clone(),
+                    accounts: c.2,
+                })
+                .collect();
+
+            ProviderView {
+                provider: p.as_str().to_owned(),
+                display_name: s.display_name.to_owned(),
+                aliases: s.aliases.iter().map(|a| (*a).to_owned()).collect(),
+                dialect: s.dialect().to_string(),
+                credential_kinds: s.credential_kinds.iter().map(ToString::to_string).collect(),
+                api_key: s.api_key(),
+                subscription: s.subscription,
+                note: s.note.map(ToOwned::to_owned),
+                adapter: adapters.contains(&p),
+                accounts: mine.map(|c| c.2).sum(),
+                by_kind,
+            }
+        })
+        .collect();
+
+    Json(out).into_response()
+}
+
 #[derive(Debug, Serialize)]
 pub struct UsageRow {
     pub request_id: String,
