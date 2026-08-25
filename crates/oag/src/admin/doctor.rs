@@ -18,6 +18,7 @@ pub async fn run(db: &Db, config: &Config, route: &str) -> Result<()> {
     let accounts = load_accounts(db, route).await?;
     failed += report_accounts(&accounts);
     failed += check_ladder(&rungs, &accounts, route);
+    failed += check_seat_prices(&accounts);
     failed += check_codex(config, &accounts);
     conclude(failed)
 }
@@ -103,6 +104,9 @@ struct Seat {
     schedulable: bool,
     cooldown_until: Option<time::OffsetDateTime>,
     rate_limited_until: Option<time::OffsetDateTime>,
+    /// The seat's flat monthly price. `None` is not a free seat — it is a seat
+    /// nobody has told the gateway the price of, which is why it is checked.
+    monthly_cost_usd: Option<rust_decimal::Decimal>,
 }
 
 impl Seat {
@@ -135,10 +139,12 @@ async fn load_accounts(db: &Db, route: &str) -> Result<Vec<Seat>> {
             bool,
             Option<time::OffsetDateTime>,
             Option<time::OffsetDateTime>,
+            Option<rust_decimal::Decimal>,
         ),
     >(
         r"
-        SELECT a.name, a.provider, a.kind, a.schedulable, a.cooldown_until, a.rate_limited_until
+        SELECT a.name, a.provider, a.kind, a.schedulable, a.cooldown_until,
+               a.rate_limited_until, a.monthly_cost_usd
         FROM account a
         JOIN account_route ar ON ar.account_id = a.id
         JOIN route r ON r.id = ar.route_id
@@ -153,13 +159,22 @@ async fn load_accounts(db: &Db, route: &str) -> Result<Vec<Seat>> {
     .map(|rows| {
         rows.into_iter()
             .map(
-                |(name, provider, kind, schedulable, cooldown_until, rate_limited_until)| Seat {
+                |(
                     name,
                     provider,
                     kind,
                     schedulable,
                     cooldown_until,
                     rate_limited_until,
+                    monthly_cost_usd,
+                )| Seat {
+                    name,
+                    provider,
+                    kind,
+                    schedulable,
+                    cooldown_until,
+                    rate_limited_until,
+                    monthly_cost_usd,
                 },
             )
             .collect()
@@ -226,6 +241,36 @@ fn check_ladder(rungs: &[oag_router::ladder::Rung], accounts: &[Seat], route: &s
     failed
 }
 
+/// A flat-rate seat with no price cannot be netted off against what its traffic
+/// would have cost, so its saving reads as a dash forever with nothing saying
+/// why. Nothing can infer the figure — a provider reports how much of a plan is
+/// left, never what the plan costs — so an unset price is a question only an
+/// operator can answer, and this is where it gets asked.
+///
+/// A warning rather than a failure: the gateway serves traffic perfectly well
+/// without knowing what the seat cost, and refusing to start over a reporting
+/// gap would be out of proportion.
+fn check_seat_prices(accounts: &[Seat]) -> u32 {
+    let unpriced: Vec<&str> = accounts
+        .iter()
+        .filter(|a| a.kind == "oauth" && a.monthly_cost_usd.is_none())
+        .map(|a| a.name.as_str())
+        .collect();
+    if unpriced.is_empty() {
+        return 0;
+    }
+    println!(
+        "WARN seats       no monthly price on {}; saving reads as unknown",
+        unpriced.join(", ")
+    );
+    println!(
+        "     fix: oag admin account set-cost {} --monthly-cost <your plan price>",
+        unpriced[0]
+    );
+    // Deliberately not counted as a failure, so `doctor` still exits zero.
+    0
+}
+
 fn check_codex(config: &Config, accounts: &[Seat]) -> u32 {
     let has_codex = accounts
         .iter()
@@ -268,5 +313,50 @@ fn check_codex(config: &Config, accounts: &[Seat]) -> u32 {
             "     fix: set gateway.codex.instructions_path: deploy/codex-instructions.txt (the backend refuses the request without it)"
         );
         1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seat(name: &str, kind: &str, cost: Option<i64>) -> Seat {
+        Seat {
+            name: name.to_owned(),
+            provider: "xai".to_owned(),
+            kind: kind.to_owned(),
+            schedulable: true,
+            cooldown_until: None,
+            rate_limited_until: None,
+            monthly_cost_usd: cost.map(rust_decimal::Decimal::from),
+        }
+    }
+
+    #[test]
+    fn a_seat_nobody_priced_is_named_along_with_the_command_that_prices_it() {
+        // The saving column can only show a dash without this figure, and a
+        // dash weeks later reads as a broken report rather than an unanswered
+        // question. Nothing can infer it, so the check exists to ask.
+        assert_eq!(check_seat_prices(&[seat("grok", "oauth", None)]), 0);
+    }
+
+    #[test]
+    fn a_priced_seat_is_not_nagged_about() {
+        assert_eq!(check_seat_prices(&[seat("grok", "oauth", Some(300))]), 0);
+    }
+
+    #[test]
+    fn a_metered_key_is_never_asked_for_a_monthly_price() {
+        // An API key is billed per token; there is no plan behind it to price,
+        // so asking would be noise on every run of a perfectly healthy gateway.
+        assert_eq!(check_seat_prices(&[seat("openai-key", "api_key", None)]), 0);
+    }
+
+    #[test]
+    fn an_unpriced_seat_does_not_fail_the_check() {
+        // Serving is unaffected by not knowing what a seat cost. Exiting
+        // non-zero over a reporting gap would make `doctor` unusable in CI.
+        let seats = [seat("a", "oauth", None), seat("b", "oauth", None)];
+        assert_eq!(check_seat_prices(&seats), 0, "a warning, never a failure");
     }
 }

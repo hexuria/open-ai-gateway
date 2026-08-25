@@ -60,6 +60,18 @@
   /* Narrower than the global input width, which is sized for a URL: this one
      sits in a table cell beside five other columns. */
   .cell-input { min-width:200px; padding:3px 8px; font-size:13px; }
+  /* The reporting period sits above the numbers it governs, and the window it
+     actually resolved to sits beside it: a total with no period attached to it
+     is a number nobody can check. */
+  .period-bar { display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap;
+                margin-bottom:20px; }
+  .period-bar .field select, .period-bar .field input { min-width:170px; }
+  /* `.field` sets display:flex, which outranks the [hidden] attribute's own
+     display:none — without this the custom-range inputs stay on screen for
+     every period. Scoped rather than !important so specificity does the work. */
+  .period-bar .field[hidden] { display:none; }
+  .resolved { color:var(--dim); font-size:12px; padding-bottom:8px;
+              font-variant-numeric:tabular-nums; }
   code { font:12px ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--dim); }
 </style>
 </head>
@@ -73,6 +85,36 @@
 </header>
 <main>
   <div id="err" class="err"></div>
+
+  <!-- Outside #content on purpose: a rejected custom range blanks #content, and
+       a picker that vanishes with the numbers leaves nobody able to fix the
+       range that caused it. -->
+  <div class="period-bar" id="periods" hidden>
+    <div class="field">
+      <label class="label" for="period">Reporting period</label>
+      <select id="period">
+        <option value="days:7">Last 7 days</option>
+        <option value="days:30">Last 30 days</option>
+        <option value="days:90">Last 90 days</option>
+        <option value="month">This month</option>
+        <option value="last-month">Last month</option>
+        <option value="year">This year</option>
+        <option value="last-year">Last year</option>
+        <option value="all">All time</option>
+        <option value="custom">Custom range&hellip;</option>
+      </select>
+    </div>
+    <div class="field" id="range-from" hidden>
+      <label class="label" for="from">From</label>
+      <input id="from" type="date">
+    </div>
+    <div class="field" id="range-to" hidden>
+      <label class="label" for="to">To</label>
+      <input id="to" type="date">
+    </div>
+    <span class="resolved" id="resolved"></span>
+  </div>
+
   <div id="content" hidden>
     <div class="grid">
       <div class="card"><div class="label">Spent</div><div class="big" id="spent">—</div></div>
@@ -80,7 +122,9 @@
       <div class="card"><div class="label">Saved</div><div class="big good" id="saved">—</div></div>
       <div class="card"><div class="label">Saved vs frontier</div><div class="big good" id="pct">—</div></div>
       <div class="card"><div class="label">Prompt cache hit</div><div class="big" id="cache">—</div></div>
-      <div class="card"><div class="label">Requests (30d)</div><div class="big" id="reqs">—</div></div>
+      <!-- The label is written from the window the server resolved, not from
+           the option that was clicked: only the server knows what it answered. -->
+      <div class="card"><div class="label" id="reqs-label">Requests</div><div class="big" id="reqs">—</div></div>
     </div>
 
     <h2>By tier</h2>
@@ -91,8 +135,12 @@
       <p class="note">Each seat is flat-rate — billed monthly, not per token — so
         it is metered on its own line: what its traffic would have cost billed
         per token, against the fixed fee that displaced that bill. Saved is the
-        difference; it reads red until a seat's use earns its fee back. Metered
-        API traffic is the headline above; this is a separate track.</p>
+        difference; it reads red until a seat's use earns its fee back. The fee
+        shown is the part of it this period carries, counted from the day the
+        seat was added — a seat the gateway has known for a day owes a day, not
+        a month, or every period before it existed would book a loss it never
+        made. Metered API traffic is the headline above; this is a separate
+        track.</p>
       <div class="scroll"><table id="seats"></table></div>
     </section>
 
@@ -194,6 +242,54 @@ async function send(method, path, body) {
 
 async function post(path) { return send('POST', path); }
 
+// The period the summary is asked for. `days:30` is what /admin/api/summary
+// answers when asked nothing, so an operator who never touches the picker keeps
+// seeing exactly the page they saw before it existed.
+const DEFAULT_PERIOD = 'days:30';
+
+// Build the summary's query from the picker.
+//
+// `tz` is the browser's own offset in minutes east of UTC, so "this month"
+// means the month the operator is living in. Without it the server computes
+// month boundaries in UTC and someone in Manila silently reads the first eight
+// hours of every month as belonging to the previous one.
+function periodQuery() {
+  const choice = $('period').value || DEFAULT_PERIOD;
+  const params = new URLSearchParams({ tz: String(-new Date().getTimezoneOffset()) });
+  if (choice === 'custom') {
+    params.set('from', $('from').value);
+    params.set('to', $('to').value);
+  } else if (choice.startsWith('days:')) {
+    params.set('days', choice.slice(5));
+  } else {
+    params.set('period', choice);
+  }
+  return params.toString();
+}
+
+// A custom range is only a question once both ends exist; asking with a blank
+// one earns a 400 that reads as though the page is broken.
+function periodReady() {
+  return $('period').value !== 'custom' || ($('from').value && $('to').value);
+}
+
+function showRange() {
+  const custom = $('period').value === 'custom';
+  $('range-from').hidden = !custom;
+  $('range-to').hidden = !custom;
+}
+
+// State the window the server actually resolved, in local time. The dates come
+// back RFC3339 with the reporting offset already applied, so trimming to
+// minutes is a display choice, not a conversion.
+function showWindow(w) {
+  if (!w) { $('resolved').textContent = ''; return; }
+  const stamp = t => String(t).slice(0, 16).replace('T', ' ');
+  const from = w.start ? stamp(w.start) : 'first record';
+  $('resolved').textContent = `${w.label}  ·  ${from} → ${stamp(w.end)}`;
+  $('reqs-label').textContent = `Requests · ${w.label}`;
+}
+
 function table(el, cols, rows) {
   const head = `<tr>${cols.map(c => `<th>${esc(c.h)}</th>`).join('')}</tr>`;
   const body = rows.map(r =>
@@ -235,12 +331,17 @@ async function load() {
   $('err').textContent = '';
   try {
     const [s, accounts, keys, routes, usage, services, providers, models] = await Promise.all([
-      get('/admin/api/summary'), get('/admin/api/accounts'), get('/admin/api/keys'),
+      get('/admin/api/summary?' + periodQuery()),
+      get('/admin/api/accounts'), get('/admin/api/keys'),
       get('/admin/api/routes'), get('/admin/api/usage?limit=25'),
       get('/admin/api/services'), get('/admin/api/providers'), get('/admin/api/models'),
     ]);
     localStorage.setItem('oag_key', $('key').value);
+    $('periods').hidden = false;
 
+    // Only the summary is windowed; the ledger tail, accounts and catalog are
+    // current-state views and are unaffected by the picker.
+    showWindow(s.window);
     $('spent').textContent = '$' + s.spent_usd;
     $('cf').textContent    = '$' + s.counterfactual_usd;
     $('saved').textContent = '$' + s.saved_usd;
@@ -490,6 +591,34 @@ $('svc-add').addEventListener('click', async () => {
 
 $('go').addEventListener('click', load);
 $('key').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+
+// The picker lives outside `main`, so the two delegated click listeners above
+// do not see it — and it changes what is asked for rather than mutating
+// anything, so it wants `change`, not a data-act button.
+$('period').addEventListener('change', () => {
+  showRange();
+  localStorage.setItem('oag_period', $('period').value);
+  if (periodReady()) load();
+});
+for (const id of ['from', 'to']) {
+  $(id).addEventListener('change', () => {
+    localStorage.setItem('oag_' + id, $(id).value);
+    if (periodReady()) load();
+  });
+}
+
+// Restore the operator's own last choice. Assigning a value the <select> no
+// longer offers leaves it blank, so fall back to the default rather than
+// sending an empty period.
+$('period').value = localStorage.getItem('oag_period') || DEFAULT_PERIOD;
+if (!$('period').value) $('period').value = DEFAULT_PERIOD;
+$('from').value = localStorage.getItem('oag_from') || '';
+$('to').value = localStorage.getItem('oag_to') || '';
+// A half-filled custom range is not a state worth restoring: it would make the
+// first load of the session a 400 with an empty page behind it.
+if (!periodReady()) $('period').value = DEFAULT_PERIOD;
+showRange();
+
 // Convenience only: this page is served on the internal admin listener, and the
 // key is an admin credential either way.
 const saved = localStorage.getItem('oag_key');
