@@ -14,6 +14,32 @@ That brings up floci + Postgres + Redis, migrates, applies a floci-patched copy
 of `stacks/gcp-cloudrun`, and health-checks the OAG Cloud Run service floci
 starts. Tear down with `docker compose -f deploy/floci/docker-compose.yml down`.
 
+## Cloud SQL for the database (mirrors GCP more closely)
+
+`deploy.sh` uses the **neutral** data tier — plain Postgres in a container. To
+rehearse the **managed** tier the way a real GCP deploy runs it, with the
+database as **Cloud SQL**:
+
+```bash
+just floci-cloudsql        # or ./deploy/floci/deploy-cloudsql.sh
+```
+
+floci Docker-backs Cloud SQL for real: `terraform apply` of the `managed` stack
+provisions a `google_sql_database_instance`, which floci starts as a Postgres 16
+container on the compose network. The gateway connects to it exactly as it would
+to Cloud SQL on GCP, and `admin init` writes land there. Two honest caveats, both
+because floci is an emulator:
+
+- **Redis stays a container.** floci backs Cloud SQL but not Memorystore, so the
+  managed tier's Memorystore is dropped and Redis runs in `docker-compose.yml`.
+- **Public IP on the compose network**, not private IP + Direct VPC egress —
+  floci has no VPC. The real managed tier keeps Cloud SQL private.
+
+The schema is migrated by a one-off container right after Cloud SQL comes up
+(floci runs services, not the Cloud Run migrate job), so the gateway reports
+not-ready for a moment and then flips to ready. Tear down with `just floci-down`,
+which also removes the Cloud SQL container floci spawned.
+
 ## What it proves, and what it doesn't
 
 **Proves:** the deploy applies against GCP's real API shapes, and the gateway

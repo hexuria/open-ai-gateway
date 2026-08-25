@@ -172,9 +172,15 @@ stack-roll:
 floci-up:
     @./deploy/floci/deploy.sh
 
-# Tear down floci + Postgres + Redis, and the Cloud Run container floci spawned.
+# Same, but with Cloud SQL for the database — mirrors a GCP deploy more closely.
+floci-cloudsql:
+    @./deploy/floci/deploy-cloudsql.sh
+
+# Tear down floci + Postgres + Redis, and the Cloud Run + Cloud SQL containers
+# floci spawned.
 floci-down:
     -@docker ps -aq --filter "name=floci-gcp-cloudrun-open-ai-gateway" | xargs -r docker rm -f
+    -@docker ps -aq --filter "name=floci-gcp-cloudsql" | xargs -r docker rm -f
     {{floci}} down
 
 # Follow the floci emulator + gateway logs.
