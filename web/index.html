@@ -144,6 +144,23 @@
       <div class="scroll"><table id="seats"></table></div>
     </section>
 
+    <!-- Hidden until something has been imported: a deployment that only ever
+         proxies has one origin and no question to answer. -->
+    <section id="origins" hidden>
+      <h2>Where usage came from</h2>
+      <p class="note">The gateway can only record what it served. Work sent straight
+        to a provider is invisible to it until <code>oag admin usage import</code> reads
+        the CLI's own transcripts. Each line names both the tool and the credential the
+        usage was booked against, because the tool alone stops being an answer at the
+        second subscription of the same kind — three Claude plans all import as
+        <code>claude-code</code>. A subscription's line costs $0: its monthly fee already
+        bought those tokens, and the per-token column is the bill that fee displaced —
+        the fee itself is settled once, per seat, in Subscriptions above. An import run
+        without <code>--account</code> belongs to no credential and is priced at list as
+        real spend.</p>
+      <div class="scroll"><table id="origins-table"></table></div>
+    </section>
+
     <h2>Services</h2>
     <p class="note">Capability backends. The gateway registers a row and health-checks it;
       it does not run the sandbox, tool, guard, or browser.</p>
@@ -359,7 +376,14 @@ async function load() {
         { h:'If per-token',f:r => '$' + esc(r.api_value_usd), num:true },
         // An unpriced seat shows a dash for cost and saving, not a zero: no
         // fee was recorded, so its saving is unknown, not nil.
-        { h:'Plan cost',   f:r => r.plan_cost_usd == null ? '—' : '$' + esc(r.plan_cost_usd), num:true },
+        // Both figures: the slice this period carries, and the plan's real
+        // price. The slice alone — $15.60 against a $300 plan — reads as a bug.
+        { h:'Plan cost',   f:r => {
+            if (r.plan_cost_usd == null) return '—';
+            const of = r.plan_monthly_usd == null ? ''
+              : ` <span class="reason">of $${esc(r.plan_monthly_usd)}/mo</span>`;
+            return `$${esc(r.plan_cost_usd)}${of}`;
+          }, num:true },
         { h:'Saved',       f:r => {
             if (r.saved_usd == null) return '—';
             // Saved is the figure that can go either way, so it carries the
@@ -379,6 +403,38 @@ async function load() {
       ], seats);
     } else {
       $('subs').hidden = true;
+    }
+
+    // Where the rows came from. The server sends this only once more than one
+    // origin exists, so an all-proxied deployment never grows a section that
+    // would always read "gateway: everything".
+    const origins = s.by_origin || [];
+    if (origins.length) {
+      $('origins').hidden = false;
+      table($('origins-table'), [
+        { h:'Source', f:r => r.origin === 'gateway'
+            ? 'this gateway'
+            : `${esc(r.origin)} <span class="reason">imported, bypassed the gateway</span>` },
+        // Which subscription paid. A transcript records no account, so this is
+        // whatever the operator told the importer with --account; a row that
+        // was told nothing says so rather than borrowing a plausible seat.
+        { h:'Credential', f:r => {
+            if (r.account == null)
+              return '<span class="reason">unattributed, priced as metered spend</span>';
+            const kind = r.subscription ? 'subscription' : 'API key';
+            const which = r.provider ? `${esc(r.provider)} ${kind}` : kind;
+            return `${esc(r.account)} <span class="reason">${which}</span>`;
+          } },
+        { h:'Requests', f:r => r.requests, num:true },
+        // A subscription's tokens were bought by its monthly fee, so this reads
+        // $0 and the money is in the next column: the bill the fee displaced.
+        // Metered and unattributed rows are priced at list, which is what they
+        // really cost.
+        { h:'Cost', f:r => '$' + esc(r.spent_usd), num:true },
+        { h:'If per-token', f:r => '$' + esc(r.counterfactual_usd), num:true },
+      ], origins);
+    } else {
+      $('origins').hidden = true;
     }
     $('reqs').textContent  = s.requests;
 

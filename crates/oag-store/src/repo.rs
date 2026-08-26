@@ -501,6 +501,48 @@ pub async fn gateway_fingerprints(
     .map_err(|e| Error::Internal(format!("loading ledger fingerprints: {e}")))
 }
 
+/// When this gateway served one provider, and nothing else about those rows.
+///
+/// The weaker question, for a source whose own records cannot be compared to a
+/// ledger row at all. The Grok CLI logs one aggregate per user turn covering
+/// every model call the turn made; the ledger holds one row per call. No
+/// fingerprint can ever line up across that, so the only thing left to ask is
+/// whether this gateway was serving the provider at all while the session ran.
+///
+/// Scoped by the provider segment of `model_id` rather than by a join onto the
+/// catalog: `model_id` is plain text with no foreign key, so a model since
+/// removed from the catalog would drop out of a join and take its evidence of
+/// proxying with it. A row whose id has lost its provider prefix is simply not
+/// evidence, which is the direction that skips rather than the one that
+/// double counts.
+///
+/// Imported rows are excluded by `origin` for the same reason they are in
+/// [`gateway_fingerprints`]: a second import must not find the first one and
+/// conclude the whole corpus was proxied.
+pub async fn gateway_activity(
+    db: &Db,
+    provider: &str,
+    from: OffsetDateTime,
+    to: OffsetDateTime,
+) -> Result<Vec<OffsetDateTime>> {
+    sqlx::query_scalar::<_, OffsetDateTime>(
+        r"
+        SELECT occurred_at
+        FROM usage_event
+        WHERE origin = 'gateway'
+          AND model_id LIKE $1
+          AND occurred_at >= $2
+          AND occurred_at <= $3
+        ",
+    )
+    .bind(format!("{provider}/%"))
+    .bind(from)
+    .bind(to)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("loading ledger activity: {e}")))
+}
+
 /// The whole model catalog.
 pub async fn catalog(db: &Db) -> Result<Vec<ModelRow>> {
     sqlx::query_as::<_, ModelRow>(

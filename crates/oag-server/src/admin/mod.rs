@@ -165,6 +165,52 @@ type SeatTuple = (
 
 type TierTotals = (String, i64, rust_decimal::Decimal, rust_decimal::Decimal);
 
+// origin, credential name, provider, is-a-subscription, requests, cost, list.
+type OriginTuple = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<bool>,
+    i64,
+    rust_decimal::Decimal,
+    rust_decimal::Decimal,
+);
+
+/// One line per place usage came from, and per credential it came in on.
+///
+/// The gateway only ever records what it served. Work sent straight to a
+/// provider is invisible to it until `admin usage import` reads the CLI's own
+/// transcripts, and those rows are marked with where they came from.
+///
+/// The tool alone is not an answer once an operator holds more than one
+/// subscription of the same kind: "claude-code, $34,000" says nothing about
+/// which of three Claude plans paid for it. So the grouping is the pair — the
+/// tool that produced the traffic and the credential it was booked against —
+/// which also makes this the one table where Claude and Grok subscriptions,
+/// imported and served alike, stand beside each other.
+#[derive(Debug, Serialize)]
+pub struct OriginRow {
+    /// `gateway` for traffic this deployment served; otherwise the tool the
+    /// rows were imported from, e.g. `claude-code`. Always the tool, never the
+    /// account: the two answer different questions and the column that holds
+    /// one must not sometimes hold the other.
+    pub origin: String,
+    /// The credential's own name. `None` for usage attributed to nothing — an
+    /// import run without `--account`, which is priced as metered spend
+    /// belonging to no seat.
+    pub account: Option<String>,
+    /// Which provider that credential is for, so a mixed fleet reads without
+    /// having to recognise every seat by name.
+    pub provider: Option<String>,
+    /// Whether that credential is flat-rate. A subscription's line means
+    /// something different from a metered one's: its cost is zero because the
+    /// fee already paid, not because the traffic was free.
+    pub subscription: bool,
+    pub requests: i64,
+    pub spent_usd: String,
+    pub counterfactual_usd: String,
+}
+
 /// The headline numbers: what was spent, and what it would have cost.
 #[derive(Debug, Serialize)]
 pub struct Summary {
@@ -186,6 +232,11 @@ pub struct Summary {
     /// rather than blurred into a fleet total. Separate from the frontier
     /// figures above, which describe only metered per-token traffic.
     pub subscriptions: Vec<SeatRow>,
+    /// Where the window's usage came from: what this gateway served, beside
+    /// what was imported from a CLI that bypassed it, each line naming the
+    /// credential it was booked against. Empty until something has been
+    /// imported, so a deployment that only ever proxies sees no extra noise.
+    pub by_origin: Vec<OriginRow>,
 }
 
 /// One subscription seat's economics over the window.
@@ -213,6 +264,11 @@ pub struct SeatRow {
     /// free one, so its saving cannot be computed rather than being shown as
     /// the whole API value.
     pub plan_cost_usd: Option<String>,
+    /// The plan's actual price per month, as recorded. Reported beside the
+    /// prorated figure because they answer different questions and a reader
+    /// seeing only the slice — $15.60 against a $300 plan — reasonably concludes
+    /// the number is wrong.
+    pub plan_monthly_usd: Option<String>,
     /// `api_value_usd - plan_cost_usd`: what this one subscription saved, net of
     /// its fee. `None` when the seat is unpriced. Negative means this seat's
     /// traffic has not yet earned its fee back.
@@ -247,6 +303,12 @@ pub struct TierRow {
 /// predicate on the join (`cost_usd = 0 AND counterfactual_api_usd > 0`) counts
 /// only what the seat actually served. Failures degrade to an empty list — a
 /// missing subscriptions table should not take down the whole summary.
+///
+/// Usage imported with `admin usage import --account <seat>` is written in that
+/// exact shape and counts here, deliberately: it is that subscription's traffic
+/// whether or not this gateway carried it, and the fee it is measured against
+/// was paid either way. The same predicate keeps it out of the headline, so it
+/// is stated once.
 async fn seat_summaries(db: &oag_store::Db, window: &period::Resolved) -> Vec<SeatRow> {
     let seats: Vec<SeatTuple> = sqlx::query_as(
         r"
@@ -302,9 +364,68 @@ async fn seat_summaries(db: &oag_store::Db, window: &period::Resolved) -> Vec<Se
                     requests,
                     api_value_usd: format!("{api_value:.4}"),
                     plan_cost_usd,
+                    plan_monthly_usd: monthly.map(|m| format!("{m:.2}")),
                     saved_usd,
                     remaining_pct: remaining.map(|r| format!("{r:.0}")),
                     usage_window: label,
+                }
+            },
+        )
+        .collect()
+}
+
+/// Usage grouped by where the rows came from and whose credential paid.
+///
+/// Unlike the headline, this counts flat-rate seat rows too: the question here
+/// is "what ran, and did this gateway see it", and excluding a subscription's
+/// traffic would answer a different one. The `LEFT JOIN` is what lets a row keep
+/// its seat's name; rows attributed to nothing group together under a null,
+/// which is the honest rendering of an import nobody said the owner of.
+///
+/// Returns nothing while every row came from the gateway, so a deployment that
+/// has never imported sees no section it would have to learn to ignore. The test
+/// is on the origins and not on the row count, because grouping by credential
+/// splits even a purely proxied deployment into a line per seat — which is
+/// interesting only once there is something outside the gateway to compare it
+/// against.
+async fn origin_breakdown(db: &oag_store::Db, window: &period::Resolved) -> Vec<OriginRow> {
+    let rows: Vec<OriginTuple> = sqlx::query_as(
+        r"
+            SELECT u.origin, a.name, a.provider, a.kind = 'oauth',
+                   COUNT(*),
+                   COALESCE(SUM(u.cost_usd), 0),
+                   COALESCE(SUM(u.counterfactual_usd), 0)
+            FROM usage_event u
+            LEFT JOIN account a ON a.id = u.account_id
+            WHERE ($1::timestamptz IS NULL OR u.occurred_at >= $1)
+              AND ($2::timestamptz IS NULL OR u.occurred_at <  $2)
+            GROUP BY u.origin, a.name, a.provider, a.kind
+            ORDER BY u.origin, COALESCE(SUM(u.counterfactual_usd), 0) DESC, a.name
+            ",
+    )
+    .bind(window.start)
+    .bind(window.end)
+    .fetch_all(db.pool())
+    .await
+    .unwrap_or_default();
+
+    if rows.iter().all(|r| r.0 == "gateway") {
+        return Vec::new();
+    }
+    rows.into_iter()
+        .map(
+            |(origin, account, provider, subscription, requests, spent, counterfactual)| {
+                OriginRow {
+                    origin,
+                    account,
+                    provider,
+                    // NULL when the row is attributed to nothing, which is not a
+                    // subscription — `unwrap_or(false)` rather than an Option so the
+                    // page has one question to ask instead of two.
+                    subscription: subscription.unwrap_or(false),
+                    requests,
+                    spent_usd: format!("{spent:.4}"),
+                    counterfactual_usd: format!("{counterfactual:.4}"),
                 }
             },
         )
@@ -399,6 +520,7 @@ pub async fn summary(
         saved_usd: format!("{saved:.4}"),
         saved_pct: format!("{pct:.1}"),
         cache_hit_rate: format!("{hit_rate:.1}"),
+        by_origin: origin_breakdown(&state.db, &window).await,
         subscriptions,
         by_tier: by_tier
             .into_iter()

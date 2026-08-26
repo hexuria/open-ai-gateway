@@ -382,19 +382,38 @@ pub enum CacheCommand {
 /// typo to make an import unremovable.
 pub(crate) const ORIGIN_CLAUDE_CODE: &str = "claude-code";
 
+/// The `origin` an imported Grok CLI row carries. Its own value, not a shared
+/// "imported": a Grok import is defended far less well than a Claude Code one,
+/// so reverting the weaker of the two must not take the stronger with it.
+pub(crate) const ORIGIN_GROK_CLI: &str = "grok-cli";
+
 #[derive(Subcommand, Debug)]
 pub enum UsageCommand {
-    /// Fold local CLI session transcripts into the ledger.
+    /// Fold local CLI session records into the ledger.
     ///
-    /// Reads Claude Code's own transcripts. Codex and the Grok CLI are not
-    /// supported and are not omitted by oversight — see the module docs on
-    /// `usage_import` for what each of them actually records.
+    /// Reads Claude Code's transcripts or the Grok CLI's session logs; pick
+    /// with `--from`. Codex is not supported and is not omitted by oversight —
+    /// it records no token counts of its own.
+    ///
+    /// The two sources are not equally well defended against re-importing
+    /// traffic this gateway already metered. A Claude Code session is matched
+    /// against the ledger call by call, and a transcript naming a non-Anthropic
+    /// model proves it was proxied. Neither holds for the Grok CLI: it logs one
+    /// aggregate per turn, which no per-call ledger row can equal, and a Grok
+    /// model name says nothing about which endpoint answered. That source falls
+    /// back to `--before` and to skipping any session this gateway was serving
+    /// x.ai during. Each run prints which protections it actually applied.
     ///
     /// Reports and writes nothing unless `--apply` is given. Writing financial
     /// history into a ledger should take saying so.
     Import {
-        /// Where the transcripts are. A directory is walked for `*.jsonl`.
-        /// Defaults to `~/.claude/projects`.
+        /// Which CLI's records to read.
+        #[arg(long, value_enum, default_value_t = usage_import::Source::ClaudeCode,
+              value_name = "CLI")]
+        from: usage_import::Source,
+        /// Where the records are. A directory is walked for `*.jsonl`.
+        /// Defaults to `~/.claude/projects`, or `~/.grok/sessions` for
+        /// `--from grok-cli`.
         #[arg(long, value_name = "PATH")]
         path: Option<String>,
         /// Only import sessions that ended before this instant (RFC 3339).
@@ -402,17 +421,36 @@ pub enum UsageCommand {
         /// The one defence against double counting that does not depend on
         /// inference: set it to the moment you started routing this CLI through
         /// the gateway and no session it served can be imported, whatever the
-        /// ledger does or does not still contain.
+        /// ledger does or does not still contain. For `--from grok-cli` it is
+        /// the only exact protection there is.
         #[arg(long, value_name = "RFC3339")]
         before: Option<String>,
+        /// The credential that paid for this usage, by name.
+        ///
+        /// A transcript records no account, so nothing on disk can say which
+        /// subscription served it — you know, the file does not. Naming one
+        /// attributes the rows to it, and if it is a subscription they book a
+        /// marginal cost of zero and record the list price as the bill the
+        /// monthly fee displaced, exactly as the gateway books a seat it serves
+        /// itself. Without it the rows are booked as metered spend at list.
+        #[arg(long, value_name = "NAME")]
+        account: Option<String>,
         /// Write the rows.
         #[arg(long)]
         apply: bool,
     },
     /// Delete every row an importer wrote, leaving gateway traffic alone.
     Revert {
+        /// Which import to undo: `claude-code` or `grok-cli`. One at a time,
+        /// because they are not equally trustworthy and undoing the weaker
+        /// should not cost the stronger.
         #[arg(long, default_value = ORIGIN_CLAUDE_CODE, value_name = "ORIGIN")]
         origin: String,
+        /// Only rows attributed to this credential. Omit to remove the whole
+        /// origin, which is what an operator undoing a first import wants and
+        /// what naming an account deliberately does not do.
+        #[arg(long, value_name = "NAME")]
+        account: Option<String>,
         /// Actually delete them.
         #[arg(long)]
         apply: bool,
@@ -457,13 +495,26 @@ pub async fn run(
 async fn usage_cmd(db: &Db, cmd: UsageCommand) -> Result<()> {
     match cmd {
         UsageCommand::Import {
+            from,
             path,
             before,
+            account,
             apply,
-        } => usage_import::import(db, path.as_deref(), before.as_deref(), apply)
-            .await
-            .map(|_| ()),
-        UsageCommand::Revert { origin, apply } => usage_import::revert(db, &origin, apply).await,
+        } => usage_import::import(
+            db,
+            from,
+            path.as_deref(),
+            before.as_deref(),
+            account.as_deref(),
+            apply,
+        )
+        .await
+        .map(|_| ()),
+        UsageCommand::Revert {
+            origin,
+            account,
+            apply,
+        } => usage_import::revert(db, &origin, account.as_deref(), apply).await,
     }
 }
 
