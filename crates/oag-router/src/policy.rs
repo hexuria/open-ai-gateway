@@ -176,7 +176,13 @@ pub enum SelectionReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingDecision {
     pub model: ModelSpec,
-    pub tier: Tier,
+    /// The ladder rung this sat on, if it sat on one.
+    ///
+    /// `None` for passthrough of a model that is on no rung. Mapping those
+    /// onto the floor used to make a named Grok request report as `cheap` on
+    /// `x-oag-tier` and in the ledger — a tier it was never on, and the label
+    /// a client Test button then surfaces.
+    pub tier: Option<Tier>,
     /// Why this rung was chosen.
     pub reason: SelectionReason,
     /// Set when the chosen rung had nothing capable enough and we had to walk
@@ -190,6 +196,14 @@ pub struct RoutingDecision {
     pub capability_escalated_from: Option<TierName>,
     /// The ladder's top rung, for the counterfactual on the usage row.
     pub ceiling_model: Option<ModelSpec>,
+}
+
+impl RoutingDecision {
+    /// The rung name to put on `x-oag-tier` and the ledger, if this sat on one.
+    #[must_use]
+    pub fn rung_name(&self) -> Option<&str> {
+        self.tier.as_ref().map(|t| t.name.as_str())
+    }
 }
 
 /// Whether an unusable answer should be retried one rung up.
@@ -319,30 +333,50 @@ impl RoutingPolicy {
             let spec = catalog.resolve(name).ok_or_else(|| {
                 Error::NoViableModel("no model on the ladder satisfies the request".to_owned())
             })?;
-            let tier = self
-                .tier_of(&spec.id)
-                .unwrap_or_else(|| self.ladder.floor());
-            let clamped = self
-                .ladder
-                .clamp_to_floor(tier.clone(), self.floor.as_ref());
-            // A floor pin outranks the caller's choice: that is what makes
-            // it an entitlement rather than a default.
-            if clamped == tier {
-                return Ok(RoutingDecision {
-                    model: spec.clone(),
-                    tier,
-                    reason: SelectionReason::Passthrough,
-                    capability_escalated_from: None,
+            if let Some(tier) = self.tier_of(&spec.id) {
+                let clamped = self
+                    .ladder
+                    .clamp_to_floor(tier.clone(), self.floor.as_ref());
+                // A floor pin outranks the caller's choice: that is what
+                // makes it an entitlement rather than a default.
+                if clamped == tier {
+                    return Ok(RoutingDecision {
+                        model: spec.clone(),
+                        tier: Some(tier),
+                        reason: SelectionReason::Passthrough,
+                        capability_escalated_from: None,
+                        ceiling_model,
+                    });
+                }
+                return self.resolve_from(
+                    clamped,
+                    SelectionReason::FloorPinned,
+                    catalog,
+                    &need,
                     ceiling_model,
-                });
+                );
             }
-            return self.resolve_from(
-                clamped,
-                SelectionReason::FloorPinned,
-                catalog,
-                &need,
+            // Off the ladder. Honour the name and do not pretend it sat on
+            // cheap — unless a floor above rank 0 would substitute a
+            // different model, which is FloorPinned.
+            if let Some(floor) = &self.floor
+                && floor.rank > 0
+            {
+                return self.resolve_from(
+                    floor.clone(),
+                    SelectionReason::FloorPinned,
+                    catalog,
+                    &need,
+                    ceiling_model,
+                );
+            }
+            return Ok(RoutingDecision {
+                model: spec.clone(),
+                tier: None,
+                reason: SelectionReason::Passthrough,
+                capability_escalated_from: None,
                 ceiling_model,
-            );
+            });
         }
 
         let classified = self.classifier.classify(signal);
@@ -428,7 +462,7 @@ impl RoutingPolicy {
                     (current.name != started_at).then(|| started_at.clone());
                 return Ok(RoutingDecision {
                     model: spec.clone(),
-                    tier: current,
+                    tier: Some(current),
                     reason,
                     capability_escalated_from,
                     ceiling_model,
@@ -670,6 +704,29 @@ mod tests {
             .expect("routes");
         assert_eq!(d.model.id.as_str(), "anthropic/opus");
         assert_eq!(d.reason, SelectionReason::Passthrough);
+        assert_eq!(d.rung_name(), Some("frontier"));
+    }
+
+    #[test]
+    fn passthrough_of_an_off_ladder_model_has_no_rung() {
+        // Mapping these onto cheap made a named Grok request report as a
+        // rung it was never on. Honour the name; do not invent a tier.
+        let d = policy()
+            .decide(
+                &RoutingMode::Passthrough,
+                Some("anthropic/sonnet"),
+                &RequestSignal {
+                    prompt_tokens: 50,
+                    ..RequestSignal::default()
+                },
+                &rich(),
+                &catalog_with_off_ladder(),
+                1024,
+            )
+            .expect("routes");
+        assert_eq!(d.model.id.as_str(), "anthropic/sonnet");
+        assert_eq!(d.reason, SelectionReason::Passthrough);
+        assert_eq!(d.rung_name(), None);
     }
 
     #[test]

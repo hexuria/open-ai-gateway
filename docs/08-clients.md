@@ -225,7 +225,7 @@ routing:
 | Header | Meaning |
 |---|---|
 | `x-oag-model` | the canonical id that served the request |
-| `x-oag-tier` | the rung it came from |
+| `x-oag-tier` | the rung it came from. Omitted when the named model sits on no rung (passthrough of an off-ladder id) — it is not `cheap`. |
 | `x-oag-request-id` | the id to look up in the ledger |
 
 What the calling key is entitled to, and in which mode:

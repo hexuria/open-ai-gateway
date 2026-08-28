@@ -239,7 +239,7 @@ async fn handle(
     tracing::info!(
         %request_id,
         model = %plan.decision.model.id,
-        tier = %plan.decision.tier,
+        tier = ?plan.decision.rung_name(),
         reason = ?plan.decision.reason,
         "routed"
     );
@@ -384,21 +384,16 @@ async fn run_with_escalation(
                 canonical.max_tokens,
                 decision.model.max_output_tokens,
             )
-            && let Some(next) = policy.escalate(
-                &decision.tier,
-                gate,
-                &signal,
-                &catalog,
-                canonical.max_tokens,
-            )
+            && let Some(from) = decision.tier.as_ref()
+            && let Some(next) = policy.escalate(from, gate, &signal, &catalog, canonical.max_tokens)
         {
             tracing::info!(
-                %request_id, from = %decision.tier, to = %next.tier, ?gate,
+                %request_id, from = ?decision.rung_name(), to = ?next.rung_name(), ?gate,
                 "escalating: this rung could not answer the request"
             );
             metrics::counter!(
                 "oag_escalations_total",
-                "from" => decision.tier.name.to_string(),
+                "from" => from.name.as_str().to_owned(),
                 "gate" => format!("{gate:?}"),
             )
             .increment(1);
@@ -827,14 +822,31 @@ fn json_response(
         )
     };
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
+    oag_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json"),
+        decision,
+        request_id,
+    )
+    .body(Body::from(out))
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Routing identity on the way out. `x-oag-tier` is omitted when the model
+/// sat on no rung — a named off-ladder pin is not `cheap`.
+fn oag_headers(
+    builder: axum::http::response::Builder,
+    decision: &RoutingDecision,
+    request_id: RequestId,
+) -> axum::http::response::Builder {
+    let builder = builder
         .header("x-oag-model", decision.model.id.as_str())
-        .header("x-oag-tier", decision.tier.name.as_str())
-        .header("x-oag-request-id", request_id.to_string())
-        .body(Body::from(out))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        .header("x-oag-request-id", request_id.to_string());
+    match decision.rung_name() {
+        Some(tier) => builder.header("x-oag-tier", tier),
+        None => builder,
+    }
 }
 
 /// Try credentials until one works or the budget of attempts runs out.
@@ -1149,18 +1161,19 @@ fn stream_response(
 
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        // Belt and braces for an intermediary we do not control: nginx honours
-        // this even when its own buffering config says otherwise.
-        .header("x-accel-buffering", "no")
-        .header("x-oag-model", decision.model.id.as_str())
-        .header("x-oag-tier", decision.tier.name.as_str())
-        .header("x-oag-request-id", request_id.to_string())
-        .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+    Ok(oag_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            // Belt and braces for an intermediary we do not control: nginx honours
+            // this even when its own buffering config says otherwise.
+            .header("x-accel-buffering", "no"),
+        decision,
+        request_id,
+    )
+    .body(body)
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
 /// Turn a successful response into the attempt the caller returns.
@@ -1781,7 +1794,7 @@ mod tests {
                 capabilities: Capabilities::default(),
                 display_label: None,
             },
-            tier: oag_core::Tier::new("cheap", 0),
+            tier: Some(oag_core::Tier::new("cheap", 0)),
             reason: oag_router::SelectionReason::Classified,
             capability_escalated_from: None,
             ceiling_model: None,
