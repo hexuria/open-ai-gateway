@@ -176,7 +176,13 @@ pub enum SelectionReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingDecision {
     pub model: ModelSpec,
-    pub tier: Tier,
+    /// The ladder rung this sat on, if it sat on one.
+    ///
+    /// `None` for passthrough of a model that is on no rung. Mapping those
+    /// onto the floor used to make a named Grok request report as `cheap` on
+    /// `x-oag-tier` and in the ledger — a tier it was never on, and the label
+    /// a client Test button then surfaces.
+    pub tier: Option<Tier>,
     /// Why this rung was chosen.
     pub reason: SelectionReason,
     /// Set when the chosen rung had nothing capable enough and we had to walk
@@ -190,6 +196,14 @@ pub struct RoutingDecision {
     pub capability_escalated_from: Option<TierName>,
     /// The ladder's top rung, for the counterfactual on the usage row.
     pub ceiling_model: Option<ModelSpec>,
+}
+
+impl RoutingDecision {
+    /// The rung name to put on `x-oag-tier` and the ledger, if this sat on one.
+    #[must_use]
+    pub fn rung_name(&self) -> Option<&str> {
+        self.tier.as_ref().map(|t| t.name.as_str())
+    }
 }
 
 /// Whether an unusable answer should be retried one rung up.
@@ -207,6 +221,29 @@ pub fn escalation_allowed(
     max_escalations: u8,
 ) -> bool {
     pressure == BudgetPressure::Normal && escalations_so_far < max_escalations
+}
+
+/// Whether a quality gate may climb to a *different* model.
+///
+/// Failover still retries the same model on another credential. Climbing the
+/// ladder is how a named `xai/grok-4.6` becomes "no credential for anthropic":
+/// passthrough parks an off-ladder name on the cheap rung, then `escalate`
+/// walks to the next provider on the ladder. A caller who was specific is not
+/// migrated onto a model they did not name.
+#[must_use]
+pub const fn climb_allowed(reason: &SelectionReason) -> bool {
+    !matches!(reason, SelectionReason::Passthrough)
+}
+
+/// Hitting the output cap the caller set is not a weaker-model failure.
+///
+/// `StopReason::MaxTokens` does not say *whose* cap it was. If the request
+/// asked for no more tokens than this model can emit, the stop is the
+/// contract — climbing a rung is how `max_tokens=2` on a named Grok request
+/// becomes "no credential for anthropic" on the ladder's next provider.
+#[must_use]
+pub const fn truncated_by_client_cap(requested_max: u32, model_max: u32) -> bool {
+    requested_max <= model_max
 }
 
 /// A route's routing rules.
@@ -296,30 +333,50 @@ impl RoutingPolicy {
             let spec = catalog.resolve(name).ok_or_else(|| {
                 Error::NoViableModel("no model on the ladder satisfies the request".to_owned())
             })?;
-            let tier = self
-                .tier_of(&spec.id)
-                .unwrap_or_else(|| self.ladder.floor());
-            let clamped = self
-                .ladder
-                .clamp_to_floor(tier.clone(), self.floor.as_ref());
-            // A floor pin outranks the caller's choice: that is what makes
-            // it an entitlement rather than a default.
-            if clamped == tier {
-                return Ok(RoutingDecision {
-                    model: spec.clone(),
-                    tier,
-                    reason: SelectionReason::Passthrough,
-                    capability_escalated_from: None,
+            if let Some(tier) = self.tier_of(&spec.id) {
+                let clamped = self
+                    .ladder
+                    .clamp_to_floor(tier.clone(), self.floor.as_ref());
+                // A floor pin outranks the caller's choice: that is what
+                // makes it an entitlement rather than a default.
+                if clamped == tier {
+                    return Ok(RoutingDecision {
+                        model: spec.clone(),
+                        tier: Some(tier),
+                        reason: SelectionReason::Passthrough,
+                        capability_escalated_from: None,
+                        ceiling_model,
+                    });
+                }
+                return self.resolve_from(
+                    clamped,
+                    SelectionReason::FloorPinned,
+                    catalog,
+                    &need,
                     ceiling_model,
-                });
+                );
             }
-            return self.resolve_from(
-                clamped,
-                SelectionReason::FloorPinned,
-                catalog,
-                &need,
+            // Off the ladder. Honour the name and do not pretend it sat on
+            // cheap — unless a floor above rank 0 would substitute a
+            // different model, which is FloorPinned.
+            if let Some(floor) = &self.floor
+                && floor.rank > 0
+            {
+                return self.resolve_from(
+                    floor.clone(),
+                    SelectionReason::FloorPinned,
+                    catalog,
+                    &need,
+                    ceiling_model,
+                );
+            }
+            return Ok(RoutingDecision {
+                model: spec.clone(),
+                tier: None,
+                reason: SelectionReason::Passthrough,
+                capability_escalated_from: None,
                 ceiling_model,
-            );
+            });
         }
 
         let classified = self.classifier.classify(signal);
@@ -405,7 +462,7 @@ impl RoutingPolicy {
                     (current.name != started_at).then(|| started_at.clone());
                 return Ok(RoutingDecision {
                     model: spec.clone(),
-                    tier: current,
+                    tier: Some(current),
                     reason,
                     capability_escalated_from,
                     ceiling_model,
@@ -426,16 +483,31 @@ impl RoutingPolicy {
     /// cheap/balanced/frontier trio, because `TierName` is operator-defined and
     /// a route with a `[budget, standard, premium]` ladder must advertise those.
     /// `oag/auto` is universal and is not returned here — it is not a rung.
+    ///
+    /// Under [`BudgetPressure::Constrained`], only the rung `decide` would
+    /// actually serve from is advertised: `oag/<rung>` forces managed mode,
+    /// and managed mode degrades to that ceiling. Advertising `oag/frontier`
+    /// would pin a rung the next turn then silently leaves.
     #[must_use]
-    pub fn virtual_names(&self) -> Vec<TierName> {
+    pub fn virtual_names(&self, pressure: BudgetPressure) -> Vec<TierName> {
+        if pressure == BudgetPressure::Exhausted {
+            return Vec::new();
+        }
         let floor_rank = self.floor.as_ref().map_or(0, |t| t.rank);
+        let ceiling_rank = if pressure == BudgetPressure::Constrained {
+            self.ladder
+                .clamp_to_floor(self.ladder.floor(), self.floor.as_ref())
+                .rank
+        } else {
+            u8::MAX
+        };
         self.ladder
             .rungs()
             .iter()
             .enumerate()
             .filter_map(|(i, rung)| {
                 let rank = u8::try_from(i).ok()?;
-                (rank >= floor_rank).then(|| rung.name.clone())
+                (rank >= floor_rank && rank <= ceiling_rank).then(|| rung.name.clone())
             })
             .collect()
     }
@@ -445,13 +517,23 @@ impl RoutingPolicy {
     /// `providers` is the set the route holds usable credentials for: a model
     /// nobody can reach is worse listed than omitted, because the failure
     /// arrives later and further from the cause.
+    ///
+    /// `honoured` is whether `decide` in this mode would return the named
+    /// model. Under [`BudgetPressure::Constrained`] that is unchanged for a
+    /// passthrough name — `decide` still honours it, budget pressure applies
+    /// only on the managed path — and still false for every managed name.
+    /// Exhausted spend lists nothing: the next turn is a hard stop.
     #[must_use]
     pub fn entitled<'c>(
         &self,
         mode: &RoutingMode,
         catalog: &'c Catalog,
         providers: &BTreeSet<Provider>,
+        pressure: BudgetPressure,
     ) -> Vec<Entitlement<'c>> {
+        if pressure == BudgetPressure::Exhausted {
+            return Vec::new();
+        }
         let floor_rank = self.floor.as_ref().map_or(0, |t| t.rank);
         let managed = *mode == RoutingMode::Managed;
         let mut out = Vec::new();
@@ -471,7 +553,9 @@ impl RoutingPolicy {
                     spec,
                     tier: Some(rung.name.clone()),
                     // In managed mode the name is advisory: `decide` classifies
-                    // and picks for itself.
+                    // and picks for itself. Constrained does not change that —
+                    // and does not un-honour a passthrough name, because
+                    // `decide`'s passthrough branch returns before budget.
                     honoured: !managed,
                 });
             }
@@ -620,6 +704,29 @@ mod tests {
             .expect("routes");
         assert_eq!(d.model.id.as_str(), "anthropic/opus");
         assert_eq!(d.reason, SelectionReason::Passthrough);
+        assert_eq!(d.rung_name(), Some("frontier"));
+    }
+
+    #[test]
+    fn passthrough_of_an_off_ladder_model_has_no_rung() {
+        // Mapping these onto cheap made a named Grok request report as a
+        // rung it was never on. Honour the name; do not invent a tier.
+        let d = policy()
+            .decide(
+                &RoutingMode::Passthrough,
+                Some("anthropic/sonnet"),
+                &RequestSignal {
+                    prompt_tokens: 50,
+                    ..RequestSignal::default()
+                },
+                &rich(),
+                &catalog_with_off_ladder(),
+                1024,
+            )
+            .expect("routes");
+        assert_eq!(d.model.id.as_str(), "anthropic/sonnet");
+        assert_eq!(d.reason, SelectionReason::Passthrough);
+        assert_eq!(d.rung_name(), None);
     }
 
     #[test]
@@ -1073,7 +1180,12 @@ mod tests {
     fn entitled_excludes_rungs_below_the_floor() {
         let floored = policy().with_floor(Some(Tier::new(TierName::new("frontier"), 2)));
         let catalog = catalog();
-        let listed = floored.entitled(&RoutingMode::Managed, &catalog, &all_providers());
+        let listed = floored.entitled(
+            &RoutingMode::Managed,
+            &catalog,
+            &all_providers(),
+            BudgetPressure::Normal,
+        );
         assert_eq!(ids(&listed), ["anthropic/opus"]);
     }
 
@@ -1083,7 +1195,12 @@ mod tests {
         // cause: the caller picks it and finds out two layers later.
         let only_kimi: BTreeSet<Provider> = [Provider::Kimi].into_iter().collect();
         let catalog = catalog();
-        let listed = policy().entitled(&RoutingMode::Managed, &catalog, &only_kimi);
+        let listed = policy().entitled(
+            &RoutingMode::Managed,
+            &catalog,
+            &only_kimi,
+            BudgetPressure::Normal,
+        );
         assert_eq!(ids(&listed), ["kimi/k2"]);
     }
 
@@ -1091,13 +1208,23 @@ mod tests {
     fn passthrough_lists_off_ladder_models_and_managed_does_not() {
         let catalog = catalog_with_off_ladder();
 
-        let managed = policy().entitled(&RoutingMode::Managed, &catalog, &all_providers());
+        let managed = policy().entitled(
+            &RoutingMode::Managed,
+            &catalog,
+            &all_providers(),
+            BudgetPressure::Normal,
+        );
         assert!(
             !ids(&managed).iter().any(|id| id == "anthropic/sonnet"),
             "managed mode picks for itself, so an off-ladder name is not on offer"
         );
 
-        let passthrough = policy().entitled(&RoutingMode::Passthrough, &catalog, &all_providers());
+        let passthrough = policy().entitled(
+            &RoutingMode::Passthrough,
+            &catalog,
+            &all_providers(),
+            BudgetPressure::Normal,
+        );
         assert!(
             ids(&passthrough).iter().any(|id| id == "anthropic/sonnet"),
             "passthrough honours a named model, so the catalog is the menu"
@@ -1112,7 +1239,12 @@ mod tests {
         // the listing has to say so.
         let catalog = catalog_with_off_ladder();
         let floored = policy().with_floor(Some(Tier::new(TierName::new("balanced"), 1)));
-        let listed = floored.entitled(&RoutingMode::Passthrough, &catalog, &all_providers());
+        let listed = floored.entitled(
+            &RoutingMode::Passthrough,
+            &catalog,
+            &all_providers(),
+            BudgetPressure::Normal,
+        );
 
         let off_ladder = listed
             .iter()
@@ -1125,7 +1257,12 @@ mod tests {
         );
 
         // With no floor, the same name is honoured exactly as given.
-        let open = policy().entitled(&RoutingMode::Passthrough, &catalog, &all_providers());
+        let open = policy().entitled(
+            &RoutingMode::Passthrough,
+            &catalog,
+            &all_providers(),
+            BudgetPressure::Normal,
+        );
         let off_ladder = open
             .iter()
             .find(|e| e.spec.id.as_str() == "anthropic/sonnet")
@@ -1136,7 +1273,12 @@ mod tests {
     #[test]
     fn managed_mode_honours_no_name() {
         let catalog = catalog();
-        let listed = policy().entitled(&RoutingMode::Managed, &catalog, &all_providers());
+        let listed = policy().entitled(
+            &RoutingMode::Managed,
+            &catalog,
+            &all_providers(),
+            BudgetPressure::Normal,
+        );
         assert!(
             listed.iter().all(|e| !e.honoured),
             "in managed mode the model name is advisory; the classifier decides"
@@ -1157,16 +1299,184 @@ mod tests {
         ])
         .expect("non-empty");
         let policy = RoutingPolicy::new(ladder, Box::new(HeuristicClassifier::default()));
-        assert_eq!(names(&policy.virtual_names()), ["budget", "premium"]);
+        assert_eq!(
+            names(&policy.virtual_names(BudgetPressure::Normal)),
+            ["budget", "premium"]
+        );
     }
 
     #[test]
     fn virtual_names_stop_at_the_floor() {
         let floored = policy().with_floor(Some(Tier::new(TierName::new("balanced"), 1)));
         assert_eq!(
-            names(&floored.virtual_names()),
+            names(&floored.virtual_names(BudgetPressure::Normal)),
             ["balanced", "frontier"],
             "advertising oag/cheap to a key floored at balanced promises what it cannot deliver"
         );
+    }
+
+    fn constrained() -> Budgets {
+        Budgets {
+            key: BudgetState {
+                spent_usd: dec!(25),
+                limit_usd: Some(dec!(30)),
+                hard_stop_multiple: Decimal::ONE,
+            },
+            route: BudgetState::unlimited(dec!(0)),
+            principal: BudgetState::unlimited(dec!(0)),
+        }
+    }
+
+    fn exhausted() -> Budgets {
+        Budgets {
+            key: BudgetState {
+                spent_usd: dec!(30),
+                limit_usd: Some(dec!(30)),
+                hard_stop_multiple: Decimal::ONE,
+            },
+            route: BudgetState::unlimited(dec!(0)),
+            principal: BudgetState::unlimited(dec!(0)),
+        }
+    }
+
+    fn trivial_signal() -> RequestSignal {
+        RequestSignal {
+            prompt_tokens: 200,
+            turn_count: 1,
+            ..RequestSignal::default()
+        }
+    }
+
+    fn naming_is_honoured(
+        policy: &RoutingPolicy,
+        mode: &RoutingMode,
+        id: &str,
+        budget: &Budgets,
+        catalog: &Catalog,
+    ) -> bool {
+        policy
+            .decide(mode, Some(id), &trivial_signal(), budget, catalog, 1024)
+            .is_ok_and(|d| d.model.id.as_str() == id)
+    }
+
+    #[test]
+    fn constrained_virtual_names_are_only_the_rung_decide_would_serve() {
+        // oag/frontier under Constrained forces managed mode, then budget
+        // degrades to cheap. Advertising it is a pin the next turn abandons.
+        assert_eq!(
+            names(&policy().virtual_names(BudgetPressure::Constrained)),
+            ["cheap"]
+        );
+        let floored = policy().with_floor(Some(Tier::new(TierName::new("balanced"), 1)));
+        assert_eq!(
+            names(&floored.virtual_names(BudgetPressure::Constrained)),
+            ["balanced"],
+            "a floor is an entitlement; Constrained cannot hide it"
+        );
+        assert!(policy().virtual_names(BudgetPressure::Exhausted).is_empty());
+    }
+
+    #[test]
+    fn entitled_honoured_matches_decide_for_the_same_inputs() {
+        // `honoured` is "naming this id is obeyed", not "decide happens to
+        // pick this model". Managed classification can land on kimi/k2
+        // without the name having been consulted.
+        let catalog = catalog();
+        let providers = all_providers();
+        let p = policy();
+        for (mode, budget) in [
+            (RoutingMode::Passthrough, rich()),
+            (RoutingMode::Passthrough, constrained()),
+            (RoutingMode::Managed, rich()),
+            (RoutingMode::Managed, constrained()),
+        ] {
+            let pressure = budget.pressure();
+            let listed = p.entitled(&mode, &catalog, &providers, pressure);
+            assert!(!listed.is_empty(), "{mode:?} {pressure:?} listed nothing");
+            for e in &listed {
+                let id = e.spec.id.as_str();
+                match mode {
+                    RoutingMode::Passthrough => assert_eq!(
+                        e.honoured,
+                        naming_is_honoured(&p, &mode, id, &budget, &catalog),
+                        "{mode:?} {pressure:?} {id}"
+                    ),
+                    RoutingMode::Managed => {
+                        assert!(!e.honoured, "managed never honours a name: {id}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_entitled_is_empty() {
+        let catalog = catalog();
+        let listed = policy().entitled(
+            &RoutingMode::Passthrough,
+            &catalog,
+            &all_providers(),
+            BudgetPressure::Exhausted,
+        );
+        assert!(listed.is_empty());
+        assert!(matches!(
+            policy().decide(
+                &RoutingMode::Passthrough,
+                Some("kimi/k2"),
+                &trivial_signal(),
+                &exhausted(),
+                &catalog,
+                1024,
+            ),
+            Err(Error::BudgetExhausted { .. })
+        ));
+    }
+
+    #[test]
+    fn constrained_passthrough_still_honours_a_named_frontier_model() {
+        // decide() returns before budget on the passthrough branch. Listing a
+        // frontier name as honoured:false would disagree with the router.
+        let catalog = catalog();
+        let listed = policy().entitled(
+            &RoutingMode::Passthrough,
+            &catalog,
+            &all_providers(),
+            BudgetPressure::Constrained,
+        );
+        let opus = listed
+            .iter()
+            .find(|e| e.spec.id.as_str() == "anthropic/opus")
+            .expect("listed");
+        assert!(opus.honoured);
+        assert!(naming_is_honoured(
+            &policy(),
+            &RoutingMode::Passthrough,
+            "anthropic/opus",
+            &constrained(),
+            &catalog,
+        ));
+    }
+
+    #[test]
+    fn truncated_by_the_callers_own_cap_is_not_a_weaker_model() {
+        assert!(truncated_by_client_cap(2, 8192));
+        assert!(truncated_by_client_cap(8, 8192));
+        assert!(truncated_by_client_cap(8192, 8192));
+        assert!(!truncated_by_client_cap(16_000, 8192));
+    }
+
+    #[test]
+    fn a_named_model_does_not_climb_the_ladder() {
+        // The other half of honouring a name: an unusable answer retries the
+        // same model on another credential, not the next provider on the
+        // ladder. Classified / floor-pinned / budget-downgraded still climb.
+        assert!(!climb_allowed(&SelectionReason::Passthrough));
+        assert!(climb_allowed(&SelectionReason::Classified));
+        assert!(climb_allowed(&SelectionReason::FloorPinned));
+        assert!(climb_allowed(&SelectionReason::BudgetDowngraded));
+        assert!(climb_allowed(&SelectionReason::Escalated {
+            from: TierName::new("cheap"),
+            gate: QualityGate::EmptyResponse,
+        }));
     }
 }

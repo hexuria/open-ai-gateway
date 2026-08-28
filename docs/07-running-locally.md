@@ -118,7 +118,7 @@ curl -N localhost:29080/v1/messages -H "x-api-key: $INFERENCE_KEY" \
        "messages":[{"role":"user","content":"hello"}]}'
 
 # What this key may actually reach: the route's ladder, intersected with the
-# credentials that can serve it right now.
+# live credentials that can serve it right now (empty if this key is exhausted).
 curl localhost:29080/v1/models -H "x-api-key: $INFERENCE_KEY"
 ```
 

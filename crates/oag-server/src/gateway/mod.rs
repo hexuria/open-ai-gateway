@@ -239,7 +239,7 @@ async fn handle(
     tracing::info!(
         %request_id,
         model = %plan.decision.model.id,
-        tier = %plan.decision.tier,
+        tier = ?plan.decision.rung_name(),
         reason = ?plan.decision.reason,
         "routed"
     );
@@ -270,6 +270,26 @@ async fn handle(
     .await
 }
 
+/// Whether this attempt may be retried one rung up.
+///
+/// Failover (same model, another credential) is a different path. Climbing
+/// changes the model. A named passthrough request must not walk onto the
+/// next ladder provider; hitting the caller's own `max_tokens` is not a
+/// weaker-model failure; budget pressure must not undo a downgrade.
+fn should_climb(
+    reason: &oag_router::SelectionReason,
+    gate: oag_router::QualityGate,
+    pressure: oag_router::BudgetPressure,
+    escalations: u8,
+    requested_max: u32,
+    model_max: u32,
+) -> bool {
+    oag_router::climb_allowed(reason)
+        && !(gate == oag_router::QualityGate::Truncated
+            && oag_router::truncated_by_client_cap(requested_max, model_max))
+        && oag_router::escalation_allowed(pressure, escalations, MAX_ESCALATIONS)
+}
+
 /// Forward, failing over between credentials, and escalate a rung if the
 /// answer comes back unusable.
 ///
@@ -277,7 +297,7 @@ async fn handle(
 /// asks "is this credential healthy", escalation asks "is this model good
 /// enough". Collapsing them would mean a provider outage silently migrated the
 /// fleet onto expensive models.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_with_escalation(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
@@ -297,11 +317,6 @@ async fn run_with_escalation(
         pressure,
         channel,
     } = plan;
-    //
-    // Escalation sits *outside* failover, and the nesting is the point:
-    // failover asks "is this credential healthy", escalation asks "is this
-    // model good enough". Collapsing them would mean a provider outage silently
-    // migrated the fleet onto expensive models.
     let mut escalations = 0u8;
     // The gate that *caused* an escalation, not the last one observed. Recording
     // the final attempt's gate would leave this empty on exactly the rows where
@@ -360,28 +375,25 @@ async fn run_with_escalation(
         };
 
         // Retry one rung up when the answer was unusable and a rung is left.
-        //
-        // Not under budget pressure, though. A principal near their cap has
-        // already been downgraded on purpose; escalating them back up to the
-        // most expensive model would undo the very saving the downgrade exists
-        // to make. Accepting the worse answer *is* the policy at that point.
         if let Some(gate) = gate
-            && oag_router::escalation_allowed(pressure, escalations, MAX_ESCALATIONS)
-            && let Some(next) = policy.escalate(
-                &decision.tier,
+            && should_climb(
+                &decision.reason,
                 gate,
-                &signal,
-                &catalog,
+                pressure,
+                escalations,
                 canonical.max_tokens,
+                decision.model.max_output_tokens,
             )
+            && let Some(from) = decision.tier.as_ref()
+            && let Some(next) = policy.escalate(from, gate, &signal, &catalog, canonical.max_tokens)
         {
             tracing::info!(
-                %request_id, from = %decision.tier, to = %next.tier, ?gate,
+                %request_id, from = ?decision.rung_name(), to = ?next.rung_name(), ?gate,
                 "escalating: this rung could not answer the request"
             );
             metrics::counter!(
                 "oag_escalations_total",
-                "from" => decision.tier.name.to_string(),
+                "from" => from.name.as_str().to_owned(),
                 "gate" => format!("{gate:?}"),
             )
             .increment(1);
@@ -492,8 +504,9 @@ struct Plan {
 
 /// Load the caller's route and build the policy it implies.
 ///
-/// Split out of `plan_request` because `/v1/models` needs exactly this much and
-/// none of what follows it — no rate token, no budgets, no decision.
+/// Split out of `plan_request` because `/v1/models` needs the route and the
+/// policy, and [`budgets_for`] the spend state — none of the rate token or the
+/// model decision.
 pub(crate) async fn policy_for(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
@@ -528,6 +541,33 @@ pub(crate) async fn policy_for(
     let policy = RoutingPolicy::new(ladder, Box::new(oag_router::HeuristicClassifier::default()))
         .with_floor(floor);
     Ok((route, policy))
+}
+
+/// The same spend caps inference consults, so `/v1/models` can refuse to
+/// advertise what the next turn would hard-stop.
+///
+/// A per-key quota is a wall at the number written on it: it still degrades
+/// through the constrained band first, but it does not get the principal's
+/// overshoot grace. An operator who writes `quota_usd = 50` means fifty. A
+/// route budget is the same shape at team scope.
+pub(crate) fn budgets_for(auth: &oag_store::AuthContext, route: &oag_store::RouteRow) -> Budgets {
+    Budgets {
+        key: BudgetState {
+            spent_usd: auth.spent_usd,
+            limit_usd: auth.quota_usd,
+            hard_stop_multiple: rust_decimal::Decimal::ONE,
+        },
+        route: BudgetState {
+            spent_usd: route.spent_usd,
+            limit_usd: route.monthly_budget_usd,
+            hard_stop_multiple: rust_decimal::Decimal::ONE,
+        },
+        principal: BudgetState {
+            spent_usd: auth.principal_spent_usd,
+            limit_usd: auth.principal_budget_usd,
+            hard_stop_multiple: auth.principal_hard_stop_multiple,
+        },
+    }
 }
 
 /// The rung an `oag/...` model name pins, if any. `oag/auto` pins nothing.
@@ -598,30 +638,7 @@ async fn plan_request(
         RoutingMode::Passthrough
     };
 
-    let budget = Budgets {
-        // A per-key quota is a wall at the number written on it: it still
-        // degrades through the constrained band first, but it does not get the
-        // principal's overshoot grace. An operator who writes `quota_usd = 50`
-        // means fifty.
-        key: BudgetState {
-            spent_usd: auth.spent_usd,
-            limit_usd: auth.quota_usd,
-            hard_stop_multiple: rust_decimal::Decimal::ONE,
-        },
-        // A route budget is the team-level cap: it bounds everyone sharing the
-        // route, regardless of whose key they used. Like the key quota it is a
-        // wall at its number rather than inheriting the principal's grace.
-        route: BudgetState {
-            spent_usd: route.spent_usd,
-            limit_usd: route.monthly_budget_usd,
-            hard_stop_multiple: rust_decimal::Decimal::ONE,
-        },
-        principal: BudgetState {
-            spent_usd: auth.principal_spent_usd,
-            limit_usd: auth.principal_budget_usd,
-            hard_stop_multiple: auth.principal_hard_stop_multiple,
-        },
-    };
+    let budget = budgets_for(auth, &route);
 
     // Logged at debug because "why did this route the way it did" is the
     // question every routing complaint turns into, and reconstructing it from
@@ -805,14 +822,31 @@ fn json_response(
         )
     };
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
+    oag_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json"),
+        decision,
+        request_id,
+    )
+    .body(Body::from(out))
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Routing identity on the way out. `x-oag-tier` is omitted when the model
+/// sat on no rung — a named off-ladder pin is not `cheap`.
+fn oag_headers(
+    builder: axum::http::response::Builder,
+    decision: &RoutingDecision,
+    request_id: RequestId,
+) -> axum::http::response::Builder {
+    let builder = builder
         .header("x-oag-model", decision.model.id.as_str())
-        .header("x-oag-tier", decision.tier.name.as_str())
-        .header("x-oag-request-id", request_id.to_string())
-        .body(Body::from(out))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        .header("x-oag-request-id", request_id.to_string());
+    match decision.rung_name() {
+        Some(tier) => builder.header("x-oag-tier", tier),
+        None => builder,
+    }
 }
 
 /// Try credentials until one works or the budget of attempts runs out.
@@ -1127,18 +1161,19 @@ fn stream_response(
 
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        // Belt and braces for an intermediary we do not control: nginx honours
-        // this even when its own buffering config says otherwise.
-        .header("x-accel-buffering", "no")
-        .header("x-oag-model", decision.model.id.as_str())
-        .header("x-oag-tier", decision.tier.name.as_str())
-        .header("x-oag-request-id", request_id.to_string())
-        .body(body)
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+    Ok(oag_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CACHE_CONTROL, "no-cache")
+            // Belt and braces for an intermediary we do not control: nginx honours
+            // this even when its own buffering config says otherwise.
+            .header("x-accel-buffering", "no"),
+        decision,
+        request_id,
+    )
+    .body(body)
+    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
 /// Turn a successful response into the attempt the caller returns.
@@ -1759,7 +1794,7 @@ mod tests {
                 capabilities: Capabilities::default(),
                 display_label: None,
             },
-            tier: oag_core::Tier::new("cheap", 0),
+            tier: Some(oag_core::Tier::new("cheap", 0)),
             reason: oag_router::SelectionReason::Classified,
             capability_escalated_from: None,
             ceiling_model: None,

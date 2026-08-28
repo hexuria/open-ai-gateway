@@ -61,10 +61,12 @@ curl localhost:29080/v1/models -H "x-api-key: $OAG_KEY"
 ```
 
 `/v1/models` lists what *this* key may actually ask for — the route's ladder,
-clamped to the key's floor, filtered to providers you hold credentials for —
-with the `oag/*` names first. `/v1/messages/count_tokens` returns a prompt-size
-estimate without spending anything upstream; it is marked `"oag_estimate": true`
-because no tokeniser is linked.
+clamped to the key's floor, filtered to providers you hold live credentials
+for — with the `oag/*` names first. Spent or reserved-out seats, and an
+exhausted caller quota, produce an empty list rather than names that would fail
+on the first turn. `/v1/messages/count_tokens` returns a prompt-size estimate
+without spending anything upstream; it is marked `"oag_estimate": true` because
+no tokeniser is linked.
 
 The full three-tier topology — Caddy, Envoy, three replicas, Postgres, Redis —
 is one command, and Prometheus and Grafana are one flag more:

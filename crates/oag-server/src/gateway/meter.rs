@@ -149,7 +149,10 @@ fn usage_write(
         route_id: Some(ctx.auth.route_id),
         account_id: Some(ctx.account.as_uuid()),
         model_id: ctx.decision.model.id.as_str().to_owned(),
-        tier: ctx.decision.tier.name.to_string(),
+        // Empty when the model sat on no rung (passthrough off-ladder). The
+        // column is NOT NULL; inventing `cheap` is what made a named Grok
+        // request show up as a cheap-rung spend in the dashboard.
+        tier: ctx.decision.rung_name().unwrap_or("").to_owned(),
         selection_reason: match fate {
             Fate::Served => reason_label(&ctx.decision.reason).to_owned(),
             // Why this model was picked matters less on this row than the fact
@@ -258,7 +261,7 @@ fn emit_metrics(
     counterfactual: Decimal,
 ) {
     let model = ctx.decision.model.id.as_str().to_owned();
-    let tier = ctx.decision.tier.name.to_string();
+    let tier = ctx.decision.rung_name().unwrap_or("").to_owned();
     let provider = ctx.decision.model.provider.as_str();
 
     metrics::counter!("oag_tokens_total", "kind" => "input", "model" => model.clone())
@@ -401,7 +404,7 @@ mod tests {
                     capabilities: Capabilities::default(),
                     display_label: None,
                 },
-                tier: oag_core::Tier::new("cheap", 0),
+                tier: Some(oag_core::Tier::new("cheap", 0)),
                 reason: SelectionReason::Classified,
                 capability_escalated_from: None,
                 // Ten times the price, so a row that wrongly claims the full
