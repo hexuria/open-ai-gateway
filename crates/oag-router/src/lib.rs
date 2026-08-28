@@ -23,5 +23,5 @@ pub use cost::{Usage, counterfactual};
 pub use ladder::TierLadder;
 pub use policy::{
     BudgetPressure, BudgetState, Budgets, Entitlement, QualityGate, RoutingDecision, RoutingPolicy,
-    SelectionReason, escalation_allowed,
+    SelectionReason, climb_allowed, escalation_allowed, truncated_by_client_cap,
 };

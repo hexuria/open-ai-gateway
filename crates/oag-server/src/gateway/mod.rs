@@ -270,6 +270,26 @@ async fn handle(
     .await
 }
 
+/// Whether this attempt may be retried one rung up.
+///
+/// Failover (same model, another credential) is a different path. Climbing
+/// changes the model. A named passthrough request must not walk onto the
+/// next ladder provider; hitting the caller's own `max_tokens` is not a
+/// weaker-model failure; budget pressure must not undo a downgrade.
+fn should_climb(
+    reason: &oag_router::SelectionReason,
+    gate: oag_router::QualityGate,
+    pressure: oag_router::BudgetPressure,
+    escalations: u8,
+    requested_max: u32,
+    model_max: u32,
+) -> bool {
+    oag_router::climb_allowed(reason)
+        && !(gate == oag_router::QualityGate::Truncated
+            && oag_router::truncated_by_client_cap(requested_max, model_max))
+        && oag_router::escalation_allowed(pressure, escalations, MAX_ESCALATIONS)
+}
+
 /// Forward, failing over between credentials, and escalate a rung if the
 /// answer comes back unusable.
 ///
@@ -277,7 +297,7 @@ async fn handle(
 /// asks "is this credential healthy", escalation asks "is this model good
 /// enough". Collapsing them would mean a provider outage silently migrated the
 /// fleet onto expensive models.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_with_escalation(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
@@ -297,11 +317,6 @@ async fn run_with_escalation(
         pressure,
         channel,
     } = plan;
-    //
-    // Escalation sits *outside* failover, and the nesting is the point:
-    // failover asks "is this credential healthy", escalation asks "is this
-    // model good enough". Collapsing them would mean a provider outage silently
-    // migrated the fleet onto expensive models.
     let mut escalations = 0u8;
     // The gate that *caused* an escalation, not the last one observed. Recording
     // the final attempt's gate would leave this empty on exactly the rows where
@@ -360,13 +375,15 @@ async fn run_with_escalation(
         };
 
         // Retry one rung up when the answer was unusable and a rung is left.
-        //
-        // Not under budget pressure, though. A principal near their cap has
-        // already been downgraded on purpose; escalating them back up to the
-        // most expensive model would undo the very saving the downgrade exists
-        // to make. Accepting the worse answer *is* the policy at that point.
         if let Some(gate) = gate
-            && oag_router::escalation_allowed(pressure, escalations, MAX_ESCALATIONS)
+            && should_climb(
+                &decision.reason,
+                gate,
+                pressure,
+                escalations,
+                canonical.max_tokens,
+                decision.model.max_output_tokens,
+            )
             && let Some(next) = policy.escalate(
                 &decision.tier,
                 gate,
@@ -492,8 +509,9 @@ struct Plan {
 
 /// Load the caller's route and build the policy it implies.
 ///
-/// Split out of `plan_request` because `/v1/models` needs exactly this much and
-/// none of what follows it — no rate token, no budgets, no decision.
+/// Split out of `plan_request` because `/v1/models` needs the route and the
+/// policy, and [`budgets_for`] the spend state — none of the rate token or the
+/// model decision.
 pub(crate) async fn policy_for(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
@@ -528,6 +546,33 @@ pub(crate) async fn policy_for(
     let policy = RoutingPolicy::new(ladder, Box::new(oag_router::HeuristicClassifier::default()))
         .with_floor(floor);
     Ok((route, policy))
+}
+
+/// The same spend caps inference consults, so `/v1/models` can refuse to
+/// advertise what the next turn would hard-stop.
+///
+/// A per-key quota is a wall at the number written on it: it still degrades
+/// through the constrained band first, but it does not get the principal's
+/// overshoot grace. An operator who writes `quota_usd = 50` means fifty. A
+/// route budget is the same shape at team scope.
+pub(crate) fn budgets_for(auth: &oag_store::AuthContext, route: &oag_store::RouteRow) -> Budgets {
+    Budgets {
+        key: BudgetState {
+            spent_usd: auth.spent_usd,
+            limit_usd: auth.quota_usd,
+            hard_stop_multiple: rust_decimal::Decimal::ONE,
+        },
+        route: BudgetState {
+            spent_usd: route.spent_usd,
+            limit_usd: route.monthly_budget_usd,
+            hard_stop_multiple: rust_decimal::Decimal::ONE,
+        },
+        principal: BudgetState {
+            spent_usd: auth.principal_spent_usd,
+            limit_usd: auth.principal_budget_usd,
+            hard_stop_multiple: auth.principal_hard_stop_multiple,
+        },
+    }
 }
 
 /// The rung an `oag/...` model name pins, if any. `oag/auto` pins nothing.
@@ -598,30 +643,7 @@ async fn plan_request(
         RoutingMode::Passthrough
     };
 
-    let budget = Budgets {
-        // A per-key quota is a wall at the number written on it: it still
-        // degrades through the constrained band first, but it does not get the
-        // principal's overshoot grace. An operator who writes `quota_usd = 50`
-        // means fifty.
-        key: BudgetState {
-            spent_usd: auth.spent_usd,
-            limit_usd: auth.quota_usd,
-            hard_stop_multiple: rust_decimal::Decimal::ONE,
-        },
-        // A route budget is the team-level cap: it bounds everyone sharing the
-        // route, regardless of whose key they used. Like the key quota it is a
-        // wall at its number rather than inheriting the principal's grace.
-        route: BudgetState {
-            spent_usd: route.spent_usd,
-            limit_usd: route.monthly_budget_usd,
-            hard_stop_multiple: rust_decimal::Decimal::ONE,
-        },
-        principal: BudgetState {
-            spent_usd: auth.principal_spent_usd,
-            limit_usd: auth.principal_budget_usd,
-            hard_stop_multiple: auth.principal_hard_stop_multiple,
-        },
-    };
+    let budget = budgets_for(auth, &route);
 
     // Logged at debug because "why did this route the way it did" is the
     // question every routing complaint turns into, and reconstructing it from

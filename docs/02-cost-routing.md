@@ -85,10 +85,13 @@ request to exactly the credential the caller wrote it to exclude. A pin nobody
 on the route can honour is a 503 that names the kind: "no subscription
 credential for xai on this route", not the generic no-credential message.
 
-`/v1/models` advertises `@api` and `@sub` for a model only where the route
-holds **both** kinds; with one kind the plain id already goes there. The ledger
-always records the canonical id, so a model's spend never splits across its
-spellings — which credential served it is `usage_event.account_id`.
+`/v1/models` advertises `@api` and `@sub` for each kind the route can actually
+reach, even when it holds only one — a lone Grok seat lists as
+`xai/grok-4.6@sub` so a picker can tell a subscription from an API key. A kind
+nobody holds is omitted, because that id would 503. The unqualified id stays
+on the list as the router-picks default. The ledger always records the
+canonical id, so a model's spend never splits across its spellings — which
+credential served it is `usage_event.account_id`.
 
 ## Naming a model
 
@@ -135,6 +138,10 @@ does not mean "everything goes to Claude":
   gets `cheap`; the architecture-review key gets `frontier`. A floor is an
   entitlement, not a preference: budget pressure does not override it.
 - **Reactive** — the response tripped a quality gate. Retry once, one rung up.
+  Not after passthrough: the caller named a model, and climbing would send a
+  Grok request to the next provider on the ladder. Failover still retries the
+  same model on another credential. Hitting the caller's own `max_tokens` is
+  not a quality gate either.
 
 ### Quality gates
 

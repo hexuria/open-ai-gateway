@@ -170,6 +170,11 @@ pub async fn account_by_id(db: &Db, id: AccountId) -> Result<Option<AccountRow>>
 /// `a.schedulable`, which `candidates` leaves to the scheduler — correct here
 /// because a disabled credential is an operator decision, not a transient
 /// state, and advertising a model nobody can reach is worse than omitting it.
+///
+/// Access-token `token_expires_at` is not a filter: that is the OAuth access
+/// token TTL, refreshed on the request path, not the subscription. Hiding on
+/// it would empty a picker every time a fifteen-minute token lapsed between
+/// polls. Subscription expiry is `usage_remaining_pct`.
 pub async fn route_channels(
     db: &Db,
     route_id: Uuid,
@@ -191,18 +196,13 @@ pub async fn route_channels(
           -- it until the client next refreshes -- worse than briefly offering
           -- one that fails over to another credential anyway.
           AND (a.rate_limited_until IS NULL OR a.rate_limited_until <= now())
-          -- Held back by its reserve, which the scheduler will not pick either.
-          -- Same reasoning as the line above and the same duration: a reserve
-          -- holds until the window resets, so a model offered on a reserved-out
-          -- seat is one the caller cannot be served from for hours.
-          --
-          -- The NULL handling is the scheduler's, restated in SQL because SQL
-          -- is where this filter has to run: an unset reserve and an unread
-          -- percentage both leave the seat listed, so a provider with no usage
-          -- API never disappears from the catalogue for want of a reading.
-          AND (a.usage_reserve_pct IS NULL
-               OR a.usage_remaining_pct IS NULL
-               OR a.usage_remaining_pct > a.usage_reserve_pct)
+          -- A spent subscription cannot serve, even when no reserve was set.
+          -- COALESCE(reserve, 0) makes an unset reserve a floor of zero:
+          -- remaining 50 lists, remaining 0 does not. NULL remaining stays
+          -- listed — unknown is not empty, and a provider with no usage API
+          -- must not vanish from the catalogue for want of a reading.
+          AND (a.usage_remaining_pct IS NULL
+               OR a.usage_remaining_pct > COALESCE(a.usage_reserve_pct, 0))
         ",
     )
     .bind(route_id)
@@ -1078,6 +1078,80 @@ mod tests {
                 .expect("list")
                 .is_empty(),
             "another principal's personal credential is not this caller's to see"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_channels_hides_a_spent_subscription_even_without_a_reserve() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+        let id = account.as_uuid();
+
+        // Unread remaining is unknown, not empty: a provider with no usage
+        // endpoint must not vanish from the picker.
+        assert_eq!(
+            route_channels(&db, route, principal).await.expect("list"),
+            vec![("anthropic".to_owned(), "api_key".to_owned())]
+        );
+
+        sqlx::query("UPDATE account SET usage_remaining_pct = 50 WHERE id = $1")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .expect("half remaining");
+        assert_eq!(
+            route_channels(&db, route, principal)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "headroom and no reserve is still a live credential"
+        );
+
+        sqlx::query("UPDATE account SET usage_remaining_pct = 0 WHERE id = $1")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .expect("spent");
+        assert!(
+            route_channels(&db, route, principal)
+                .await
+                .expect("list")
+                .is_empty(),
+            "a spent seat cannot serve today, reserve or not"
+        );
+
+        sqlx::query(
+            "UPDATE account SET usage_remaining_pct = 20, usage_reserve_pct = 10 WHERE id = $1",
+        )
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .expect("above reserve");
+        assert_eq!(
+            route_channels(&db, route, principal)
+                .await
+                .expect("list")
+                .len(),
+            1,
+            "above the reserve is listed"
+        );
+
+        sqlx::query("UPDATE account SET usage_remaining_pct = 10 WHERE id = $1")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .expect("at reserve");
+        assert!(
+            route_channels(&db, route, principal)
+                .await
+                .expect("list")
+                .is_empty(),
+            "at the reserve line is held back"
         );
     }
 

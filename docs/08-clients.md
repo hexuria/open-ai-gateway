@@ -236,9 +236,12 @@ curl -s -H "Authorization: Bearer $OAG_KEY" \
 ```
 
 That listing is per-caller: the intersection of the route's ladder, the key's
-floor tier, and the providers that route holds schedulable credentials for
+floor tier, and the providers that route holds live credentials for
 (owner-scoped, so a personal seat appears only for its owner), minus providers
-whose credentials are all rate limited.
+whose credentials are all rate limited, reserved-out, or whose subscription
+allowance is spent. A key with headroom left (`quota_usd` $30 spent $0.50)
+still lists. If the calling key's quota — or the route or principal budget —
+is exhausted, `data` is empty, including no `oag/*` names.
 
 ## Any OpenAI-compatible tool
 
@@ -332,7 +335,7 @@ it. Run it before reading further.
 | 401 on inference | key revoked, or sent in a header the client mangled | `oag admin key list`, then `curl -i` with `Authorization: Bearer` |
 | `no_viable_model` (400) | nothing on this route's ladder can serve the request — no rung, or no credential for the rung's providers | `oag admin doctor --route <route>`; the error itself names the route and the fixing command |
 | Empty `/model` picker in Claude Code | the `/^(claude\|anthropic)/i` filter dropped every id | set `gateway.claude_code_model_aliases: true`, then confirm with `/v1/models?claude_code=1` |
-| A model you own is missing from `/v1/models` | not on the ladder, below the key's floor tier, owned by another principal, or every credential for it is rate limited | `oag admin doctor`, `oag admin account list` |
+| A model you own is missing from `/v1/models` | not on the ladder, below the key's floor tier, owned by another principal, every credential for it is rate limited / reserved-out / spent, or this key's quota is exhausted | `oag admin doctor`, `oag admin account list` |
 | Wrong model served | managed mode, or a floor tier | see the section above; check `x-oag-model` and `selection_reason` |
 | A Codex seat imports, then every request fails | `gateway.codex.instructions` (or `instructions_path`) unset — the backend refuses and it reads as a dead credential | `oag admin doctor` names it; `deploy/codex-instructions.txt` is a starting file |
 | `unsupported_field` (400) | the request set a field the chosen upstream's dialect cannot express; refused rather than silently dropped, because a dropped field is indistinguishable from a model ignoring it | drop the field, or pin the request to a provider whose dialect has it |

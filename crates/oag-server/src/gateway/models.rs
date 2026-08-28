@@ -6,21 +6,24 @@
 //!
 //! The answer is per-caller, not a catalog dump. It is the intersection of the
 //! route's ladder, the key's floor, and the providers this route actually holds
-//! credentials for — because a model listed but unreachable turns into a
-//! failure much later and much further from its cause. That also makes this an
-//! entitlement surface, which is why it authenticates.
+//! *live* credentials for — because a model listed but unreachable turns into a
+//! failure much later and much further from its cause. Spent subscription
+//! allowances, reserved-out seats, and an exhausted caller quota (key, route,
+//! or principal) all empty the list, including the `oag/*` names: advertising
+//! auto for a key that cannot spend is a 402 on the first turn. That also makes
+//! this an entitlement surface, which is why it authenticates.
 //!
 //! One client reads it through a filter rather than as-is: see [`super::alias`]
 //! for why `gateway.claude_code_model_aliases` exists and why it adds a second
 //! copy of each entry instead of renaming the first.
 
-use super::{Caller, alias, error_response, policy_for};
+use super::{Caller, alias, budgets_for, error_response, policy_for};
 use crate::AppState;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use oag_core::credential::CredentialKind;
 use oag_core::{Provider, TierName, tier::RoutingMode};
-use oag_router::Entitlement;
+use oag_router::{BudgetPressure, Entitlement};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -56,28 +59,34 @@ pub async fn list(
         policy,
         channels,
         mode,
+        pressure,
     } = match resolve(&state, &auth).await {
         Ok(r) => r,
         Err(response) => return response,
     };
 
-    let providers: BTreeSet<Provider> = channels.keys().copied().collect();
-    let catalog = state.catalog().await;
-    let concrete = policy.entitled(&mode, &catalog, &providers);
     let aliases = wants_aliases(
         query.claude_code.as_deref(),
         state.config.gateway.claude_code_model_aliases,
     );
 
-    // Virtual names first: they are the cost-routing entry point, and a client
-    // rendering a picker shows the top of the list.
+    let providers: BTreeSet<Provider> = channels.keys().copied().collect();
+    let catalog = state.catalog().await;
+    let concrete = policy.entitled(&mode, &catalog, &providers, pressure);
+
+    // Virtual names first when anything can serve: they are the cost-routing
+    // entry point, and a client rendering a picker shows the top of the list.
+    // Omitted when nothing can: `oag/auto` on an empty picker is a 503.
+    // Constrained spend hides oag/<rung> pins decide() would then abandon.
     let mut data: Vec<Value> = Vec::new();
-    for rung in virtual_rungs(&policy) {
-        push(&mut data, virtual_entry(rung.as_ref()), aliases);
-    }
-    for e in &concrete {
-        for entry in concrete_entries(e, &channels) {
-            push(&mut data, entry, aliases);
+    if advertise(pressure, concrete.len()) {
+        for rung in virtual_rungs(&policy, pressure) {
+            push(&mut data, virtual_entry(rung.as_ref()), aliases);
+        }
+        for e in &concrete {
+            for entry in concrete_entries(e, &channels) {
+                push(&mut data, entry, aliases);
+            }
         }
     }
     envelope(data, &mode, aliases).into_response()
@@ -147,6 +156,7 @@ pub async fn list_gemini(State(state): State<Arc<AppState>>, Caller(auth): Calle
         policy,
         channels,
         mode,
+        pressure,
     } = match resolve(&state, &auth).await {
         Ok(r) => r,
         Err(response) => return response,
@@ -154,7 +164,11 @@ pub async fn list_gemini(State(state): State<Arc<AppState>>, Caller(auth): Calle
 
     let providers: BTreeSet<Provider> = channels.keys().copied().collect();
     let catalog = state.catalog().await;
-    let concrete = policy.entitled(&mode, &catalog, &providers);
+    let concrete = policy.entitled(&mode, &catalog, &providers, pressure);
+
+    if !advertise(pressure, concrete.len()) {
+        return axum::Json(json!({ "models": [] })).into_response();
+    }
 
     // A virtual name has no single window of its own, so it advertises the
     // widest one it could resolve to.
@@ -169,7 +183,7 @@ pub async fn list_gemini(State(state): State<Arc<AppState>>, Caller(auth): Calle
         .max()
         .unwrap_or(0);
 
-    let mut models: Vec<Value> = virtual_rungs(&policy)
+    let mut models: Vec<Value> = virtual_rungs(&policy, pressure)
         .map(|rung| gemini_virtual_entry(rung.as_ref(), window, max_output))
         .collect();
     models.extend(concrete.iter().map(gemini_entry));
@@ -180,6 +194,7 @@ struct Resolved {
     policy: oag_router::RoutingPolicy,
     channels: Channels,
     mode: RoutingMode,
+    pressure: BudgetPressure,
 }
 
 /// Who is asking, and what the route lets them reach.
@@ -190,24 +205,45 @@ async fn resolve(
     let (route, policy) = policy_for(state, auth)
         .await
         .map_err(|e| error_response(&e))?;
-    let channels = channels_for(state, route.id, auth.principal_id)
-        .await
-        .map_err(|e| error_response(&e))?;
+    let mode = if route.default_mode == "managed" {
+        RoutingMode::Managed
+    } else {
+        RoutingMode::Passthrough
+    };
+    let pressure = budgets_for(auth, &route).pressure();
+    // An exhausted caller cannot spend: skip the credential scan, because
+    // nothing it would return can be advertised.
+    let channels = if pressure == BudgetPressure::Exhausted {
+        Channels::new()
+    } else {
+        channels_for(state, route.id, auth.principal_id)
+            .await
+            .map_err(|e| error_response(&e))?
+    };
 
     Ok(Resolved {
         policy,
         channels,
-        mode: if route.default_mode == "managed" {
-            RoutingMode::Managed
-        } else {
-            RoutingMode::Passthrough
-        },
+        mode,
+        pressure,
     })
 }
 
+/// Whether this caller gets a picker.
+///
+/// Exhausted spend is a hard stop on inference. No reachable model is a 503
+/// on `oag/auto`. Both belong as an empty list, not as virtual names a client
+/// would then send.
+fn advertise(pressure: BudgetPressure, concrete: usize) -> bool {
+    pressure != BudgetPressure::Exhausted && concrete > 0
+}
+
 /// `oag/auto`, then one per advertised rung. `None` is `auto`.
-fn virtual_rungs(policy: &oag_router::RoutingPolicy) -> impl Iterator<Item = Option<TierName>> {
-    std::iter::once(None).chain(policy.virtual_names().into_iter().map(Some))
+fn virtual_rungs(
+    policy: &oag_router::RoutingPolicy,
+    pressure: BudgetPressure,
+) -> impl Iterator<Item = Option<TierName>> {
+    std::iter::once(None).chain(policy.virtual_names(pressure).into_iter().map(Some))
 }
 
 /// Providers the route holds usable credentials for, and through which
@@ -248,26 +284,26 @@ async fn channels_for(
 }
 
 /// One concrete model: its own id, then a qualified id per credential kind
-/// that is worth addressing.
+/// the route can actually reach.
 ///
-/// A qualified twin only appears when the route holds **both** kinds for this
-/// provider. With one kind the unqualified id already goes there, so a second
-/// spelling of it is a picker entry that teaches the caller a distinction they
-/// do not have; and a kind they hold no credential for would be an id that
-/// resolves to a 503, which is the failure this listing exists to move earlier.
+/// A qualifier is how a caller pins a subscription or an API key instead of
+/// letting the router pick. That pin is worth advertising even when the route
+/// holds only one kind — otherwise a lone Grok seat lists as `xai/grok-4.6`
+/// with `channel: null`, and a picker cannot tell it is a subscription. A kind
+/// nobody holds is still omitted: that id would 503, which is the failure this
+/// listing exists to move earlier.
 fn concrete_entries(e: &Entitlement, channels: &Channels) -> Vec<Value> {
     let mut out = vec![concrete_entry(e, None)];
     let Some(held) = channels.get(&e.spec.provider) else {
         return out;
     };
-    let addressable: Vec<CredentialKind> = CredentialKind::QUALIFIED
-        .iter()
-        .copied()
-        .filter(|k| held.contains(k))
-        .collect();
-    if addressable.len() > 1 {
-        out.extend(addressable.into_iter().map(|k| concrete_entry(e, Some(k))));
-    }
+    out.extend(
+        CredentialKind::QUALIFIED
+            .iter()
+            .copied()
+            .filter(|k| held.contains(k))
+            .map(|k| concrete_entry(e, Some(k))),
+    );
     out
 }
 
@@ -419,7 +455,7 @@ fn gemini(id: &str, window: u32, max_output: u32) -> Value {
 mod tests {
     use super::*;
     use oag_router::catalog::{Capabilities, ModelId, ModelSpec, Pricing};
-    use rust_decimal::Decimal;
+    use rust_decimal::{Decimal, dec};
 
     fn spec() -> ModelSpec {
         ModelSpec {
@@ -535,6 +571,86 @@ mod tests {
         assert_eq!(body.0["first_id"], Value::Null);
         assert_eq!(body.0["last_id"], Value::Null);
         assert_eq!(body.0["has_more"], false);
+    }
+
+    fn key(quota: rust_decimal::Decimal, spent: rust_decimal::Decimal) -> oag_store::AuthContext {
+        oag_store::AuthContext {
+            api_key_id: uuid::Uuid::nil(),
+            principal_id: uuid::Uuid::nil(),
+            route_id: uuid::Uuid::nil(),
+            key_floor_tier: None,
+            admin: false,
+            quota_usd: Some(quota),
+            spent_usd: spent,
+            principal_budget_usd: None,
+            principal_hard_stop_multiple: rust_decimal::Decimal::ONE,
+            principal_spent_usd: rust_decimal::Decimal::ZERO,
+        }
+    }
+
+    fn uncapped_route() -> oag_store::RouteRow {
+        oag_store::RouteRow {
+            id: uuid::Uuid::nil(),
+            name: "default".to_owned(),
+            tiers: json!([]),
+            default_mode: "passthrough".to_owned(),
+            floor_tier: None,
+            rpm_limit: None,
+            monthly_budget_usd: None,
+            spent_usd: rust_decimal::Decimal::ZERO,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn a_key_with_budget_left_still_advertises() {
+        // $30 spent $0.50 is the case a picker must not empty over.
+        let pressure = budgets_for(&key(dec!(30), dec!(0.5)), &uncapped_route()).pressure();
+        assert_ne!(pressure, BudgetPressure::Exhausted);
+        assert!(advertise(pressure, 1));
+    }
+
+    #[test]
+    fn an_exhausted_key_advertises_nothing_not_even_virtual_names() {
+        let pressure = budgets_for(&key(dec!(30), dec!(30)), &uncapped_route()).pressure();
+        assert_eq!(pressure, BudgetPressure::Exhausted);
+        assert!(
+            !advertise(pressure, 3),
+            "oag/auto on a hard-stopped key is a refused first turn"
+        );
+    }
+
+    #[test]
+    fn a_constrained_key_still_advertises() {
+        // The last fifth degrades to cheap; it does not refuse. Emptying the
+        // picker here would hide models the gateway would still serve.
+        // Which *rungs* stay on the list is RoutingPolicy::virtual_names, not
+        // this gate — Constrained is not Exhausted.
+        let pressure = budgets_for(&key(dec!(30), dec!(25)), &uncapped_route()).pressure();
+        assert_eq!(pressure, BudgetPressure::Constrained);
+        assert!(advertise(pressure, 1));
+        assert!(advertise(BudgetPressure::Normal, 1));
+        assert!(!advertise(BudgetPressure::Exhausted, 3));
+    }
+
+    #[test]
+    fn no_reachable_model_omits_virtual_names() {
+        assert!(!advertise(BudgetPressure::Normal, 0));
+    }
+
+    #[test]
+    fn an_exhausted_route_budget_empties_the_listing_too() {
+        let mut route = uncapped_route();
+        route.monthly_budget_usd = Some(dec!(10));
+        route.spent_usd = dec!(10);
+        let uncapped_key = oag_store::AuthContext {
+            quota_usd: None,
+            spent_usd: rust_decimal::Decimal::ZERO,
+            ..key(dec!(1), dec!(0))
+        };
+        let pressure = budgets_for(&uncapped_key, &route).pressure();
+        assert_eq!(pressure, BudgetPressure::Exhausted);
+        assert!(!advertise(pressure, 1));
     }
 
     /// The filter as Claude Code spells it, written independently of
@@ -707,11 +823,10 @@ mod tests {
     }
 
     #[test]
-    fn a_qualified_id_is_offered_only_where_both_channels_exist() {
-        // The listing was just narrowed to offer only what can serve, and this
-        // must not walk that back: an `@sub` on a route with no seat is an id
-        // that resolves to a 503, which is the failure the listing exists to
-        // move earlier.
+    fn a_qualified_id_is_offered_for_each_kind_the_route_can_reach() {
+        // A lone seat must still say it is a subscription: otherwise the picker
+        // only has `xai/grok-4.6` and cannot tell a seat from an API key. A
+        // kind nobody holds is still omitted — that id would 503.
         let grok = grok();
 
         let both = channels(
@@ -723,17 +838,17 @@ mod tests {
             ["xai/grok-4.6", "xai/grok-4.6@api", "xai/grok-4.6@sub"]
         );
 
-        // One kind: the plain id already goes there, so a second spelling of it
-        // teaches a distinction the caller does not have.
-        for only in [CredentialKind::ApiKey, CredentialKind::OAuth] {
-            assert_eq!(
-                qualified_ids(&grok, &channels(Provider::XAI, &[only])),
-                ["xai/grok-4.6"],
-                "{only}"
-            );
-        }
+        assert_eq!(
+            qualified_ids(&grok, &channels(Provider::XAI, &[CredentialKind::OAuth])),
+            ["xai/grok-4.6", "xai/grok-4.6@sub"],
+            "a lone seat is advertised as @sub"
+        );
+        assert_eq!(
+            qualified_ids(&grok, &channels(Provider::XAI, &[CredentialKind::ApiKey])),
+            ["xai/grok-4.6", "xai/grok-4.6@api"],
+            "a lone API key is advertised as @api"
+        );
 
-        // And a provider the route holds nothing for is listed as it was.
         assert_eq!(
             qualified_ids(&grok, &Channels::new()),
             ["xai/grok-4.6"],
