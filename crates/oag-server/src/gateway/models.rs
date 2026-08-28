@@ -10,8 +10,11 @@
 //! failure much later and much further from its cause. Spent subscription
 //! allowances, reserved-out seats, and an exhausted caller quota (key, route,
 //! or principal) all empty the list, including the `oag/*` names: advertising
-//! auto for a key that cannot spend is a 402 on the first turn. That also makes
-//! this an entitlement surface, which is why it authenticates.
+//! auto for a key that cannot spend is a 402 on the first turn. The `oag`
+//! envelope still names the cause — `budget.pressure` and `providers[]` — so
+//! an empty picker is not indistinguishable from "you are out of money" and
+//! "your seat resets Thursday". That also makes this an entitlement surface,
+//! which is why it authenticates.
 //!
 //! One client reads it through a filter rather than as-is: see [`super::alias`]
 //! for why `gateway.claude_code_model_aliases` exists and why it adds a second
@@ -27,6 +30,7 @@ use oag_router::{BudgetPressure, Entitlement};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
+use time::OffsetDateTime;
 
 /// Which credential kinds a route can reach each provider through.
 ///
@@ -89,7 +93,30 @@ pub async fn list(
             }
         }
     }
-    envelope(data, &mode, aliases).into_response()
+
+    // Always, including when `data` is empty: that is the case a status panel
+    // cannot guess from the picker. Same principal/route scope as the channels
+    // query, without the serving filters, so a reserved or rate-limited seat
+    // still appears. Failure here refuses the listing rather than returning a
+    // picker with no explanation — the explanation is the new contract.
+    let status =
+        match oag_store::repo::route_channel_status(&state.db, auth.route_id, auth.principal_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => return error_response(&e),
+        };
+    let presence: Vec<Value> = super::presence::diagnose(
+        &status,
+        pressure,
+        &model_counts(&concrete),
+        OffsetDateTime::now_utc(),
+    )
+    .iter()
+    .map(super::presence::ProviderPresence::to_json)
+    .collect();
+
+    envelope(data, &mode, aliases, pressure, presence).into_response()
 }
 
 /// Whether to emit the aliased twins.
@@ -402,7 +429,21 @@ fn entry(id: &str, owned_by: &str, display_name: &str, oag: Value) -> Value {
     entry
 }
 
-fn envelope(data: Vec<Value>, mode: &RoutingMode, aliases: bool) -> axum::Json<Value> {
+fn model_counts(concrete: &[Entitlement<'_>]) -> BTreeMap<Provider, usize> {
+    let mut counts = BTreeMap::new();
+    for e in concrete {
+        *counts.entry(e.spec.provider).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn envelope(
+    data: Vec<Value>,
+    mode: &RoutingMode,
+    aliases: bool,
+    pressure: BudgetPressure,
+    providers: Vec<Value>,
+) -> axum::Json<Value> {
     // Null when the list is empty, rather than indexing into it.
     let first = data
         .first()
@@ -419,9 +460,15 @@ fn envelope(data: Vec<Value>, mode: &RoutingMode, aliases: bool) -> axum::Json<V
             // So an operator setting this up can see the flag took effect
             // without diffing two listings.
             "claude_code_aliases": aliases,
+            "budget": { "pressure": pressure.as_str() },
         },
     });
     body["data"] = Value::Array(data);
+    // Present even when `data` is empty: that is the case that needed
+    // explaining. Assigned rather than interpolated so the Vec is moved,
+    // not re-serialized. Additive, so an SDK that never looks here still
+    // parses the list it parsed before.
+    body["oag"]["providers"] = Value::Array(providers);
     axum::Json(body)
 }
 
@@ -566,11 +613,73 @@ mod tests {
 
     #[test]
     fn an_empty_list_renders_without_indexing_into_it() {
-        let body = envelope(Vec::new(), &RoutingMode::Passthrough, false);
+        let body = envelope(
+            Vec::new(),
+            &RoutingMode::Passthrough,
+            false,
+            BudgetPressure::Normal,
+            Vec::new(),
+        );
         assert_eq!(body.0["data"], json!([]));
         assert_eq!(body.0["first_id"], Value::Null);
         assert_eq!(body.0["last_id"], Value::Null);
         assert_eq!(body.0["has_more"], false);
+        assert_eq!(body.0["oag"]["budget"]["pressure"], "normal");
+        assert_eq!(body.0["oag"]["providers"], json!([]));
+    }
+
+    #[test]
+    fn an_empty_list_still_explains_why() {
+        // Exhausted spend and spent seats both empty `data`. The envelope is
+        // how a client tells "raise the quota" from "wait for the window".
+        let spent = json!([{
+            "provider": "xai",
+            "serving": false,
+            "reason": "quota_spent",
+            "until": Value::Null,
+            "remaining_pct": 0.0,
+            "reserve_pct": Value::Null,
+            "kinds": ["sub"],
+            "models": 0,
+        }]);
+        let seats = envelope(
+            Vec::new(),
+            &RoutingMode::Passthrough,
+            false,
+            BudgetPressure::Normal,
+            spent.as_array().cloned().unwrap(),
+        );
+        let money = envelope(
+            Vec::new(),
+            &RoutingMode::Passthrough,
+            false,
+            BudgetPressure::Exhausted,
+            vec![json!({
+                "provider": "xai",
+                "serving": false,
+                "reason": "budget_exhausted",
+                "until": Value::Null,
+                "remaining_pct": Value::Null,
+                "reserve_pct": Value::Null,
+                "kinds": ["sub"],
+                "models": 0,
+            })],
+        );
+
+        assert_eq!(seats.0["data"], json!([]));
+        assert_eq!(money.0["data"], json!([]));
+        assert_eq!(seats.0["oag"]["budget"]["pressure"], "normal");
+        assert_eq!(money.0["oag"]["budget"]["pressure"], "exhausted");
+        assert_eq!(seats.0["oag"]["providers"][0]["reason"], "quota_spent");
+        assert_eq!(money.0["oag"]["providers"][0]["reason"], "budget_exhausted");
+        assert_ne!(
+            seats.0["oag"]["providers"][0]["reason"],
+            money.0["oag"]["providers"][0]["reason"]
+        );
+        // Additive: a client that never learned `oag.providers` still sees
+        // the fields it parsed before this existed.
+        assert_eq!(seats.0["oag"]["mode"], "passthrough");
+        assert_eq!(seats.0["oag"]["claude_code_aliases"], false);
     }
 
     fn key(quota: rust_decimal::Decimal, spent: rust_decimal::Decimal) -> oag_store::AuthContext {

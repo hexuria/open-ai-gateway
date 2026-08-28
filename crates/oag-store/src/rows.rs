@@ -156,6 +156,21 @@ impl AuthContext {
     }
 }
 
+/// Why a credential is or is not serving, as `/v1/models` reports it.
+///
+/// No name, no id, no sealed material: an inference key learns the health of
+/// the seats it may draw on, not the operator's inventory and not a secret.
+#[derive(Debug, Clone, PartialEq, FromRow)]
+pub struct ChannelStatusRow {
+    pub provider: String,
+    pub kind: String,
+    pub schedulable: bool,
+    pub rate_limited_until: Option<OffsetDateTime>,
+    pub window_resets_at: Option<OffsetDateTime>,
+    pub usage_remaining_pct: Option<Decimal>,
+    pub usage_reserve_pct: Option<i16>,
+}
+
 /// One catalog entry.
 // The capability flags mirror the catalog columns one-for-one; folding them
 // into an enum here would just mean unfolding them again on every query.

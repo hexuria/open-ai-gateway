@@ -64,7 +64,8 @@ curl localhost:29080/v1/models -H "x-api-key: $OAG_KEY"
 clamped to the key's floor, filtered to providers you hold live credentials
 for — with the `oag/*` names first. Spent or reserved-out seats, and an
 exhausted caller quota, produce an empty list rather than names that would fail
-on the first turn. `/v1/messages/count_tokens` returns a prompt-size estimate
+on the first turn. The `oag` envelope still says why (`budget.pressure`,
+`providers[].reason`) so an empty picker is not a mystery. `/v1/messages/count_tokens` returns a prompt-size estimate
 without spending anything upstream; it is marked `"oag_estimate": true` because
 no tokeniser is linked.
 

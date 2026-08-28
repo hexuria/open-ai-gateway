@@ -203,6 +203,11 @@ The pressure bands, applied to whichever cap is tightest:
 | 80%–100% | Constrained | Downgrade to the cheapest rung the floor allows. |
 | > 100% | Exhausted | Refuse. |
 
+`GET /v1/models` reports the tightest of those bands on `oag.budget.pressure`.
+An exhausted caller still gets `oag.providers` (the seats, and why each is or
+is not serving) with an empty `data`, so "out of money" and "every seat is
+spent" are different answers.
+
 The principal budget alone carries a grace band above its limit
 (`hard_stop_multiple`, 1.2 by default) before it refuses. The key quota and the
 route budget are walls at their number: `quota_usd = 50` means fifty.
