@@ -1,7 +1,9 @@
 //! Queries.
 
 use crate::Db;
-use crate::rows::{AccountRow, AuthContext, ModelRow, RouteRow, ServiceRow, UsageWrite};
+use crate::rows::{
+    AccountRow, AuthContext, ChannelStatusRow, ModelRow, RouteRow, ServiceRow, UsageWrite,
+};
 use oag_core::{AccountId, Error, Result};
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
@@ -210,6 +212,37 @@ pub async fn route_channels(
     .fetch_all(db.pool())
     .await
     .map_err(|e| Error::Internal(format!("loading route providers: {e}")))
+}
+
+/// Every credential this principal may draw on for this route, including ones
+/// that cannot serve right now.
+///
+/// [`route_channels`] is the picker: it hides a spent, reserved, rate-limited,
+/// or disabled seat so `/v1/models` `data` does not advertise a 503. This is
+/// the status panel: the same owner predicate, none of those serving filters,
+/// so a caller whose picker is empty can still learn *why*. Name and sealed
+/// material stay off the SELECT — an inference key is not an inventory dump.
+pub async fn route_channel_status(
+    db: &Db,
+    route_id: Uuid,
+    principal_id: Uuid,
+) -> Result<Vec<ChannelStatusRow>> {
+    sqlx::query_as::<_, ChannelStatusRow>(
+        r"
+        SELECT a.provider, a.kind, a.schedulable,
+               a.rate_limited_until, a.window_resets_at,
+               a.usage_remaining_pct, a.usage_reserve_pct
+        FROM account a
+        JOIN account_route ar ON ar.account_id = a.id
+        WHERE ar.route_id = $1
+          AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $2)
+        ",
+    )
+    .bind(route_id)
+    .bind(principal_id)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("loading route credential status: {e}")))
 }
 
 /// Take a credential out of rotation, or put it back. Returns its name, or
@@ -1152,6 +1185,113 @@ mod tests {
                 .expect("list")
                 .is_empty(),
             "at the reserve line is held back"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_channel_status_includes_what_the_listing_hides() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+        let id = account.as_uuid();
+
+        assert_eq!(
+            route_channel_status(&db, route, principal)
+                .await
+                .expect("status")
+                .len(),
+            1,
+            "a live credential is visible to both the picker and the panel"
+        );
+
+        set_schedulable(&db, account, false).await.expect("disable");
+        assert!(
+            route_channels(&db, route, principal)
+                .await
+                .expect("list")
+                .is_empty(),
+            "disabled is hidden from the picker"
+        );
+        let disabled = route_channel_status(&db, route, principal)
+            .await
+            .expect("status");
+        assert_eq!(disabled.len(), 1);
+        assert!(!disabled[0].schedulable);
+        set_schedulable(&db, account, true).await.expect("enable");
+
+        sqlx::query(
+            "UPDATE account SET usage_remaining_pct = 8, usage_reserve_pct = 15 WHERE id = $1",
+        )
+        .bind(id)
+        .execute(db.pool())
+        .await
+        .expect("reserve");
+        assert!(
+            route_channels(&db, route, principal)
+                .await
+                .expect("list")
+                .is_empty(),
+            "reserved is hidden from the picker"
+        );
+        let reserved = &route_channel_status(&db, route, principal)
+            .await
+            .expect("status")[0];
+        assert_eq!(reserved.usage_remaining_pct, Some(dec!(8)));
+        assert_eq!(reserved.usage_reserve_pct, Some(15));
+
+        let until = OffsetDateTime::now_utc() + time::Duration::days(15);
+        sqlx::query(
+            "UPDATE account
+                SET usage_remaining_pct = NULL, usage_reserve_pct = NULL,
+                    rate_limited_until = $2
+              WHERE id = $1",
+        )
+        .bind(id)
+        .bind(until)
+        .execute(db.pool())
+        .await
+        .expect("rate limit");
+        assert!(
+            route_channels(&db, route, principal)
+                .await
+                .expect("list")
+                .is_empty(),
+            "rate-limited is hidden from the picker"
+        );
+        let limited = &route_channel_status(&db, route, principal)
+            .await
+            .expect("status")[0];
+        assert!(
+            limited
+                .rate_limited_until
+                .is_some_and(|t| t > OffsetDateTime::now_utc())
+        );
+
+        // A credential bound to someone else is not this caller's to diagnose,
+        // the same way it is not theirs to pick.
+        let other: Uuid = sqlx::query_scalar(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')
+             RETURNING id",
+        )
+        .bind(format!("other-{}@example.invalid", Uuid::new_v4()))
+        .fetch_one(db.pool())
+        .await
+        .expect("other principal");
+        sqlx::query("UPDATE account SET owner_principal_id = $2 WHERE id = $1")
+            .bind(id)
+            .bind(other)
+            .execute(db.pool())
+            .await
+            .expect("bind");
+        assert!(
+            route_channel_status(&db, route, principal)
+                .await
+                .expect("status")
+                .is_empty(),
+            "another principal's personal credential is not this caller's to see"
         );
     }
 

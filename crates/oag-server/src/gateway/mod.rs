@@ -5,6 +5,7 @@ pub mod authn;
 pub mod count_tokens;
 pub mod meter;
 pub mod models;
+mod presence;
 pub mod refresh;
 pub mod select;
 pub mod sse;

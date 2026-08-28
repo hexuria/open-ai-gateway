@@ -26,6 +26,19 @@ pub enum BudgetPressure {
     Exhausted,
 }
 
+impl BudgetPressure {
+    /// The spelling `/v1/models` puts on the wire. Distinct from the variant
+    /// name so a JSON client sees `exhausted`, not `Exhausted`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Constrained => "constrained",
+            Self::Exhausted => "exhausted",
+        }
+    }
+}
+
 /// Spend against a cap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetState {
@@ -1089,6 +1102,13 @@ mod tests {
         // variants stay ordered from most headroom to least.
         assert!(BudgetPressure::Normal < BudgetPressure::Constrained);
         assert!(BudgetPressure::Constrained < BudgetPressure::Exhausted);
+    }
+
+    #[test]
+    fn pressure_wire_spellings_are_lowercase() {
+        assert_eq!(BudgetPressure::Normal.as_str(), "normal");
+        assert_eq!(BudgetPressure::Constrained.as_str(), "constrained");
+        assert_eq!(BudgetPressure::Exhausted.as_str(), "exhausted");
     }
 
     #[test]
