@@ -76,7 +76,10 @@ pub async fn list(
 
     let providers: BTreeSet<Provider> = channels.keys().copied().collect();
     let catalog = state.catalog().await;
-    let concrete = policy.entitled(&mode, &catalog, &providers, pressure);
+    let concrete = offered(
+        policy.entitled(&mode, &catalog, &providers, pressure),
+        &channels,
+    );
 
     // Virtual names first when anything can serve: they are the cost-routing
     // entry point, and a client rendering a picker shows the top of the list.
@@ -191,7 +194,10 @@ pub async fn list_gemini(State(state): State<Arc<AppState>>, Caller(auth): Calle
 
     let providers: BTreeSet<Provider> = channels.keys().copied().collect();
     let catalog = state.catalog().await;
-    let concrete = policy.entitled(&mode, &catalog, &providers, pressure);
+    let concrete = offered(
+        policy.entitled(&mode, &catalog, &providers, pressure),
+        &channels,
+    );
 
     if !advertise(pressure, concrete.len()) {
         return axum::Json(json!({ "models": [] })).into_response();
@@ -429,6 +435,30 @@ fn entry(id: &str, owned_by: &str, display_name: &str, oag: Value) -> Value {
     entry
 }
 
+/// Whether this entitlement belongs on the picker for the credentials we hold.
+///
+/// Ladder models always do. Off-ladder catalog names are an API menu: a
+/// metered key can call whatever the provider sells, so dumping the catalog
+/// is honest. A subscription seat is not an API key — listing every
+/// historical `xai/grok-*` behind `grok-seat` is how two Grok models read as
+/// forty-six. `decide` still honours a name someone typed; this only decides
+/// what we advertise.
+fn on_offer(e: &Entitlement<'_>, channels: &Channels) -> bool {
+    if e.tier.is_some() {
+        return true;
+    }
+    channels
+        .get(&e.spec.provider)
+        .is_some_and(|kinds| kinds.iter().copied().any(|k| !k.flat_rate()))
+}
+
+fn offered<'c>(concrete: Vec<Entitlement<'c>>, channels: &Channels) -> Vec<Entitlement<'c>> {
+    concrete
+        .into_iter()
+        .filter(|e| on_offer(e, channels))
+        .collect()
+}
+
 fn model_counts(concrete: &[Entitlement<'_>]) -> BTreeMap<Provider, usize> {
     let mut counts = BTreeMap::new();
     for e in concrete {
@@ -609,6 +639,38 @@ mod tests {
         let rendered = concrete_entry(&entitled(&spec), None).to_string();
         assert!(!rendered.contains("per_mtok"), "{rendered}");
         assert!(!rendered.contains("pricing"), "{rendered}");
+    }
+
+    #[test]
+    fn a_subscription_seat_does_not_offer_the_api_catalog() {
+        // grok-seat is OAuth. Dumping LiteLLM's 46 xAI ids behind it is how
+        // two Grok models read as forty-six. An API key is the catalog menu.
+        let grok = grok();
+        let off_ladder = entitled(&grok);
+        let on_ladder = Entitlement {
+            spec: &grok,
+            tier: Some(TierName::new("frontier")),
+            honoured: true,
+        };
+
+        let sub = channels(Provider::XAI, &[CredentialKind::OAuth]);
+        assert!(!on_offer(&off_ladder, &sub), "a seat is not an API catalog");
+        assert!(
+            on_offer(&on_ladder, &sub),
+            "a ladder model the seat can reach still lists"
+        );
+
+        let api = channels(Provider::XAI, &[CredentialKind::ApiKey]);
+        assert!(on_offer(&off_ladder, &api), "an API key offers the catalog");
+
+        let both = channels(
+            Provider::XAI,
+            &[CredentialKind::ApiKey, CredentialKind::OAuth],
+        );
+        assert!(
+            on_offer(&off_ladder, &both),
+            "holding an API key as well as a seat still offers the catalog"
+        );
     }
 
     #[test]

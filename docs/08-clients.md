@@ -239,7 +239,9 @@ That listing is per-caller: the intersection of the route's ladder, the key's
 floor tier, and the providers that route holds live credentials for
 (owner-scoped, so a personal seat appears only for its owner), minus providers
 whose credentials are all rate limited, reserved-out, or whose subscription
-allowance is spent. A key with headroom left (`quota_usd` $30 spent $0.50)
+allowance is spent. A metered API key still offers the rest of that provider's
+catalog (off-ladder names `decide` would honour). A subscription-only seat
+does not — the catalog is an API menu, not a SuperGrok plan. A key with headroom left (`quota_usd` $30 spent $0.50)
 still lists. If the calling key's quota — or the route or principal budget —
 is exhausted, `data` is empty, including no `oag/*` names.
 
