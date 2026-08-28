@@ -521,6 +521,15 @@ pub struct RenderState {
     message: Option<(usize, String)>,
     /// Text accumulated in the open message, needed for its `done` events.
     text: String,
+    /// The open reasoning item, if any: its index and id.
+    ///
+    /// Reasoning is an output item of its own, with the same added/done
+    /// lifecycle as a message. Emitting a summary delta for an item the
+    /// client was never told about is how AI-SDK aborts with
+    /// "reasoning part `rs_0:0` not found".
+    reasoning: Option<(usize, String)>,
+    /// Text accumulated in the open reasoning item, for its `done` frames.
+    reasoning_text: String,
     /// Open tool calls, in the order they were opened.
     tools: Vec<ToolCall>,
     usage: Usage,
@@ -582,11 +591,91 @@ impl RenderState {
         ));
     }
 
+    /// Open a reasoning item and its first summary part.
+    fn open_reasoning(&mut self, out: &mut String) -> (usize, String) {
+        if let Some(open) = self.reasoning.clone() {
+            return open;
+        }
+        self.close_message(out);
+        let index = self.next_index;
+        self.next_index += 1;
+        let item_id = format!("rs_{index}");
+
+        out.push_str(&Self::frame(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": {
+                    "id": item_id,
+                    "type": "reasoning",
+                    "summary": [],
+                }
+            }),
+        ));
+        out.push_str(&Self::frame(
+            "response.reasoning_summary_part.added",
+            &json!({
+                "type": "response.reasoning_summary_part.added",
+                "item_id": item_id,
+                "output_index": index,
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": "" },
+            }),
+        ));
+
+        self.reasoning = Some((index, item_id.clone()));
+        (index, item_id)
+    }
+
+    /// Close the open reasoning item, if there is one.
+    fn close_reasoning(&mut self, out: &mut String) {
+        let Some((index, item_id)) = self.reasoning.take() else {
+            return;
+        };
+        let text = std::mem::take(&mut self.reasoning_text);
+
+        out.push_str(&Self::frame(
+            "response.reasoning_summary_text.done",
+            &json!({
+                "type": "response.reasoning_summary_text.done",
+                "item_id": item_id,
+                "output_index": index,
+                "summary_index": 0,
+                "text": text,
+            }),
+        ));
+        out.push_str(&Self::frame(
+            "response.reasoning_summary_part.done",
+            &json!({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": item_id,
+                "output_index": index,
+                "summary_index": 0,
+                "part": { "type": "summary_text", "text": text },
+            }),
+        ));
+        out.push_str(&Self::frame(
+            "response.output_item.done",
+            &json!({
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": {
+                    "id": item_id,
+                    "type": "reasoning",
+                    "summary": [{ "type": "summary_text", "text": text }],
+                }
+            }),
+        ));
+    }
+
     /// Open a message item and its first content part.
     fn open_message(&mut self, out: &mut String) -> (usize, String) {
         if let Some(open) = self.message.clone() {
             return open;
         }
+        // One item at a time: reasoning must close before the message opens.
+        self.close_reasoning(out);
         let index = self.next_index;
         self.next_index += 1;
         let item_id = format!("msg_{index}");
@@ -680,11 +769,13 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
 
         StreamEvent::ThinkingDelta { text } => {
             st.ensure_created(&mut out);
+            let (index, item_id) = st.open_reasoning(&mut out);
+            st.reasoning_text.push_str(text);
             out.push_str(&RenderState::frame(
                 "response.reasoning_summary_text.delta",
                 &json!({
                     "type": "response.reasoning_summary_text.delta",
-                    "item_id": "rs_0", "output_index": 0,
+                    "item_id": item_id, "output_index": index,
                     "summary_index": 0, "delta": text,
                 }),
             ));
@@ -708,6 +799,7 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
             st.finished = true;
             st.usage.merge(usage);
             st.ensure_created(&mut out);
+            st.close_reasoning(&mut out);
             st.close_message(&mut out);
 
             let incomplete = matches!(reason, StopReason::MaxTokens | StopReason::Refusal);
@@ -756,6 +848,7 @@ fn render_failure(st: &mut RenderState, out: &mut String, message: &str) -> Opti
     }
     st.finished = true;
     st.ensure_created(out);
+    st.close_reasoning(out);
     st.close_message(out);
     out.push_str(&RenderState::frame(
         "response.failed",
@@ -778,7 +871,9 @@ fn render_failure(st: &mut RenderState, out: &mut String, message: &str) -> Opti
 /// Open a `function_call` item, closing any open message item first.
 fn render_tool_start(st: &mut RenderState, out: &mut String, id: &str, name: &str) {
     st.ensure_created(out);
-    // One item at a time: a message item must close before the next opens.
+    // One item at a time: an open reasoning or message item must close
+    // before the next opens.
+    st.close_reasoning(out);
     st.close_message(out);
 
     let index = st.next_index;
@@ -1295,6 +1390,84 @@ mod tests {
             ]
         );
         assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn a_reasoning_item_is_opened_before_its_deltas() {
+        // AI-SDK maps reasoning_summary_part.added to reasoning-start. A
+        // summary delta for an item that was never added aborts the run with
+        // "reasoning part rs_0:0 not found".
+        let (names, _) = render_all(&[
+            StreamEvent::ThinkingDelta {
+                text: "hmm".to_owned(),
+            },
+            StreamEvent::TextDelta {
+                text: "hi".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        ]);
+        assert_eq!(
+            names,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reasoning_item_identifies_itself_as_reasoning() {
+        let mut st = RenderState::new("r", "m");
+        let raw = render_event(
+            &StreamEvent::ThinkingDelta {
+                text: "hmm".to_owned(),
+            },
+            &mut st,
+        )
+        .expect("frames");
+        let frames: Vec<Value> = raw
+            .split("\n\n")
+            .filter(|f| !f.trim().is_empty())
+            .filter_map(|f| f.lines().find_map(|l| l.strip_prefix("data: ")))
+            .map(|d| serde_json::from_str(d).expect("valid json"))
+            .collect();
+
+        let added = frames
+            .iter()
+            .find(|v| v["type"] == "response.output_item.added")
+            .expect("opened");
+        assert_eq!(added["item"]["type"], "reasoning");
+        assert_eq!(added["item"]["id"], "rs_0");
+        assert_eq!(added["output_index"], 0);
+
+        let part = frames
+            .iter()
+            .find(|v| v["type"] == "response.reasoning_summary_part.added")
+            .expect("part");
+        assert_eq!(part["item_id"], "rs_0");
+        assert_eq!(part["summary_index"], 0);
+
+        let delta = frames
+            .iter()
+            .find(|v| v["type"] == "response.reasoning_summary_text.delta")
+            .expect("delta");
+        assert_eq!(delta["item_id"], "rs_0");
+        assert_eq!(delta["delta"], "hmm");
     }
 
     #[test]
