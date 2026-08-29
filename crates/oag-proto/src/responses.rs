@@ -570,6 +570,16 @@ impl RenderState {
         format!("event: {name}\ndata: {body}\n\n")
     }
 
+    /// Item id unique across responses, not just within one.
+    ///
+    /// `self.id` is `resp_{request_id}`. A client that keys transcript
+    /// messages by item id otherwise treats every new reply as an edit to
+    /// `msg_1` from the first turn.
+    fn item_id(&self, kind: &str, index: usize) -> String {
+        let rest = self.id.strip_prefix("resp_").unwrap_or(&self.id);
+        format!("{kind}_{rest}_{index}")
+    }
+
     fn ensure_created(&mut self, out: &mut String) {
         if self.created {
             return;
@@ -599,7 +609,7 @@ impl RenderState {
         self.close_message(out);
         let index = self.next_index;
         self.next_index += 1;
-        let item_id = format!("rs_{index}");
+        let item_id = self.item_id("rs", index);
 
         out.push_str(&Self::frame(
             "response.output_item.added",
@@ -678,7 +688,7 @@ impl RenderState {
         self.close_reasoning(out);
         let index = self.next_index;
         self.next_index += 1;
-        let item_id = format!("msg_{index}");
+        let item_id = self.item_id("msg", index);
 
         out.push_str(&Self::frame(
             "response.output_item.added",
@@ -878,7 +888,7 @@ fn render_tool_start(st: &mut RenderState, out: &mut String, id: &str, name: &st
 
     let index = st.next_index;
     st.next_index += 1;
-    let item_id = format!("fc_{index}");
+    let item_id = st.item_id("fc", index);
     st.tools.push(ToolCall {
         call_id: id.to_owned(),
         index,
@@ -963,7 +973,7 @@ pub fn render_response(anthropic: &Value, request_id: &str) -> Value {
         match block["type"].as_str().unwrap_or_default() {
             "text" => text.push_str(block["text"].as_str().unwrap_or_default()),
             "tool_use" => output.push(json!({
-                "id": format!("fc_{}", output.len()),
+                "id": format!("fc_{request_id}_{}", output.len()),
                 "type": "function_call",
                 "status": "completed",
                 "call_id": block["id"],
@@ -980,7 +990,7 @@ pub fn render_response(anthropic: &Value, request_id: &str) -> Value {
         output.insert(
             0,
             json!({
-                "id": "msg_0",
+                "id": format!("msg_{request_id}_0"),
                 "type": "message",
                 "status": "completed",
                 "role": "assistant",
@@ -1452,22 +1462,46 @@ mod tests {
             .find(|v| v["type"] == "response.output_item.added")
             .expect("opened");
         assert_eq!(added["item"]["type"], "reasoning");
-        assert_eq!(added["item"]["id"], "rs_0");
+        assert_eq!(added["item"]["id"], "rs_r_0");
         assert_eq!(added["output_index"], 0);
 
         let part = frames
             .iter()
             .find(|v| v["type"] == "response.reasoning_summary_part.added")
             .expect("part");
-        assert_eq!(part["item_id"], "rs_0");
+        assert_eq!(part["item_id"], "rs_r_0");
         assert_eq!(part["summary_index"], 0);
 
         let delta = frames
             .iter()
             .find(|v| v["type"] == "response.reasoning_summary_text.delta")
             .expect("delta");
-        assert_eq!(delta["item_id"], "rs_0");
+        assert_eq!(delta["item_id"], "rs_r_0");
         assert_eq!(delta["delta"], "hmm");
+    }
+
+    #[test]
+    fn item_ids_do_not_repeat_across_responses() {
+        // CopilotKit keys transcript messages by the item id on the wire.
+        // `msg_1` every turn merges reply N into reply 1.
+        let mut a = RenderState::new("aaa", "m");
+        let mut b = RenderState::new("bbb", "m");
+        let ea = render_event(
+            &StreamEvent::TextDelta {
+                text: "hi".to_owned(),
+            },
+            &mut a,
+        )
+        .expect("a");
+        let eb = render_event(
+            &StreamEvent::TextDelta {
+                text: "hi".to_owned(),
+            },
+            &mut b,
+        )
+        .expect("b");
+        assert!(ea.contains("\"id\":\"msg_aaa_0\""), "{ea}");
+        assert!(eb.contains("\"id\":\"msg_bbb_0\""), "{eb}");
     }
 
     #[test]
