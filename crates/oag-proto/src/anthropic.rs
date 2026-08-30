@@ -7,7 +7,8 @@
 //! machine and not a map.
 
 use crate::canonical::{
-    CacheControl, CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
+    CacheControl, CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool,
+    ToolChoice,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -196,6 +197,9 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         #[allow(clippy::cast_possible_truncation)]
         temperature: body["temperature"].as_f64().map(|t| t as f32),
         thinking_budget,
+        // This dialect speaks budgets. Carry the nearest level too, so a hop to
+        // one that speaks levels does not silently drop the request to think.
+        thinking_effort: thinking_budget.map(Effort::from_budget),
         client_session,
         tool_choice: parse_tool_choice(&body["tool_choice"]),
         // Neither exists in this dialect, so a client speaking it never set one.
@@ -1165,6 +1169,7 @@ mod tests {
             stream: false,
             temperature: None,
             thinking_budget: None,
+            thinking_effort: None,
             client_session: None,
             tool_choice: None,
             response_format: None,

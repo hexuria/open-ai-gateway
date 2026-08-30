@@ -27,7 +27,7 @@
 //!   has, because no other dialect stores the turn.
 
 use crate::canonical::{
-    CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
+    CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -84,9 +84,17 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
-    if req.thinking_budget.is_some() {
-        // No token budget in this dialect; effort is the closest thing it has.
-        body["reasoning"] = json!({ "effort": "medium" });
+    // The client's own level, where it gave one; otherwise the nearest level to
+    // the budget it asked for.
+    //
+    // This was pinned to "medium" regardless, which meant a client could not
+    // ask a Codex seat to think harder or cheaper — the dial existed on the
+    // wire and nothing downstream could reach it.
+    if let Some(effort) = req
+        .thinking_effort
+        .or_else(|| req.thinking_budget.map(Effort::from_budget))
+    {
+        body["reasoning"] = json!({ "effort": effort.as_str() });
     }
 
     // The one field this dialect cannot take. Chat Completions has `stop`,
@@ -240,9 +248,14 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         stream: body["stream"].as_bool().unwrap_or(false),
         #[allow(clippy::cast_possible_truncation)]
         temperature: body["temperature"].as_f64().map(|t| t as f32),
-        // Effort rather than a token budget; map any effort to a nominal one so
-        // the classifier sees that reasoning was asked for.
-        thinking_budget: body["reasoning"]["effort"].as_str().map(|_| 4096),
+        // Both, from the one field: the level is what the client said, and the
+        // nominal budget is what the classifier downstream reads to see that
+        // reasoning was asked for at all.
+        thinking_budget: body["reasoning"]["effort"]
+            .as_str()
+            .and_then(Effort::parse)
+            .map(Effort::as_budget),
+        thinking_effort: body["reasoning"]["effort"].as_str().and_then(Effort::parse),
         client_session: body["user"].as_str().map(std::borrow::ToOwned::to_owned),
         tool_choice: parse_tool_choice(&body["tool_choice"]),
         response_format: parse_response_format(&body["text"]["format"]),
@@ -1235,6 +1248,7 @@ mod tests {
             stream: false,
             temperature: None,
             thinking_budget: None,
+            thinking_effort: None,
             client_session: None,
             tool_choice: None,
             response_format: None,
@@ -1753,5 +1767,92 @@ mod tests {
         let out = render_response(&anthropic, "r");
         assert_eq!(out["status"], "incomplete");
         assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+    use crate::canonical::Effort;
+
+    fn asking(effort: Option<Effort>, budget: Option<u32>) -> CanonicalRequest {
+        CanonicalRequest {
+            model: "gpt-5.6-luna".to_owned(),
+            system: vec![],
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "q".into(),
+                    cache_control: None,
+                }],
+            }],
+            tools: vec![],
+            max_tokens: 100,
+            stream: false,
+            temperature: None,
+            thinking_budget: budget,
+            thinking_effort: effort,
+            client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
+        }
+    }
+
+    #[test]
+    fn the_client_s_own_level_reaches_the_upstream() {
+        // THE BUG THIS PINS. This was `json!({ "effort": "medium" })` whatever
+        // the client asked for, so a Codex seat could not be told to think
+        // harder or cheaper: the dial existed on the wire and nothing
+        // downstream could reach it.
+        for level in [
+            Effort::Off,
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::XHigh,
+            Effort::Max,
+        ] {
+            let body = render_request(&asking(Some(level), None), "gpt-5.6-luna").expect("renders");
+            assert_eq!(body["reasoning"]["effort"], level.as_str());
+        }
+    }
+
+    #[test]
+    fn a_budget_still_asks_for_reasoning_in_a_dialect_that_has_no_budgets() {
+        // A client speaking Anthropic or Gemini states tokens. This dialect has
+        // no such field, so the ask has to survive as the nearest level rather
+        // than be dropped on the way.
+        let body = render_request(&asking(None, Some(16384)), "gpt-5.6-luna").expect("renders");
+        assert_eq!(body["reasoning"]["effort"], "high");
+        // Any positive budget asks for thinking, so the floor is `low` and not
+        // `none` — rounding a small ask down to off answers the opposite.
+        let body = render_request(&asking(None, Some(1024)), "gpt-5.6-luna").expect("renders");
+        assert_eq!(body["reasoning"]["effort"], "low");
+        let body = render_request(&asking(None, Some(65536)), "gpt-5.6-luna").expect("renders");
+        assert_eq!(body["reasoning"]["effort"], "max");
+    }
+
+    #[test]
+    fn saying_nothing_sends_nothing() {
+        // An absent ask must stay absent: sending a level the client never
+        // named would override the upstream's own default with our opinion.
+        let body = render_request(&asking(None, None), "gpt-5.6-luna").expect("renders");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn a_level_read_back_is_the_level_that_was_sent() {
+        // Round trip, because this dialect both renders and parses it, and a
+        // value that drifts on a hop is worse than one that never travelled.
+        let parsed = parse_request(&serde_json::json!({
+            "model": "gpt-5.6-luna",
+            "input": [],
+            "reasoning": { "effort": "high" },
+        }))
+        .expect("parses");
+        assert_eq!(parsed.thinking_effort, Some(Effort::High));
+        assert_eq!(parsed.thinking_budget, Some(Effort::High.as_budget()));
     }
 }

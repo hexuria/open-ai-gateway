@@ -16,7 +16,7 @@
 //!    inside a user turn.
 
 use crate::canonical::{
-    CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
+    CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -56,6 +56,16 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
         "stream": req.stream,
         "max_tokens": req.max_tokens,
     });
+
+    // The level, where the client gave one. A budget is rendered as the nearest
+    // level rather than dropped, so an Anthropic client reaching an OpenAI
+    // upstream still asks for reasoning at all.
+    if let Some(effort) = req
+        .thinking_effort
+        .or_else(|| req.thinking_budget.map(Effort::from_budget))
+    {
+        body["reasoning_effort"] = json!(effort.as_str());
+    }
 
     if req.stream {
         // Usage is omitted from a stream unless asked for, and without it every
@@ -247,7 +257,11 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         #[allow(clippy::cast_possible_truncation)]
         temperature: body["temperature"].as_f64().map(|t| t as f32),
         // No equivalent field in this dialect.
+        // This dialect states a LEVEL, not a budget. Read as a level and left
+        // as one: rendering it into a nominal budget here would lose the word
+        // the client actually said before any upstream saw it.
         thinking_budget: None,
+        thinking_effort: body["reasoning_effort"].as_str().and_then(Effort::parse),
         client_session: body["user"].as_str().map(std::borrow::ToOwned::to_owned),
         tool_choice: parse_tool_choice(&body["tool_choice"]),
         response_format: parse_response_format(&body["response_format"]),

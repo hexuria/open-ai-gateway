@@ -128,6 +128,104 @@ impl ResponseFormat {
     }
 }
 
+/// How hard a model should think, as the dialects that offer a level say it.
+///
+/// The names and the ladder are OpenAI's, because it is the vendor that models
+/// this as a level at all; Anthropic and Gemini state a token budget instead.
+///
+/// SIX RUNGS, TAKEN FROM THE BACKEND RATHER THAN GUESSED. `gpt-5.6-luna`
+/// refuses `minimal` and names what it does accept: "Supported values are:
+/// 'none', 'low', 'medium', 'high', 'xhigh', and 'max'." An earlier version of
+/// this enum stopped at `High` and folded `xhigh` and `max` into it, which
+/// silently capped a client asking for the most reasoning available at the
+/// middle of the range — the opposite of what it asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    /// Rendered as `none`: reasoning off, which is a request like any other.
+    Off,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+impl Effort {
+    /// The wire spelling, which is the same in every dialect that has the concept.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "none",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    /// Read a level, or nothing for a word this does not know.
+    ///
+    /// Unknown is `None` rather than a default: a client that asked for
+    /// something we cannot express should get the upstream's own default, not
+    /// a level we invented on its behalf.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            // `minimal` is another vendor's spelling of the bottom rung, and
+            // some models refuse it by that name. Read it, render `none`.
+            "none" | "minimal" => Some(Self::Off),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// A token budget for a dialect that only speaks budgets.
+    ///
+    /// Nominal, and unavoidably so — there is no exchange rate between "high"
+    /// and a number of tokens, and any figure here is this gateway's opinion
+    /// rather than the vendor's. The ordering is the only part that carries
+    /// meaning, and it is what a downstream classifier reads.
+    #[must_use]
+    pub const fn as_budget(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Low => 4096,
+            Self::Medium => 8192,
+            Self::High => 16384,
+            Self::XHigh => 32768,
+            Self::Max => 65536,
+        }
+    }
+
+    /// The nearest level to a budget, for a dialect that only speaks levels.
+    ///
+    /// Any budget above zero means at least `Low`: a client that asked for a
+    /// thousand tokens of thinking asked for thinking, and rounding that down
+    /// to `none` would answer the opposite of the question.
+    #[must_use]
+    pub const fn from_budget(tokens: u32) -> Self {
+        if tokens == 0 {
+            Self::Off
+        } else if tokens >= 65536 {
+            Self::Max
+        } else if tokens >= 32768 {
+            Self::XHigh
+        } else if tokens >= 16384 {
+            Self::High
+        } else if tokens >= 8192 {
+            Self::Medium
+        } else {
+            Self::Low
+        }
+    }
+}
+
 /// A request, dialect-independent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalRequest {
@@ -147,6 +245,21 @@ pub struct CanonicalRequest {
     /// Extended thinking budget, in tokens.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub thinking_budget: Option<u32>,
+    /// How hard to think, where the dialect says it as a level rather than a
+    /// budget.
+    ///
+    /// SEPARATE FROM `thinking_budget`, and not derivable from it. The two are
+    /// how different vendors express the same intent, and neither converts
+    /// cleanly: a budget is a ceiling the model may not reach, a level is a
+    /// dial with no stated cost. Collapsing them loses whichever the client
+    /// actually said — and it is the client's own words that should reach an
+    /// upstream speaking the same dialect.
+    ///
+    /// Both may be set. A dialect renders whichever it can express, and
+    /// `Effort::as_budget`/`from_budget` bridge the gap when it can only
+    /// express the other one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub thinking_effort: Option<Effort>,
     /// A session identifier the client supplied, if any.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub client_session: Option<String>,
@@ -368,6 +481,7 @@ mod tests {
             stream: true,
             temperature: None,
             thinking_budget: None,
+            thinking_effort: None,
             client_session: None,
             tool_choice: None,
             response_format: None,
@@ -490,6 +604,7 @@ mod count_tests {
             stream: false,
             temperature: None,
             thinking_budget: None,
+            thinking_effort: None,
             client_session: None,
             tool_choice: None,
             response_format: None,

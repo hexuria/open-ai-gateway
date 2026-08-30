@@ -111,6 +111,7 @@ mod tests {
             stream: true,
             temperature: None,
             thinking_budget: None,
+            thinking_effort: None,
             client_session: None,
             tool_choice: None,
             response_format: None,
