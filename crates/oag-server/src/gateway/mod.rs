@@ -441,6 +441,15 @@ async fn run_with_escalation(
         // way: a gate we could not act on is exactly the signal that a rung is
         // mis-set for this workload.
         let ctx = meter_context(auth, &decision, &lease, request_id, started, escalations);
+        // Read while the lease is still here: the answer is a fact about the
+        // adapter this account got, and `release` below takes the account with
+        // it. Falling back to the provider's dialect once it is gone is exactly
+        // the bug this call site had.
+        let upstream_dialect = adapter_for(state, decision.model.provider, &lease.account)
+            .map_or_else(
+                |_| decision.model.provider.native_dialect(),
+                |a| a.dialect(),
+            );
         // Before the ledger write, which is ours rather than the credential's.
         lease.release().await;
         // `triggering_gate` when we escalated, otherwise whatever this attempt
@@ -452,7 +461,13 @@ async fn run_with_escalation(
             meter::record_abandoned(state, abandoned).await;
         }
 
-        return Ok(json_response(&body, &decision, request_id, ingress));
+        return Ok(json_response(
+            &body,
+            &decision,
+            request_id,
+            ingress,
+            upstream_dialect,
+        ));
     }
 }
 
@@ -736,8 +751,10 @@ fn egress_for(
     decision: &RoutingDecision,
     request_id: RequestId,
     framing: oag_upstream::Framing,
+    // The dialect the chosen ADAPTER speaks, which is not always the provider's:
+    // a Codex seat is `Provider::OpenAI` and speaks Responses.
+    upstream: Dialect,
 ) -> Result<sse::Egress> {
-    let upstream = decision.model.provider.native_dialect();
     let model = decision.model.id.as_str().to_owned();
     let request_id = request_id.to_string();
 
@@ -773,14 +790,41 @@ fn egress_for(
     })
 }
 
+/// Which adapter this account actually gets.
+///
+/// An OpenAI OAuth seat is a Codex subscription: the same provider key, a
+/// different dialect and backend, so it takes the Codex adapter rather than the
+/// Chat Completions one. Every other account uses its provider's adapter.
+///
+/// ONE PLACE, because the answer is needed twice and the two must agree. The
+/// request path picks an adapter to build with; the response path needs the
+/// same adapter's dialect and framing to decide whether the upstream's bytes
+/// can be forwarded as they are. When only the first knew about Codex seats,
+/// the second asked the provider instead, was told Chat Completions, and passed
+/// Responses bytes through to a client that reads them as an empty answer.
+fn adapter_for(
+    state: &Arc<AppState>,
+    provider: oag_core::Provider,
+    account: &oag_store::AccountRow,
+) -> Result<Arc<dyn oag_upstream::ProviderAdapter>> {
+    let is_codex_seat = matches!(provider, oag_core::Provider::OpenAI)
+        && oag_core::credential::CredentialKind::from_column(&account.kind)
+            .is_some_and(|k| matches!(k, oag_core::credential::CredentialKind::OAuth));
+    if is_codex_seat {
+        Ok(state.codex_adapter())
+    } else {
+        state.adapter(provider)
+    }
+}
+
 fn json_response(
     body: &bytes::Bytes,
     decision: &RoutingDecision,
     request_id: RequestId,
     ingress: Dialect,
+    // The dialect the chosen ADAPTER speaks. See `adapter_for`.
+    upstream_dialect: Dialect,
 ) -> Response {
-    let upstream_dialect = decision.model.provider.native_dialect();
-
     // Framing does not come into it here: a non-streamed response is a single
     // JSON body whatever the provider streams, so dialect alone decides.
     //
@@ -995,19 +1039,9 @@ async fn try_credential(
     let provider = decision.model.provider;
     let account = lease.account.account_id();
 
-    // An OpenAI OAuth seat is a Codex subscription: same provider key, a
-    // different dialect and backend, so it takes the Codex adapter rather than
-    // the Chat Completions one. Every other account uses its provider's adapter.
-    let is_codex_seat = matches!(provider, oag_core::Provider::OpenAI)
-        && oag_core::credential::CredentialKind::from_column(&lease.account.kind)
-            .is_some_and(|k| matches!(k, oag_core::credential::CredentialKind::OAuth));
-    let adapter = if is_codex_seat {
-        state.codex_adapter()
-    } else {
-        match state.adapter(provider) {
-            Ok(a) => a,
-            Err(e) => return Outcome::Fatal(e),
-        }
+    let adapter = match adapter_for(state, provider, &lease.account) {
+        Ok(a) => a,
+        Err(e) => return Outcome::Fatal(e),
     };
     // Refreshes first if the token is close to expiry. A credential that is
     // merely expiring must not be treated as a credential that is broken.
@@ -1129,8 +1163,18 @@ fn stream_response(
     ingress: Dialect,
     guard: crate::shutdown::InFlightGuard,
 ) -> Result<Response> {
-    let adapter = state.adapter(decision.model.provider)?;
-    let egress = egress_for(ingress, decision, request_id, adapter.framing())?;
+    // The adapter this lease actually gets, not the provider's default one:
+    // both the framing and the dialect below are facts about that adapter, and
+    // asking the provider is what forwarded Responses bytes to a Chat
+    // Completions client as a 200 it could not read.
+    let adapter = adapter_for(state, decision.model.provider, &lease.account)?;
+    let egress = egress_for(
+        ingress,
+        decision,
+        request_id,
+        adapter.framing(),
+        adapter.dialect(),
+    )?;
 
     // Bounded: a slow client parks the reader instead of buffering the whole
     // response in memory.
@@ -1204,9 +1248,16 @@ async fn succeeded(
             lease: lease.clone(),
         }));
     }
-    // The upstream's dialect, which is what its body is in —
-    // not the client's, which `json_response` converts to.
-    match sse::collect(response, provider.native_dialect()).await {
+    // The upstream's dialect, which is what its body is in — not the client's,
+    // which `json_response` converts to.
+    //
+    // The ADAPTER's, not the provider's: a Codex seat is `Provider::OpenAI` and
+    // its body is Responses. Asking the provider parsed a Responses stream as
+    // Chat Completions, found nothing it recognised, and collected an empty
+    // body — the 200 that reached a client as "no completion in it".
+    let upstream_dialect = adapter_for(state, provider, &lease.account)
+        .map_or_else(|_| provider.native_dialect(), |a| a.dialect());
+    match sse::collect(response, upstream_dialect).await {
         Ok((body, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
             body,
             accumulator,
@@ -1813,6 +1864,7 @@ mod tests {
             &d,
             RequestId::new(),
             oag_upstream::Framing::Sse,
+            Dialect::OpenAIChatCompletions,
         )
         .expect("supported");
         assert!(matches!(
@@ -1835,6 +1887,7 @@ mod tests {
             &d,
             RequestId::new(),
             oag_upstream::Framing::AwsEventStream,
+            Dialect::AnthropicMessages,
         )
         .expect("supported");
         assert!(
@@ -1851,9 +1904,47 @@ mod tests {
             &d,
             RequestId::new(),
             oag_upstream::Framing::Sse,
+            Dialect::AnthropicMessages,
         )
         .expect("supported");
         assert!(matches!(e, sse::Egress::ChatCompletions { .. }));
+    }
+
+    #[test]
+    fn a_codex_seat_is_rendered_rather_than_forwarded_to_a_chat_client() {
+        // THE BUG THIS PINS. A Codex subscription is `Provider::OpenAI`, whose
+        // native dialect is Chat Completions, but the adapter serving it speaks
+        // Responses. While this function asked the PROVIDER, the two dialects
+        // appeared to agree and the Responses bytes were forwarded verbatim —
+        // a 200 that a Chat Completions client reads as an empty answer, which
+        // is how it reached a person as "the model is broken".
+        //
+        // The upstream dialect is a parameter now precisely so this case can
+        // differ from the provider's.
+        let d = decision_for(oag_core::Provider::OpenAI);
+        let e = egress_for(
+            Dialect::OpenAIChatCompletions,
+            &d,
+            RequestId::new(),
+            oag_upstream::Framing::Sse,
+            Dialect::OpenAIResponses,
+        )
+        .expect("supported");
+        assert!(
+            matches!(e, sse::Egress::ChatCompletions { .. }),
+            "must be rendered into the client's dialect, not forwarded"
+        );
+    }
+
+    #[test]
+    fn the_codex_adapter_says_it_speaks_responses() {
+        // The other half: the parameter above is only right if the adapter
+        // reports its own dialect rather than inheriting the provider's.
+        use oag_upstream::ProviderAdapter;
+        let codex = oag_upstream::codex::CodexAdapter::new();
+        assert_eq!(codex.provider(), oag_core::Provider::OpenAI);
+        assert_eq!(codex.dialect(), Dialect::OpenAIResponses);
+        assert_ne!(codex.dialect(), codex.provider().native_dialect());
     }
 
     /// A state that dials nothing: `Db::connect` builds a lazy pool and
