@@ -1597,6 +1597,7 @@ dependencies = [
  "oag-pool",
  "oag-proto",
  "oag-router",
+ "rand 0.8.7",
  "redis",
  "rust_decimal",
  "serde",

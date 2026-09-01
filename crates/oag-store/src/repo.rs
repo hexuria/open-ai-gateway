@@ -290,6 +290,207 @@ pub async fn revoke_key(db: &Db, id: Uuid) -> Result<Option<(String, String, Str
     .map_err(|e| Error::Internal(format!("revoking key: {e}")))
 }
 
+/// A freshly minted key. `key` is the plaintext, and this is the only time it
+/// exists anywhere — it is hashed on the way into the row.
+#[derive(Debug, Clone)]
+pub struct MintedKey {
+    pub id: Uuid,
+    pub prefix: String,
+    pub key: String,
+}
+
+/// One principal's spend and its budget — the rollup a partner service shows for
+/// the org bound to this principal.
+#[derive(Debug, Clone)]
+pub struct PrincipalUsage {
+    pub principal_id: Uuid,
+    pub email: String,
+    pub monthly_budget_usd: Option<Decimal>,
+    /// Month-to-date, from the first of the current UTC month.
+    pub month_to_date_usd: Decimal,
+    pub requests: i64,
+}
+
+/// Create or update a principal, returning its id.
+///
+/// The identity-integration surface: a partner service (`OpenGrok`) binds each of
+/// its orgs to one principal, so the org's budget and usage rollup are this
+/// row's. Idempotent on `email`, which is the only stable handle a caller that
+/// stores no gateway ids can use.
+///
+/// `budget` is `COALESCE`d rather than overwritten so an upsert-before-mint
+/// cannot silently erase a budget an operator set at the CLI; clearing one is
+/// [`set_principal_budget`]'s job, where it is the caller's stated intent.
+///
+/// **`role` IS NOT UPDATED ON CONFLICT, and that is the point.** This path can only
+/// ever ask for `member`, so updating the role would mean an upsert against an
+/// existing admin's email SILENTLY DEMOTES them — and since the admin gate wants
+/// both an admin key and an admin principal, that locks a human operator out of
+/// the admin API without touching their key. An idempotent bind must not be able
+/// to remove authority. Granting or changing a role stays the CLI's job (the CLI
+/// keeps its own upsert, which does write the role, because promoting the first
+/// admin is exactly what `oag admin init` is for).
+pub async fn upsert_principal(
+    db: &Db,
+    email: &str,
+    role: &str,
+    budget: Option<Decimal>,
+) -> Result<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        r"
+        INSERT INTO principal (id, email, role, monthly_budget_usd)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (email) DO UPDATE SET
+            monthly_budget_usd = COALESCE(EXCLUDED.monthly_budget_usd, principal.monthly_budget_usd),
+            updated_at = now()
+        RETURNING id
+        ",
+    )
+    .bind(Uuid::now_v7())
+    .bind(email)
+    .bind(role)
+    .bind(budget)
+    .fetch_one(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("upserting principal: {e}")))
+}
+
+/// Mint an inbound key on an existing principal and route. Returns the plaintext
+/// ONCE — it is hashed on the way in and is not recoverable afterwards.
+///
+/// `None` means the principal or route does not exist, so a caller naming either
+/// wrongly is told rather than silently given nothing.
+///
+/// `quota_usd` is the per-key spend cap (the per-member cap in the identity
+/// integration); `None` leaves the key uncapped and bounded only by the
+/// principal's monthly budget.
+pub async fn mint_key(
+    db: &Db,
+    principal_email: &str,
+    route: &str,
+    name: &str,
+    quota_usd: Option<Decimal>,
+) -> Result<Option<MintedKey>> {
+    use rand::Rng as _;
+    use std::fmt::Write as _;
+
+    // 32 bytes of entropy. The prefix exists so a leaked key is recognisable in
+    // a log and greppable during an incident.
+    let mut raw = [0u8; 32];
+    rand::thread_rng().fill(&mut raw);
+    let key = format!(
+        "oag_live_{}",
+        raw.iter().fold(String::with_capacity(64), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+    );
+    let hash = hash_key(&key);
+    let prefix: String = key.chars().take(16).collect();
+
+    // Never `admin`: a key minted over HTTP must not be able to mint more keys.
+    // Admin authority is the CLI's to grant (`oag admin key create --admin`).
+    let id = sqlx::query_scalar::<_, Uuid>(
+        r"
+        INSERT INTO api_key
+            (id, key_hash, key_prefix, name, principal_id, route_id, quota_usd, admin)
+        SELECT $1, $2, $3, $4, p.id, r.id, $7, false
+        FROM principal p, route r
+        WHERE p.email = $5 AND r.name = $6
+        RETURNING id
+        ",
+    )
+    .bind(Uuid::now_v7())
+    .bind(&hash)
+    .bind(&prefix)
+    .bind(name)
+    .bind(principal_email)
+    .bind(route)
+    .bind(quota_usd)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("minting key: {e}")))?;
+
+    Ok(id.map(|id| MintedKey { id, prefix, key }))
+}
+
+/// Set (or clear, with `None`) a principal's monthly budget. `None` return means
+/// no principal with that email.
+pub async fn set_principal_budget(
+    db: &Db,
+    email: &str,
+    budget: Option<Decimal>,
+) -> Result<Option<Uuid>> {
+    sqlx::query_scalar::<_, Uuid>(
+        "UPDATE principal SET monthly_budget_usd = $2, updated_at = now()
+         WHERE email = $1 RETURNING id",
+    )
+    .bind(email)
+    .bind(budget)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("setting principal budget: {e}")))
+}
+
+/// Set (or clear) one key's spend cap. Returns `(name, key_prefix)`; `None` means
+/// no key with that id.
+pub async fn set_key_quota(
+    db: &Db,
+    id: Uuid,
+    quota_usd: Option<Decimal>,
+) -> Result<Option<(String, String)>> {
+    sqlx::query_as::<_, (String, String)>(
+        "UPDATE api_key SET quota_usd = $2 WHERE id = $1 RETURNING name, key_prefix",
+    )
+    .bind(id)
+    .bind(quota_usd)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("setting key quota: {e}")))
+}
+
+/// A principal's budget and month-to-date spend. `None` means no such principal.
+///
+/// Month-to-date is computed from the ledger rather than a running counter: the
+/// ledger is the record, and a counter that drifts from it is a bill nobody can
+/// reconcile.
+pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsage>> {
+    sqlx::query_as::<_, (Uuid, String, Option<Decimal>, Decimal, i64)>(
+        r"
+        SELECT p.id,
+               p.email,
+               p.monthly_budget_usd,
+               COALESCE(SUM(u.cost_usd) FILTER (
+                   WHERE u.occurred_at >= date_trunc('month', now())
+               ), 0)::numeric(14,6),
+               COUNT(u.request_id) FILTER (
+                   WHERE u.occurred_at >= date_trunc('month', now())
+               )
+        FROM principal p
+        LEFT JOIN usage_event u ON u.principal_id = p.id
+        WHERE p.email = $1
+        GROUP BY p.id, p.email, p.monthly_budget_usd
+        ",
+    )
+    .bind(email)
+    .fetch_optional(db.pool())
+    .await
+    .map(|row| {
+        row.map(
+            |(principal_id, email, monthly_budget_usd, month_to_date_usd, requests)| {
+                PrincipalUsage {
+                    principal_id,
+                    email,
+                    monthly_budget_usd,
+                    month_to_date_usd,
+                    requests,
+                }
+            },
+        )
+    })
+    .map_err(|e| Error::Internal(format!("reading principal usage: {e}")))
+}
+
 /// Revoke by the displayed prefix, for the CLI — during an incident the prefix
 /// is what an operator can actually see.
 pub async fn revoke_key_by_prefix(
@@ -903,6 +1104,176 @@ mod tests {
     #[test]
     fn the_hash_does_not_contain_the_key() {
         assert!(!hash_key("oag_live_secret").contains("secret"));
+    }
+
+    /// The identity-integration round trip: bind a principal, mint a key on it,
+    /// and confirm the key authenticates, carries its cap, is never admin, and
+    /// stops working once revoked.
+    ///
+    /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it.
+    #[tokio::test]
+    async fn a_minted_key_authenticates_is_capped_and_is_never_admin() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("org-{}@gateway.local", Uuid::new_v4());
+        let route = format!("route-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO route (id, name, tiers, default_mode)
+             VALUES (gen_random_uuid(), $1, '[{\"name\":\"cheap\",\"models\":[\"kimi-k2\"]}]'::jsonb, 'passthrough')",
+        )
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("insert route");
+
+        // Upsert is idempotent on email: a second call must not create a twin.
+        let first = upsert_principal(&db, &email, "member", Some(dec!(25.00)))
+            .await
+            .expect("upsert");
+        let again = upsert_principal(&db, &email, "member", None)
+            .await
+            .expect("upsert again");
+        assert_eq!(first, again, "upsert is idempotent on email");
+
+        // ...and a budget already set is not erased by an upsert that omits one.
+        let usage = principal_usage(&db, &email)
+            .await
+            .expect("usage")
+            .expect("principal exists");
+        assert_eq!(usage.monthly_budget_usd, Some(dec!(25.000000)));
+        assert_eq!(usage.month_to_date_usd, dec!(0));
+
+        let minted = mint_key(&db, &email, &route, "member-key", Some(dec!(5.00)))
+            .await
+            .expect("mint")
+            .expect("principal and route exist");
+        assert!(minted.key.starts_with("oag_live_"));
+        assert_eq!(minted.prefix, minted.key[..16]);
+
+        let context = authenticate(&db, &minted.key)
+            .await
+            .expect("authenticate")
+            .expect("the minted key is live");
+        assert_eq!(context.principal_id, first);
+        assert!(
+            !context.admin,
+            "a key minted over HTTP must never carry admin authority"
+        );
+
+        // The cap landed, and can be cleared.
+        let quota: Option<Decimal> =
+            sqlx::query_scalar("SELECT quota_usd FROM api_key WHERE id = $1")
+                .bind(minted.id)
+                .fetch_one(db.pool())
+                .await
+                .expect("read quota");
+        assert_eq!(quota, Some(dec!(5.000000)));
+        set_key_quota(&db, minted.id, None)
+            .await
+            .expect("clear quota")
+            .expect("key exists");
+
+        // The org budget can be raised.
+        set_principal_budget(&db, &email, Some(dec!(99.00)))
+            .await
+            .expect("set budget")
+            .expect("principal exists");
+        let raised = principal_usage(&db, &email)
+            .await
+            .expect("usage")
+            .expect("principal exists");
+        assert_eq!(raised.monthly_budget_usd, Some(dec!(99.000000)));
+
+        // Revocation is what makes the key stop working.
+        revoke_key(&db, minted.id).await.expect("revoke");
+        assert!(
+            authenticate(&db, &minted.key)
+                .await
+                .expect("authenticate")
+                .is_none(),
+            "a revoked key must not authenticate"
+        );
+    }
+
+    /// An idempotent bind MUST NOT be able to remove authority: upserting against
+    /// an existing admin's email leaves their role alone. Getting this wrong locks
+    /// a human operator out of the admin API — the gate wants an admin key AND an
+    /// admin principal — without their key ever changing.
+    #[tokio::test]
+    async fn upserting_a_principal_never_demotes_an_existing_admin() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("operator-{}@example.com", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'admin')",
+        )
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("seed an admin principal");
+
+        // The identity-integration path can only ever ask for `member`.
+        upsert_principal(&db, &email, "member", Some(dec!(10.00)))
+            .await
+            .expect("upsert");
+
+        let role: String = sqlx::query_scalar("SELECT role FROM principal WHERE email = $1")
+            .bind(&email)
+            .fetch_one(db.pool())
+            .await
+            .expect("read role");
+        assert_eq!(
+            role, "admin",
+            "an upsert must not strip an existing principal's admin role"
+        );
+        // ...while still doing its actual job.
+        let usage = principal_usage(&db, &email)
+            .await
+            .expect("usage")
+            .expect("exists");
+        assert_eq!(usage.monthly_budget_usd, Some(dec!(10.000000)));
+    }
+
+    /// Naming a principal or route that does not exist is reported, not silently
+    /// swallowed — otherwise a caller believes it minted a key that never was.
+    #[tokio::test]
+    async fn minting_on_a_missing_principal_or_route_is_none_not_a_phantom_key() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let nobody = format!("nobody-{}@gateway.local", Uuid::new_v4());
+        assert!(
+            mint_key(&db, &nobody, "default", "k", None)
+                .await
+                .expect("mint")
+                .is_none()
+        );
+        assert!(
+            set_principal_budget(&db, &nobody, Some(dec!(1.00)))
+                .await
+                .expect("budget")
+                .is_none()
+        );
+        assert!(
+            principal_usage(&db, &nobody)
+                .await
+                .expect("usage")
+                .is_none()
+        );
     }
 
     /// `route_by_id` against a real Postgres.
