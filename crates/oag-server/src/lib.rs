@@ -145,7 +145,8 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/accounts", get(admin::accounts))
         .route("/routes", get(admin::routes))
         .route("/usage", get(admin::usage))
-        .route("/keys", get(admin::keys))
+        // POST mints; see the identity-integration note in `admin/write.rs`.
+        .route("/keys", get(admin::keys).post(admin::mint_key))
         .route("/providers", get(admin::providers))
         .route(
             "/services",
@@ -165,6 +166,16 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/accounts/{id}/enable", post(admin::enable_account))
         .route("/accounts/{id}/clear-cooldown", post(admin::clear_cooldown))
         .route("/keys/{id}/revoke", post(admin::revoke_key))
+        // The identity-integration set: a partner service binds each of its orgs
+        // to a principal and each member to a key on it, so an org admin can hand
+        // a teammate a working credential from a console. See `admin/write.rs`.
+        .route("/principals", post(admin::upsert_principal))
+        .route(
+            "/principals/{email}/budget",
+            patch(admin::set_principal_budget),
+        )
+        .route("/principals/{email}/usage", get(admin::principal_usage))
+        .route("/keys/{id}/quota", patch(admin::set_key_quota))
         // `route_layer` rather than `layer`: an unmatched path under
         // /admin/api should 404 without a database round trip.
         .route_layer(axum::middleware::from_fn_with_state(
@@ -375,6 +386,17 @@ server:
         (
             "POST",
             "/admin/api/keys/00000000-0000-0000-0000-000000000001/revoke",
+        ),
+        // The identity-integration set. A mint endpoint that answered without a
+        // key would hand anyone a working credential, so its place in this list
+        // matters more than most.
+        ("POST", "/admin/api/principals"),
+        ("PATCH", "/admin/api/principals/who@example.com/budget"),
+        ("GET", "/admin/api/principals/who@example.com/usage"),
+        ("POST", "/admin/api/keys"),
+        (
+            "PATCH",
+            "/admin/api/keys/00000000-0000-0000-0000-000000000001/quota",
         ),
         ("GET", "/admin/api/services"),
         ("POST", "/admin/api/services"),
