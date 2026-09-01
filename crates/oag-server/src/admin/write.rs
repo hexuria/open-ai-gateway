@@ -17,15 +17,25 @@
 //! Those four take no request body — each is a verb against an id.
 //!
 //! **The identity-integration set** (principals, keys, budgets) is the second
-//! group, and it is a deliberate, bounded exception to "calm work stays in the
-//! CLI" — not the first step back to sprawl. A partner service (`OpenGrok`) binds
+//! group, and it is a deliberate exception to "calm work stays in the CLI" — not
+//! the first step back to sprawl. A partner service (`OpenGrok`) binds
 //! each of its orgs to a principal and each of its members to a key on that
 //! principal, so that an org admin can hand a teammate a working credential from
 //! a web console. That flow is a *program* driving us, not an operator at a
 //! prompt, and a program cannot shell out to the CLI. It stays inside the same
 //! rule that governs the four above: minting is an OS RNG, a SHA-256 and an
 //! INSERT — it reads no sealed credential, no KEK, and no signing secret. A key
-//! minted here is never `admin`, so this surface cannot widen its own authority.
+//! minted here is never `admin`, so this surface cannot widen its own authority,
+//! and an upsert never rewrites an existing principal's role, so it cannot remove
+//! anyone else's either.
+//!
+//! BE CLEAR ABOUT WHAT IS *NOT* BOUNDED. `require_admin_layer` is all-or-nothing:
+//! any key with `admin = true` reaches every route under `/admin/api`, these
+//! included. So the admin key handed to a partner service is a FULL admin
+//! credential for this gateway, not a scoped one — "bounded" describes this set of
+//! endpoints, never the authority of the key that calls them. Per-key admin scopes
+//! are the honest fix and do not exist yet; until they do, that key should be
+//! treated as an operator credential and rotated like one.
 
 use super::auth::AdminActor;
 use super::{failed, invalid, not_found};
@@ -259,6 +269,12 @@ fn parse_money(raw: Option<&str>) -> std::result::Result<Option<Decimal>, String
         .map_err(|_| format!("'{raw}' is not an amount, e.g. \"25.00\""))?;
     if value.is_sign_negative() {
         return Err("an amount cannot be negative".to_string());
+    }
+    // The columns are numeric(14,6) — eight integer digits. Rejecting here makes an
+    // out-of-range budget a 400 that says so, rather than a Postgres overflow
+    // surfacing as a bare 500 with the real cause swallowed.
+    if value >= Decimal::from(100_000_000u32) {
+        return Err("an amount must be under 100000000".to_string());
     }
     Ok(Some(value))
 }

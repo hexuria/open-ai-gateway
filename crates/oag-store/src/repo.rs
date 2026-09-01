@@ -321,6 +321,15 @@ pub struct PrincipalUsage {
 /// `budget` is `COALESCE`d rather than overwritten so an upsert-before-mint
 /// cannot silently erase a budget an operator set at the CLI; clearing one is
 /// [`set_principal_budget`]'s job, where it is the caller's stated intent.
+///
+/// **`role` IS NOT UPDATED ON CONFLICT, and that is the point.** This path can only
+/// ever ask for `member`, so updating the role would mean an upsert against an
+/// existing admin's email SILENTLY DEMOTES them — and since the admin gate wants
+/// both an admin key and an admin principal, that locks a human operator out of
+/// the admin API without touching their key. An idempotent bind must not be able
+/// to remove authority. Granting or changing a role stays the CLI's job (the CLI
+/// keeps its own upsert, which does write the role, because promoting the first
+/// admin is exactly what `oag admin init` is for).
 pub async fn upsert_principal(
     db: &Db,
     email: &str,
@@ -332,7 +341,6 @@ pub async fn upsert_principal(
         INSERT INTO principal (id, email, role, monthly_budget_usd)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (email) DO UPDATE SET
-            role = EXCLUDED.role,
             monthly_budget_usd = COALESCE(EXCLUDED.monthly_budget_usd, principal.monthly_budget_usd),
             updated_at = now()
         RETURNING id
@@ -1190,6 +1198,50 @@ mod tests {
                 .is_none(),
             "a revoked key must not authenticate"
         );
+    }
+
+    /// An idempotent bind MUST NOT be able to remove authority: upserting against
+    /// an existing admin's email leaves their role alone. Getting this wrong locks
+    /// a human operator out of the admin API — the gate wants an admin key AND an
+    /// admin principal — without their key ever changing.
+    #[tokio::test]
+    async fn upserting_a_principal_never_demotes_an_existing_admin() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("operator-{}@example.com", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'admin')",
+        )
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("seed an admin principal");
+
+        // The identity-integration path can only ever ask for `member`.
+        upsert_principal(&db, &email, "member", Some(dec!(10.00)))
+            .await
+            .expect("upsert");
+
+        let role: String = sqlx::query_scalar("SELECT role FROM principal WHERE email = $1")
+            .bind(&email)
+            .fetch_one(db.pool())
+            .await
+            .expect("read role");
+        assert_eq!(
+            role, "admin",
+            "an upsert must not strip an existing principal's admin role"
+        );
+        // ...while still doing its actual job.
+        let usage = principal_usage(&db, &email)
+            .await
+            .expect("usage")
+            .expect("exists");
+        assert_eq!(usage.monthly_budget_usd, Some(dec!(10.000000)));
     }
 
     /// Naming a principal or route that does not exist is reported, not silently
