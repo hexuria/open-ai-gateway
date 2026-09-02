@@ -17,7 +17,7 @@
 //!   prefix, like Chat Completions and unlike Anthropic.
 
 use crate::canonical::{
-    CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
+    CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -206,6 +206,12 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         thinking_budget: cfg["thinkingConfig"]["thinkingBudget"]
             .as_u64()
             .and_then(|v| u32::try_from(v).ok()),
+        // This dialect speaks budgets. Carry the nearest level too, so a hop to
+        // one that speaks levels does not silently drop the request to think.
+        thinking_effort: cfg["thinkingConfig"]["thinkingBudget"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .map(Effort::from_budget),
         client_session: None,
         tool_choice: parse_tool_choice(&body["toolConfig"]["functionCallingConfig"]),
         response_format: parse_response_format(cfg),
@@ -872,6 +878,7 @@ mod tests {
             stream: false,
             temperature: None,
             thinking_budget: None,
+            thinking_effort: None,
             client_session: None,
             tool_choice: None,
             response_format: None,

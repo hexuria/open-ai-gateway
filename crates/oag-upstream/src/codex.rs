@@ -233,6 +233,7 @@ mod tests {
             stream: false,
             temperature: None,
             thinking_budget: None,
+            thinking_effort: None,
             client_session: None,
             tool_choice: None,
             response_format: None,
