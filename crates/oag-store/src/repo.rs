@@ -525,29 +525,48 @@ pub struct KeyUsage {
     pub five_hour_frees_at: Option<OffsetDateTime>,
     pub seven_day_usd: Decimal,
     pub seven_day_frees_at: Option<OffsetDateTime>,
+    /// Requests inside the rolling windows; the month's are `requests`.
+    pub five_hour_requests: i64,
+    pub seven_day_requests: i64,
+    /// What the same tokens would have cost at the model's own list API price
+    /// (`counterfactual_api_usd`): for a subscription seat, the pay-per-token bill it displaced —
+    /// the figure a seat's usage is shown against, since its `cost_usd` is truthfully zero; for
+    /// a metered credential it equals the cost. NOT the top-rung `counterfactual_usd`, which is
+    /// the routing story, not the seat's.
+    pub month_counterfactual_usd: Decimal,
+    pub five_hour_counterfactual_usd: Decimal,
+    pub seven_day_counterfactual_usd: Decimal,
+}
+
+/// The row `key_usage` reads, named: nineteen columns is past what a tuple can carry.
+#[derive(sqlx::FromRow)]
+struct KeyUsageRow {
+    id: Uuid,
+    name: String,
+    key_prefix: String,
+    email: String,
+    active: bool,
+    quota_usd: Option<Decimal>,
+    spent_usd: Decimal,
+    month_usd: Decimal,
+    month_requests: i64,
+    month_resets_at: OffsetDateTime,
+    five_hour_usd: Decimal,
+    five_hour_frees_at: Option<OffsetDateTime>,
+    seven_day_usd: Decimal,
+    seven_day_frees_at: Option<OffsetDateTime>,
+    five_hour_requests: i64,
+    seven_day_requests: i64,
+    month_counterfactual_usd: Decimal,
+    five_hour_counterfactual_usd: Decimal,
+    seven_day_counterfactual_usd: Decimal,
 }
 
 /// One key's cap and spend; `None` for an id that is not a key. Every figure comes from the
 /// ledger, not the counter, for the same reason `principal_usage` reads the ledger: the ledger
 /// is the record. One statement, three windows, the key's own rows only.
 pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
-    type Row = (
-        Uuid,
-        String,
-        String,
-        String,
-        bool,
-        Option<Decimal>,
-        Decimal,
-        Decimal,
-        i64,
-        OffsetDateTime,
-        Decimal,
-        Option<OffsetDateTime>,
-        Decimal,
-        Option<OffsetDateTime>,
-    );
-    sqlx::query_as::<_, Row>(
+    sqlx::query_as::<_, KeyUsageRow>(
         r"
         SELECT k.id,
                k.name,
@@ -558,23 +577,38 @@ pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
                k.spent_usd,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
-               ), 0)::numeric(14,6),
+               ), 0)::numeric(14,6) AS month_usd,
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
-               ),
-               date_trunc('month', now()) + interval '1 month',
+               ) AS month_requests,
+               date_trunc('month', now()) + interval '1 month' AS month_resets_at,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '5 hours'
-               ), 0)::numeric(14,6),
+               ), 0)::numeric(14,6) AS five_hour_usd,
                MIN(u.occurred_at) FILTER (
                    WHERE u.occurred_at >= now() - interval '5 hours'
-               ) + interval '5 hours',
+               ) + interval '5 hours' AS five_hour_frees_at,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '7 days'
-               ), 0)::numeric(14,6),
+               ), 0)::numeric(14,6) AS seven_day_usd,
                MIN(u.occurred_at) FILTER (
                    WHERE u.occurred_at >= now() - interval '7 days'
-               ) + interval '7 days'
+               ) + interval '7 days' AS seven_day_frees_at,
+               COUNT(u.request_id) FILTER (
+                   WHERE u.occurred_at >= now() - interval '5 hours'
+               ) AS five_hour_requests,
+               COUNT(u.request_id) FILTER (
+                   WHERE u.occurred_at >= now() - interval '7 days'
+               ) AS seven_day_requests,
+               COALESCE(SUM(u.counterfactual_api_usd) FILTER (
+                   WHERE u.occurred_at >= date_trunc('month', now())
+               ), 0)::numeric(14,6) AS month_counterfactual_usd,
+               COALESCE(SUM(u.counterfactual_api_usd) FILTER (
+                   WHERE u.occurred_at >= now() - interval '5 hours'
+               ), 0)::numeric(14,6) AS five_hour_counterfactual_usd,
+               COALESCE(SUM(u.counterfactual_api_usd) FILTER (
+                   WHERE u.occurred_at >= now() - interval '7 days'
+               ), 0)::numeric(14,6) AS seven_day_counterfactual_usd
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
         LEFT JOIN usage_event u ON u.api_key_id = k.id
@@ -586,39 +620,27 @@ pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
     .fetch_optional(db.pool())
     .await
     .map(|row| {
-        row.map(
-            |(
-                key_id,
-                name,
-                prefix,
-                principal_email,
-                active,
-                quota_usd,
-                spent_usd,
-                month_to_date_usd,
-                requests,
-                month_resets_at,
-                five_hour_usd,
-                five_hour_frees_at,
-                seven_day_usd,
-                seven_day_frees_at,
-            )| KeyUsage {
-                key_id,
-                name,
-                prefix,
-                principal_email,
-                active,
-                quota_usd,
-                spent_usd,
-                month_to_date_usd,
-                requests,
-                month_resets_at,
-                five_hour_usd,
-                five_hour_frees_at,
-                seven_day_usd,
-                seven_day_frees_at,
-            },
-        )
+        row.map(|row| KeyUsage {
+            key_id: row.id,
+            name: row.name,
+            prefix: row.key_prefix,
+            principal_email: row.email,
+            active: row.active,
+            quota_usd: row.quota_usd,
+            spent_usd: row.spent_usd,
+            month_to_date_usd: row.month_usd,
+            requests: row.month_requests,
+            month_resets_at: row.month_resets_at,
+            five_hour_usd: row.five_hour_usd,
+            five_hour_frees_at: row.five_hour_frees_at,
+            seven_day_usd: row.seven_day_usd,
+            seven_day_frees_at: row.seven_day_frees_at,
+            five_hour_requests: row.five_hour_requests,
+            seven_day_requests: row.seven_day_requests,
+            month_counterfactual_usd: row.month_counterfactual_usd,
+            five_hour_counterfactual_usd: row.five_hour_counterfactual_usd,
+            seven_day_counterfactual_usd: row.seven_day_counterfactual_usd,
+        })
     })
     .map_err(|e| Error::Internal(format!("reading key usage: {e}")))
 }
@@ -1619,7 +1641,7 @@ mod tests {
         )
         .await;
 
-        let write = |key: Uuid, cost: &str| UsageWrite {
+        let write = |key: Uuid, cost: &str, api: &str| UsageWrite {
             request_id: Uuid::new_v4(),
             attempt: 0,
             principal_id: Some(principal),
@@ -1640,18 +1662,20 @@ mod tests {
             cost_usd: cost.parse().expect("decimal"),
             counterfactual_usd: Decimal::ZERO,
             counterfactual_model_id: None,
-            counterfactual_api_usd: Decimal::ZERO,
+            // What the same tokens would cost at the model's list API price — for a seat, the
+            // bill it displaced while `cost_usd` stays truthfully what it is.
+            counterfactual_api_usd: api.parse().expect("decimal"),
             status: 200,
             latency_ms: Some(10),
             ttft_ms: None,
             streamed: false,
         };
-        let early = write(own, "1.25");
+        let early = write(own, "1.25", "2.00");
         record_usage(&db, &early).await.expect("record");
-        record_usage(&db, &write(own, "0.50"))
+        record_usage(&db, &write(own, "0.50", "0.80"))
             .await
             .expect("record");
-        record_usage(&db, &write(theirs, "9.00"))
+        record_usage(&db, &write(theirs, "9.00", "9.00"))
             .await
             .expect("record");
         // The first spend happened six hours ago: inside the week and the month, outside the
@@ -1684,6 +1708,18 @@ mod tests {
         );
         assert_eq!(usage.requests, 2);
         assert_windows(&usage);
+        assert_eq!(
+            usage.five_hour_requests, 1,
+            "only the recent spend is inside five hours"
+        );
+        assert_eq!(usage.seven_day_requests, 2);
+        assert_eq!(
+            usage.month_counterfactual_usd,
+            dec!(2.800000),
+            "the list-price bill the same tokens would have carried"
+        );
+        assert_eq!(usage.five_hour_counterfactual_usd, dec!(0.800000));
+        assert_eq!(usage.seven_day_counterfactual_usd, dec!(2.800000));
 
         let other = key_usage(&db, theirs)
             .await
@@ -1703,6 +1739,15 @@ mod tests {
             .expect("usage")
             .expect("the key exists");
         assert_eq!(empty.five_hour_usd, dec!(0));
+        assert_eq!(
+            (
+                empty.five_hour_requests,
+                empty.seven_day_requests,
+                empty.requests
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(empty.month_counterfactual_usd, dec!(0));
         assert!(
             empty.five_hour_frees_at.is_none() && empty.seven_day_frees_at.is_none(),
             "an empty window has nothing to free up"
