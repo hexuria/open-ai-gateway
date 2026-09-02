@@ -491,6 +491,102 @@ pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsa
     .map_err(|e| Error::Internal(format!("reading principal usage: {e}")))
 }
 
+/// One key's cap and spend — what a partner service shows next to the member
+/// (or the coworker) that holds the key.
+///
+/// Two spend figures, on purpose. `spent_usd` is the counter the quota check
+/// runs against: lifetime, denormalised on `api_key`, debited by `record_usage`
+/// in the same statement as the ledger row. `month_to_date_usd` is the ledger
+/// summed from the first of the current UTC month, the figure a person expects
+/// next to "this month". A cap written on a key is a wall on the first number;
+/// a service that shows the second as if it were what the cap measures would be
+/// lying about when the wall is reached.
+#[derive(Debug, Clone)]
+pub struct KeyUsage {
+    pub key_id: Uuid,
+    pub name: String,
+    pub prefix: String,
+    pub principal_email: String,
+    pub active: bool,
+    pub quota_usd: Option<Decimal>,
+    /// Lifetime, and what `quota_usd` is enforced against.
+    pub spent_usd: Decimal,
+    /// From the first of the current UTC month, out of the ledger.
+    pub month_to_date_usd: Decimal,
+    /// Requests this month.
+    pub requests: i64,
+}
+
+/// One key's cap and spend; `None` for an id that is not a key. The month figure
+/// comes from the ledger, not the counter, for the same reason `principal_usage`
+/// reads the ledger: the ledger is the record.
+pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
+    sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            String,
+            bool,
+            Option<Decimal>,
+            Decimal,
+            Decimal,
+            i64,
+        ),
+    >(
+        r"
+        SELECT k.id,
+               k.name,
+               k.key_prefix,
+               p.email,
+               k.active,
+               k.quota_usd,
+               k.spent_usd,
+               COALESCE(SUM(u.cost_usd) FILTER (
+                   WHERE u.occurred_at >= date_trunc('month', now())
+               ), 0)::numeric(14,6),
+               COUNT(u.request_id) FILTER (
+                   WHERE u.occurred_at >= date_trunc('month', now())
+               )
+        FROM api_key k
+        JOIN principal p ON p.id = k.principal_id
+        LEFT JOIN usage_event u ON u.api_key_id = k.id
+        WHERE k.id = $1
+        GROUP BY k.id, k.name, k.key_prefix, p.email, k.active, k.quota_usd, k.spent_usd
+        ",
+    )
+    .bind(id)
+    .fetch_optional(db.pool())
+    .await
+    .map(|row| {
+        row.map(
+            |(
+                key_id,
+                name,
+                prefix,
+                principal_email,
+                active,
+                quota_usd,
+                spent_usd,
+                month_to_date_usd,
+                requests,
+            )| KeyUsage {
+                key_id,
+                name,
+                prefix,
+                principal_email,
+                active,
+                quota_usd,
+                spent_usd,
+                month_to_date_usd,
+                requests,
+            },
+        )
+    })
+    .map_err(|e| Error::Internal(format!("reading key usage: {e}")))
+}
+
 /// Revoke by the displayed prefix, for the CLI — during an incident the prefix
 /// is what an operator can actually see.
 pub async fn revoke_key_by_prefix(
@@ -1397,9 +1493,133 @@ mod tests {
         (principal, route, AccountId::from_uuid(account))
     }
 
+    /// A capped key on `principal`, straight into the table — `mint_key` would
+    /// do, but a test about the ledger should not depend on the mint path.
+    async fn capped_key(db: &Db, principal: Uuid, route: Uuid, name: String) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO api_key (id, key_hash, key_prefix, name, principal_id, route_id, quota_usd)
+             VALUES (gen_random_uuid(), $1, 'oag_live_test', $2, $3, $4, $5)
+             RETURNING id",
+        )
+        .bind(hash_key(&name))
+        .bind(&name)
+        .bind(principal)
+        .bind(route)
+        .bind(Some(dec!(5.00)))
+        .fetch_one(db.pool())
+        .await
+        .expect("mint")
+    }
+
     fn test_db() -> Option<Db> {
         let url = std::env::var("OAG_TEST_DATABASE_URL").ok()?;
         Some(Db::connect(&url, 2).expect("connect"))
+    }
+
+    /// A key's usage is its OWN ledger rows: another key on the same principal
+    /// does not count, the month figure is the ledger's sum, and the lifetime
+    /// counter is what the cap is enforced against. An id that is not a key is
+    /// `None`, never a zeroed row.
+    #[tokio::test]
+    async fn key_usage_reads_one_keys_ledger_and_its_cap() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+        let email: String = sqlx::query_scalar("SELECT email FROM principal WHERE id = $1")
+            .bind(principal)
+            .fetch_one(db.pool())
+            .await
+            .expect("principal email");
+
+        let own = capped_key(
+            &db,
+            principal,
+            route,
+            format!("usage-own-{}", Uuid::new_v4()),
+        )
+        .await;
+        let theirs = capped_key(
+            &db,
+            principal,
+            route,
+            format!("usage-theirs-{}", Uuid::new_v4()),
+        )
+        .await;
+
+        let write = |key: Uuid, cost: &str| UsageWrite {
+            request_id: Uuid::new_v4(),
+            attempt: 0,
+            principal_id: Some(principal),
+            api_key_id: Some(key),
+            route_id: Some(route),
+            account_id: Some(account.as_uuid()),
+            model_id: "kimi-k2".to_owned(),
+            tier: "cheap".to_owned(),
+            selection_reason: "default".to_owned(),
+            escalated_from_tier: None,
+            escalation_gate: None,
+            usage: oag_router::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            cost_usd: cost.parse().expect("decimal"),
+            counterfactual_usd: Decimal::ZERO,
+            counterfactual_model_id: None,
+            counterfactual_api_usd: Decimal::ZERO,
+            status: 200,
+            latency_ms: Some(10),
+            ttft_ms: None,
+            streamed: false,
+        };
+        record_usage(&db, &write(own, "1.25"))
+            .await
+            .expect("record");
+        record_usage(&db, &write(own, "0.50"))
+            .await
+            .expect("record");
+        record_usage(&db, &write(theirs, "9.00"))
+            .await
+            .expect("record");
+
+        let usage = key_usage(&db, own)
+            .await
+            .expect("usage")
+            .expect("the key exists");
+        assert_eq!(usage.key_id, own);
+        assert_eq!(usage.principal_email, email);
+        assert!(usage.active);
+        assert_eq!(usage.quota_usd, Some(dec!(5.000000)));
+        assert_eq!(
+            usage.spent_usd,
+            dec!(1.750000),
+            "the counter the cap is enforced against"
+        );
+        assert_eq!(
+            usage.month_to_date_usd,
+            dec!(1.750000),
+            "this key's rows only"
+        );
+        assert_eq!(usage.requests, 2);
+
+        let other = key_usage(&db, theirs)
+            .await
+            .expect("usage")
+            .expect("the key exists");
+        assert_eq!(other.month_to_date_usd, dec!(9.000000));
+        assert_eq!(other.requests, 1);
+
+        assert!(
+            key_usage(&db, Uuid::new_v4())
+                .await
+                .expect("usage")
+                .is_none(),
+            "an unknown id is None, not a zeroed row"
+        );
     }
 
     /// The queries whose SELECT lists name every column by hand.

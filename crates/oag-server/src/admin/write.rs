@@ -258,6 +258,29 @@ pub async fn principal_usage(
     }
 }
 
+/// One key's cap and spend — the per-member (or per-coworker) figure a partner
+/// service shows next to the holder. `spent_usd` is what the cap is enforced
+/// against (lifetime); `month_to_date_usd` is the ledger this month. Both are
+/// given so the caller cannot mistake one for the other.
+pub async fn key_usage(State(state): State<Arc<AppState>>, Path(id): Path<uuid::Uuid>) -> Response {
+    match oag_store::repo::key_usage(&state.db, id).await {
+        Ok(Some(usage)) => Json(json!({
+            "id": usage.key_id,
+            "name": usage.name,
+            "key_prefix": usage.prefix,
+            "principal": usage.principal_email,
+            "active": usage.active,
+            "quota_usd": usage.quota_usd.map(|q| format!("{q:.6}")),
+            "spent_usd": format!("{:.6}", usage.spent_usd),
+            "month_to_date_usd": format!("{:.6}", usage.month_to_date_usd),
+            "requests": usage.requests,
+        }))
+        .into_response(),
+        Ok(None) => not_found("no key with that id"),
+        Err(e) => failed(&e),
+    }
+}
+
 /// Money arrives as a STRING, never a float: a budget is currency, and JSON
 /// numbers are binary floating point. `None`/absent clears the value.
 fn parse_money(raw: Option<&str>) -> std::result::Result<Option<Decimal>, String> {

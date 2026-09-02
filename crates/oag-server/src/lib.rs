@@ -176,6 +176,7 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/principals/{email}/usage", get(admin::principal_usage))
         .route("/keys/{id}/quota", patch(admin::set_key_quota))
+        .route("/keys/{id}/usage", get(admin::key_usage))
         // `route_layer` rather than `layer`: an unmatched path under
         // /admin/api should 404 without a database round trip.
         .route_layer(axum::middleware::from_fn_with_state(
@@ -397,6 +398,10 @@ server:
         (
             "PATCH",
             "/admin/api/keys/00000000-0000-0000-0000-000000000001/quota",
+        ),
+        (
+            "GET",
+            "/admin/api/keys/00000000-0000-0000-0000-000000000001/usage",
         ),
         ("GET", "/admin/api/services"),
         ("POST", "/admin/api/services"),
