@@ -26,6 +26,7 @@
 use crate::adapter::{ProviderAdapter, UpstreamRequest};
 use async_trait::async_trait;
 use oag_core::credential::SecretMaterial;
+use oag_core::provider::Dialect;
 use oag_core::{Error, Provider, Result};
 use oag_proto::{StreamAccumulator, StreamEvent, responses};
 use serde_json::json;
@@ -120,6 +121,16 @@ impl ProviderAdapter for CodexAdapter {
     fn provider(&self) -> Provider {
         // A Codex seat is an OpenAI credential; only the dialect differs.
         Provider::OpenAI
+    }
+
+    fn dialect(&self) -> Dialect {
+        // The whole reason this override exists. `provider()` says OpenAI and
+        // `Provider::OpenAI::native_dialect()` says Chat Completions, which is
+        // true of an API-key seat and false of this one. A caller that asks the
+        // provider concludes the dialects already agree and forwards these
+        // bytes verbatim — and a Chat Completions client reads a 200 with
+        // nothing it recognises in it.
+        Dialect::OpenAIResponses
     }
 
     fn build(&self, req: &UpstreamRequest<'_>) -> Result<reqwest::Request> {

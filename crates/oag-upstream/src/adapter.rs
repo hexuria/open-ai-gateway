@@ -8,6 +8,7 @@
 //! there means reading four of them to work out the shape.
 
 use async_trait::async_trait;
+use oag_core::provider::Dialect;
 use oag_core::{Provider, Result, credential::SecretMaterial};
 use oag_proto::{CanonicalRequest, StreamAccumulator, StreamEvent};
 use oag_router::ModelSpec;
@@ -45,6 +46,22 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
     /// it, and the compiler is no help there — hence the loud note above.
     fn framing(&self) -> Framing {
         Framing::Sse
+    }
+
+    /// The dialect this adapter actually speaks.
+    ///
+    /// Defaults to the provider's, which is right for every adapter chosen by
+    /// provider alone. It is NOT right for one chosen by credential: a Codex
+    /// subscription is `Provider::OpenAI` and speaks Responses, so a caller
+    /// asking the provider is told Chat Completions and forwards Responses
+    /// bytes verbatim to a client that cannot read them — a 200 carrying a
+    /// body the client sees as empty.
+    ///
+    /// The same shape as `framing` above, and for the same reason: both are
+    /// facts about the ADAPTER that the provider cannot answer for. Framing
+    /// learned it from Bedrock; this learned it from Codex.
+    fn dialect(&self) -> Dialect {
+        self.provider().native_dialect()
     }
 
     /// Build the HTTP request. Sets the URL, auth header, and body.
