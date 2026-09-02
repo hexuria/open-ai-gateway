@@ -286,6 +286,15 @@ pub async fn key_usage(State(state): State<Arc<AppState>>, Path(id): Path<uuid::
             "five_hour_frees_at": usage.five_hour_frees_at.map(rfc3339),
             "seven_day_usd": format!("{:.6}", usage.seven_day_usd),
             "seven_day_frees_at": usage.seven_day_frees_at.map(rfc3339),
+            // Requests per rolling window, and what the same tokens would have cost at the
+            // model's list API price: a subscription seat's usage shown against the bill it
+            // displaced ("12 requests · would have cost $0.41 on API"), since its cost is
+            // truthfully zero. The month's request count is `requests` above.
+            "five_hour_requests": usage.five_hour_requests,
+            "seven_day_requests": usage.seven_day_requests,
+            "month_counterfactual_usd": format!("{:.6}", usage.month_counterfactual_usd),
+            "five_hour_counterfactual_usd": format!("{:.6}", usage.five_hour_counterfactual_usd),
+            "seven_day_counterfactual_usd": format!("{:.6}", usage.seven_day_counterfactual_usd),
         }))
         .into_response(),
         Ok(None) => not_found("no key with that id"),
