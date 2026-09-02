@@ -491,16 +491,21 @@ pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsa
     .map_err(|e| Error::Internal(format!("reading principal usage: {e}")))
 }
 
-/// One key's cap and spend — what a partner service shows next to the member
-/// (or the coworker) that holds the key.
+/// One key's cap and spend — what a partner service shows next to the member (or the
+/// coworker) that holds the key, and what it evaluates a per-key limit against.
 ///
-/// Two spend figures, on purpose. `spent_usd` is the counter the quota check
-/// runs against: lifetime, denormalised on `api_key`, debited by `record_usage`
-/// in the same statement as the ledger row. `month_to_date_usd` is the ledger
-/// summed from the first of the current UTC month, the figure a person expects
-/// next to "this month". A cap written on a key is a wall on the first number;
-/// a service that shows the second as if it were what the cap measures would be
-/// lying about when the wall is reached.
+/// Four spend figures, on purpose. `spent_usd` is the counter the gateway's own quota check
+/// runs against: lifetime, denormalised on `api_key`, debited by `record_usage` in the same
+/// statement as the ledger row. The three windows are the ledger summed since an instant —
+/// a rolling five hours, a rolling seven days, the first of the current UTC month — the shape
+/// of a subscription's limits, which is what a partner service writes its rules in. A cap on
+/// the key is a wall on the first number; a service that showed a window figure as if it were
+/// what that cap measures would be lying about when the wall is reached, so all four are given.
+///
+/// A rolling window has no boundary: its "resets at" is the moment the OLDEST spend still
+/// inside it ages out — the earliest instant the figure drops at all — which is `oldest +
+/// window`, handed back as `frees_at` (`None` when the window is empty). The month resets on the
+/// first of the next month.
 #[derive(Debug, Clone)]
 pub struct KeyUsage {
     pub key_id: Uuid,
@@ -515,26 +520,34 @@ pub struct KeyUsage {
     pub month_to_date_usd: Decimal,
     /// Requests this month.
     pub requests: i64,
+    pub month_resets_at: OffsetDateTime,
+    pub five_hour_usd: Decimal,
+    pub five_hour_frees_at: Option<OffsetDateTime>,
+    pub seven_day_usd: Decimal,
+    pub seven_day_frees_at: Option<OffsetDateTime>,
 }
 
-/// One key's cap and spend; `None` for an id that is not a key. The month figure
-/// comes from the ledger, not the counter, for the same reason `principal_usage`
-/// reads the ledger: the ledger is the record.
+/// One key's cap and spend; `None` for an id that is not a key. Every figure comes from the
+/// ledger, not the counter, for the same reason `principal_usage` reads the ledger: the ledger
+/// is the record. One statement, three windows, the key's own rows only.
 pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
-    sqlx::query_as::<
-        _,
-        (
-            Uuid,
-            String,
-            String,
-            String,
-            bool,
-            Option<Decimal>,
-            Decimal,
-            Decimal,
-            i64,
-        ),
-    >(
+    type Row = (
+        Uuid,
+        String,
+        String,
+        String,
+        bool,
+        Option<Decimal>,
+        Decimal,
+        Decimal,
+        i64,
+        OffsetDateTime,
+        Decimal,
+        Option<OffsetDateTime>,
+        Decimal,
+        Option<OffsetDateTime>,
+    );
+    sqlx::query_as::<_, Row>(
         r"
         SELECT k.id,
                k.name,
@@ -548,7 +561,20 @@ pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
                ), 0)::numeric(14,6),
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
-               )
+               ),
+               date_trunc('month', now()) + interval '1 month',
+               COALESCE(SUM(u.cost_usd) FILTER (
+                   WHERE u.occurred_at >= now() - interval '5 hours'
+               ), 0)::numeric(14,6),
+               MIN(u.occurred_at) FILTER (
+                   WHERE u.occurred_at >= now() - interval '5 hours'
+               ) + interval '5 hours',
+               COALESCE(SUM(u.cost_usd) FILTER (
+                   WHERE u.occurred_at >= now() - interval '7 days'
+               ), 0)::numeric(14,6),
+               MIN(u.occurred_at) FILTER (
+                   WHERE u.occurred_at >= now() - interval '7 days'
+               ) + interval '7 days'
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
         LEFT JOIN usage_event u ON u.api_key_id = k.id
@@ -571,6 +597,11 @@ pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
                 spent_usd,
                 month_to_date_usd,
                 requests,
+                month_resets_at,
+                five_hour_usd,
+                five_hour_frees_at,
+                seven_day_usd,
+                seven_day_frees_at,
             )| KeyUsage {
                 key_id,
                 name,
@@ -581,6 +612,11 @@ pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
                 spent_usd,
                 month_to_date_usd,
                 requests,
+                month_resets_at,
+                five_hour_usd,
+                five_hour_frees_at,
+                seven_day_usd,
+                seven_day_frees_at,
             },
         )
     })
@@ -1493,6 +1529,39 @@ mod tests {
         (principal, route, AccountId::from_uuid(account))
     }
 
+    /// The three windows after one spend six hours ago and one just now: the five-hour window
+    /// holds only the recent one and frees up when it ages out; the week holds both and frees
+    /// up when the older one does; the month resets on the first.
+    fn assert_windows(usage: &KeyUsage) {
+        assert_eq!(
+            usage.five_hour_usd,
+            dec!(0.500000),
+            "the six-hour-old spend is outside"
+        );
+        assert_eq!(usage.seven_day_usd, dec!(1.750000), "and inside the week");
+        let now = OffsetDateTime::now_utc();
+        let frees = usage
+            .five_hour_frees_at
+            .expect("a non-empty window frees up");
+        let minutes = (frees - now).whole_minutes();
+        assert!(
+            (4 * 60 + 58..=5 * 60).contains(&minutes),
+            "the five-hour window frees up when its oldest (just-now) spend ages out: {frees}"
+        );
+        let frees = usage
+            .seven_day_frees_at
+            .expect("a non-empty window frees up");
+        let hours = (frees - now).whole_hours();
+        assert!(
+            (7 * 24 - 7..=7 * 24 - 5).contains(&hours),
+            "the seven-day window frees up when the six-hour-old spend ages out: {frees}"
+        );
+        assert!(
+            usage.month_resets_at > now,
+            "the month resets on the first of next month"
+        );
+    }
+
     /// A capped key on `principal`, straight into the table — `mint_key` would
     /// do, but a test about the ledger should not depend on the mint path.
     async fn capped_key(db: &Db, principal: Uuid, route: Uuid, name: String) -> Uuid {
@@ -1521,6 +1590,7 @@ mod tests {
     /// counter is what the cap is enforced against. An id that is not a key is
     /// `None`, never a zeroed row.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one ledger, three windows, two keys: the setup is the test
     async fn key_usage_reads_one_keys_ledger_and_its_cap() {
         let Some(db) = test_db() else {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
@@ -1576,15 +1646,23 @@ mod tests {
             ttft_ms: None,
             streamed: false,
         };
-        record_usage(&db, &write(own, "1.25"))
-            .await
-            .expect("record");
+        let early = write(own, "1.25");
+        record_usage(&db, &early).await.expect("record");
         record_usage(&db, &write(own, "0.50"))
             .await
             .expect("record");
         record_usage(&db, &write(theirs, "9.00"))
             .await
             .expect("record");
+        // The first spend happened six hours ago: inside the week and the month, outside the
+        // five-hour window.
+        sqlx::query(
+            "UPDATE usage_event SET occurred_at = now() - interval '6 hours' WHERE request_id = $1",
+        )
+        .bind(early.request_id)
+        .execute(db.pool())
+        .await
+        .expect("backdate");
 
         let usage = key_usage(&db, own)
             .await
@@ -1605,6 +1683,7 @@ mod tests {
             "this key's rows only"
         );
         assert_eq!(usage.requests, 2);
+        assert_windows(&usage);
 
         let other = key_usage(&db, theirs)
             .await
@@ -1612,6 +1691,22 @@ mod tests {
             .expect("the key exists");
         assert_eq!(other.month_to_date_usd, dec!(9.000000));
         assert_eq!(other.requests, 1);
+        let empty_key = capped_key(
+            &db,
+            principal,
+            route,
+            format!("usage-empty-{}", Uuid::new_v4()),
+        )
+        .await;
+        let empty = key_usage(&db, empty_key)
+            .await
+            .expect("usage")
+            .expect("the key exists");
+        assert_eq!(empty.five_hour_usd, dec!(0));
+        assert!(
+            empty.five_hour_frees_at.is_none() && empty.seven_day_frees_at.is_none(),
+            "an empty window has nothing to free up"
+        );
 
         assert!(
             key_usage(&db, Uuid::new_v4())

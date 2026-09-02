@@ -259,10 +259,17 @@ pub async fn principal_usage(
 }
 
 /// One key's cap and spend — the per-member (or per-coworker) figure a partner
-/// service shows next to the holder. `spent_usd` is what the cap is enforced
-/// against (lifetime); `month_to_date_usd` is the ledger this month. Both are
-/// given so the caller cannot mistake one for the other.
+/// service shows next to the holder, and evaluates its own per-key limits
+/// against. `spent_usd` is what the gateway's cap is enforced against (lifetime);
+/// the three windows are the ledger since an instant, each with the moment it
+/// next frees up (a rolling window: when its oldest spend ages out; the month:
+/// the first of next month). All given so the caller cannot mistake one for
+/// another. Instants are RFC 3339; money is a string.
 pub async fn key_usage(State(state): State<Arc<AppState>>, Path(id): Path<uuid::Uuid>) -> Response {
+    let rfc3339 = |t: time::OffsetDateTime| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default()
+    };
     match oag_store::repo::key_usage(&state.db, id).await {
         Ok(Some(usage)) => Json(json!({
             "id": usage.key_id,
@@ -273,7 +280,12 @@ pub async fn key_usage(State(state): State<Arc<AppState>>, Path(id): Path<uuid::
             "quota_usd": usage.quota_usd.map(|q| format!("{q:.6}")),
             "spent_usd": format!("{:.6}", usage.spent_usd),
             "month_to_date_usd": format!("{:.6}", usage.month_to_date_usd),
+            "month_resets_at": rfc3339(usage.month_resets_at),
             "requests": usage.requests,
+            "five_hour_usd": format!("{:.6}", usage.five_hour_usd),
+            "five_hour_frees_at": usage.five_hour_frees_at.map(rfc3339),
+            "seven_day_usd": format!("{:.6}", usage.seven_day_usd),
+            "seven_day_frees_at": usage.seven_day_frees_at.map(rfc3339),
         }))
         .into_response(),
         Ok(None) => not_found("no key with that id"),
