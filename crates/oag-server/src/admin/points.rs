@@ -10,14 +10,16 @@
 use super::{AdminActor, failed, invalid, not_found};
 use crate::AppState;
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 use oag_store::repo;
+use oag_store::repo::UsageWindow;
 use oag_store::rows::ModelRow;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+use time::OffsetDateTime;
 
 /// A model's multipliers over the reference price, per token class. `None` where the catalog
 /// has no price for the class. `shown_x` is the input multiplier: the one figure a picker
@@ -126,6 +128,126 @@ pub async fn points_models(State(state): State<Arc<AppState>>) -> Response {
                 })
                 .collect();
             Json(rows).into_response()
+        }
+        Err(e) => failed(&e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WindowQuery {
+    pub window: Option<String>,
+}
+
+/// The window a query names, month by default; the sentence for a 400 otherwise.
+fn window_of(raw: Option<&str>) -> std::result::Result<UsageWindow, String> {
+    let raw = raw.unwrap_or("month");
+    UsageWindow::parse(raw)
+        .ok_or_else(|| format!("'{raw}' is not a window; one of 5h, 24h, 7d, month"))
+}
+
+/// `GET /admin/api/keys/{id}/usage/models?window=5h|24h|7d|month` → one row per model the key
+/// used inside the window: requests, tokens by class, cost, list price, points. A key that
+/// exists and used nothing is `[]`; an unknown id is 404.
+pub async fn key_usage_models(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<uuid::Uuid>,
+    Query(query): Query<WindowQuery>,
+) -> Response {
+    let window = match window_of(query.window.as_deref()) {
+        Ok(window) => window,
+        Err(message) => return invalid(&message),
+    };
+    match repo::key_exists(&state.db, id).await {
+        Ok(true) => {}
+        Ok(false) => return not_found("no key with that id"),
+        Err(e) => return failed(&e),
+    }
+    let reference = match repo::points_reference(&state.db).await {
+        Ok(reference) => reference,
+        Err(e) => return failed(&e),
+    };
+    match repo::key_usage_by_model(&state.db, id, window, reference, OffsetDateTime::now_utc())
+        .await
+    {
+        Ok(rows) => Json(
+            rows.iter()
+                .map(|row| {
+                    json!({
+                        "model_id": row.model_id,
+                        "requests": row.requests,
+                        "input_tokens": row.input_tokens,
+                        "output_tokens": row.output_tokens,
+                        "cache_read_tokens": row.cache_read_tokens,
+                        "cache_write_tokens": row.cache_write_tokens,
+                        "cost_usd": format!("{:.6}", row.cost_usd),
+                        "list_usd": format!("{:.6}", row.list_usd),
+                        "points": row.points,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(e) => failed(&e),
+    }
+}
+
+/// How many keys one pool read may name. A member with fifty coworkers is fifty; five hundred
+/// is a bug or an attack.
+const MAX_POOL_KEYS: usize = 500;
+
+#[derive(Debug, Deserialize)]
+pub struct PointsInput {
+    pub keys: Vec<uuid::Uuid>,
+    pub window: Option<String>,
+}
+
+/// `POST /admin/api/usage/points` ← `{ "keys": [...], "window": "month" }` → the points each
+/// key spent inside the window and their total, in one query — the partner service's pool
+/// read (a member's pool is the sum over that member's coworker keys). A key with no rows is
+/// 0; 404 with the reason while no reference price is set.
+pub async fn points_for_keys(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<PointsInput>,
+) -> Response {
+    let window = match window_of(body.window.as_deref()) {
+        Ok(window) => window,
+        Err(message) => return invalid(&message),
+    };
+    if body.keys.len() > MAX_POOL_KEYS {
+        return invalid(&format!("at most {MAX_POOL_KEYS} keys per read"));
+    }
+    let reference = match repo::points_reference(&state.db).await {
+        Ok(Some(reference)) => reference,
+        Ok(None) => {
+            return not_found("no reference price set; PUT /admin/api/points/reference first");
+        }
+        Err(e) => return failed(&e),
+    };
+    let mut keys: Vec<uuid::Uuid> = body.keys;
+    keys.sort_unstable();
+    keys.dedup();
+    match repo::points_for_keys(
+        &state.db,
+        &keys,
+        window,
+        reference,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    {
+        Ok(spent) => {
+            let mut per_key = serde_json::Map::new();
+            let mut total: i64 = 0;
+            for key in &keys {
+                let points = spent
+                    .iter()
+                    .find(|(id, _)| id == key)
+                    .map_or(0, |(_, points)| *points);
+                total = total.saturating_add(points);
+                per_key.insert(key.to_string(), json!(points));
+            }
+            Json(json!({ "window": window.as_str(), "keys": per_key, "total": total }))
+                .into_response()
         }
         Err(e) => failed(&e),
     }
