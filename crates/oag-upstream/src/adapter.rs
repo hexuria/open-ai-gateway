@@ -83,4 +83,22 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
     async fn refresh(&self, _credential: &SecretMaterial) -> Result<Option<SecretMaterial>> {
         Ok(None)
     }
+
+    /// Which models this *credential* can be used with, as the provider's own
+    /// upstream names.
+    ///
+    /// A fact about the CREDENTIAL, not about the provider, which is the whole
+    /// reason it lives on the adapter: a Codex subscription and an ordinary
+    /// OpenAI API key are both `Provider::OpenAI` and serve different sets, so
+    /// a caller asking the provider gets an answer that is wrong for one of
+    /// them. The same shape as `framing` and `dialect` above, and the third
+    /// time Codex has taught this lesson.
+    ///
+    /// `None` means this adapter cannot be asked, and a caller must conclude
+    /// nothing from it — notably not that the credential serves nothing. An
+    /// empty `Vec` is the different, stronger claim that it was asked and the
+    /// answer was none.
+    async fn served_models(&self, _credential: &SecretMaterial) -> Result<Option<Vec<String>>> {
+        Ok(None)
+    }
 }

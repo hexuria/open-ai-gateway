@@ -34,7 +34,7 @@ pub fn spawn_usage_poll(state: Arc<AppState>) {
 }
 
 /// One sweep over every subscription seat.
-async fn poll_once(state: &AppState) {
+async fn poll_once(state: &Arc<AppState>) {
     let accounts = match oag_store::repo::schedulable_oauth_accounts(&state.db).await {
         Ok(a) => a,
         Err(e) => {
@@ -100,5 +100,51 @@ async fn poll_once(state: &AppState) {
             Ok(None) => {}
             Err(e) => tracing::debug!(%account, error = %e, "usage poll: provider read failed"),
         }
+
+        discover_served(state, &row, provider, account, &material).await;
+    }
+}
+
+/// Ask one credential which models it will actually accept, and record it.
+///
+/// Rides the usage sweep rather than getting a task of its own: it wants the
+/// same set of credentials, the same freshened token, and the same failure
+/// posture, and a second interval task polling the same seats would only be a
+/// second thing to reason about.
+///
+/// The answer cannot come from anywhere else. The catalogue is priced from
+/// LiteLLM and knows nothing about entitlement; a local proxy's model list is
+/// that proxy's opinion; and the served set is a property of the PLAN behind
+/// one credential, so a free `ChatGPT` seat and a paid one at the same provider
+/// disagree. Only the credential can answer for itself.
+///
+/// Failure leaves the column exactly as it was, which is the same reasoning as
+/// the usage columns above: NULL means "never asked" and falls back to ladder
+/// visibility, while writing an empty array would claim the seat serves
+/// nothing and empty the caller's picker.
+async fn discover_served(
+    state: &Arc<AppState>,
+    row: &oag_store::AccountRow,
+    provider: oag_core::Provider,
+    account: oag_core::AccountId,
+    material: &oag_core::credential::SecretMaterial,
+) {
+    let Ok(adapter) = crate::gateway::adapter_for(state, provider, row) else {
+        return;
+    };
+    match adapter.served_models(material).await {
+        Ok(Some(models)) => {
+            if let Err(e) =
+                oag_store::repo::set_served_models(&state.db, account.as_uuid(), &models).await
+            {
+                tracing::warn!(%account, error = %e, "served models: could not record");
+                return;
+            }
+            tracing::debug!(%account, count = models.len(), "served models discovered");
+        }
+        // This adapter cannot be asked. Not a failure, and not evidence of
+        // anything about the credential.
+        Ok(None) => {}
+        Err(e) => tracing::debug!(%account, error = %e, "served models: provider read failed"),
     }
 }

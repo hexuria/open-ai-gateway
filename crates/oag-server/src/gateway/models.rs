@@ -28,17 +28,24 @@ use oag_core::credential::CredentialKind;
 use oag_core::{Provider, TierName, tier::RoutingMode};
 use oag_router::{BudgetPressure, Entitlement};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use time::OffsetDateTime;
 
-/// Which credential kinds a route can reach each provider through.
+/// Which credential kinds a route can reach each provider through, and what
+/// each of those will actually accept.
 ///
 /// The listing offers `<model>@sub` only where a subscription is actually
 /// reachable. Advertising a channel nobody holds a credential for is the same
 /// mistake as listing a model with no provider behind it: the failure moves
 /// away from its cause and turns up as a 503 much later.
-type Channels = BTreeMap<Provider, HashSet<CredentialKind>>;
+///
+/// Keyed by kind rather than collapsed to a provider because the served set is
+/// a property of the CREDENTIAL, not of the provider: a Codex seat on a free
+/// `ChatGPT` plan and an ordinary OpenAI API key are both `Provider::OpenAI` and
+/// accept different models, so one answer for the provider is wrong for one of
+/// them. `None` is "never asked", which is emphatically not "serves nothing".
+type Channels = BTreeMap<Provider, HashMap<CredentialKind, Option<HashSet<String>>>>;
 
 /// Query parameters on the listing.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -304,7 +311,7 @@ async fn channels_for(
 ) -> oag_core::Result<Channels> {
     let raw = oag_store::repo::route_channels(&state.db, route_id, principal_id).await?;
     let mut out = Channels::new();
-    for (name, kind) in raw {
+    for (name, kind, served) in raw {
         let Ok(provider) = name.parse::<Provider>() else {
             tracing::warn!(
                 provider = %name,
@@ -312,15 +319,35 @@ async fn channels_for(
             );
             continue;
         };
-        let entry = out.entry(provider).or_default();
-        if let Some(kind) = CredentialKind::from_column(&kind) {
-            entry.insert(kind);
-        } else {
+        let Some(parsed) = CredentialKind::from_column(&kind) else {
             tracing::warn!(
                 provider = %name,
                 kind = %kind,
                 "account.kind is not a known credential kind; not offering a qualified id for it"
             );
+            continue;
+        };
+        let served: Option<HashSet<String>> = served.map(|m| m.into_iter().collect());
+        match out.entry(provider).or_default().entry(parsed) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(served);
+            }
+            // Two credentials of the same kind at one provider merge. Both
+            // known unions; either unknown makes the pair unknown, because a
+            // credential we never asked might serve what the other refuses and
+            // hiding a model on that guess is the bug being fixed.
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let unknown = match (slot.get_mut().as_mut(), served) {
+                    (Some(acc), Some(more)) => {
+                        acc.extend(more);
+                        false
+                    }
+                    _ => true,
+                };
+                if unknown {
+                    slot.insert(None);
+                }
+            }
         }
     }
     Ok(out)
@@ -344,7 +371,7 @@ fn concrete_entries(e: &Entitlement, channels: &Channels) -> Vec<Value> {
         CredentialKind::QUALIFIED
             .iter()
             .copied()
-            .filter(|k| held.contains(k))
+            .filter(|k| kind_serves(held, *k, &e.spec.upstream_name))
             .map(|k| concrete_entry(e, Some(k))),
     );
     out
@@ -454,12 +481,57 @@ fn entry(id: &str, owned_by: &str, display_name: &str, oag: Value) -> Value {
 /// forty-six. `decide` still honours a name someone typed; this only decides
 /// what we advertise.
 fn on_offer(e: &Entitlement<'_>, channels: &Channels) -> bool {
-    if e.tier.is_some() {
-        return true;
+    let Some(held) = channels.get(&e.spec.provider) else {
+        return false;
+    };
+    match serves(held, &e.spec.upstream_name) {
+        // We asked the credentials and they answered. That is the whole
+        // answer: a rung cannot make a refused model servable — a free Codex
+        // plan refuses `gpt-5` however prominently a ladder names it — and a
+        // model the seat serves is reachable whether or not a rung names it.
+        Some(answer) => answer,
+        // Never asked. The old rule, which is the best guess available: rung
+        // membership, or a metered key that can call the whole catalogue.
+        None => e.tier.is_some() || held.keys().any(|k| !k.flat_rate()),
     }
-    channels
-        .get(&e.spec.provider)
-        .is_some_and(|kinds| kinds.iter().copied().any(|k| !k.flat_rate()))
+}
+
+/// Whether any of a provider's credentials serves this model, or `None` when
+/// at least one of them has never been asked.
+///
+/// Unknown beats a negative deliberately. A credential we have not
+/// interrogated might serve the model, and hiding it on that guess is the
+/// same class of mistake as advertising one that refuses — it just fails in
+/// the other direction, where nobody can see it.
+fn serves(held: &HashMap<CredentialKind, Option<HashSet<String>>>, upstream: &str) -> Option<bool> {
+    let mut unknown = false;
+    for set in held.values() {
+        match set {
+            Some(s) if s.contains(upstream) => return Some(true),
+            Some(_) => {}
+            None => unknown = true,
+        }
+    }
+    (!unknown).then_some(false)
+}
+
+/// Whether this exact credential kind is held, and serves this model.
+///
+/// The `@sub` twin used to be emitted for any model whose provider had a
+/// subscription anywhere on the route, with nothing checking the seat would
+/// take it. That is how a free `ChatGPT` plan came to advertise `openai/gpt-5@sub`
+/// and refuse it on the first turn.
+fn kind_serves(
+    held: &HashMap<CredentialKind, Option<HashSet<String>>>,
+    kind: CredentialKind,
+    upstream: &str,
+) -> bool {
+    match held.get(&kind) {
+        Some(Some(served)) => served.contains(upstream),
+        // Held, never asked: the old behaviour, which is to offer it.
+        Some(None) => true,
+        None => false,
+    }
 }
 
 fn offered<'c>(concrete: Vec<Entitlement<'c>>, channels: &Channels) -> Vec<Entitlement<'c>> {
@@ -567,9 +639,16 @@ mod tests {
         }
     }
 
-    /// A route holding every kind named, for one provider.
+    /// A route holding every kind named, for one provider, none of them yet
+    /// asked what they serve — the pre-discovery state.
     fn channels(provider: Provider, kinds: &[CredentialKind]) -> Channels {
-        Channels::from([(provider, kinds.iter().copied().collect())])
+        Channels::from([(provider, kinds.iter().copied().map(|k| (k, None)).collect())])
+    }
+
+    /// A route where one kind has been asked and answered.
+    fn channels_serving(provider: Provider, kind: CredentialKind, upstream: &[&str]) -> Channels {
+        let served: HashSet<String> = upstream.iter().map(|s| (*s).to_owned()).collect();
+        Channels::from([(provider, HashMap::from([(kind, Some(served))]))])
     }
 
     fn entitled(spec: &ModelSpec) -> Entitlement<'_> {
@@ -691,6 +770,98 @@ mod tests {
         };
         assert_eq!(names(false), ["cheap", "frontier"]);
         assert_eq!(names(true), names(false));
+    }
+
+    #[test]
+    fn a_discovered_refusal_beats_ladder_membership() {
+        // The bug this whole change exists for. A free ChatGPT seat refuses
+        // `gpt-5` however prominently a rung names it, so a rung must not be
+        // able to advertise a model the credential has told us it will not take.
+        let spec = spec();
+        let on_a_rung = Entitlement {
+            spec: &spec,
+            tier: Some(TierName::new("balanced")),
+            honoured: true,
+        };
+        let seat_refuses =
+            channels_serving(spec.provider, CredentialKind::OAuth, &["something-else"]);
+        assert!(
+            !on_offer(&on_a_rung, &seat_refuses),
+            "a ladder rung advertised a model the credential refuses"
+        );
+    }
+
+    #[test]
+    fn a_discovered_model_is_offered_without_any_rung() {
+        // The other half: once a credential has answered, the ladder stops
+        // being what makes a model visible. An off-ladder model the seat
+        // serves is reachable, and on a subscription-only route it used to be
+        // dropped for want of a metered key.
+        let spec = spec();
+        let off_ladder = entitled(&spec);
+        assert_eq!(off_ladder.tier, None);
+        let seat_serves =
+            channels_serving(spec.provider, CredentialKind::OAuth, &[&spec.upstream_name]);
+        assert!(
+            on_offer(&off_ladder, &seat_serves),
+            "a model the seat serves was hidden because no rung named it"
+        );
+    }
+
+    #[test]
+    fn an_undiscovered_credential_keeps_the_old_behaviour() {
+        // Never asked must not read as "serves nothing", or a gateway that has
+        // not yet run a discovery sweep would advertise an empty picker.
+        let spec = spec();
+        let on_a_rung = Entitlement {
+            spec: &spec,
+            tier: Some(TierName::new("balanced")),
+            honoured: true,
+        };
+        let unasked = channels(spec.provider, &[CredentialKind::OAuth]);
+        assert!(on_offer(&on_a_rung, &unasked), "rung visibility regressed");
+        assert!(
+            !on_offer(&entitled(&spec), &unasked),
+            "a flat-rate credential should not offer the whole catalogue"
+        );
+    }
+
+    #[test]
+    fn one_unasked_credential_makes_the_pair_unknown() {
+        // Two seats of a kind, one discovered and one not. The undiscovered one
+        // might serve what the other refuses, and hiding the model on that
+        // guess fails in the direction nobody can see.
+        let spec = spec();
+        let mut mixed = channels_serving(spec.provider, CredentialKind::OAuth, &["other"]);
+        mixed
+            .get_mut(&spec.provider)
+            .expect("provider")
+            .insert(CredentialKind::ApiKey, None);
+        assert_eq!(
+            serves(
+                mixed.get(&spec.provider).expect("provider"),
+                &spec.upstream_name
+            ),
+            None,
+            "an unasked credential must leave the answer unknown, not false"
+        );
+    }
+
+    #[test]
+    fn a_sub_twin_is_offered_only_where_the_seat_serves_the_model() {
+        // `openai/gpt-5@sub` on a free Codex plan: the provider had a
+        // subscription, nothing checked the seat would take that model, and the
+        // caller found out on the first turn.
+        let spec = spec();
+        let refuses = channels_serving(spec.provider, CredentialKind::OAuth, &["something-else"]);
+        let ids: Vec<String> = concrete_entries(&entitled(&spec), &refuses)
+            .iter()
+            .filter_map(|e| e["id"].as_str().map(String::from))
+            .collect();
+        assert!(
+            !ids.iter().any(|id| id.ends_with("@sub")),
+            "advertised a @sub twin the seat refuses: {ids:?}"
+        );
     }
 
     #[test]

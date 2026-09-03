@@ -802,7 +802,7 @@ fn egress_for(
 /// can be forwarded as they are. When only the first knew about Codex seats,
 /// the second asked the provider instead, was told Chat Completions, and passed
 /// Responses bytes through to a client that reads them as an empty answer.
-fn adapter_for(
+pub(crate) fn adapter_for(
     state: &Arc<AppState>,
     provider: oag_core::Provider,
     account: &oag_store::AccountRow,

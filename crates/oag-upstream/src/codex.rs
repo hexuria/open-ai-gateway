@@ -186,6 +186,95 @@ impl ProviderAdapter for CodexAdapter {
         // the token endpoint. No-ops on a credential with no refresh token.
         crate::openai_oauth::refresh(credential, &self.token_url).await
     }
+
+    async fn served_models(&self, credential: &SecretMaterial) -> Result<Option<Vec<String>>> {
+        // Same auth and same account scoping as `build`: the answer is
+        // per-seat, so asking without `chatgpt-account-id` would be asking a
+        // different question from the one inference will ask.
+        let mut builder = reqwest::Client::new()
+            .get(format!("{}/models", self.base_url))
+            .header("accept", "application/json")
+            .header(
+                "authorization",
+                format!("Bearer {}", credential.access_token),
+            )
+            .header("originator", self.originator.as_str())
+            .header("user-agent", self.user_agent.as_str());
+        if let Some(account_id) = &credential.account_id {
+            builder = builder.header("chatgpt-account-id", account_id.as_str());
+        }
+
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| Error::Internal(format!("asking codex for its models: {e}")))?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(Error::Internal(format!(
+                "codex models returned {status}: {}",
+                truncate(&body)
+            )));
+        }
+
+        parse_served(&body).map(Some)
+    }
+}
+
+/// Pull model ids out of whatever shape the backend answers with.
+///
+/// Split out and pure because the shape is the part we are least sure of: this
+/// endpoint is undocumented, and a parser that can be tested against a captured
+/// body is worth more than one that can only be exercised against a live seat.
+/// Accepts the OpenAI listing shape (`{"data":[{"id":...}]}`) and a bare array
+/// of strings, and fails loudly with the body rather than returning an empty
+/// list — "served nothing" is a claim callers act on, so it must never be what
+/// an unrecognised payload degrades into.
+fn parse_served(body: &str) -> Result<Vec<String>> {
+    let json: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| Error::Internal(format!("codex models is not JSON: {e}")))?;
+
+    let ids: Vec<String> = match &json {
+        serde_json::Value::Object(o) => o
+            .get("data")
+            .and_then(|d| d.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| match r {
+                        serde_json::Value::String(s) => Some(s.clone()),
+                        other => other["id"].as_str().map(str::to_owned),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        serde_json::Value::Array(rows) => rows
+            .iter()
+            .filter_map(|r| r.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    if ids.is_empty() {
+        return Err(Error::Internal(format!(
+            "codex models: no ids in a payload shaped {}",
+            truncate(body)
+        )));
+    }
+    Ok(ids)
+}
+
+/// Keep an upstream body short enough to belong in an error message.
+fn truncate(body: &str) -> String {
+    const MAX: usize = 300;
+    if body.len() <= MAX {
+        return body.to_owned();
+    }
+    let cut = body
+        .char_indices()
+        .take_while(|(i, _)| *i <= MAX)
+        .last()
+        .map_or(0, |(i, _)| i);
+    format!("{}…", &body[..cut])
 }
 
 #[cfg(test)]
