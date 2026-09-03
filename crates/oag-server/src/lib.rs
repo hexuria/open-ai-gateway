@@ -184,6 +184,10 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
             get(admin::points_reference).put(admin::set_points_reference),
         )
         .route("/points/models", get(admin::points_models))
+        // Usage in points: per model for one key, and the batch over several keys that a
+        // partner service reads as a member's pool.
+        .route("/keys/{id}/usage/models", get(admin::key_usage_models))
+        .route("/usage/points", post(admin::points_for_keys))
         // `route_layer` rather than `layer`: an unmatched path under
         // /admin/api should 404 without a database round trip.
         .route_layer(axum::middleware::from_fn_with_state(
@@ -431,6 +435,11 @@ server:
         ("GET", "/admin/api/points/reference"),
         ("PUT", "/admin/api/points/reference"),
         ("GET", "/admin/api/points/models"),
+        (
+            "GET",
+            "/admin/api/keys/00000000-0000-0000-0000-000000000001/usage/models",
+        ),
+        ("POST", "/admin/api/usage/points"),
     ];
 
     async fn status(router: Router, method: &str, path: &str) -> StatusCode {

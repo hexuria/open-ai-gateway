@@ -26,7 +26,9 @@ pub mod write;
 pub use auth::{AdminActor, require_admin_layer};
 pub use models::{list_models, update_model};
 pub use period::{Window, WindowView};
-pub use points::{points_models, points_reference, set_points_reference};
+pub use points::{
+    key_usage_models, points_for_keys, points_models, points_reference, set_points_reference,
+};
 pub use services::{
     check_service, create_service, disable_service, enable_service, list_services, update_service,
 };

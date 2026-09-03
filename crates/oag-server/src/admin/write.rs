@@ -270,7 +270,12 @@ pub async fn key_usage(State(state): State<Arc<AppState>>, Path(id): Path<uuid::
         t.format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default()
     };
-    match oag_store::repo::key_usage(&state.db, id).await {
+    // The points price first: without it the points fields are null, never zero.
+    let reference = match oag_store::repo::points_reference(&state.db).await {
+        Ok(reference) => reference,
+        Err(e) => return failed(&e),
+    };
+    match oag_store::repo::key_usage(&state.db, id, reference).await {
         Ok(Some(usage)) => Json(json!({
             "id": usage.key_id,
             "name": usage.name,
@@ -295,6 +300,16 @@ pub async fn key_usage(State(state): State<Arc<AppState>>, Path(id): Path<uuid::
             "month_counterfactual_usd": format!("{:.6}", usage.month_counterfactual_usd),
             "five_hour_counterfactual_usd": format!("{:.6}", usage.five_hour_counterfactual_usd),
             "seven_day_counterfactual_usd": format!("{:.6}", usage.seven_day_counterfactual_usd),
+            // The rolling day: the optional daily brake a coworker's owner may set.
+            "day_usd": format!("{:.6}", usage.day_usd),
+            "day_frees_at": usage.day_frees_at.map(rfc3339),
+            "day_requests": usage.day_requests,
+            "day_counterfactual_usd": format!("{:.6}", usage.day_counterfactual_usd),
+            // Points per window; null while no reference price is set.
+            "month_points": usage.month_points,
+            "five_hour_points": usage.five_hour_points,
+            "day_points": usage.day_points,
+            "seven_day_points": usage.seven_day_points,
         }))
         .into_response(),
         Ok(None) => not_found("no key with that id"),

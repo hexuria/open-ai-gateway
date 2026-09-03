@@ -536,6 +536,216 @@ pub struct KeyUsage {
     pub month_counterfactual_usd: Decimal,
     pub five_hour_counterfactual_usd: Decimal,
     pub seven_day_counterfactual_usd: Decimal,
+    /// The rolling day — the optional daily brake a coworker's owner may set.
+    pub day_usd: Decimal,
+    pub day_frees_at: Option<OffsetDateTime>,
+    pub day_requests: i64,
+    pub day_counterfactual_usd: Decimal,
+    /// Points per window: each request's list-price cost over the reference price, rounded
+    /// half up per request and summed. `None` while no reference price is set.
+    pub month_points: Option<i64>,
+    pub five_hour_points: Option<i64>,
+    pub day_points: Option<i64>,
+    pub seven_day_points: Option<i64>,
+}
+
+/// The rolling windows a partner service meters a key over, plus the calendar month. Rolling
+/// windows are measured back from now; the month is the UTC month.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageWindow {
+    FiveHours,
+    Day,
+    SevenDays,
+    Month,
+}
+
+impl UsageWindow {
+    /// The wire spelling, the one the partner service and the desktop use.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim() {
+            "5h" => Some(Self::FiveHours),
+            "24h" => Some(Self::Day),
+            "7d" => Some(Self::SevenDays),
+            "month" => Some(Self::Month),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FiveHours => "5h",
+            Self::Day => "24h",
+            Self::SevenDays => "7d",
+            Self::Month => "month",
+        }
+    }
+
+    /// The length of a rolling window; the month has none.
+    pub fn length(self) -> Option<time::Duration> {
+        match self {
+            Self::FiveHours => Some(time::Duration::hours(5)),
+            Self::Day => Some(time::Duration::hours(24)),
+            Self::SevenDays => Some(time::Duration::days(7)),
+            Self::Month => None,
+        }
+    }
+
+    /// The instant the window starts at, as of `now`.
+    pub fn since(self, now: OffsetDateTime) -> OffsetDateTime {
+        match self.length() {
+            Some(length) => now - length,
+            None => first_of_month(now),
+        }
+    }
+
+    /// When the window next frees up: a rolling window's oldest spend ageing out (none when
+    /// it is empty); the month's reset.
+    pub fn frees_at(
+        self,
+        oldest: Option<OffsetDateTime>,
+        now: OffsetDateTime,
+    ) -> Option<OffsetDateTime> {
+        match self.length() {
+            Some(length) => oldest.map(|oldest| oldest + length),
+            None => Some(first_of_next_month(now)),
+        }
+    }
+}
+
+fn first_of_month(now: OffsetDateTime) -> OffsetDateTime {
+    let now = now.to_offset(time::UtcOffset::UTC);
+    now.replace_day(1)
+        .and_then(|d| d.replace_time(time::Time::MIDNIGHT).replace_nanosecond(0))
+        .unwrap_or(now)
+}
+
+fn first_of_next_month(now: OffsetDateTime) -> OffsetDateTime {
+    let start = first_of_month(now);
+    let (year, month) = if start.month() == time::Month::December {
+        (start.year() + 1, time::Month::January)
+    } else {
+        (start.year(), start.month().next())
+    };
+    start
+        .replace_year(year)
+        .and_then(|d| d.replace_month(month))
+        .unwrap_or(start)
+}
+
+/// One model's share of a key's usage inside a window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelUsage {
+    pub model_id: String,
+    pub requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_usd: Decimal,
+    /// What the same tokens would have cost at the model's list API price.
+    pub list_usd: Decimal,
+    /// `None` while no reference price is set.
+    pub points: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ModelUsageRow {
+    model_id: String,
+    requests: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    cost_usd: Decimal,
+    list_usd: Decimal,
+    points: Option<i64>,
+}
+
+/// Whether an id names a key at all — an empty per-model report needs to know.
+pub async fn key_exists(db: &Db, id: Uuid) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM api_key WHERE id = $1)")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("looking up a key: {e}")))
+}
+
+/// A key's usage inside a window, per model: requests, tokens by class, cost, list price and
+/// points (rounded half up per request, summed as integers; `None` without a reference).
+pub async fn key_usage_by_model(
+    db: &Db,
+    id: Uuid,
+    window: UsageWindow,
+    reference: Option<Decimal>,
+    now: OffsetDateTime,
+) -> Result<Vec<ModelUsage>> {
+    sqlx::query_as::<_, ModelUsageRow>(
+        r"
+        SELECT model_id,
+               COUNT(request_id) AS requests,
+               COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
+               COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
+               COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
+               COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens,
+               COALESCE(SUM(cost_usd), 0)::numeric(14,6) AS cost_usd,
+               COALESCE(SUM(counterfactual_api_usd), 0)::numeric(14,6) AS list_usd,
+               CASE WHEN $3::numeric IS NULL THEN NULL
+                    ELSE SUM(ROUND(counterfactual_api_usd * 1000000 / $3::numeric))::bigint
+               END AS points
+        FROM usage_event
+        WHERE api_key_id = $1 AND occurred_at >= $2
+        GROUP BY model_id
+        ORDER BY list_usd DESC, model_id
+        ",
+    )
+    .bind(id)
+    .bind(window.since(now))
+    .bind(reference)
+    .fetch_all(db.pool())
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| ModelUsage {
+                model_id: row.model_id,
+                requests: row.requests,
+                input_tokens: row.input_tokens,
+                output_tokens: row.output_tokens,
+                cache_read_tokens: row.cache_read_tokens,
+                cache_write_tokens: row.cache_write_tokens,
+                cost_usd: row.cost_usd,
+                list_usd: row.list_usd,
+                points: row.points,
+            })
+            .collect()
+    })
+    .map_err(|e| Error::Internal(format!("reading a key's usage by model: {e}")))
+}
+
+/// Points spent inside a window by each of several keys — one query, the partner service's
+/// pool read (a member's pool is the sum over that member's coworker keys). Keys with no rows
+/// are absent; the caller says 0 for them.
+pub async fn points_for_keys(
+    db: &Db,
+    keys: &[Uuid],
+    window: UsageWindow,
+    reference: Decimal,
+    now: OffsetDateTime,
+) -> Result<Vec<(Uuid, i64)>> {
+    sqlx::query_as::<_, (Uuid, i64)>(
+        r"
+        SELECT api_key_id,
+               SUM(ROUND(counterfactual_api_usd * 1000000 / $3::numeric))::bigint
+        FROM usage_event
+        WHERE api_key_id = ANY($1) AND occurred_at >= $2
+        GROUP BY api_key_id
+        ",
+    )
+    .bind(keys)
+    .bind(window.since(now))
+    .bind(reference)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("reading points over keys: {e}")))
 }
 
 /// The row `key_usage` reads, named: nineteen columns is past what a tuple can carry.
@@ -560,12 +770,25 @@ struct KeyUsageRow {
     month_counterfactual_usd: Decimal,
     five_hour_counterfactual_usd: Decimal,
     seven_day_counterfactual_usd: Decimal,
+    day_usd: Decimal,
+    day_frees_at: Option<OffsetDateTime>,
+    day_requests: i64,
+    day_counterfactual_usd: Decimal,
+    month_points: Option<i64>,
+    five_hour_points: Option<i64>,
+    day_points: Option<i64>,
+    seven_day_points: Option<i64>,
 }
 
 /// One key's cap and spend; `None` for an id that is not a key. Every figure comes from the
 /// ledger, not the counter, for the same reason `principal_usage` reads the ledger: the ledger
 /// is the record. One statement, three windows, the key's own rows only.
-pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
+/// `reference` is the points price, read first by the caller; without one the points fields
+/// are `None`, never zero.
+// One statement, four windows, ten figures each: the length is the SELECT list, and splitting
+// it would read the ledger twice.
+#[allow(clippy::too_many_lines)]
+pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<Option<KeyUsage>> {
     sqlx::query_as::<_, KeyUsageRow>(
         r"
         SELECT k.id,
@@ -608,7 +831,31 @@ pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
                ), 0)::numeric(14,6) AS five_hour_counterfactual_usd,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '7 days'
-               ), 0)::numeric(14,6) AS seven_day_counterfactual_usd
+               ), 0)::numeric(14,6) AS seven_day_counterfactual_usd,
+               COALESCE(SUM(u.cost_usd) FILTER (
+                   WHERE u.occurred_at >= now() - interval '24 hours'
+               ), 0)::numeric(14,6) AS day_usd,
+               MIN(u.occurred_at) FILTER (
+                   WHERE u.occurred_at >= now() - interval '24 hours'
+               ) + interval '24 hours' AS day_frees_at,
+               COUNT(u.request_id) FILTER (
+                   WHERE u.occurred_at >= now() - interval '24 hours'
+               ) AS day_requests,
+               COALESCE(SUM(u.counterfactual_api_usd) FILTER (
+                   WHERE u.occurred_at >= now() - interval '24 hours'
+               ), 0)::numeric(14,6) AS day_counterfactual_usd,
+               CASE WHEN $2::numeric IS NULL THEN NULL ELSE COALESCE(SUM(ROUND(u.counterfactual_api_usd * 1000000 / $2::numeric)) FILTER (
+                   WHERE u.occurred_at >= date_trunc('month', now())
+               ), 0)::bigint END AS month_points,
+               CASE WHEN $2::numeric IS NULL THEN NULL ELSE COALESCE(SUM(ROUND(u.counterfactual_api_usd * 1000000 / $2::numeric)) FILTER (
+                   WHERE u.occurred_at >= now() - interval '5 hours'
+               ), 0)::bigint END AS five_hour_points,
+               CASE WHEN $2::numeric IS NULL THEN NULL ELSE COALESCE(SUM(ROUND(u.counterfactual_api_usd * 1000000 / $2::numeric)) FILTER (
+                   WHERE u.occurred_at >= now() - interval '24 hours'
+               ), 0)::bigint END AS day_points,
+               CASE WHEN $2::numeric IS NULL THEN NULL ELSE COALESCE(SUM(ROUND(u.counterfactual_api_usd * 1000000 / $2::numeric)) FILTER (
+                   WHERE u.occurred_at >= now() - interval '7 days'
+               ), 0)::bigint END AS seven_day_points
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
         LEFT JOIN usage_event u ON u.api_key_id = k.id
@@ -617,6 +864,7 @@ pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
         ",
     )
     .bind(id)
+    .bind(reference)
     .fetch_optional(db.pool())
     .await
     .map(|row| {
@@ -640,6 +888,14 @@ pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
             month_counterfactual_usd: row.month_counterfactual_usd,
             five_hour_counterfactual_usd: row.five_hour_counterfactual_usd,
             seven_day_counterfactual_usd: row.seven_day_counterfactual_usd,
+            day_usd: row.day_usd,
+            day_frees_at: row.day_frees_at,
+            day_requests: row.day_requests,
+            day_counterfactual_usd: row.day_counterfactual_usd,
+            month_points: row.month_points,
+            five_hour_points: row.five_hour_points,
+            day_points: row.day_points,
+            seven_day_points: row.seven_day_points,
         })
     })
     .map_err(|e| Error::Internal(format!("reading key usage: {e}")))
@@ -1711,7 +1967,7 @@ mod tests {
         .await
         .expect("backdate");
 
-        let usage = key_usage(&db, own)
+        let usage = key_usage(&db, own, Some(dec!(0.20)))
             .await
             .expect("usage")
             .expect("the key exists");
@@ -1743,13 +1999,75 @@ mod tests {
         );
         assert_eq!(usage.five_hour_counterfactual_usd, dec!(0.800000));
         assert_eq!(usage.seven_day_counterfactual_usd, dec!(2.800000));
+        // The rolling day holds both (six hours ago is inside it).
+        assert_eq!(usage.day_usd, dec!(1.750000));
+        assert_eq!(usage.day_requests, 2);
+        assert_eq!(usage.day_counterfactual_usd, dec!(2.800000));
+        assert!(usage.day_frees_at.is_some());
+        // Points at R = 0.20: list price × 1e6 / 0.20, per request, summed.
+        assert_eq!(
+            usage.month_points,
+            Some(14_000_000),
+            "2.00 and 0.80 at list price"
+        );
+        assert_eq!(usage.five_hour_points, Some(4_000_000));
+        assert_eq!(usage.day_points, Some(14_000_000));
+        assert_eq!(usage.seven_day_points, Some(14_000_000));
+        // Per model, inside the month and inside five hours.
+        let by_model = key_usage_by_model(
+            &db,
+            own,
+            UsageWindow::Month,
+            Some(dec!(0.20)),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("by model");
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0].model_id, "kimi-k2");
+        assert_eq!(by_model[0].requests, 2);
+        assert_eq!(
+            (by_model[0].input_tokens, by_model[0].output_tokens),
+            (20, 10)
+        );
+        assert_eq!(by_model[0].cost_usd, dec!(1.750000));
+        assert_eq!(by_model[0].list_usd, dec!(2.800000));
+        assert_eq!(by_model[0].points, Some(14_000_000));
+        let recent = key_usage_by_model(
+            &db,
+            own,
+            UsageWindow::FiveHours,
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("by model");
+        assert_eq!(recent[0].requests, 1);
+        assert_eq!(
+            recent[0].points, None,
+            "no reference, no points — never zero"
+        );
+        // The batch: three keys, one query; the empty one is absent.
+        let pool = points_for_keys(
+            &db,
+            &[own, theirs],
+            UsageWindow::Month,
+            dec!(0.20),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("points");
+        let of = |key: Uuid| pool.iter().find(|(k, _)| *k == key).map(|(_, p)| *p);
+        assert_eq!(of(own), Some(14_000_000));
+        assert_eq!(of(theirs), Some(45_000_000), "9.00 at list price over 0.20");
 
-        let other = key_usage(&db, theirs)
+        let other = key_usage(&db, theirs, None)
             .await
             .expect("usage")
             .expect("the key exists");
         assert_eq!(other.month_to_date_usd, dec!(9.000000));
         assert_eq!(other.requests, 1);
+        assert_eq!(other.month_points, None, "read without a reference");
         let empty_key = capped_key(
             &db,
             principal,
@@ -1757,7 +2075,7 @@ mod tests {
             format!("usage-empty-{}", Uuid::new_v4()),
         )
         .await;
-        let empty = key_usage(&db, empty_key)
+        let empty = key_usage(&db, empty_key, Some(dec!(0.20)))
             .await
             .expect("usage")
             .expect("the key exists");
@@ -1771,13 +2089,31 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!(empty.month_counterfactual_usd, dec!(0));
+        assert_eq!(
+            empty.month_points,
+            Some(0),
+            "a reference and no rows is zero points"
+        );
+        assert!(empty.day_frees_at.is_none());
+        assert!(
+            key_usage_by_model(
+                &db,
+                empty_key,
+                UsageWindow::Day,
+                Some(dec!(0.20)),
+                OffsetDateTime::now_utc()
+            )
+            .await
+            .expect("by model")
+            .is_empty()
+        );
         assert!(
             empty.five_hour_frees_at.is_none() && empty.seven_day_frees_at.is_none(),
             "an empty window has nothing to free up"
         );
 
         assert!(
-            key_usage(&db, Uuid::new_v4())
+            key_usage(&db, Uuid::new_v4(), None)
                 .await
                 .expect("usage")
                 .is_none(),
@@ -1807,6 +2143,43 @@ mod tests {
         assert!(
             set_points_reference(&db, dec!(0)).await.is_err(),
             "the table refuses a price that is not positive even if a caller forgot to"
+        );
+    }
+
+    #[test]
+    fn a_window_starts_where_it_says_and_frees_when_its_oldest_spend_ages_out() {
+        use time::macros::datetime;
+        let now = datetime!(2026-09-03 10:30:00 UTC);
+        assert_eq!(UsageWindow::parse("5h"), Some(UsageWindow::FiveHours));
+        assert_eq!(UsageWindow::parse("24h"), Some(UsageWindow::Day));
+        assert_eq!(UsageWindow::parse("7d"), Some(UsageWindow::SevenDays));
+        assert_eq!(UsageWindow::parse(" month "), Some(UsageWindow::Month));
+        assert_eq!(UsageWindow::parse("1d"), None);
+        assert_eq!(
+            UsageWindow::Day.since(now),
+            datetime!(2026-09-02 10:30:00 UTC)
+        );
+        assert_eq!(
+            UsageWindow::Month.since(now),
+            datetime!(2026-09-01 00:00:00 UTC)
+        );
+        let oldest = datetime!(2026-09-03 08:00:00 UTC);
+        assert_eq!(
+            UsageWindow::FiveHours.frees_at(Some(oldest), now),
+            Some(datetime!(2026-09-03 13:00:00 UTC))
+        );
+        assert_eq!(
+            UsageWindow::FiveHours.frees_at(None, now),
+            None,
+            "empty: nothing to free"
+        );
+        assert_eq!(
+            UsageWindow::Month.frees_at(None, now),
+            Some(datetime!(2026-10-01 00:00:00 UTC))
+        );
+        assert_eq!(
+            UsageWindow::Month.frees_at(None, datetime!(2026-12-15 00:00:00 UTC)),
+            Some(datetime!(2027-01-01 00:00:00 UTC))
         );
     }
 
