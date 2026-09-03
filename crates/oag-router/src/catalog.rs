@@ -182,13 +182,31 @@ impl Catalog {
     /// same class of untruth as advertising it.
     ///
     /// "Dearest" is input plus output per Mtok, a single scalar because the
-    /// token split is not known when the baseline is chosen. An unpriced row
-    /// cannot win, so a model the catalogue has not priced never becomes the
-    /// baseline and silently reports a saving of zero.
+    /// token split is not known when the baseline is chosen. In practice that
+    /// makes it "dearest by output", since output typically runs five to six
+    /// times input; it only differs from a more careful ranking when two
+    /// candidates straddle. Pricing the baseline at meter time, where the real
+    /// split is known, would remove the arbitrariness — a later change.
+    ///
+    /// An unpriced row cannot win, so a model the catalogue has not priced
+    /// never becomes the baseline and silently reports a saving of zero.
+    ///
+    /// `need` is applied INSIDE the selection, not to its result. Filtering
+    /// afterwards would discard the whole served set whenever the single
+    /// dearest model could not hold the prompt, falling back to the ladder
+    /// exactly on the largest requests — the ones whose counterfactual matters
+    /// most — while a cheaper, capable, still-dearer-than-the-rung model sat
+    /// right there. `None` therefore means "nothing served can do this at
+    /// all", which is what the caller's fallback should be reacting to.
     #[must_use]
-    pub fn dearest_served(&self, served: &std::collections::HashSet<String>) -> Option<&ModelSpec> {
+    pub fn dearest_served(
+        &self,
+        served: &std::collections::HashSet<String>,
+        need: &Requirements,
+    ) -> Option<&ModelSpec> {
         self.iter()
             .filter(|spec| served.contains(spec.upstream_name.as_str()))
+            .filter(|spec| spec.satisfies(need))
             .filter(|spec| {
                 spec.pricing.input_per_mtok > rust_decimal::Decimal::ZERO
                     || spec.pricing.output_per_mtok > rust_decimal::Decimal::ZERO
@@ -301,7 +319,7 @@ mod tests {
             ["cheap", "dear"].iter().map(|s| (*s).to_owned()).collect();
         assert_eq!(
             catalog
-                .dearest_served(&served)
+                .dearest_served(&served, &Requirements::default())
                 .expect("a match")
                 .id
                 .as_str(),
@@ -324,7 +342,7 @@ mod tests {
             .collect();
         assert_eq!(
             catalog
-                .dearest_served(&served)
+                .dearest_served(&served, &Requirements::default())
                 .expect("a match")
                 .id
                 .as_str(),
@@ -337,7 +355,7 @@ mod tests {
         let catalog = Catalog::from_entries([priced("openai/a", "a", dec!(1), dec!(2))]);
         assert!(
             catalog
-                .dearest_served(&std::collections::HashSet::new())
+                .dearest_served(&std::collections::HashSet::new(), &Requirements::default())
                 .is_none(),
             "an empty served set must not fall through to an arbitrary model"
         );

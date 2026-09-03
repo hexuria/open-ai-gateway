@@ -712,7 +712,7 @@ async fn plan_request(
         &budget,
         &catalog,
         canonical.max_tokens,
-        catalog.dearest_served(&served),
+        &served,
     ) {
         Ok(d) => d,
         Err(Error::NoViableModel(_)) => {

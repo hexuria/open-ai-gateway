@@ -332,12 +332,12 @@ impl RoutingPolicy {
         budget: &Budgets,
         catalog: &Catalog,
         max_output_tokens: u32,
-        reachable_ceiling: Option<&ModelSpec>,
+        served: &std::collections::HashSet<String>,
     ) -> Result<RoutingDecision> {
         let need = signal.requirements(max_output_tokens);
-        // The savings baseline. `reachable_ceiling` is the priciest model the
-        // route's credentials actually serve; the ladder's top rung is the
-        // fallback for when nothing has told us what they serve.
+        // The savings baseline: the dearest model the route's credentials
+        // actually serve and this catalogue prices, with the ladder's top rung
+        // as the fallback for when nothing has told us what they serve.
         //
         // Taking it from the ladder was wrong in a way that only showed on a
         // short ladder: `ceiling()` is the LAST rung and `pick` is the same
@@ -346,14 +346,16 @@ impl RoutingPolicy {
         // stops meaning "versus your best model". Ordering cannot fix that —
         // routing wants the rung cheapest-first and the baseline wants it
         // dearest-first, and one order serves both.
-        let ceiling_model = reachable_ceiling
-            .filter(|spec| spec.satisfies(&need))
-            .cloned()
-            .or_else(|| {
-                self.ladder
-                    .pick(&self.ladder.ceiling(), catalog, &need)
-                    .cloned()
-            });
+        //
+        // The selection happens HERE rather than in the caller because it needs
+        // `need`, and applying capability after choosing one model would throw
+        // away the whole served set whenever that one model could not hold the
+        // prompt.
+        let ceiling_model = catalog.dearest_served(served, &need).cloned().or_else(|| {
+            self.ladder
+                .pick(&self.ladder.ceiling(), catalog, &need)
+                .cloned()
+        });
 
         if budget.pressure() == BudgetPressure::Exhausted {
             return Err(Error::BudgetExhausted {
@@ -635,6 +637,7 @@ mod tests {
     use crate::ladder::Rung;
     use oag_core::Provider;
     use rust_decimal::dec;
+    use std::collections::HashSet;
 
     /// Pins every request to the cheapest rung, so capability escalation can be
     /// tested independently of what the real classifier would have chosen.
@@ -713,7 +716,7 @@ mod tests {
                 &rich(),
                 &catalog(),
                 1024,
-                None,
+                &HashSet::new(),
             )
             .expect("routes");
         assert_eq!(d.model.id.as_str(), "kimi/k2");
@@ -735,7 +738,7 @@ mod tests {
                 &rich(),
                 &catalog(),
                 1024,
-                None,
+                &HashSet::new(),
             )
             .expect("routes");
         assert_eq!(d.model.id.as_str(), "anthropic/opus");
@@ -758,7 +761,7 @@ mod tests {
                 &rich(),
                 &catalog_with_off_ladder(),
                 1024,
-                None,
+                &HashSet::new(),
             )
             .expect("routes");
         assert_eq!(d.model.id.as_str(), "anthropic/sonnet");
@@ -779,7 +782,7 @@ mod tests {
                 &rich(),
                 &catalog(),
                 1024,
-                None,
+                &HashSet::new(),
             )
             .expect("routes");
         assert_eq!(
@@ -796,7 +799,7 @@ mod tests {
         // one-rung ladder the baseline and the served model are the same model
         // and the saving stops meaning "versus your best model".
         let catalog = catalog();
-        let reachable = catalog.get(&ModelId::new("kimi/k2")).expect("in catalog");
+        let served: HashSet<String> = ["k2"].iter().map(|s| (*s).to_owned()).collect();
         let d = policy()
             .decide(
                 &RoutingMode::Managed,
@@ -808,42 +811,50 @@ mod tests {
                 &rich(),
                 &catalog,
                 1024,
-                Some(reachable),
+                &served,
             )
             .expect("routes");
         assert_eq!(
             d.ceiling_model.expect("ceiling exists").id.as_str(),
             "kimi/k2",
-            "the supplied reachable ceiling should win over the ladder's"
+            "the served set should decide the baseline, not the ladder's top rung"
         );
     }
 
     #[test]
-    fn a_reachable_ceiling_that_cannot_serve_the_request_is_not_used() {
-        // A baseline is a counterfactual: "what this would have cost on the
-        // best model we could have used". A model that could not have taken
-        // the request is not one of those, so the ladder's ceiling stands.
-        let catalog = catalog();
-        let reachable = catalog.get(&ModelId::new("kimi/k2")).expect("in catalog");
-        let huge = RequestSignal {
-            prompt_tokens: u64::from(reachable.context_window) + 1_000,
-            ..RequestSignal::default()
-        };
+    fn an_incapable_dearest_does_not_discard_the_rest_of_the_served_set() {
+        // Applying capability AFTER choosing the single dearest served model
+        // throws the whole set away whenever that one model cannot hold the
+        // prompt, and falls back to the ladder — on exactly the largest
+        // requests, whose counterfactual matters most, while a cheaper but
+        // capable and still-dearer-than-the-rung model sat right there.
+        let catalog = Catalog::from_entries([
+            model("kimi/k2", Provider::Kimi, 128_000, dec!(0.6)),
+            // Dearest of the served pair, and too small for the prompt below.
+            model("anthropic/opus", Provider::Anthropic, 10_000, dec!(15)),
+            // Cheaper than opus, dearer than the cheap rung, and big enough.
+            model("anthropic/haiku", Provider::Anthropic, 1_000_000, dec!(1)),
+        ]);
+        let served: HashSet<String> = ["opus", "haiku"].iter().map(|s| (*s).to_owned()).collect();
         let d = policy()
             .decide(
                 &RoutingMode::Managed,
                 None,
-                &huge,
+                &RequestSignal {
+                    prompt_tokens: 50_000,
+                    ..RequestSignal::default()
+                },
                 &rich(),
                 &catalog,
                 1024,
-                Some(reachable),
+                &served,
             )
             .expect("routes");
-        assert_ne!(
+        assert_eq!(
             d.ceiling_model.expect("ceiling exists").id.as_str(),
-            "kimi/k2",
-            "a model that cannot hold the prompt is not a valid counterfactual"
+            "anthropic/haiku",
+            "the dearest CAPABLE served model is the baseline; selecting first \
+             and filtering after would have fallen through to the ladder"
         );
     }
 
@@ -869,7 +880,7 @@ mod tests {
                 &Budgets::principal_only(constrained.clone()),
                 &catalog(),
                 1024,
-                None,
+                &HashSet::new(),
             )
             .expect("still serves");
         // Budget is still the reason the rung was chosen...
@@ -896,7 +907,7 @@ mod tests {
             &Budgets::principal_only(blown.clone()),
             &catalog(),
             1024,
-            None,
+            &HashSet::new(),
         );
         assert!(matches!(err, Err(Error::BudgetExhausted { .. })));
     }
@@ -934,7 +945,7 @@ mod tests {
                 &Budgets::principal_only(constrained.clone()),
                 &catalog(),
                 1024,
-                None,
+                &HashSet::new(),
             )
             .expect("routes");
         assert_eq!(
@@ -971,7 +982,7 @@ mod tests {
                 &rich(),
                 &catalog(),
                 1024,
-                None,
+                &HashSet::new(),
             )
             .expect("escalates on capability");
         assert_eq!(d.model.id.as_str(), "anthropic/opus");
@@ -1119,7 +1130,7 @@ mod tests {
                 &budgets,
                 &catalog(),
                 1024,
-                None,
+                &HashSet::new(),
             )
             .expect("a constrained key still gets served, just cheaply");
         assert_eq!(d.reason, SelectionReason::BudgetDowngraded);
@@ -1143,7 +1154,7 @@ mod tests {
             &budgets,
             &catalog(),
             1024,
-            None,
+            &HashSet::new(),
         );
         assert!(matches!(
             err,
@@ -1176,7 +1187,7 @@ mod tests {
             &budgets,
             &catalog(),
             1024,
-            None,
+            &HashSet::new(),
         );
         assert!(matches!(
             err,
@@ -1225,7 +1236,7 @@ mod tests {
             &budgets,
             &catalog(),
             1024,
-            None,
+            &HashSet::new(),
         );
         assert!(matches!(
             err,
@@ -1473,7 +1484,7 @@ mod tests {
                 budget,
                 catalog,
                 1024,
-                None,
+                &HashSet::new(),
             )
             .is_ok_and(|d| d.model.id.as_str() == id)
     }
@@ -1546,7 +1557,7 @@ mod tests {
                 &exhausted(),
                 &catalog,
                 1024,
-                None,
+                &HashSet::new(),
             ),
             Err(Error::BudgetExhausted { .. })
         ));
