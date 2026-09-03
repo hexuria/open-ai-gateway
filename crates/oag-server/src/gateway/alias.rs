@@ -214,6 +214,7 @@ mod tests {
     use oag_router::ladder::Rung;
     use oag_router::{Budgets, RoutingPolicy, TierLadder};
     use rust_decimal::Decimal;
+    use std::collections::HashSet;
 
     fn spec(id: &str, provider: Provider, upstream: &str) -> ModelSpec {
         ModelSpec {
@@ -371,6 +372,7 @@ mod tests {
                 &Budgets::principal_only(oag_router::BudgetState::unlimited(Decimal::ZERO)),
                 &catalog,
                 1024,
+                &HashSet::new(),
             )
             .expect("routable");
         assert_eq!(decision.model.id.as_str(), "xai/grok-4.6");
@@ -408,6 +410,7 @@ mod tests {
                     &Budgets::principal_only(oag_router::BudgetState::unlimited(Decimal::ZERO)),
                     &catalog,
                     1024,
+                    &HashSet::new(),
                 )
                 .expect("routable");
             assert_eq!(decision.model.id.as_str(), "xai/grok-4.6", "{requested}");
