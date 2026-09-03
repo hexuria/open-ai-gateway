@@ -249,6 +249,24 @@ pub struct GatewayConfig {
     /// written while it was on does not start failing.
     #[serde(default)]
     pub claude_code_model_aliases: bool,
+    /// Advertise `oag/auto` in the `/v1/models` listing.
+    ///
+    /// `oag/auto` is the one virtual name that claims a judgement. The
+    /// classifier picks its rung from the request's *shape* — token count, tool
+    /// count, turn count, images, code — and never from what the task is, so a
+    /// one-line "prove this theorem" classifies cheap and a large log paste
+    /// asking for its last line classifies frontier. That is an honest cost
+    /// heuristic and a poor difficulty router, and an entry called `auto` in a
+    /// picker reads as the second thing. The `oag/<rung>` names make no such
+    /// claim — they are a tier the caller named — so they are advertised
+    /// regardless of this flag.
+    ///
+    /// Off by default: a name that oversells itself is worse than an absent
+    /// one. Advertisement only, so this is safe to turn on or off at any time
+    /// — `oag/auto` stays resolvable either way, and a client that cached the
+    /// name or pinned it before this flag existed keeps working.
+    #[serde(default)]
+    pub advertise_auto: bool,
 }
 
 impl Default for GatewayConfig {
@@ -265,6 +283,7 @@ impl Default for GatewayConfig {
             provider_base_urls: std::collections::BTreeMap::new(),
             codex: CodexConfig::default(),
             claude_code_model_aliases: false,
+            advertise_auto: false,
         }
     }
 }

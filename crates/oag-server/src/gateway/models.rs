@@ -87,7 +87,7 @@ pub async fn list(
     // Constrained spend hides oag/<rung> pins decide() would then abandon.
     let mut data: Vec<Value> = Vec::new();
     if advertise(pressure, concrete.len()) {
-        for rung in virtual_rungs(&policy, pressure) {
+        for rung in virtual_rungs(&policy, pressure, state.config.gateway.advertise_auto) {
             push(&mut data, virtual_entry(rung.as_ref()), aliases);
         }
         for e in &concrete {
@@ -216,9 +216,10 @@ pub async fn list_gemini(State(state): State<Arc<AppState>>, Caller(auth): Calle
         .max()
         .unwrap_or(0);
 
-    let mut models: Vec<Value> = virtual_rungs(&policy, pressure)
-        .map(|rung| gemini_virtual_entry(rung.as_ref(), window, max_output))
-        .collect();
+    let mut models: Vec<Value> =
+        virtual_rungs(&policy, pressure, state.config.gateway.advertise_auto)
+            .map(|rung| gemini_virtual_entry(rung.as_ref(), window, max_output))
+            .collect();
     models.extend(concrete.iter().map(gemini_entry));
     axum::Json(json!({ "models": models })).into_response()
 }
@@ -271,12 +272,21 @@ fn advertise(pressure: BudgetPressure, concrete: usize) -> bool {
     pressure != BudgetPressure::Exhausted && concrete > 0
 }
 
-/// `oag/auto`, then one per advertised rung. `None` is `auto`.
+/// `oag/auto` when it is advertised, then one per advertised rung. `None` is
+/// `auto`.
+///
+/// `auto` is behind a flag and the rungs are not, because only `auto` claims a
+/// judgement the classifier makes from the payload's shape rather than from the
+/// task; see `gateway.advertise_auto`. Hiding it does not unhook it — `decide`
+/// still honours the name, so an existing pin keeps resolving.
 fn virtual_rungs(
     policy: &oag_router::RoutingPolicy,
     pressure: BudgetPressure,
+    auto: bool,
 ) -> impl Iterator<Item = Option<TierName>> {
-    std::iter::once(None).chain(policy.virtual_names(pressure).into_iter().map(Some))
+    auto.then_some(None)
+        .into_iter()
+        .chain(policy.virtual_names(pressure).into_iter().map(Some))
 }
 
 /// Providers the route holds usable credentials for, and through which
@@ -629,6 +639,58 @@ mod tests {
             virtual_entry(Some(&TierName::new("cheap")))["oag"]["tier"],
             "cheap"
         );
+    }
+
+    fn two_rung_policy() -> oag_router::RoutingPolicy {
+        let ladder = oag_router::TierLadder::new(vec![
+            oag_router::ladder::Rung {
+                name: TierName::new("cheap"),
+                models: vec![ModelId::new("xai/grok-4.6")],
+            },
+            oag_router::ladder::Rung {
+                name: TierName::new("frontier"),
+                models: vec![ModelId::new("anthropic/claude-opus-5")],
+            },
+        ])
+        .expect("non-empty");
+        oag_router::RoutingPolicy::new(ladder, Box::new(oag_router::HeuristicClassifier::default()))
+    }
+
+    #[test]
+    fn auto_is_advertised_only_behind_its_flag() {
+        // The classifier picks a rung from the payload's shape, never from the
+        // task, so `oag/auto` in a picker promises a judgement it does not
+        // make. Hidden by default; the operator opts back in.
+        let policy = two_rung_policy();
+
+        let hidden: Vec<_> = virtual_rungs(&policy, BudgetPressure::Normal, false).collect();
+        assert!(
+            !hidden.contains(&None),
+            "oag/auto advertised with the flag off: {hidden:?}"
+        );
+
+        let shown: Vec<_> = virtual_rungs(&policy, BudgetPressure::Normal, true).collect();
+        assert_eq!(
+            shown.first(),
+            Some(&None),
+            "auto leads the list when advertised, where a picker looks"
+        );
+    }
+
+    #[test]
+    fn the_rung_pins_are_advertised_whichever_way_the_auto_flag_points() {
+        // `oag/cheap` is a tier the caller named, not a judgement we made, so
+        // it claims nothing `auto` claims. Hiding auto must not take the rung
+        // pins with it.
+        let policy = two_rung_policy();
+        let names = |auto: bool| -> Vec<String> {
+            virtual_rungs(&policy, BudgetPressure::Normal, auto)
+                .flatten()
+                .map(|t| t.as_str().to_owned())
+                .collect()
+        };
+        assert_eq!(names(false), ["cheap", "frontier"]);
+        assert_eq!(names(true), names(false));
     }
 
     #[test]
