@@ -128,6 +128,64 @@ Rules, in order of how strong a signal each is:
 Every rule is a statement about the *task*, not about the wording. A rule keyed
 on phrasing would be gameable and would drift as prompt styles change.
 
+### Rung names are load-bearing, in one direction
+
+The rungs in that table — `cheap`, `balanced`, `frontier` — are the
+classifier's **hardcoded defaults**, not a description of your ladder. It
+returns one of those three names and the router then looks it up:
+`ladder.tier(&classified).unwrap_or_else(|| self.ladder.floor())`. A name with
+no matching rung falls to the floor, which is `rungs[0]`.
+
+Two consequences follow, and they are opposites.
+
+**A ladder whose rungs are named anything else turns classification off.** Not
+"simplifies" — off. No name the classifier can return will ever match, so every
+request lands on the floor rung regardless of tokens, tools or turns, and
+`oag/auto` becomes a no-op that resolves to the floor. A route laddered
+`[budget, standard, premium]` is in exactly this state, and so is one collapsed
+to a single rung under any name but those three.
+
+**Naming a rung `cheap`, `balanced` or `frontier` turns it back on, silently.**
+Add a second rung and call it `cheap` and tier routing reactivates for that
+rung with nothing anywhere saying so. If you do not want classification, this is
+the reason to name rungs anything but those three words — a better one than
+tidiness.
+
+### With one rung, the rung's order is the routing policy
+
+`Ladder::pick` takes the **first capable member in list order** — `rung.models
+.iter().filter_map(..).find(|spec| spec.satisfies(need))`. It does not sort by
+price, and nothing else does either. On a multi-rung ladder that rarely shows,
+because the rungs carry the cost ordering. Collapse to one rung and the
+within-rung order becomes the whole of the routing decision.
+
+So order a single rung cheapest-first, deliberately. A rung listing an
+expensive model ahead of a cheap one that would have served the same request
+routes every request to the expensive one, reports nothing unusual, and is
+visible only in the bill. A live deployment ran at ten times its necessary cost
+this way, with the cheaper model sitting one slot behind.
+
+### Retiring a rung does not orphan its pins
+
+`oag/<rung>` pins survive their rung being renamed or removed, as long as one
+rung remains (`TierLadder::new` rejects an empty ladder). This makes collapsing
+a ladder a config change rather than a pin migration.
+
+It survives **two** independent name misses, and only the second is obvious:
+
+1. The requested tier is filtered against the rungs that exist before the
+   classifier runs — `signal.explicit_tier = requested_tier.filter(|n|
+   policy.rung(n).is_some())` — so `oag/cheap` on a ladder with no `cheap` rung
+   arrives at classification carrying nothing. This is why the unknown-tier
+   note above says the name is ignored rather than honoured.
+2. The classifier then returns one of its own hardcoded names, which on such a
+   ladder misses too, and *that* is the miss which reaches the floor.
+
+So `oag/cheap`, `oag/frontier` and `oag/auto` all keep resolving on a ladder
+that has none of those rungs. They become aliases for the floor rather than
+dead names. Measured on a live deployment: fourteen coworkers pinned to
+`oag/cheap` kept working across a three-rung ladder being collapsed to one.
+
 ## Escalation
 
 Three paths to a better model, so "let people reach Claude for demanding tasks"
