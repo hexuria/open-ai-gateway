@@ -285,6 +285,55 @@ mod tests {
     use rust_decimal::dec;
     use serde_json::Value;
 
+    #[test]
+    fn the_openai_listing_shape_parses() {
+        let body = r#"{"object":"list","data":[
+            {"id":"gpt-5.6-luna","object":"model"},
+            {"id":"gpt-5.6-terra","object":"model"}]}"#;
+        assert_eq!(
+            super::parse_served(body).expect("parsed"),
+            ["gpt-5.6-luna", "gpt-5.6-terra"]
+        );
+    }
+
+    #[test]
+    fn a_bare_array_of_names_parses_too() {
+        // The endpoint is undocumented, so the shape is the part we are least
+        // sure of. Accepting both costs one match arm and saves a release.
+        assert_eq!(
+            super::parse_served(r#"["gpt-5.4-mini","gpt-5.5"]"#).expect("parsed"),
+            ["gpt-5.4-mini", "gpt-5.5"]
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_payload_fails_rather_than_reading_as_empty() {
+        // The whole reason this is a Result. An empty Vec is the claim "this
+        // credential serves nothing", which hides every one of its models from
+        // the picker -- so a shape we did not anticipate must never decay into
+        // it. The body rides along in the error because the next person to see
+        // this needs to know what the backend actually said.
+        let err = super::parse_served(r#"{"models":{"unexpected":"shape"}}"#)
+            .expect_err("an unknown shape must not read as 'serves nothing'");
+        let text = err.to_string();
+        assert!(text.contains("unexpected"), "the body is missing: {text}");
+    }
+
+    #[test]
+    fn a_non_json_body_is_an_error_not_an_empty_list() {
+        assert!(super::parse_served("<html>502 Bad Gateway</html>").is_err());
+    }
+
+    #[test]
+    fn a_long_body_is_truncated_on_a_character_boundary() {
+        // Multi-byte input, because slicing a String by byte offset is how a
+        // diagnostic path panics on the one request that needed diagnosing.
+        let long = "\u{e9}".repeat(500);
+        let out = super::truncate(&long);
+        assert!(out.chars().count() < 500, "not truncated");
+        assert!(out.ends_with('\u{2026}'));
+    }
+
     fn model() -> ModelSpec {
         ModelSpec {
             id: ModelId::new("openai/gpt-5-codex"),
