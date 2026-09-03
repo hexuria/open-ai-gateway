@@ -177,6 +177,13 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/principals/{email}/usage", get(admin::principal_usage))
         .route("/keys/{id}/quota", patch(admin::set_key_quota))
         .route("/keys/{id}/usage", get(admin::key_usage))
+        // Points: the reference price (one row) and every model's multipliers over it. The
+        // partner service reads these and enforces limits in points; nothing here enforces.
+        .route(
+            "/points/reference",
+            get(admin::points_reference).put(admin::set_points_reference),
+        )
+        .route("/points/models", get(admin::points_models))
         // `route_layer` rather than `layer`: an unmatched path under
         // /admin/api should 404 without a database round trip.
         .route_layer(axum::middleware::from_fn_with_state(
@@ -421,6 +428,9 @@ server:
             "POST",
             "/admin/api/services/00000000-0000-0000-0000-000000000001/check",
         ),
+        ("GET", "/admin/api/points/reference"),
+        ("PUT", "/admin/api/points/reference"),
+        ("GET", "/admin/api/points/models"),
     ];
 
     async fn status(router: Router, method: &str, path: &str) -> StatusCode {
