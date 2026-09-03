@@ -594,6 +594,33 @@ pub(crate) fn virtual_tier(model: &str) -> Option<TierName> {
         .map(TierName::from)
 }
 
+/// Every upstream model name this route's credentials say they serve.
+///
+/// Empty means nothing has been discovered yet, and the caller must read that
+/// as "unknown" rather than "nothing" — the same distinction
+/// `account.served_models` draws between NULL and an empty array. A failure
+/// here degrades the savings baseline and must never fail the request: the
+/// answer has been paid for either way.
+async fn served_models_for(
+    state: &Arc<AppState>,
+    auth: &oag_store::AuthContext,
+) -> HashSet<String> {
+    match oag_store::repo::route_channels(&state.db, auth.route_id, auth.principal_id).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|(_, _, served)| served)
+            .flatten()
+            .collect(),
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "served models unavailable; savings baseline falls back to the ladder"
+            );
+            HashSet::new()
+        }
+    }
+}
+
 /// Resolve the route, build its policy, and choose a model.
 ///
 /// Separated from `handle` because it is the part with no I/O side effects
@@ -673,6 +700,11 @@ async fn plan_request(
         "budget and mode"
     );
 
+    // The savings baseline. Taken from what this route's credentials actually
+    // serve rather than from the ladder's top rung: see `RoutingPolicy::decide`
+    // for why the ladder cannot supply it. Empty means nothing has been asked
+    // yet, and the ladder's ceiling stands — the pre-discovery behaviour.
+    let served = served_models_for(state, auth).await;
     let decision = match policy.decide(
         &mode,
         Some(&canonical.model),
@@ -680,6 +712,7 @@ async fn plan_request(
         &budget,
         &catalog,
         canonical.max_tokens,
+        catalog.dearest_served(&served),
     ) {
         Ok(d) => d,
         Err(Error::NoViableModel(_)) => {

@@ -319,6 +319,11 @@ impl RoutingPolicy {
     /// 3. If the resulting rung has nothing capable enough, walk up until one
     ///    does. Escalating on capability is not a cost failure; sending a
     ///    200k-token prompt to a model that cannot hold it is.
+    // Eight arguments, and they are all inputs to one decision rather than a
+    // struct waiting to be extracted: mode, name, signal, budget, catalog,
+    // token cap and baseline are supplied by different callers from different
+    // sources, and bundling them would only move the argument list.
+    #[allow(clippy::too_many_arguments)]
     pub fn decide(
         &self,
         mode: &RoutingMode,
@@ -327,12 +332,28 @@ impl RoutingPolicy {
         budget: &Budgets,
         catalog: &Catalog,
         max_output_tokens: u32,
+        reachable_ceiling: Option<&ModelSpec>,
     ) -> Result<RoutingDecision> {
         let need = signal.requirements(max_output_tokens);
-        let ceiling_model = self
-            .ladder
-            .pick(&self.ladder.ceiling(), catalog, &need)
-            .cloned();
+        // The savings baseline. `reachable_ceiling` is the priciest model the
+        // route's credentials actually serve; the ladder's top rung is the
+        // fallback for when nothing has told us what they serve.
+        //
+        // Taking it from the ladder was wrong in a way that only showed on a
+        // short ladder: `ceiling()` is the LAST rung and `pick` is the same
+        // call the routing path makes, so with one rung the baseline and the
+        // served model are the same model and `SUM(counterfactual - cost)`
+        // stops meaning "versus your best model". Ordering cannot fix that —
+        // routing wants the rung cheapest-first and the baseline wants it
+        // dearest-first, and one order serves both.
+        let ceiling_model = reachable_ceiling
+            .filter(|spec| spec.satisfies(&need))
+            .cloned()
+            .or_else(|| {
+                self.ladder
+                    .pick(&self.ladder.ceiling(), catalog, &need)
+                    .cloned()
+            });
 
         if budget.pressure() == BudgetPressure::Exhausted {
             return Err(Error::BudgetExhausted {
@@ -692,6 +713,7 @@ mod tests {
                 &rich(),
                 &catalog(),
                 1024,
+                None,
             )
             .expect("routes");
         assert_eq!(d.model.id.as_str(), "kimi/k2");
@@ -713,6 +735,7 @@ mod tests {
                 &rich(),
                 &catalog(),
                 1024,
+                None,
             )
             .expect("routes");
         assert_eq!(d.model.id.as_str(), "anthropic/opus");
@@ -735,6 +758,7 @@ mod tests {
                 &rich(),
                 &catalog_with_off_ladder(),
                 1024,
+                None,
             )
             .expect("routes");
         assert_eq!(d.model.id.as_str(), "anthropic/sonnet");
@@ -755,12 +779,71 @@ mod tests {
                 &rich(),
                 &catalog(),
                 1024,
+                None,
             )
             .expect("routes");
         assert_eq!(
             d.ceiling_model.expect("ceiling exists").id.as_str(),
             "anthropic/opus",
-            "savings are measured against the top rung, whatever we actually used"
+            "with nothing discovered, savings fall back to the top rung"
+        );
+    }
+
+    #[test]
+    fn a_reachable_ceiling_outranks_the_ladders_top_rung() {
+        // The savings baseline must not come from the ladder. `ceiling()` is
+        // the last rung and `pick` is the same call routing makes, so on a
+        // one-rung ladder the baseline and the served model are the same model
+        // and the saving stops meaning "versus your best model".
+        let catalog = catalog();
+        let reachable = catalog.get(&ModelId::new("kimi/k2")).expect("in catalog");
+        let d = policy()
+            .decide(
+                &RoutingMode::Managed,
+                None,
+                &RequestSignal {
+                    prompt_tokens: 100,
+                    ..RequestSignal::default()
+                },
+                &rich(),
+                &catalog,
+                1024,
+                Some(reachable),
+            )
+            .expect("routes");
+        assert_eq!(
+            d.ceiling_model.expect("ceiling exists").id.as_str(),
+            "kimi/k2",
+            "the supplied reachable ceiling should win over the ladder's"
+        );
+    }
+
+    #[test]
+    fn a_reachable_ceiling_that_cannot_serve_the_request_is_not_used() {
+        // A baseline is a counterfactual: "what this would have cost on the
+        // best model we could have used". A model that could not have taken
+        // the request is not one of those, so the ladder's ceiling stands.
+        let catalog = catalog();
+        let reachable = catalog.get(&ModelId::new("kimi/k2")).expect("in catalog");
+        let huge = RequestSignal {
+            prompt_tokens: u64::from(reachable.context_window) + 1_000,
+            ..RequestSignal::default()
+        };
+        let d = policy()
+            .decide(
+                &RoutingMode::Managed,
+                None,
+                &huge,
+                &rich(),
+                &catalog,
+                1024,
+                Some(reachable),
+            )
+            .expect("routes");
+        assert_ne!(
+            d.ceiling_model.expect("ceiling exists").id.as_str(),
+            "kimi/k2",
+            "a model that cannot hold the prompt is not a valid counterfactual"
         );
     }
 
@@ -786,6 +869,7 @@ mod tests {
                 &Budgets::principal_only(constrained.clone()),
                 &catalog(),
                 1024,
+                None,
             )
             .expect("still serves");
         // Budget is still the reason the rung was chosen...
@@ -812,6 +896,7 @@ mod tests {
             &Budgets::principal_only(blown.clone()),
             &catalog(),
             1024,
+            None,
         );
         assert!(matches!(err, Err(Error::BudgetExhausted { .. })));
     }
@@ -849,6 +934,7 @@ mod tests {
                 &Budgets::principal_only(constrained.clone()),
                 &catalog(),
                 1024,
+                None,
             )
             .expect("routes");
         assert_eq!(
@@ -885,6 +971,7 @@ mod tests {
                 &rich(),
                 &catalog(),
                 1024,
+                None,
             )
             .expect("escalates on capability");
         assert_eq!(d.model.id.as_str(), "anthropic/opus");
@@ -1032,6 +1119,7 @@ mod tests {
                 &budgets,
                 &catalog(),
                 1024,
+                None,
             )
             .expect("a constrained key still gets served, just cheaply");
         assert_eq!(d.reason, SelectionReason::BudgetDowngraded);
@@ -1055,6 +1143,7 @@ mod tests {
             &budgets,
             &catalog(),
             1024,
+            None,
         );
         assert!(matches!(
             err,
@@ -1087,6 +1176,7 @@ mod tests {
             &budgets,
             &catalog(),
             1024,
+            None,
         );
         assert!(matches!(
             err,
@@ -1135,6 +1225,7 @@ mod tests {
             &budgets,
             &catalog(),
             1024,
+            None,
         );
         assert!(matches!(
             err,
@@ -1375,7 +1466,15 @@ mod tests {
         catalog: &Catalog,
     ) -> bool {
         policy
-            .decide(mode, Some(id), &trivial_signal(), budget, catalog, 1024)
+            .decide(
+                mode,
+                Some(id),
+                &trivial_signal(),
+                budget,
+                catalog,
+                1024,
+                None,
+            )
             .is_ok_and(|d| d.model.id.as_str() == id)
     }
 
@@ -1447,6 +1546,7 @@ mod tests {
                 &exhausted(),
                 &catalog,
                 1024,
+                None,
             ),
             Err(Error::BudgetExhausted { .. })
         ));

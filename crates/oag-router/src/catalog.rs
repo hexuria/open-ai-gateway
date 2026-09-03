@@ -173,6 +173,29 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// The dearest model in this catalogue whose upstream name is in `served`.
+    ///
+    /// The savings baseline: what these tokens would have cost on the best
+    /// model the caller could actually have reached. Filtered by `served`
+    /// rather than taken from a ladder, because a rung can name a model the
+    /// credential refuses — comparing against something unreachable is the
+    /// same class of untruth as advertising it.
+    ///
+    /// "Dearest" is input plus output per Mtok, a single scalar because the
+    /// token split is not known when the baseline is chosen. An unpriced row
+    /// cannot win, so a model the catalogue has not priced never becomes the
+    /// baseline and silently reports a saving of zero.
+    #[must_use]
+    pub fn dearest_served(&self, served: &std::collections::HashSet<String>) -> Option<&ModelSpec> {
+        self.iter()
+            .filter(|spec| served.contains(spec.upstream_name.as_str()))
+            .filter(|spec| {
+                spec.pricing.input_per_mtok > rust_decimal::Decimal::ZERO
+                    || spec.pricing.output_per_mtok > rust_decimal::Decimal::ZERO
+            })
+            .max_by_key(|spec| spec.pricing.input_per_mtok + spec.pricing.output_per_mtok)
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -256,6 +279,68 @@ mod tests {
             },
             display_label: None,
         }
+    }
+
+    fn priced(id: &str, upstream: &str, input: Decimal, output: Decimal) -> ModelSpec {
+        let mut s = spec(id, Provider::OpenAI, upstream, 200_000);
+        s.pricing.input_per_mtok = input;
+        s.pricing.output_per_mtok = output;
+        s
+    }
+
+    #[test]
+    fn the_dearest_served_model_is_the_savings_baseline() {
+        let catalog = Catalog::from_entries([
+            priced("openai/cheap", "cheap", dec!(0.2), dec!(1.2)),
+            priced("openai/dear", "dear", dec!(5), dec!(30)),
+            // Dearer still, but the credential does not serve it — comparing
+            // against something unreachable is the untruth being removed.
+            priced("openai/unreachable", "unreachable", dec!(50), dec!(300)),
+        ]);
+        let served: std::collections::HashSet<String> =
+            ["cheap", "dear"].iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(
+            catalog
+                .dearest_served(&served)
+                .expect("a match")
+                .id
+                .as_str(),
+            "openai/dear"
+        );
+    }
+
+    #[test]
+    fn an_unpriced_model_never_becomes_the_baseline() {
+        // A zero-priced row would report a saving of zero for every request
+        // measured against it, which reads as "the gateway saved you nothing"
+        // rather than as "we could not say".
+        let catalog = Catalog::from_entries([
+            priced("openai/cheap", "cheap", dec!(0.2), dec!(1.2)),
+            priced("openai/unpriced", "unpriced", dec!(0), dec!(0)),
+        ]);
+        let served: std::collections::HashSet<String> = ["cheap", "unpriced"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(
+            catalog
+                .dearest_served(&served)
+                .expect("a match")
+                .id
+                .as_str(),
+            "openai/cheap"
+        );
+    }
+
+    #[test]
+    fn nothing_served_means_no_baseline_rather_than_a_wrong_one() {
+        let catalog = Catalog::from_entries([priced("openai/a", "a", dec!(1), dec!(2))]);
+        assert!(
+            catalog
+                .dearest_served(&std::collections::HashSet::new())
+                .is_none(),
+            "an empty served set must not fall through to an arbitrary model"
+        );
     }
 
     #[test]

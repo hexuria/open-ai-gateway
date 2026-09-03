@@ -371,6 +371,7 @@ mod tests {
                 &Budgets::principal_only(oag_router::BudgetState::unlimited(Decimal::ZERO)),
                 &catalog,
                 1024,
+                None,
             )
             .expect("routable");
         assert_eq!(decision.model.id.as_str(), "xai/grok-4.6");
@@ -408,6 +409,7 @@ mod tests {
                     &Budgets::principal_only(oag_router::BudgetState::unlimited(Decimal::ZERO)),
                     &catalog,
                     1024,
+                    None,
                 )
                 .expect("routable");
             assert_eq!(decision.model.id.as_str(), "xai/grok-4.6", "{requested}");
