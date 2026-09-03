@@ -88,6 +88,14 @@ gateway:
   # docs/03-providers.md.
   # claude_code_model_aliases: true
 
+  # Advertise `oag/auto` in /v1/models. Off by default: the classifier behind it
+  # picks a rung from the request's SHAPE (token count, tool count, turn count,
+  # images, code) and never from what the task is, so the name promises a
+  # judgement it does not make. The `oag/<rung>` pins are advertised either way
+  # — they are a tier the caller named. Advertisement only: `oag/auto` stays
+  # resolvable whichever way this points, so an existing pin keeps working.
+  # advertise_auto: true
+
 telemetry:
   log_filter: "info"
   log_json: false
