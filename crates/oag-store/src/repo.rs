@@ -645,6 +645,29 @@ pub async fn key_usage(db: &Db, id: Uuid) -> Result<Option<KeyUsage>> {
     .map_err(|e| Error::Internal(format!("reading key usage: {e}")))
 }
 
+/// The points reference price — one token at this many USD per million is one point — if the
+/// admin has set one. `None` until then: no multiplier and no points figure can be derived.
+pub async fn points_reference(db: &Db) -> Result<Option<Decimal>> {
+    sqlx::query_scalar::<_, Decimal>("SELECT usd_per_mtok FROM points_reference WHERE only_row")
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("reading the points reference: {e}")))
+}
+
+/// Set the points reference price. One row, replaced; the caller has already refused a price
+/// that is not positive, and the table's own check refuses it again.
+pub async fn set_points_reference(db: &Db, usd_per_mtok: Decimal) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO points_reference (only_row, usd_per_mtok) VALUES (true, $1)
+         ON CONFLICT (only_row) DO UPDATE SET usd_per_mtok = EXCLUDED.usd_per_mtok, updated_at = now()",
+    )
+    .bind(usd_per_mtok)
+    .execute(db.pool())
+    .await
+    .map(|_| ())
+    .map_err(|e| Error::Internal(format!("setting the points reference: {e}")))
+}
+
 /// Revoke by the displayed prefix, for the CLI — during an incident the prefix
 /// is what an operator can actually see.
 pub async fn revoke_key_by_prefix(
@@ -1759,6 +1782,31 @@ mod tests {
                 .expect("usage")
                 .is_none(),
             "an unknown id is None, not a zeroed row"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_points_reference_is_one_row_the_admin_replaces() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        // Another test may have set it; what this proves is replace-in-place and the read-back.
+        set_points_reference(&db, dec!(0.20)).await.expect("set");
+        assert_eq!(points_reference(&db).await.expect("read"), Some(dec!(0.20)));
+        set_points_reference(&db, dec!(0.25))
+            .await
+            .expect("replace");
+        assert_eq!(points_reference(&db).await.expect("read"), Some(dec!(0.25)));
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM points_reference")
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(rows, 1, "one row, replaced, never a second");
+        assert!(
+            set_points_reference(&db, dec!(0)).await.is_err(),
+            "the table refuses a price that is not positive even if a caller forgot to"
         );
     }
 
