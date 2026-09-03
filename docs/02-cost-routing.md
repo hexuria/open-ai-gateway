@@ -141,14 +141,29 @@ Two consequences follow, and they are opposites.
 **A ladder whose rungs are named anything else turns classification off.** Not
 "simplifies" — off. No name the classifier can return will ever match, so every
 request lands on the floor rung regardless of tokens, tools or turns, and
-`oag/auto` becomes a no-op that resolves to the cheapest rung. A route laddered
-`[budget, standard, premium]` is in exactly this state today.
+`oag/auto` becomes a no-op that resolves to the floor. A route laddered
+`[budget, standard, premium]` is in exactly this state, and so is one collapsed
+to a single rung under any name but those three.
 
 **Naming a rung `cheap`, `balanced` or `frontier` turns it back on, silently.**
 Add a second rung and call it `cheap` and tier routing reactivates for that
 rung with nothing anywhere saying so. If you do not want classification, this is
 the reason to name rungs anything but those three words — a better one than
 tidiness.
+
+### With one rung, the rung's order is the routing policy
+
+`Ladder::pick` takes the **first capable member in list order** — `rung.models
+.iter().filter_map(..).find(|spec| spec.satisfies(need))`. It does not sort by
+price, and nothing else does either. On a multi-rung ladder that rarely shows,
+because the rungs carry the cost ordering. Collapse to one rung and the
+within-rung order becomes the whole of the routing decision.
+
+So order a single rung cheapest-first, deliberately. A rung listing an
+expensive model ahead of a cheap one that would have served the same request
+routes every request to the expensive one, reports nothing unusual, and is
+visible only in the bill. A live deployment ran at ten times its necessary cost
+this way, with the cheaper model sitting one slot behind.
 
 ### Retiring a rung does not orphan its pins
 
