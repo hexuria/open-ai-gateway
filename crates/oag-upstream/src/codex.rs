@@ -193,6 +193,12 @@ impl ProviderAdapter for CodexAdapter {
         // different question from the one inference will ask.
         let mut builder = reqwest::Client::new()
             .get(format!("{}/models", self.base_url))
+            // Required, and the backend says so rather than guessing for us:
+            // without it the answer is a 400 naming `('query', 'client_version')`
+            // as a missing field. Derived from `user_agent` rather than given a
+            // config knob of its own, so the two cannot disagree about which
+            // client this is claiming to be.
+            .query(&[("client_version", client_version(&self.user_agent))])
             .header("accept", "application/json")
             .header(
                 "authorization",
@@ -234,25 +240,31 @@ fn parse_served(body: &str) -> Result<Vec<String>> {
     let json: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| Error::Internal(format!("codex models is not JSON: {e}")))?;
 
-    let ids: Vec<String> = match &json {
+    // `models`/`slug` is what the Codex backend actually answers; `data`/`id`
+    // is the OpenAI listing shape. Both are accepted because this adapter is
+    // pointed at either in different deployments, and neither costs anything to
+    // keep.
+    let rows = match &json {
         serde_json::Value::Object(o) => o
-            .get("data")
-            .and_then(|d| d.as_array())
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|r| match r {
-                        serde_json::Value::String(s) => Some(s.clone()),
-                        other => other["id"].as_str().map(str::to_owned),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        serde_json::Value::Array(rows) => rows
-            .iter()
-            .filter_map(|r| r.as_str().map(str::to_owned))
-            .collect(),
-        _ => Vec::new(),
+            .get("models")
+            .or_else(|| o.get("data"))
+            .and_then(|d| d.as_array()),
+        serde_json::Value::Array(rows) => Some(rows),
+        _ => None,
     };
+    let ids: Vec<String> = rows
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| match r {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    other => other["slug"]
+                        .as_str()
+                        .or_else(|| other["id"].as_str())
+                        .map(str::to_owned),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     if ids.is_empty() {
         return Err(Error::Internal(format!(
@@ -261,6 +273,32 @@ fn parse_served(body: &str) -> Result<Vec<String>> {
         )));
     }
     Ok(ids)
+}
+
+/// What to send as `client_version` when the user agent carries no version.
+///
+/// The backend validates the SHAPE — `codex_cli_rs/unknown`, which is the
+/// shipped default, is refused with "Invalid `client_version` format" — so the
+/// field cannot be filled with a placeholder. This is the Codex CLI release
+/// this adapter is written against; see the lockstep note at the top of the
+/// file. An operator running a different client sets `gateway.codex.user_agent`
+/// to `name/version` and that version is used instead.
+const DEFAULT_CLIENT_VERSION: &str = "0.152.1";
+
+/// The version half of a `name/version` user agent, or a usable default.
+///
+/// `codex_cli_rs/0.104.0` yields `0.104.0`. Anything not shaped like a version
+/// — the default `unknown`, or a user agent with no slash at all — falls back
+/// to [`DEFAULT_CLIENT_VERSION`], because the backend rejects a malformed value
+/// as firmly as a missing one and a refused discovery leaves the served set
+/// NULL for that credential.
+fn client_version(user_agent: &str) -> &str {
+    let candidate = user_agent.rsplit_once('/').map_or(user_agent, |(_, v)| v);
+    if candidate.starts_with(|c: char| c.is_ascii_digit()) {
+        candidate
+    } else {
+        DEFAULT_CLIENT_VERSION
+    }
 }
 
 /// Keep an upstream body short enough to belong in an error message.
@@ -286,6 +324,22 @@ mod tests {
     use serde_json::Value;
 
     #[test]
+    fn a_client_version_is_the_half_after_the_slash() {
+        assert_eq!(super::client_version("codex_cli_rs/0.104.0"), "0.104.0");
+        // Only the LAST slash separates, so a versioned path does not lose its
+        // tail to an earlier one.
+        assert_eq!(super::client_version("a/b/1.2.3"), "1.2.3");
+        // The shipped default carries no version, and the backend refuses a
+        // non-version with "Invalid client_version format" — so a placeholder
+        // must not be passed through as though it were one.
+        assert_eq!(
+            super::client_version("codex_cli_rs/unknown"),
+            super::DEFAULT_CLIENT_VERSION
+        );
+        assert_eq!(super::client_version("bare"), super::DEFAULT_CLIENT_VERSION);
+    }
+
+    #[test]
     fn the_openai_listing_shape_parses() {
         let body = r#"{"object":"list","data":[
             {"id":"gpt-5.6-luna","object":"model"},
@@ -293,6 +347,20 @@ mod tests {
         assert_eq!(
             super::parse_served(body).expect("parsed"),
             ["gpt-5.6-luna", "gpt-5.6-terra"]
+        );
+    }
+
+    #[test]
+    fn the_codex_backend_shape_parses() {
+        // What the live backend actually answers: `models`, keyed by `slug`,
+        // with a pile of capability fields we do not read. Captured from a real
+        // response rather than imagined.
+        let body = r#"{"models":[
+            {"slug":"gpt-reserve","prefer_websockets":true,"default_verbosity":"low"},
+            {"slug":"gpt-5.6-luna","input_modalities":["text","image"]}]}"#;
+        assert_eq!(
+            super::parse_served(body).expect("parsed"),
+            ["gpt-reserve", "gpt-5.6-luna"]
         );
     }
 
