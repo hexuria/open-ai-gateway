@@ -181,10 +181,14 @@ pub async fn route_channels(
     db: &Db,
     route_id: Uuid,
     principal_id: Uuid,
-) -> Result<Vec<(String, String)>> {
-    sqlx::query_as::<_, (String, String)>(
+) -> Result<Vec<(String, String, Option<Vec<String>>)>> {
+    // `served_models` rides along because it is a property of the same
+    // credential row and the listing needs both together: which channels exist,
+    // and what each one will actually accept. A NULL here is "never asked", and
+    // the caller must treat it as unknown rather than as empty.
+    sqlx::query_as::<_, (String, String, Option<Vec<String>>)>(
         r"
-        SELECT DISTINCT a.provider, a.kind
+        SELECT DISTINCT a.provider, a.kind, a.served_models
         FROM account a
         JOIN account_route ar ON ar.account_id = a.id
         WHERE ar.route_id = $1
@@ -212,6 +216,24 @@ pub async fn route_channels(
     .fetch_all(db.pool())
     .await
     .map_err(|e| Error::Internal(format!("loading route providers: {e}")))
+}
+
+/// Record what a credential told us it serves.
+///
+/// Written by the discovery sweep, never by hand. Storing the timestamp
+/// alongside means a stale answer is visible as stale rather than merely old:
+/// an operator debugging a missing model wants to know whether we ever asked.
+pub async fn set_served_models(db: &Db, account: Uuid, models: &[String]) -> Result<()> {
+    sqlx::query(
+        "UPDATE account SET served_models = $2, served_models_at = now(), \
+         updated_at = now() WHERE id = $1",
+    )
+    .bind(account)
+    .bind(models)
+    .execute(db.pool())
+    .await
+    .map(|_| ())
+    .map_err(|e| Error::Internal(format!("recording served models: {e}")))
 }
 
 /// Every credential this principal may draw on for this route, including ones
@@ -2227,8 +2249,9 @@ mod tests {
 
         assert_eq!(
             route_channels(&db, route, principal).await.expect("list"),
-            vec![("anthropic".to_owned(), "api_key".to_owned())],
-            "the kind rides along, so the listing knows which qualifiers to offer"
+            vec![("anthropic".to_owned(), "api_key".to_owned(), None)],
+            "the kind rides along, so the listing knows which qualifiers to offer, \
+             and the served set so it knows which models each will take"
         );
 
         // Disabled is an operator decision, not a transient state: advertising
@@ -2280,7 +2303,7 @@ mod tests {
         // endpoint must not vanish from the picker.
         assert_eq!(
             route_channels(&db, route, principal).await.expect("list"),
-            vec![("anthropic".to_owned(), "api_key".to_owned())]
+            vec![("anthropic".to_owned(), "api_key".to_owned(), None)]
         );
 
         sqlx::query("UPDATE account SET usage_remaining_pct = 50 WHERE id = $1")
