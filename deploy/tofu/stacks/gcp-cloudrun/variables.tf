@@ -81,6 +81,18 @@ variable "ingress" {
   default = "INGRESS_TRAFFIC_ALL"
 }
 
+# Who may invoke the service at the platform layer. The gateway authenticates
+# every inference request itself, so the default is the open one — but it is
+# a default this stack now SETS rather than one an operator had to grant by
+# hand in the console after `apply`, which is how a fresh deploy answered 403
+# to everyone until somebody remembered. Fronting the service with a Google
+# load balancer or IAP? Narrow this to that principal and set `ingress` to
+# match; the two are one decision.
+variable "invoker_members" {
+  type    = list(string)
+  default = ["allUsers"]
+}
+
 variable "cloudflare_zone_id" {
   type    = string
   default = ""

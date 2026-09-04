@@ -69,6 +69,14 @@ variable "certificate_arn" {
   type    = string
   default = ""
 }
+# Without a certificate the listener is plaintext HTTP on port 80: every API
+# key and every prompt from every client crosses the internet readable. That
+# used to be the silent default. It is now a refusal unless an operator says,
+# in writing, that this deployment is behind something that terminates TLS.
+variable "allow_plaintext_listener" {
+  type    = bool
+  default = false
+}
 variable "log_retention_days" {
   type    = number
   default = 30

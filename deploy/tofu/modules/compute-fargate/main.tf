@@ -92,6 +92,13 @@ resource "aws_lb_listener" "this" {
     type             = "forward"
     target_group_arn = aws_lb_target_group.this.arn
   }
+
+  lifecycle {
+    precondition {
+      condition     = var.certificate_arn != "" || var.allow_plaintext_listener
+      error_message = "No certificate_arn: the public listener would be plaintext HTTP on port 80, exposing every API key and prompt. Provide a certificate, or set allow_plaintext_listener = true for a deployment that terminates TLS in front of this ALB."
+    }
+  }
 }
 
 locals {

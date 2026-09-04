@@ -69,6 +69,14 @@ resource "google_redis_instance" "this" {
   authorized_network = var.network_id
   connect_mode       = "PRIVATE_SERVICE_ACCESS"
 
+  # AUTH on. Private-network reachability is a perimeter, not a credential:
+  # anything else on the VPC could otherwise read the auth cache's sealed
+  # entries and forge slot state. The AUTH string is composed into the URL
+  # this module outputs, so the gateway needs no separate knob. Transit
+  # encryption is NOT enabled here: Memorystore's TLS uses a CA the client
+  # must be given, and the gateway has no setting to hand it one yet.
+  auth_enabled = true
+
   # Everything the gateway keeps here is expendable — slots, session pins, the
   # auth cache — so persistence buys little. Losing it costs a burst of
   # database reads, not money or credentials.

@@ -138,6 +138,17 @@ module "gateway" {
   ]
 }
 
+# The invoker grant that used to be a manual console step. See
+# `invoker_members` for what it means and when to narrow it.
+resource "google_cloud_run_v2_service_iam_member" "invoker" {
+  for_each = toset(var.invoker_members)
+  project  = var.project_id
+  location = var.region
+  name     = module.gateway.service_name
+  role     = "roles/run.invoker"
+  member   = each.value
+}
+
 resource "google_secret_manager_secret_iam_member" "read" {
   for_each  = google_secret_manager_secret.this
   secret_id = each.value.id
