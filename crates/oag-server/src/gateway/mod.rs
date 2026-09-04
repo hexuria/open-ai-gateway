@@ -452,14 +452,29 @@ async fn run_with_escalation(
             );
         // Before the ledger write, which is ours rather than the credential's.
         lease.release().await;
+
+        // The ledger writes run as their own task, exactly as the streamed
+        // path's do. This future is the request handler's: a client that hangs
+        // up while the writes are in flight cancels it, and an inline `.await`
+        // here went with it — no row, no debit, while the provider had already
+        // generated and invoiced the answer. Detached, the writes finish
+        // whatever the connection does. The guard rides along so a shutdown
+        // drain waits for them rather than exiting out from under the ledger.
+        //
         // `triggering_gate` when we escalated, otherwise whatever this attempt
         // tripped — so the ledger always names the reason, never nothing.
-        meter::record_collected(state, &ctx, &accumulator, triggering_gate.or(gate)).await;
-        // Second, and only ever second: this is the row the surviving primary key
-        // drops, and the served one above is the row that must not be dropped.
-        if let Some(abandoned) = &abandoned {
-            meter::record_abandoned(state, abandoned).await;
-        }
+        let recorded_gate = triggering_gate.or(gate);
+        let state2 = Arc::clone(state);
+        tokio::spawn(async move {
+            let _guard = guard;
+            meter::record_collected(&state2, &ctx, &accumulator, recorded_gate).await;
+            // Second, and only ever second: this is the row the surviving
+            // primary key drops, and the served one above is the row that must
+            // not be dropped.
+            if let Some(abandoned) = &abandoned {
+                meter::record_abandoned(&state2, abandoned).await;
+            }
+        });
 
         return Ok(json_response(
             &body,
