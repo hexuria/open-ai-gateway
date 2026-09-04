@@ -170,6 +170,12 @@ pub struct Requirements {
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     models: BTreeMap<ModelId, ModelSpec>,
+    /// Every catalogue id sharing an upstream name — one, usually; two when
+    /// two providers spell a model identically, which is the ambiguity
+    /// `resolve` refuses to guess at. Maintained by `insert`, so the two
+    /// lookups the request path makes by upstream name are a probe each
+    /// rather than a scan of the catalogue.
+    by_upstream: std::collections::HashMap<String, Vec<ModelId>>,
 }
 
 impl Catalog {
@@ -204,8 +210,19 @@ impl Catalog {
         served: &std::collections::HashSet<String>,
         need: &Requirements,
     ) -> Option<&ModelSpec> {
-        self.iter()
-            .filter(|spec| served.contains(spec.upstream_name.as_str()))
+        // Iterate the served set — a handful of names — and probe, rather
+        // than walk a few hundred catalogue rows asking each whether it is in
+        // the set. This ran on every request, including the common one where
+        // `served` was empty and the answer was provably `None` before the
+        // walk began.
+        if served.is_empty() {
+            return None;
+        }
+        served
+            .iter()
+            .filter_map(|name| self.by_upstream.get(name))
+            .flatten()
+            .filter_map(|id| self.models.get(id))
             .filter(|spec| spec.satisfies(need))
             .filter(|spec| {
                 spec.pricing.input_per_mtok > rust_decimal::Decimal::ZERO
@@ -220,6 +237,22 @@ impl Catalog {
     }
 
     pub fn insert(&mut self, spec: ModelSpec) {
+        // A re-insert under the same id may carry a different upstream name
+        // (a reprice, a rename); drop the old mapping so it cannot resolve to
+        // a spec that no longer spells it.
+        if let Some(previous) = self.models.get(&spec.id)
+            && previous.upstream_name != spec.upstream_name
+            && let Some(ids) = self.by_upstream.get_mut(&previous.upstream_name)
+        {
+            ids.retain(|id| *id != spec.id);
+        }
+        let ids = self
+            .by_upstream
+            .entry(spec.upstream_name.clone())
+            .or_default();
+        if !ids.contains(&spec.id) {
+            ids.push(spec.id.clone());
+        }
         self.models.insert(spec.id.clone(), spec);
     }
 
@@ -253,12 +286,12 @@ impl Catalog {
         if let Some(spec) = self.models.get(&ModelId::new(name)) {
             return Some(spec);
         }
-        let mut hits = self.models.values().filter(|m| m.upstream_name == name);
-        let first = hits.next()?;
-        if hits.next().is_some() {
-            return None;
+        // Exactly one catalogue id spells this upstream name, or nothing:
+        // two is the ambiguity the doc above refuses to guess at.
+        match self.by_upstream.get(name).map(Vec::as_slice) {
+            Some([only]) => self.models.get(only),
+            _ => None,
         }
-        Some(first)
     }
 
     /// Build from parsed `LiteLLM` pricing entries.
