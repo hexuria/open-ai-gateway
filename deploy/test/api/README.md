@@ -77,7 +77,7 @@ State-changing — opt-in only:
 | `mutating/points-reference.hurl` | 9 | writes the same value back. **No-op by design** |
 | `mutating/principals.hurl` | 6 | leaves one principal |
 | `mutating/services.hurl` | 9 | leaves one service per run |
-| `mutating/accounts.hurl` | 9 | **needs `--variable account_id=<uuid>`**; without it hurl refuses |
+| `mutating/accounts.hurl` | 9 | **needs `-V account_id=<uuid>`**. Named without one it errors; swept up by `--all` it is skipped with a notice |
 
 ## `mutating/` is separate on purpose
 

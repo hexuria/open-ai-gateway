@@ -324,19 +324,32 @@ def cmd_test(args):
             files += sorted(
                 os.path.join(mut, f) for f in os.listdir(mut) if f.endswith(".hurl")
             )
-    for f in files:
-        if f.endswith("mutating/accounts.hurl") and not any(
-            v.startswith("account_id=") for v in args.var
-        ):
-            print(
-                "mutating/accounts needs --var account_id=<uuid>.\n"
-                "  Disabling a seat takes it out of rotation for real: on a "
-                "deployment whose only\n  serving credential is that seat, a turn "
-                "landing between the disable and the\n  enable fails for a reason "
-                "nobody will connect to a test run.\n"
-                "  List them with: api run 1  (or the admin accounts endpoint)"
-            )
+    # `mutating/accounts` needs an account id chosen by a person, because
+    # disabling a seat takes it out of rotation for real.
+    #
+    # Naming it and sweeping it up are different requests and get different
+    # answers. Asking for it by name without the id is an error — you asked for
+    # exactly this and cannot have it. Sweeping it up with `--all` skips it and
+    # SAYS SO, because failing the whole suite over one file nobody singled out
+    # would make `--all` useless, and dropping it silently would let a run
+    # report success over coverage it never attempted.
+    needs_account = [f for f in files if f.endswith("mutating/accounts.hurl")]
+    has_account = any(v.startswith("account_id=") for v in args.var)
+    if needs_account and not has_account:
+        detail = (
+            "  Disabling a seat takes it out of rotation for real: on a deployment "
+            "whose only\n  serving credential is that seat, a turn landing between "
+            "the disable and the\n  enable fails for a reason nobody will connect "
+            "to a test run."
+        )
+        if args.file:
+            print(f"mutating/accounts needs --var account_id=<uuid>.\n{detail}")
             return 1
+        print(
+            f"skipping mutating/accounts: no --var account_id=<uuid> given.\n{detail}",
+            file=sys.stderr,
+        )
+        files = [f for f in files if f not in needs_account]
     return hurl(files, args, test_mode=True)
 
 
