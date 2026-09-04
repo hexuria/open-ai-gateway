@@ -148,21 +148,62 @@ pub enum Egress {
     Responses { request_id: String, model: String },
 }
 
+/// The clocks a pump runs against.
+///
+/// Four, and each measures a different party: `idle` the upstream's silence,
+/// `client_write` the client's, `max` the whole stream, and `keepalive` how
+/// often our own silence is broken for intermediaries. They arrived one at a
+/// time as four positional `Duration`s, which is how a caller swaps two and
+/// gets a watchdog that never fires with no compile error to show for it.
+#[derive(Debug, Clone, Copy)]
+pub struct Deadlines {
+    /// How long the upstream may send nothing before the stream is failed.
+    pub idle: Duration,
+    /// Ceiling on the whole stream, checked on both sides of every await.
+    pub max: Duration,
+    /// How long a send to the client may wait before the client is given up.
+    pub client_write: Duration,
+    /// How often a no-op frame goes downstream while the upstream is quiet.
+    pub keepalive: Duration,
+}
+
 /// Read `response`, forward it to `tx`, and account for usage.
+///
+/// Long, deliberately: this is one state machine over a handful of locals
+/// that every branch reads, and slicing it into helpers would thread those
+/// locals through five signatures to save the lint.
+#[allow(clippy::too_many_lines)]
 pub async fn pump(
     response: reqwest::Response,
     adapter: Arc<dyn ProviderAdapter>,
     tx: mpsc::Sender<Chunk>,
-    idle_timeout: Duration,
-    max_duration: Duration,
-    client_write_timeout: Duration,
+    deadlines: Deadlines,
     egress: Egress,
 ) -> StreamOutcome {
+    let Deadlines {
+        idle: idle_timeout,
+        max: max_duration,
+        client_write: client_write_timeout,
+        keepalive: keepalive_interval,
+    } = deadlines;
     let started = Instant::now();
     let mut acc = StreamAccumulator::new();
     let mut ttft = None;
     let mut client_gone = false;
     let mut error = None;
+
+    // A no-op frame downstream while the upstream is quiet, so an intermediary
+    // with its own idle timeout does not sever a stream the model is still
+    // thinking on. Three Terraform modules, a Cloudflare precondition and
+    // docs/04-cloud.md all described this as what keeps quiet streams alive;
+    // until now no code emitted one. An SSE comment (`: keepalive`) is
+    // discarded by every conforming parser and needs no per-dialect renderer.
+    // Reset on every real chunk, so it only fires into silence.
+    let mut keepalive = tokio::time::interval(keepalive_interval.max(Duration::from_millis(1)));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick of an interval is immediate; a keepalive before the first
+    // byte would be noise, so it is consumed here.
+    keepalive.tick().await;
 
     // Ask the adapter how this provider delimits events, once, up front.
     let framing = adapter.framing();
@@ -178,7 +219,29 @@ pub async fn pump(
             break;
         }
 
-        let next = tokio::time::timeout(idle_timeout, body.next()).await;
+        // The idle deadline is fixed before the wait, not re-armed per
+        // keepalive tick: a keepalive is our silence, not the upstream's, and
+        // must not keep resetting the watchdog that measures the upstream.
+        // `StreamExt::next` is cancellation-safe, so dropping it to service a
+        // tick loses nothing.
+        let idle_deadline = tokio::time::Instant::now() + idle_timeout;
+        let next = loop {
+            tokio::select! {
+                n = tokio::time::timeout_at(idle_deadline, body.next()) => break n,
+                _ = keepalive.tick(), if !client_gone => {
+                    // Not `mark_committed` on success: nothing of the answer
+                    // went out. A refused or stalled send is a gone client,
+                    // exactly as for a real chunk.
+                    let frame = bytes::Bytes::from_static(b": keepalive\n\n");
+                    let sent = tokio::time::timeout(client_write_timeout, tx.send(Ok(frame))).await;
+                    if !matches!(sent, Ok(Ok(()))) {
+                        client_gone = true;
+                        tracing::debug!("client gone during keepalive; draining upstream for accounting");
+                    }
+                }
+            }
+        };
+        keepalive.reset();
 
         let chunk = match next {
             // The watchdog measures the *upstream*, so a slow client can never
@@ -702,6 +765,46 @@ mod tests {
     // ── how a stream ends ────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn a_quiet_upstream_gets_keepalives_downstream_until_the_watchdog_fires() {
+        // The upstream sends one frame and then nothing. The client must see
+        // comment frames at the keepalive interval — the thing every deploy
+        // artefact promised and nothing emitted — and the idle watchdog must
+        // still fire on the UPSTREAM's silence, undisturbed by our own.
+        let (tx, mut rx) = mpsc::channel(64);
+        let outcome = pump(
+            stalling(vec![sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            )]),
+            anthropic(),
+            tx,
+            Deadlines {
+                idle: Duration::from_millis(250),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_millis(40),
+            },
+            Egress::Passthrough {
+                dialect: Dialect::AnthropicMessages,
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(
+            outcome.error.is_some(),
+            "the idle watchdog fired on the upstream"
+        );
+        let sent = drain(&mut rx).await;
+        let keepalives = sent.matches(": keepalive\n\n").count();
+        assert!(
+            keepalives >= 3,
+            "expected several keepalives across 250ms of silence at 40ms; got {keepalives}: {sent:?}"
+        );
+        assert!(sent.contains("hi"), "the real frame went out too");
+    }
+
+    #[tokio::test]
     async fn a_client_that_stops_reading_does_not_park_the_pump() {
         // A receiver that is alive but never polls. With a channel of one and
         // several chunks to send, the second send would have blocked for as
@@ -729,9 +832,12 @@ mod tests {
             streamed(frames),
             anthropic(),
             tx,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            Duration::from_millis(50),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_millis(50),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::AnthropicMessages {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -770,9 +876,12 @@ mod tests {
             )]),
             anthropic(),
             tx,
-            Duration::from_millis(50),
-            Duration::from_secs(30),
-            Duration::from_secs(5),
+            Deadlines {
+                idle: Duration::from_millis(50),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -811,9 +920,12 @@ mod tests {
             )]),
             anthropic(),
             tx,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            Duration::from_secs(5),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -848,9 +960,12 @@ mod tests {
             )]),
             anthropic(),
             tx,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            Duration::from_secs(5),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::AnthropicMessages {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -880,9 +995,12 @@ mod tests {
             )]),
             anthropic(),
             tx,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            Duration::from_secs(5),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -916,9 +1034,12 @@ mod tests {
             )]),
             anthropic(),
             tx,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            Duration::from_secs(5),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -941,9 +1062,12 @@ mod tests {
             stalling(vec![sse(r#"{"type":"ping"}"#)]),
             anthropic(),
             tx,
-            Duration::from_millis(50),
-            Duration::from_secs(30),
-            Duration::from_secs(5),
+            Deadlines {
+                idle: Duration::from_millis(50),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::Passthrough {
                 dialect: Dialect::AnthropicMessages,
                 request_id: "r1".to_owned(),
@@ -975,9 +1099,12 @@ mod tests {
             tx,
             // Long enough that neither watchdog can be what stops this: the cap
             // trips within milliseconds of the bytes arriving.
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(5),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(5),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
