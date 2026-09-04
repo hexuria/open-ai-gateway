@@ -1042,15 +1042,6 @@ pub async fn revoke_key_by_prefix(
     .map_err(|e| Error::Internal(format!("revoking key by prefix: {e}")))
 }
 
-pub async fn touch_account(db: &Db, id: AccountId) -> Result<()> {
-    sqlx::query("UPDATE account SET last_used_at = now() WHERE id = $1")
-        .bind(id.as_uuid())
-        .execute(db.pool())
-        .await
-        .map_err(|e| Error::Internal(format!("touching account: {e}")))?;
-    Ok(())
-}
-
 /// Put a credential in cooldown after a failure.
 pub async fn cool_down(db: &Db, id: AccountId, until: OffsetDateTime, reason: &str) -> Result<()> {
     sqlx::query(
@@ -1199,7 +1190,17 @@ pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
                 status, latency_ms, ttft_ms, streamed
             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
             ON CONFLICT DO NOTHING
-            RETURNING api_key_id, principal_id, route_id, cost_usd
+            RETURNING api_key_id, principal_id, route_id, account_id, cost_usd
+        ),
+        -- The credential's recency, for the scheduler's last-resort tie-break.
+        -- This was its own UPDATE on the response path, awaited between the
+        -- upstream answering and the first byte going out; here it costs
+        -- nothing the ledger write was not already paying.
+        account_touch AS (
+            UPDATE account a
+               SET last_used_at = now()
+              FROM ins
+             WHERE a.id = ins.account_id
         ),
         -- Spend is denormalised for the cap checks, which must not run a SUM
         -- over the ledger on every request — and must not read a cached copy

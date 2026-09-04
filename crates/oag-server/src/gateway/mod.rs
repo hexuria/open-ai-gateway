@@ -1387,7 +1387,12 @@ async fn succeeded(
     stream: bool,
 ) -> Outcome {
     let account = lease.account.account_id();
-    let _ = oag_store::repo::touch_account(&state.db, account).await;
+    // No `touch_account` here any more. It was a Postgres write awaited
+    // between "the upstream answered" and "the first byte reaches the client"
+    // — on the one latency the user feels — to stamp `last_used_at`, which
+    // the ledger write now stamps in the same statement as the row. Recency
+    // for the scheduler's tie-break moves from "last dispatched to" to "last
+    // completed on", which is a finer definition of used anyway.
     state.breakers.record_success(account);
     metrics::counter!(
         "oag_requests_total",
