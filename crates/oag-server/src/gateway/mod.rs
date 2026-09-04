@@ -1600,6 +1600,11 @@ pub(crate) fn error_response(e: &Error) -> Response {
             "rate_limit_error",
             e.to_string(),
         ),
+        // 503 with its own kind: a client should retry, and a balancer with
+        // another replica behind it will land the retry somewhere with room.
+        // `at_capacity` means every credential is busy and waiting helps;
+        // this means this replica is busy and *another* one helps.
+        Error::Overloaded => (StatusCode::SERVICE_UNAVAILABLE, "overloaded", e.to_string()),
         Error::UnsupportedAction { .. } => (StatusCode::NOT_FOUND, "not_found", e.to_string()),
         Error::NoCredential { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1706,6 +1711,10 @@ pub(crate) fn error_response(e: &Error) -> Response {
             retry_after,
             ..
         } => Some(retry_after.unwrap_or(std::time::Duration::from_secs(1))),
+        // Shed load clears in the time it takes one admitted request to
+        // finish; a second is the honest lower bound, and a balancer retrying
+        // elsewhere needs no more of a hint than "not immediately, here".
+        Error::Overloaded => Some(std::time::Duration::from_secs(1)),
         _ => None,
     };
     if let Some(wait) = wait {

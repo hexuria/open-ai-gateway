@@ -124,6 +124,8 @@ impl AppState {
                 cache.clone(),
                 10_000,
                 &config.security.signing_secret,
+                // Half the pool for lookups, half for the requests that pass.
+                usize::try_from(config.database.max_connections).unwrap_or(16) * 2,
             ),
             transports: TransportPool::new(
                 2_048,

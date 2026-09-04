@@ -125,6 +125,19 @@ pub enum Error {
     #[error("route rate limit exceeded")]
     RateLimited { retry_after: Duration },
 
+    /// This replica is at its in-flight ceiling and shed the request rather
+    /// than queue it.
+    ///
+    /// Not [`Error::RateLimited`]: that is the caller's route being over its
+    /// own allowance, and the fix is theirs. This is the replica being full,
+    /// and the fix is a retry — against a different replica if the balancer
+    /// has one. Not [`Error::AtCapacity`] either, which is every *credential*
+    /// being busy; here nothing about the pool was consulted. Shed, never
+    /// queued: a request queued behind a full replica holds its own memory
+    /// while it waits, which is the resource the ceiling exists to bound.
+    #[error("this replica is at capacity; retry")]
+    Overloaded,
+
     /// A dialect path named an operation this gateway does not implement.
     /// Distinct from a bad request: the path parsed, the verb just is not one
     /// of ours, and answering 400 would send the caller looking at their body.
@@ -366,6 +379,7 @@ pub fn every_variant() -> Vec<Error> {
         Error::RateLimited {
             retry_after: Duration::from_secs(30),
         },
+        Error::Overloaded,
         Error::UnsupportedAction {
             action: "embed".to_owned(),
         },
@@ -409,6 +423,7 @@ pub fn every_variant() -> Vec<Error> {
             | Error::Unauthenticated
             | Error::BudgetExhausted { .. }
             | Error::RateLimited { .. }
+            | Error::Overloaded
             | Error::UnsupportedAction { .. }
             | Error::UnsupportedField { .. }
             | Error::Upstream { .. }

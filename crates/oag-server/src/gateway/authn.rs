@@ -57,6 +57,14 @@ pub async fn require_key_layer(
     let Some(key) = super::extract_key(req.headers()) else {
         return super::error_response(&Error::Unauthenticated);
     };
+    // Shape first, before the caches and long before Postgres. Every key
+    // this gateway has issued has one exact shape; a string without it is not
+    // an unknown key, it is not a key, and it used to buy a Redis GET and a
+    // Postgres probe from anyone who could reach the port. Same answer as an
+    // unknown key — a 401 — just without the round trips.
+    if !oag_store::repo::is_issued_key_shape(key) {
+        return super::error_response(&Error::Unauthenticated);
+    }
     let caller = match state.auth.authenticate(key).await {
         Ok(Some(ctx)) => ctx,
         Ok(None) => return super::error_response(&Error::Unauthenticated),

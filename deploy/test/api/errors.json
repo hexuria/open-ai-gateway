@@ -156,6 +156,19 @@
     }
   },
   {
+    "type": "overloaded",
+    "status": 503,
+    "variant": "Overloaded",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "overloaded",
+        "message": "this replica is at capacity; retry"
+      }
+    },
+    "retry_after_header": "1"
+  },
+  {
     "type": "quota_reserve_held",
     "status": 503,
     "variant": "ReserveHeld",

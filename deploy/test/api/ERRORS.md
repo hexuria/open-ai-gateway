@@ -50,6 +50,7 @@ when the body was truncated and no longer parses.
 | `no_credential_of_kind` | 503 | credentials exist, none of the *kind* pinned | drop the `@` pin, or the operator adds that kind |
 | `quota_reserve_held` | 503 | every credential is at its reserve floor | retry after the window resets |
 | `at_capacity` | 503 | every credential is at max concurrency | retry shortly — this one really is transient |
+| `overloaded` | 503 | this replica is at its in-flight ceiling; the request was shed, not queued | **honour `Retry-After`**; a balancer will land the retry on a replica with room |
 | `stream_idle` | 504 | the upstream went quiet mid-stream | retry |
 | `upstream_timeout` | 504 | the upstream accepted the connection and never began a response | retry |
 | `upstream_error` | *see below* | the provider refused | depends on `upstream_status` |

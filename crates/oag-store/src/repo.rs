@@ -15,6 +15,36 @@ use uuid::Uuid;
 /// The key is never stored in the clear, so this is also the only way to find
 /// one. sub2api stores inbound keys plaintext and matches on column equality,
 /// which turns read access to one table into every client's credential.
+/// What every key this gateway has ever issued looks like: the prefix, then
+/// 32 bytes of entropy as lowercase hex. See `mint_key`.
+pub const KEY_PREFIX: &str = "oag_live_";
+/// `KEY_PREFIX` plus 64 hex digits.
+pub const KEY_LEN: usize = 9 + 64;
+
+/// Whether `raw` has the shape of a key `mint_key` could have produced.
+///
+/// A syntactic check, and the *only* thing that runs before the database on
+/// the inference surface. Every issued key has exactly this shape, so a
+/// string without it is not an unknown key — it is not a key — and refusing
+/// it here costs nothing. Without this, a flood of arbitrary strings in the
+/// `Authorization` header bought a Redis GET and a Postgres probe apiece from
+/// anyone who could reach the port, ahead of any rate limit: the one lookup
+/// on the request path that no valid credential was needed to trigger.
+///
+/// What this is not: a negative cache. A random key per request misses a
+/// negative cache exactly as it misses the positive one, and a fleet-wide
+/// "this key does not exist" entry would lock a freshly minted key out for
+/// its TTL. Shape is the cheap filter; a permit around the lookup itself
+/// (`AuthCache`) is the bound on what gets past it.
+#[must_use]
+pub fn is_issued_key_shape(raw: &str) -> bool {
+    raw.len() == KEY_LEN
+        && raw.starts_with(KEY_PREFIX)
+        && raw[KEY_PREFIX.len()..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 #[must_use]
 pub fn hash_key(raw: &str) -> String {
     use std::fmt::Write as _;
@@ -1623,6 +1653,28 @@ mod tests {
         assert_eq!(h.len(), 64);
         assert_eq!(h, hash_key("oag_live_abc123"));
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn only_a_key_this_gateway_could_have_minted_has_the_issued_shape() {
+        let minted = format!("{KEY_PREFIX}{}", "0123456789abcdef".repeat(4));
+        assert_eq!(minted.len(), KEY_LEN);
+        assert!(is_issued_key_shape(&minted));
+
+        // Every way a string can fail to be one of ours, each refused
+        // without a lookup: wrong prefix, wrong length either way, a
+        // character outside lowercase hex, and the fake key errors.hurl
+        // sends to prove a 401.
+        assert!(!is_issued_key_shape("sk-ant-0123456789abcdef"));
+        assert!(!is_issued_key_shape(&minted[..KEY_LEN - 1]));
+        assert!(!is_issued_key_shape(&format!("{minted}0")));
+        assert!(!is_issued_key_shape(&minted.to_uppercase()));
+        assert!(!is_issued_key_shape(&format!(
+            "{KEY_PREFIX}{}",
+            "g".repeat(64)
+        )));
+        assert!(!is_issued_key_shape("oag_live_definitely_not_a_real_key"));
+        assert!(!is_issued_key_shape(""));
     }
 
     #[test]
