@@ -300,6 +300,105 @@ fn names_a_capability_limit(body: &str) -> bool {
     MARKERS.iter().any(|marker| body.contains(marker))
 }
 
+/// One of every [`Error`] variant, for rendering the error-shape catalogue that
+/// `deploy/test/api/ERRORS.md` documents and a client builds against.
+///
+/// Feature-gated (`test-fixtures`) because it exists to be EXHAUSTIVE, not to be
+/// called: it is a list that must never fall behind the enum. The `match` at the
+/// bottom is what enforces that. It has no wildcard arm, and `#[non_exhaustive]`
+/// does not apply inside the defining crate, so adding a variant to `Error`
+/// stops this function compiling until it is listed here too.
+///
+/// Which is the whole point. A catalogue of error shapes that silently omits the
+/// error somebody's client is about to receive is worse than no catalogue: it
+/// reads as complete.
+#[cfg(feature = "test-fixtures")]
+#[must_use]
+pub fn every_variant() -> Vec<Error> {
+    let all = vec![
+        Error::UnknownProvider("nosuch".to_owned()),
+        Error::Config("something in the config file".to_owned()),
+        Error::NoCredential {
+            provider: Provider::OpenAI,
+        },
+        Error::UnknownModelChannel {
+            qualifier: "subscription".to_owned(),
+        },
+        Error::ChannelNotOffered {
+            provider: Provider::Anthropic,
+            kind: CredentialKind::OAuth,
+        },
+        Error::NoCredentialOfKind {
+            provider: Provider::OpenAI,
+            kind: CredentialKind::ApiKey,
+        },
+        Error::ReserveHeld {
+            provider: Provider::XAI,
+            reserve_pct: 20,
+        },
+        Error::AtCapacity {
+            provider: Provider::OpenAI,
+            candidates: 3,
+        },
+        Error::NoViableModel("no model on the ladder satisfies the request".to_owned()),
+        Error::Unauthenticated,
+        Error::BudgetExhausted {
+            scope: BudgetScope::ApiKey,
+        },
+        Error::RateLimited {
+            retry_after: Duration::from_secs(30),
+        },
+        Error::UnsupportedAction {
+            action: "embed".to_owned(),
+        },
+        Error::UnsupportedField {
+            field: "response_format",
+            dialect: crate::provider::Dialect::AnthropicMessages,
+        },
+        Error::Upstream {
+            provider: Provider::OpenAI,
+            account: AccountId::new(),
+            status: 400,
+            body: r#"{"detail":"the model is not supported for this account"}"#.to_owned(),
+            retry_after: None,
+        },
+        Error::StreamIdle(Duration::from_mins(3)),
+        // `unwrap_err` on a value that is unconditionally an `Err`: the clippy
+        // lint is about Results that might be `Ok`, and "not json" is not an i32
+        // in any build.
+        Error::Serde(match serde_json::from_str::<i32>("not json") {
+            Err(e) => e,
+            Ok(_) => unreachable!("\"not json\" does not parse as an integer"),
+        }),
+        Error::Internal("a connection string nobody should see".to_owned()),
+    ];
+
+    // The guard. No wildcard arm on purpose — see this function's doc comment.
+    for e in &all {
+        match e {
+            Error::UnknownProvider(_)
+            | Error::Config(_)
+            | Error::NoCredential { .. }
+            | Error::UnknownModelChannel { .. }
+            | Error::ChannelNotOffered { .. }
+            | Error::NoCredentialOfKind { .. }
+            | Error::ReserveHeld { .. }
+            | Error::AtCapacity { .. }
+            | Error::NoViableModel(_)
+            | Error::Unauthenticated
+            | Error::BudgetExhausted { .. }
+            | Error::RateLimited { .. }
+            | Error::UnsupportedAction { .. }
+            | Error::UnsupportedField { .. }
+            | Error::Upstream { .. }
+            | Error::StreamIdle(_)
+            | Error::Serde(_)
+            | Error::Internal(_) => {}
+        }
+    }
+    all
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

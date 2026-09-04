@@ -20,5 +20,11 @@ base64.workspace = true
 sha2.workspace = true
 url.workspace = true
 
+[features]
+# Exposes `error::every_variant()`, which is the source for the error-shape
+# fixtures in deploy/test/api. Behind a feature so it is not in a release build:
+# it exists to be exhaustive over `Error`, not to be called at runtime.
+test-fixtures = []
+
 [lints]
 workspace = true

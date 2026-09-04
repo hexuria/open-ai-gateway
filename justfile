@@ -95,7 +95,10 @@ catalog-prices provider="xai":
       cargo run --quiet -p oag -- admin catalog sync-prices --provider {{provider}}
 
 # Mint an inference key — for sending requests to :29080. `just key` or
-# `just key name=codex`. This is the key that goes in an SDK / client config.
+# `just key codex`. Positional: `just key name=codex` mints one literally called
+# `name=codex`, because a recipe parameter is not a variable override.
+#
+# This is the key that goes in an SDK / client config.
 key name="cli":
     @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
@@ -163,6 +166,46 @@ config:
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
       cargo run --quiet -p oag -- config
+
+# ── poking the API by hand ─────────────────────────────────────────────────────
+# `deploy/test/api/api` is the tool; this just forwards to it, because a recipe
+# takes positional parameters and not flags. Everything after `just api` is
+# passed straight through:
+#
+#   just api list                 every endpoint
+#   just api list models          the ones about models
+#   just api show 63              doc, assertions, request body
+#   just api run 63               send it
+#   just api run 63 -m xai/grok-4.6
+#   just api test                 the safe files, as a suite
+#   just api test --all           including the ones that change state
+#
+# Needs hurl: `brew install hurl` (or `cargo install hurl`).
+
+hurl_vars := ".dev-hurl-vars"
+
+# Mint the inference and admin keys into a gitignored vars file. Never printed:
+# a key is shown once at creation and only its SHA-256 is stored, so this file
+# is the only copy.
+#
+# Re-running mints new keys and leaves the old ones active — revoke first if
+# that matters (`oag admin key list`, then `oag admin key revoke <prefix>`).
+#
+# Mint the two keys the hurl files use, into a gitignored vars file.
+api-keys:
+    @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
+      OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
+      OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
+      sh -c 'set -e; \
+        printf "host=http://127.0.0.1:{{pub_port}}\nadmin_host=http://127.0.0.1:{{adm_port}}\n" > {{hurl_vars}}; \
+        printf "api_key=%s\n" "$(cargo run --quiet -p oag -- admin key create --email dev@localhost --name hurl | sed -n 2p | tr -d "[:space:]")" >> {{hurl_vars}}; \
+        printf "admin_key=%s\n" "$(cargo run --quiet -p oag -- admin key create --email dev@localhost --name hurl-admin --admin | sed -n 2p | tr -d "[:space:]")" >> {{hurl_vars}}'
+    @chmod 600 {{hurl_vars}}
+    @echo "wrote {{hurl_vars}} (not shown, gitignored)"
+
+# List, search, inspect and send endpoints. `just api` alone lists them.
+api *args:
+    @./deploy/test/api/api {{args}}
 
 # ── the full topology ──────────────────────────────────────────────────────────
 # Caddy -> Envoy -> 3 replicas -> Postgres + Redis. The full topology.

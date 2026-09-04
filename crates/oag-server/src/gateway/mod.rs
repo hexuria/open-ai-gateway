@@ -2299,6 +2299,124 @@ security:
         }
     }
 
+    /// Where the client-facing catalogue lives.
+    const ERROR_FIXTURES: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../deploy/test/api/errors.json"
+    );
+
+    /// Render every `Error` variant to the bytes a client actually receives, and
+    /// hold the committed fixture to them.
+    ///
+    /// This is the mechanism behind `deploy/test/api/ERRORS.md`. Two ways it
+    /// stays honest, and both matter:
+    ///
+    /// 1. `every_variant()` is exhaustive over `Error` — it lives in `oag-core`
+    ///    where `#[non_exhaustive]` does not apply, and its match has no wildcard
+    ///    arm. A new variant stops THAT crate compiling.
+    /// 2. This asserts the rendered shapes equal the committed file. A change to
+    ///    a status code or a `type` string fails here rather than in somebody's
+    ///    client, months later, as an unhandled case.
+    ///
+    /// Regenerate deliberately after an intended change:
+    ///
+    /// ```text
+    /// UPDATE_ERROR_FIXTURES=1 cargo test -p oag-server error_shape
+    /// ```
+    #[tokio::test]
+    async fn every_error_shape_matches_the_committed_catalogue() {
+        let mut rendered = Vec::new();
+        for error in oag_core::error::every_variant() {
+            // The Rust variant that produced this shape. Worth recording because
+            // the mapping is many-to-one and deliberately so: three different
+            // internal failures all render as `internal_error` with the same
+            // redacted message, and without this the fixture shows three
+            // identical entries and no way to tell why.
+            let variant = format!("{error:?}");
+            let variant = variant
+                .split(['(', ' ', '{'])
+                .next()
+                .unwrap_or("?")
+                .to_owned();
+            let response = error_response(&error);
+            let status = response.status().as_u16();
+            let retry_after = retry_after_of(&response).map(str::to_owned);
+            let body = json_body(response).await;
+            let kind = body["error"]["type"]
+                .as_str()
+                .expect("every envelope names its kind")
+                .to_owned();
+
+            // The envelope shape itself, asserted for every variant rather than
+            // trusted: a client branches on these two fields and nothing else.
+            assert_eq!(body["type"], "error", "{kind} lost its outer type");
+            assert!(
+                body["error"]["message"].is_string(),
+                "{kind} has no message"
+            );
+
+            let mut entry = serde_json::json!({
+                "type": kind,
+                "status": status,
+                "variant": variant,
+                "body": body,
+            });
+            if let Some(wait) = retry_after {
+                entry["retry_after_header"] = serde_json::json!(wait);
+            }
+            rendered.push(entry);
+        }
+
+        // Sorted so the file is stable and a diff shows a real change rather
+        // than a reordering.
+        rendered.sort_by(|a, b| {
+            (a["type"].as_str(), a["variant"].as_str())
+                .cmp(&(b["type"].as_str(), b["variant"].as_str()))
+        });
+        let actual = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&rendered).expect("serialisable")
+        );
+
+        if std::env::var_os("UPDATE_ERROR_FIXTURES").is_some() {
+            std::fs::write(ERROR_FIXTURES, &actual).expect("write the catalogue");
+            return;
+        }
+
+        let expected = std::fs::read_to_string(ERROR_FIXTURES).unwrap_or_default();
+        assert_eq!(
+            actual.trim(),
+            expected.trim(),
+            "the error shapes a client receives have changed.\n\
+             If that was intended, regenerate the catalogue and update ERRORS.md:\n\
+             \n    UPDATE_ERROR_FIXTURES=1 cargo test -p oag-server error_shapes\n"
+        );
+    }
+
+    /// The catalogue is only useful if the kinds are distinct. Two variants
+    /// rendering to one `type` would leave a client unable to tell them apart —
+    /// and the two would have to be handled differently, or they would not be
+    /// two variants.
+    #[tokio::test]
+    async fn no_two_errors_are_indistinguishable_to_a_client() {
+        let mut seen: std::collections::HashMap<String, u16> = std::collections::HashMap::new();
+        for error in oag_core::error::every_variant() {
+            let response = error_response(&error);
+            let status = response.status().as_u16();
+            let body = json_body(response).await;
+            let kind = body["error"]["type"].as_str().expect("a kind").to_owned();
+            // Sharing a kind is allowed only when the status also matches: those
+            // are deliberate groupings, like the two model-qualifier failures.
+            if let Some(previous) = seen.insert(kind.clone(), status) {
+                assert_eq!(
+                    previous, status,
+                    "`{kind}` is returned with two different statuses, so a \
+                     client branching on it cannot know which it has"
+                );
+            }
+        }
+    }
+
     #[test]
     fn budget_exhaustion_is_distinguishable_from_an_auth_failure() {
         // The client needs to tell "you are out of money" from "your key is

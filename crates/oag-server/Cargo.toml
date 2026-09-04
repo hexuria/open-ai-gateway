@@ -38,6 +38,8 @@ tokio-stream = "0.1"
 async-trait.workspace = true
 
 [dev-dependencies]
+# For the error-shape catalogue test: `every_variant()` is feature-gated.
+oag-core = { workspace = true, features = ["test-fixtures"] }
 base64.workspace = true
 http-body-util.workspace = true
 

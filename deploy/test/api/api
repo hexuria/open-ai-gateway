@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+"""Explore and trigger this gateway's API.
+
+    api list [term]     every endpoint, optionally filtered
+    api show <n>        one endpoint in full: doc, headers, body, assertions
+    api run <n>         send it
+    api test [file...]  run whole .hurl files as a test suite
+
+The endpoint list is PARSED from the .hurl files next to this script. It is not
+a second copy of the routes maintained by hand — a list that has to agree with
+something else and has no mechanism forcing it to will drift, and every drifting
+list this deployment has met drifted silently.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+VARS = os.path.join(REPO, ".dev-hurl-vars")
+METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+
+BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
+if not sys.stdout.isatty():
+    BOLD = DIM = RESET = ""
+
+
+class Endpoint:
+    """One request in one .hurl file."""
+
+    def __init__(self, path, line, method, url, doc, lines):
+        self.file = path
+        self.line = line
+        self.method = method
+        self.url = url
+        self.doc = doc
+        self.lines = lines
+
+    @property
+    def name(self):
+        return os.path.relpath(self.file, HERE)[: -len(".hurl")]
+
+    @property
+    def mutating(self):
+        return self.name.startswith("mutating/")
+
+    @property
+    def pretty_url(self):
+        # `{{host}}/v1/models` reads as `/v1/models`; the base is noise in a list.
+        return re.sub(r"^\{\{(admin_)?host\}\}", "", self.url)
+
+    @property
+    def auth(self):
+        blob = "\n".join(self.lines)
+        if "{{admin_key}}" in blob:
+            return "admin"
+        if "Authorization:" in blob:
+            return "key"
+        return "none"
+
+    @property
+    def status(self):
+        for line in self.lines:
+            m = re.match(r"^HTTP (\d+)", line.strip())
+            if m:
+                return m.group(1)
+        return "?"
+
+    @property
+    def asserts(self):
+        try:
+            i = self.lines.index("[Asserts]")
+        except ValueError:
+            return []
+        out = []
+        for line in self.lines[i + 1 :]:
+            s = line.strip()
+            if not s or s.startswith("[") or s.startswith("#"):
+                break
+            out.append(s)
+        return out
+
+    @property
+    def summary(self):
+        """The one-line label for this request.
+
+        The `.hurl` files head each request with a `── like this ──` banner and
+        then explain underneath, so the banner IS the summary and the prose is
+        the detail. Falling back to the first prose line covers requests written
+        without a banner; falling back to the LAST line — which is what this
+        first did — reliably produced the tail of a wrapped sentence.
+        """
+        for line in self.doc:
+            s = line.lstrip("#").strip()
+            m = re.match(r"^──+\s*(.+?)\s*──+$", s)
+            if m:
+                return m.group(1)
+        for line in self.doc:
+            s = line.lstrip("#").strip()
+            if s and not set(s) <= set("─ "):
+                return s
+        return ""
+
+    @property
+    def variables(self):
+        return sorted(set(re.findall(r"\{\{(\w+)\}\}", "\n".join(self.lines))))
+
+
+def parse(path):
+    """Every request in one file, each carrying the comment block above it."""
+    with open(path, encoding="utf-8") as fh:
+        raw = fh.read().split("\n")
+
+    endpoints, doc, i = [], [], 0
+    while i < len(raw):
+        line = raw[i]
+        if line.startswith("#"):
+            doc.append(line)
+            i += 1
+            continue
+        if not line.strip():
+            # A blank line ends a comment block only if a request has not started.
+            i += 1
+            continue
+        m = re.match(r"^(%s) (\S+)" % "|".join(METHODS), line)
+        if not m:
+            doc = []
+            i += 1
+            continue
+
+        start, body = i, [line]
+        i += 1
+        # A request runs until the next request or the next comment block.
+        while i < len(raw):
+            nxt = raw[i]
+            if re.match(r"^(%s) \S+" % "|".join(METHODS), nxt):
+                break
+            if nxt.startswith("#"):
+                break
+            body.append(nxt)
+            i += 1
+        while body and not body[-1].strip():
+            body.pop()
+        endpoints.append(Endpoint(path, start + 1, m.group(1), m.group(2), doc, body))
+        doc = []
+    return endpoints
+
+
+def collect(include_mutating=True):
+    files = sorted(
+        os.path.join(HERE, f) for f in os.listdir(HERE) if f.endswith(".hurl")
+    )
+    mut = os.path.join(HERE, "mutating")
+    if include_mutating and os.path.isdir(mut):
+        files += sorted(
+            os.path.join(mut, f) for f in os.listdir(mut) if f.endswith(".hurl")
+        )
+    out = []
+    for f in files:
+        out.extend(parse(f))
+    return out
+
+
+def matches(ep, term):
+    t = term.lower()
+    return (
+        t in ep.pretty_url.lower()
+        or t in ep.method.lower()
+        or t in ep.summary.lower()
+        or t in ep.name.lower()
+        or t in "\n".join(ep.doc).lower()
+    )
+
+
+def cmd_list(args):
+    # The number is the endpoint's position in the WHOLE list, not in the
+    # filtered view. Renumbering per search would mean `api search points` shows
+    # a 14 that `api run 14` resolves to something else — the numbers have to
+    # mean the same thing in both commands or they are a trap.
+    numbered = list(enumerate(collect(), 1))
+    if args.term:
+        numbered = [(n, e) for n, e in numbered if matches(e, args.term)]
+    if not numbered:
+        print(f"nothing matching {args.term!r}. `api list` shows everything.")
+        return 1
+    width = max(len(e.pretty_url) for _, e in numbered)
+    last_file = None
+    for n, e in numbered:
+        if e.name != last_file:
+            flag = f"  {DIM}(changes state){RESET}" if e.mutating else ""
+            print(f"\n{BOLD}{e.name}{RESET}{flag}")
+            last_file = e.name
+        auth = {"admin": "admin", "key": "key  ", "none": "     "}[e.auth]
+        summary = e.summary
+        if len(summary) > 68:
+            summary = summary[:67].rstrip() + "…"
+        print(
+            f"  {n:>3}  {e.method:<6} {e.pretty_url:<{width}}  "
+            f"{DIM}{auth}  {e.status}{RESET}  {summary}"
+        )
+    print(
+        f"\n{len(numbered)} endpoint(s). `api show <n>` for one, "
+        f"`api run <n>` to send it."
+    )
+    return 0
+
+
+def resolve(n):
+    eps = collect()
+    if not 1 <= n <= len(eps):
+        print(f"no endpoint {n}. There are {len(eps)}; `api list` shows them.")
+        return None
+    return eps[n - 1]
+
+
+def cmd_show(args):
+    e = resolve(args.n)
+    if not e:
+        return 1
+    print(f"{BOLD}{e.method} {e.pretty_url}{RESET}")
+    print(f"{DIM}{e.name}.hurl:{e.line}{RESET}\n")
+    if e.doc:
+        for line in e.doc:
+            print(f"  {line.lstrip('#').rstrip()}")
+        print()
+    print(f"  {BOLD}auth{RESET}      {e.auth}")
+    print(f"  {BOLD}expects{RESET}   HTTP {e.status}")
+    if e.mutating:
+        print(f"  {BOLD}warning{RESET}   changes state")
+    if e.variables:
+        print(f"  {BOLD}variables{RESET} {', '.join('{{%s}}' % v for v in e.variables)}")
+    if e.asserts:
+        print(f"\n  {BOLD}assertions{RESET}")
+        for a in e.asserts:
+            print(f"    {a}")
+    print(f"\n  {BOLD}request{RESET}")
+    for line in e.lines:
+        print(f"    {line}")
+    return 0
+
+
+def known_vars(extra):
+    names = set()
+    if os.path.exists(VARS):
+        with open(VARS, encoding="utf-8") as fh:
+            for line in fh:
+                if "=" in line:
+                    names.add(line.split("=", 1)[0].strip())
+    for kv in extra:
+        if "=" in kv:
+            names.add(kv.split("=", 1)[0])
+    return names
+
+
+def cmd_run(args):
+    # ONE collect() call: `resolve` used to re-parse, which built fresh Endpoint
+    # objects, and `.index()` then compared by identity against a different set
+    # and never matched.
+    eps = collect()
+    if not 1 <= args.n <= len(eps):
+        print(f"no endpoint {args.n}. There are {len(eps)}; `api list` shows them.")
+        return 1
+    e = eps[args.n - 1]
+
+    # A request may use a variable an EARLIER request in its file captured. Running
+    # it alone would fail on an undefined variable, so when that is the case the
+    # prefix runs too — and it is said out loud, because for a mutating file that
+    # means re-running earlier side effects.
+    supplied = known_vars(args.var) | {"model", "newUuid"}
+    needed = [v for v in e.variables if v not in supplied]
+    same_file = [x for x in eps if x.file == e.file]
+    idx = same_file.index(e)
+    chunk = same_file[: idx + 1] if needed else [e]
+
+    if needed and len(chunk) > 1:
+        print(
+            f"{DIM}{e.pretty_url} needs {', '.join(needed)}, captured earlier in "
+            f"{e.name}.hurl — running the {len(chunk)} requests up to it.{RESET}",
+            file=sys.stderr,
+        )
+        if e.mutating:
+            print(
+                f"{DIM}That file changes state, so those earlier requests take "
+                f"effect again.{RESET}",
+                file=sys.stderr,
+            )
+
+    body = "\n\n".join("\n".join(x.lines) for x in chunk) + "\n"
+    tmp = tempfile.NamedTemporaryFile(
+        "w", suffix=".hurl", delete=False, encoding="utf-8"
+    )
+    tmp.write(body)
+    tmp.close()
+    try:
+        return hurl([tmp.name], args, test_mode=False)
+    finally:
+        os.unlink(tmp.name)
+
+
+def cmd_test(args):
+    if args.file:
+        files = []
+        for name in args.file:
+            p = os.path.join(HERE, name)
+            if not os.path.isfile(p):
+                p += ".hurl"
+            if not os.path.isfile(p):
+                print(f"no such file: {name}. `api list` shows what exists.")
+                return 1
+            files.append(p)
+    else:
+        files = sorted(
+            os.path.join(HERE, f) for f in os.listdir(HERE) if f.endswith(".hurl")
+        )
+        if args.all:
+            mut = os.path.join(HERE, "mutating")
+            files += sorted(
+                os.path.join(mut, f) for f in os.listdir(mut) if f.endswith(".hurl")
+            )
+    for f in files:
+        if f.endswith("mutating/accounts.hurl") and not any(
+            v.startswith("account_id=") for v in args.var
+        ):
+            print(
+                "mutating/accounts needs --var account_id=<uuid>.\n"
+                "  Disabling a seat takes it out of rotation for real: on a "
+                "deployment whose only\n  serving credential is that seat, a turn "
+                "landing between the disable and the\n  enable fails for a reason "
+                "nobody will connect to a test run.\n"
+                "  List them with: api run 1  (or the admin accounts endpoint)"
+            )
+            return 1
+    return hurl(files, args, test_mode=True)
+
+
+def hurl(files, args, test_mode):
+    if not shutil.which("hurl"):
+        print("hurl is not installed — brew install hurl (or cargo install hurl)")
+        return 1
+    if not os.path.exists(VARS) or os.path.getsize(VARS) == 0:
+        print(f"no {VARS} — run: just api-keys")
+        return 1
+    cmd = ["hurl", "--variables-file", VARS, "--variable", f"model={args.model}"]
+    for kv in args.var:
+        cmd += ["--variable", kv]
+    if test_mode:
+        cmd.append("--test")
+    if args.verbose:
+        cmd.append("--very-verbose")
+    cmd += files
+    if args.dry_run:
+        print(" ".join(cmd))
+        return 0
+    return subprocess.call(cmd)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="api",
+        description="Explore and trigger this gateway's API.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  api list                     every endpoint\n"
+            "  api list models              only ones mentioning 'models'\n"
+            "  api list admin               the admin surface\n"
+            "  api show 12                  doc, assertions, request body\n"
+            "  api run 12                   send it\n"
+            "  api run 12 -m xai/grok-4.6   against a different model\n"
+            "  api test                     the safe suite\n"
+            "  api test --all               including the mutating files\n"
+        ),
+    )
+    # The shared options go on the top-level parser AND on every subparser, so
+    # they work on either side of the verb: argparse otherwise requires them
+    # BEFORE it, which would make `api run 12 -m xai/grok-4.6` — the example in
+    # this very help text — an error.
+    #
+    # SUPPRESS is what makes that safe. Without it a subparser's unset default
+    # overwrites whatever the top-level parser already stored, so `api -v run 12`
+    # would silently lose the -v.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "-m", "--model", default=argparse.SUPPRESS, help="{{model}}"
+    )
+    common.add_argument(
+        "-V", "--var", action="append", default=argparse.SUPPRESS, metavar="K=V",
+        help="any hurl variable; repeatable",
+    )
+    common.add_argument(
+        "-v", "--verbose", action="store_true", default=argparse.SUPPRESS,
+        help="full request/response",
+    )
+    common.add_argument(
+        "-n", "--dry-run", action="store_true", default=argparse.SUPPRESS,
+        help="print the hurl command",
+    )
+    for action in common._actions:
+        p._add_action(action)
+
+    sub = p.add_subparsers(dest="cmd")
+
+    lp = sub.add_parser("list", parents=[common], help="list endpoints, optionally filtered")
+    lp.add_argument("term", nargs="?", help="match path, method, file or description")
+    lp.set_defaults(fn=cmd_list)
+
+    # `search` is `list` with a required term. Kept because it is the word people
+    # reach for, not because it does anything different.
+    sp = sub.add_parser("search", parents=[common], help="alias for `list <term>`")
+    sp.add_argument("term")
+    sp.set_defaults(fn=cmd_list)
+
+    shp = sub.add_parser("show", parents=[common], help="one endpoint in full")
+    shp.add_argument("n", type=int)
+    shp.set_defaults(fn=cmd_show)
+
+    rp = sub.add_parser("run", parents=[common], help="send one endpoint")
+    rp.add_argument("n", type=int)
+    rp.set_defaults(fn=cmd_run)
+
+    tp = sub.add_parser("test", parents=[common], help="run whole files as a suite")
+    tp.add_argument("file", nargs="*")
+    tp.add_argument("--all", action="store_true", help="include mutating/")
+    tp.set_defaults(fn=cmd_test)
+
+    args = p.parse_args()
+    # SUPPRESS means an unsupplied option is simply absent, so the real defaults
+    # are applied here rather than by argparse.
+    for name, default in (
+        ("model", "openai/gpt-5.6-luna"),
+        ("var", []),
+        ("verbose", False),
+        ("dry_run", False),
+    ):
+        if not hasattr(args, name):
+            setattr(args, name, default)
+    if not args.cmd:
+        args.term = None
+        return cmd_list(args)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
