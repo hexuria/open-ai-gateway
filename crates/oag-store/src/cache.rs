@@ -58,7 +58,9 @@ local key = KEYS[1]
 local ttl = tonumber(ARGV[1])
 
 local now = redis.call('TIME')[1]
-return redis.call('ZCOUNT', key, now - ttl, '+inf')
+-- Exclusive at the boundary, because the acquire's trim is inclusive there:
+-- a member scored exactly now - ttl is one the next acquire removes.
+return redis.call('ZCOUNT', key, '(' .. (now - ttl), '+inf')
 ";
 
 /// Take one token from a route's bucket, returning the seconds to wait.
