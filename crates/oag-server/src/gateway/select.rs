@@ -406,8 +406,21 @@ async fn candidate_for(state: &AppState, row: &AccountRow, _now: i64) -> Option<
 /// traffic because the coordination store blinked trades a real outage for a
 /// theoretical oversubscription.
 fn slot_accounting_degraded(op: &'static str, e: &Error) {
+    use std::sync::atomic::AtomicU64;
+    static SEEN: AtomicU64 = AtomicU64::new(0);
     metrics::counter!("oag_slot_accounting_degraded_total", "op" => op).increment(1);
-    tracing::warn!(error = %e, op, "slot accounting unavailable; admitting without it");
+    // Every request asks a slot question or two, so an outage is thousands of
+    // these a minute. The first, and then one in a hundred, at warn; the rest
+    // at debug. The counter above is the signal; the log line is the context.
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed);
+    if seen.is_multiple_of(100) {
+        tracing::warn!(
+            error = %e, op, occurrences = seen + 1,
+            "slot accounting unavailable; admitting without it"
+        );
+    } else {
+        tracing::debug!(error = %e, op, "slot accounting unavailable; admitting without it");
+    }
 }
 
 fn is_eligible(c: &Candidate, now: i64) -> bool {
