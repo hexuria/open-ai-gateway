@@ -251,6 +251,7 @@ async fn handle(
 
     let cache_blocks = extract_cache_blocks(&canonical);
     let session = SessionKey::resolve(
+        &auth.principal_id.to_string(),
         canonical.client_session.as_deref(),
         &cache_blocks,
         &auth.api_key_id.to_string(),
