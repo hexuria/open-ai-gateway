@@ -133,12 +133,21 @@ impl ProviderAdapter for CodexAdapter {
         Dialect::OpenAIResponses
     }
 
+    fn always_streams(&self) -> bool {
+        // See `build`: `stream` is forced on below, whatever the client sent.
+        // Declared here so the response path reads the stream it will get
+        // rather than the JSON body the client asked for.
+        true
+    }
+
     fn build(&self, req: &UpstreamRequest<'_>) -> Result<reqwest::Request> {
         // Codex is the Responses dialect; reuse the codec and add only what the
         // subscription backend needs on top.
         let mut body = responses::render_request(req.canonical, &req.model.upstream_name)?;
         // A streaming SSE backend that never persists a turn server-side; with
         // store:false it wants the encrypted reasoning replayed back to it.
+        // Forced regardless of `req.canonical.stream` — which is exactly why
+        // `always_streams` above says so.
         body["stream"] = json!(true);
         body["store"] = json!(false);
         body["include"] = json!(["reasoning.encrypted_content"]);

@@ -441,38 +441,114 @@ fn fold_payloads(
 pub async fn collect(
     response: reqwest::Response,
     dialect: Dialect,
-) -> std::result::Result<(bytes::Bytes, StreamAccumulator), Error> {
+) -> std::result::Result<(bytes::Bytes, Vec<StreamEvent>, StreamAccumulator), Error> {
     let bytes = response
         .bytes()
         .await
         .map_err(|e| Error::Internal(format!("reading upstream response: {e}")))?;
 
-    let mut acc = StreamAccumulator::new();
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        tracing::warn!("a successful upstream response was not JSON");
-        acc.mark_unparsed();
-        return Ok((bytes, acc));
-    };
+    // A 200 whose body is not JSON is not an answer in any dialect. This used
+    // to be waved through as "unparsed" and handed to the client verbatim —
+    // which for a translated pair meant bytes in the wrong shape, and for a
+    // same-dialect pair meant whatever the provider's front door emitted. An
+    // error switches credentials, and says what happened.
+    let v = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| {
+        Error::Internal(format!("a successful upstream response was not JSON: {e}"))
+    })?;
 
     let events = match dialect {
         Dialect::AnthropicMessages => oag_proto::anthropic::parse_response(&v),
         Dialect::OpenAIChatCompletions => oag_proto::openai::parse_response(&v),
         Dialect::GeminiGenerateContent => oag_proto::gemini::parse_response(&v),
-        // No provider declares Responses as its native dialect, so nothing
-        // reaches this today — but `Dialect` is non-exhaustive, and the next one
-        // added must not be silently judged by a reader it does not have.
+        Dialect::OpenAIResponses => oag_proto::responses::parse_response(&v),
+        // `Dialect` is non-exhaustive. A dialect with no reader cannot be
+        // rendered for the client either, so this is an error rather than an
+        // unjudged pass: the comment that used to sit here — "no provider
+        // declares Responses as its native dialect, so nothing reaches this"
+        // — was false the day the Codex adapter existed, and the silent arm
+        // beneath it is how a Codex seat's answers reached clients as raw
+        // SSE under application/json.
         other => {
-            tracing::warn!(dialect = ?other, "no non-streaming reader for this dialect");
-            acc.mark_unparsed();
-            return Ok((bytes, acc));
+            return Err(Error::Internal(format!(
+                "no non-streaming reader for the {other:?} dialect"
+            )));
         }
     };
 
+    let mut acc = StreamAccumulator::new();
     for e in &events {
         acc.observe(e);
     }
 
-    Ok((bytes, acc))
+    Ok((bytes, events, acc))
+}
+
+/// Read a streamed upstream response to completion and fold it into events.
+///
+/// For an adapter that streams regardless of what the client asked for (see
+/// `ProviderAdapter::always_streams`): the client wants one body, the upstream
+/// only sends a stream, and the body has to be rendered from the events. This
+/// is `pump` without a client to write to — the same framing, the same parser,
+/// the same watchdogs — and it returns what `collect` returns for a JSON body,
+/// so the caller need not care which it got.
+pub async fn collect_stream(
+    response: reqwest::Response,
+    adapter: Arc<dyn ProviderAdapter>,
+    idle_timeout: Duration,
+    max_duration: Duration,
+) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), Error> {
+    let started = Instant::now();
+    let framing = adapter.framing();
+    let mut body = response.bytes_stream();
+    let mut pending = Vec::<u8>::new();
+    let mut acc = StreamAccumulator::new();
+    let mut events = Vec::new();
+
+    loop {
+        if started.elapsed() >= max_duration {
+            return Err(Error::Internal(format!(
+                "upstream stream exceeded {}s",
+                max_duration.as_secs()
+            )));
+        }
+        let chunk = match tokio::time::timeout(idle_timeout, body.next()).await {
+            Err(_) => {
+                return Err(Error::Internal(format!(
+                    "upstream idle for {}s",
+                    idle_timeout.as_secs()
+                )));
+            }
+            Ok(None) => break,
+            Ok(Some(Err(e))) => {
+                return Err(Error::Internal(format!("upstream read failed: {e}")));
+            }
+            Ok(Some(Ok(bytes))) => bytes,
+        };
+        pending.extend_from_slice(&chunk);
+        for payload in take_payloads(&mut pending, framing) {
+            match adapter.parse_event(&payload, &mut acc) {
+                Ok(parsed) => {
+                    for e in &parsed {
+                        acc.observe(e);
+                    }
+                    events.extend(parsed);
+                }
+                Err(e) => tracing::debug!(error = %e, "skipping unparseable stream frame"),
+            }
+        }
+    }
+
+    // An error the upstream put inside a 200 stream is an error, not an
+    // answer: with no client holding the bytes yet, another credential can
+    // still be tried.
+    if let Some(message) = events.iter().find_map(|e| match e {
+        StreamEvent::Error { message } => Some(message.clone()),
+        _ => None,
+    }) {
+        return Err(Error::Internal(format!("upstream stream error: {message}")));
+    }
+
+    Ok((events, acc))
 }
 
 #[cfg(test)]
@@ -940,7 +1016,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_parses_openai_usage_and_text() {
-        let (_, acc) = collect(
+        let (_, _, acc) = collect(
             body(
                 r#"{
                     "choices": [{
@@ -974,7 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_parses_gemini_usage_and_text() {
-        let (_, acc) = collect(
+        let (_, _, acc) = collect(
             body(
                 r#"{
                     "candidates": [{
@@ -1001,7 +1077,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_still_parses_anthropic_usage_and_text() {
-        let (_, acc) = collect(
+        let (_, _, acc) = collect(
             body(
                 r#"{
                     "content": [{ "type": "text", "text": "the answer is 4" }],
@@ -1031,7 +1107,7 @@ mod tests {
         // The agentic case: no text at all, and arguments that arrive whole
         // rather than in fragments. Read as Anthropic this was an empty
         // response; read as fragments it would look like a truncated tool call.
-        let (_, acc) = collect(
+        let (_, _, acc) = collect(
             body(
                 r#"{
                     "choices": [{
@@ -1063,20 +1139,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_body_with_no_reader_is_not_judged_as_an_empty_answer() {
-        // Nothing serves Responses as an upstream today, so this stands in for
-        // whichever dialect is added next. Gating on it would escalate every
-        // request through it while recording zero tokens for either attempt —
-        // blaming the model for a gap that is ours.
-        let (bytes, acc) = collect(
-            body(r#"{"output":[{"type":"message"}],"usage":{"input_tokens":10}}"#),
+    async fn a_responses_body_is_read_like_every_other() {
+        // This test used to assert the opposite: that a Responses body had no
+        // reader and was passed on unjudged, on the grounds that "nothing
+        // serves Responses as an upstream today". The Codex adapter does, and
+        // an unjudged pass is exactly how its answers reached clients as raw
+        // bytes with zero tokens in the ledger.
+        let (_, events, acc) = collect(
+            body(
+                r#"{
+                    "status": "completed",
+                    "output": [{
+                        "type": "message", "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "the answer is 4" }]
+                    }],
+                    "usage": { "input_tokens": 1200, "output_tokens": 142,
+                               "input_tokens_details": { "cached_tokens": 200 } }
+                }"#,
+            ),
             Dialect::OpenAIResponses,
         )
         .await
         .expect("collects");
 
-        assert_eq!(acc.quality_gate(), None, "unreadable is not unusable");
-        assert!(!bytes.is_empty(), "the client still gets the body");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "the answer is 4"))
+        );
+        assert_eq!(acc.usage().input_tokens, 1_000);
+        assert_eq!(acc.usage().cache_read_tokens, 200);
+        assert_eq!(acc.usage().output_tokens, 142);
+        assert_eq!(acc.quality_gate(), None);
+    }
+
+    #[tokio::test]
+    async fn a_successful_response_that_is_not_json_is_an_error_not_an_answer() {
+        let err = collect(
+            body("<html>rate limited</html>"),
+            Dialect::AnthropicMessages,
+        )
+        .await
+        .expect_err("not an answer");
+        assert!(err.to_string().contains("not JSON"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_always_streaming_adapter_is_read_to_completion_into_events() {
+        // THE CODEX CASE. The client asked for one body; the adapter forced a
+        // stream. Reading that stream as a JSON body found nothing and handed
+        // the raw `data:` lines back under application/json, with zero tokens
+        // metered. Read as the stream it is, the events carry the text, the
+        // whole tool call, and the usage the seat will be charged for.
+        let frames = [
+            r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":19200,"input_tokens_details":{"cached_tokens":18000}}}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant"}}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"Let me "}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"check."}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":"{\"path\""}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":": \"a.rs\"}"}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file"}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":19200,"input_tokens_details":{"cached_tokens":18000},"output_tokens":142}}}"#,
+        ];
+        let sse = frames.iter().fold(String::new(), |mut out, f| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "data: {f}\n\n");
+            out
+        });
+        let codex: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::codex::CodexAdapter::new());
+        assert!(codex.always_streams());
+
+        let (events, acc) = collect_stream(
+            body(&sse),
+            codex,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("collects the stream");
+
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Let me check.");
+        assert_eq!(acc.usage().input_tokens, 1_200);
+        assert_eq!(acc.usage().cache_read_tokens, 18_000);
+        assert_eq!(
+            acc.usage().output_tokens,
+            142,
+            "the seat is charged for these"
+        );
+        assert_eq!(acc.quality_gate(), None, "the tool call reassembled");
     }
 
     /// Build one AWS event-stream message carrying `inner`.

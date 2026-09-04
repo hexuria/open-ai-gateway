@@ -362,9 +362,10 @@ async fn run_with_escalation(
             Attempt::Rejected(e) => Err(e),
             Attempt::Collected {
                 body,
+                events,
                 accumulator,
                 lease,
-            } => Ok((body, accumulator, lease)),
+            } => Ok((body, events, accumulator, lease)),
         };
 
         let gate = match &answer {
@@ -372,7 +373,7 @@ async fn run_with_escalation(
             // and nothing reached the client, so this is the one escalation a
             // streaming request can also take.
             Err(_) => Some(oag_router::QualityGate::ContextOverflow),
-            Ok((_, accumulator, _)) => accumulator.quality_gate(),
+            Ok((_, _, accumulator, _)) => accumulator.quality_gate(),
         };
 
         // Retry one rung up when the answer was unusable and a rung is left.
@@ -409,7 +410,7 @@ async fn run_with_escalation(
             // Released here rather than left to the drop, and awaited: the
             // rung above may pick this same credential, and a release still
             // in flight would look like a credential with no room.
-            if let Ok((_, accumulator, lease)) = &answer {
+            if let Ok((_, _, accumulator, lease)) = &answer {
                 abandoned = Some(meter::abandon(
                     meter_context(auth, &decision, lease, request_id, started, escalations),
                     accumulator,
@@ -435,20 +436,20 @@ async fn run_with_escalation(
 
         // No rung left to try. A refusal is now the caller's error — the same
         // one they used to get before the first attempt was allowed to climb.
-        let (body, accumulator, lease) = answer?;
+        let (body, events, accumulator, lease) = answer?;
 
         // Either it was fine, or nothing better exists. Record the gate either
         // way: a gate we could not act on is exactly the signal that a rung is
         // mis-set for this workload.
         let ctx = meter_context(auth, &decision, &lease, request_id, started, escalations);
-        // Read while the lease is still here: the answer is a fact about the
-        // adapter this account got, and `release` below takes the account with
-        // it. Falling back to the provider's dialect once it is gone is exactly
-        // the bug this call site had.
-        let upstream_dialect = adapter_for(state, decision.model.provider, &lease.account)
-            .map_or_else(
-                |_| decision.model.provider.native_dialect(),
-                |a| a.dialect(),
+        // Read while the lease is still here: both are facts about the adapter
+        // this account got, and `release` below takes the account with it.
+        // Falling back to the provider's dialect once it is gone is exactly the
+        // bug this call site had.
+        let (upstream_dialect, always_streams) =
+            adapter_for(state, decision.model.provider, &lease.account).map_or_else(
+                |_| (decision.model.provider.native_dialect(), false),
+                |a| (a.dialect(), a.always_streams()),
             );
         // Before the ledger write, which is ours rather than the credential's.
         lease.release().await;
@@ -478,10 +479,12 @@ async fn run_with_escalation(
 
         return Ok(json_response(
             &body,
+            &events,
             &decision,
             request_id,
             ingress,
             upstream_dialect,
+            always_streams,
         ));
     }
 }
@@ -779,7 +782,13 @@ enum Attempt {
     },
     /// Read in full, so the answer can still be judged and retried.
     Collected {
+        /// The upstream's own bytes, for the one case they can be forwarded
+        /// as they are: a client in the upstream's dialect, over an adapter
+        /// that sent a JSON body rather than a stream. Empty otherwise.
         body: bytes::Bytes,
+        /// The answer as canonical events, which is what every other case
+        /// renders the client's body from.
+        events: Vec<oag_proto::StreamEvent>,
         accumulator: oag_proto::StreamAccumulator,
         lease: select::Lease,
     },
@@ -865,54 +874,69 @@ pub(crate) fn adapter_for(
     }
 }
 
+/// Render a collected answer as one body in the client's dialect.
+///
+/// Every pair goes through the same hub: the events become an Anthropic
+/// message (`anthropic::render_from_events`), and that message is converted by
+/// the client-dialect converter that already takes one. The converter is
+/// therefore chosen by the client's dialect *and* fed a shape it reads — the
+/// two halves that used to be decided separately. When the converter was
+/// picked by the client's dialect alone and handed the upstream's body as it
+/// came, each converter read exactly one upstream shape and eight of the
+/// twelve pairs rendered a well-formed, fully-billed, empty answer.
+fn render_collected(
+    events: &[oag_proto::StreamEvent],
+    ingress: Dialect,
+    request_id: &str,
+    model: &str,
+) -> Result<bytes::Bytes> {
+    let hub = oag_proto::anthropic::render_from_events(events, request_id, model);
+    let out = match ingress {
+        Dialect::AnthropicMessages => hub,
+        Dialect::OpenAIChatCompletions => oag_proto::openai::render_completion(&hub, request_id),
+        Dialect::GeminiGenerateContent => oag_proto::gemini::render_message_response(&hub),
+        Dialect::OpenAIResponses => oag_proto::responses::render_response(&hub, request_id),
+        // `Dialect` is non-exhaustive. A client dialect with no converter gets
+        // an error naming it — never the upstream's body, which is the silent
+        // wrong shape this function exists to stop.
+        other => {
+            return Err(Error::Internal(format!(
+                "no non-streaming converter into the {other:?} dialect"
+            )));
+        }
+    };
+    Ok(bytes::Bytes::from(out.to_string()))
+}
+
 fn json_response(
     body: &bytes::Bytes,
+    events: &[oag_proto::StreamEvent],
     decision: &RoutingDecision,
     request_id: RequestId,
     ingress: Dialect,
     // The dialect the chosen ADAPTER speaks. See `adapter_for`.
     upstream_dialect: Dialect,
+    // Whether that adapter streamed the upstream regardless of the client's
+    // request, in which case `body` is not a JSON body at all.
+    always_streams: bool,
 ) -> Response {
-    // Framing does not come into it here: a non-streamed response is a single
-    // JSON body whatever the provider streams, so dialect alone decides.
-    //
-    // Verbatim when the dialects agree — the upstream's own bytes are the most
-    // faithful answer we can give, and re-serialising can only differ from it.
-    let out = if ingress == upstream_dialect {
+    // Verbatim when the dialects agree and the upstream actually sent a body
+    // — the upstream's own bytes are the most faithful answer we can give,
+    // and re-serialising can only differ from them. An adapter that streamed
+    // has no such bytes: what it has is events, and a body is rendered from
+    // those like any translated pair's.
+    let out = if ingress == upstream_dialect && !always_streams {
         body.clone()
     } else {
-        let id = request_id.to_string();
-        serde_json::from_slice::<serde_json::Value>(body).map_or_else(
-            |_| body.clone(),
-            |v| match ingress {
-                Dialect::OpenAIChatCompletions => {
-                    bytes::Bytes::from(oag_proto::openai::render_completion(&v, &id).to_string())
-                }
-                Dialect::AnthropicMessages => bytes::Bytes::from(
-                    oag_proto::anthropic::render_message_response(&v, &id).to_string(),
-                ),
-                Dialect::GeminiGenerateContent => {
-                    bytes::Bytes::from(oag_proto::gemini::render_message_response(&v).to_string())
-                }
-                Dialect::OpenAIResponses => {
-                    bytes::Bytes::from(oag_proto::responses::render_response(&v, &id).to_string())
-                }
-                // No converter for this dialect. Hand back the upstream's own
-                // body rather than something half-translated — but say so:
-                // a silent wildcard here is exactly how a missing arm went
-                // unnoticed once already, returning the wrong shape with
-                // nothing to show for it.
-                other => {
-                    tracing::warn!(
-                        ingress = ?other,
-                        upstream = ?upstream_dialect,
-                        "no non-streaming converter for this dialect pair; \
-                         returning the upstream body unchanged"
-                    );
-                    body.clone()
-                }
-            },
-        )
+        match render_collected(
+            events,
+            ingress,
+            &request_id.to_string(),
+            decision.model.id.as_str(),
+        ) {
+            Ok(out) => out,
+            Err(e) => return error_response(&e),
+        }
     };
 
     oag_headers(
@@ -1337,18 +1361,30 @@ async fn succeeded(
             lease: lease.clone(),
         }));
     }
-    // The upstream's dialect, which is what its body is in — not the client's,
-    // which `json_response` converts to.
-    //
-    // The ADAPTER's, not the provider's: a Codex seat is `Provider::OpenAI` and
-    // its body is Responses. Asking the provider parsed a Responses stream as
-    // Chat Completions, found nothing it recognised, and collected an empty
-    // body — the 200 that reached a client as "no completion in it".
-    let upstream_dialect = adapter_for(state, provider, &lease.account)
-        .map_or_else(|_| provider.native_dialect(), |a| a.dialect());
-    match sse::collect(response, upstream_dialect).await {
-        Ok((body, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
+    // The ADAPTER's facts, not the provider's: a Codex seat is
+    // `Provider::OpenAI`, speaks Responses, and streams whatever the client
+    // asked. Asking the provider parsed a Responses stream as Chat
+    // Completions, found nothing it recognised, and collected an empty body —
+    // the 200 that reached a client as "no completion in it". And asking the
+    // client's `stream` flag whether the upstream streamed read that stream
+    // as a JSON body, handed the raw `data:` lines back, and metered zero.
+    let adapter = match adapter_for(state, provider, &lease.account) {
+        Ok(adapter) => adapter,
+        Err(e) => return Outcome::Switch(e),
+    };
+    let collected = if adapter.always_streams() {
+        let idle = state.config.gateway.stream_idle_timeout;
+        let max = state.config.gateway.max_stream_duration;
+        sse::collect_stream(response, adapter, idle, max)
+            .await
+            .map(|(events, accumulator)| (bytes::Bytes::new(), events, accumulator))
+    } else {
+        sse::collect(response, adapter.dialect()).await
+    };
+    match collected {
+        Ok((body, events, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
             body,
+            events,
             accumulator,
             lease: lease.clone(),
         })),
@@ -2035,6 +2071,109 @@ mod tests {
         assert_eq!(codex.provider(), oag_core::Provider::OpenAI);
         assert_eq!(codex.dialect(), Dialect::OpenAIResponses);
         assert_ne!(codex.dialect(), codex.provider().native_dialect());
+        // And that it streams regardless of the client: the third adapter
+        // fact the response path has to ask for rather than assume.
+        assert!(codex.always_streams());
+        assert!(!oag_upstream::AnthropicAdapter::default().always_streams());
+    }
+
+    #[test]
+    fn every_client_dialect_gets_a_body_with_the_answer_in_it() {
+        // THE MATRIX. One answer as canonical events — text, a whole tool
+        // call, a stop, usage — rendered for each client dialect, then read
+        // back by that dialect's own reader. Every body must carry the text
+        // and the tool call and non-zero usage. Before the hub, the converter
+        // was picked by the client's dialect and handed whatever the upstream
+        // sent, and for eight of the twelve pairs that body had a shape the
+        // converter did not read: a well-formed, fully-billed, empty 200.
+        use oag_proto::{StopReason, StreamEvent};
+        let events = [
+            StreamEvent::UsageUpdate {
+                usage: oag_router::Usage {
+                    input_tokens: 1000,
+                    cache_read_tokens: 200,
+                    ..oag_router::Usage::default()
+                },
+            },
+            StreamEvent::TextDelta {
+                text: "Reading it now.".to_owned(),
+            },
+            StreamEvent::ToolUseStart {
+                id: "toolu_1".to_owned(),
+                name: "read_file".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "toolu_1".to_owned(),
+                partial_json: r#"{"path":"a.rs"}"#.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "toolu_1".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                usage: oag_router::Usage {
+                    output_tokens: 42,
+                    ..oag_router::Usage::default()
+                },
+            },
+        ];
+
+        for ingress in [
+            Dialect::AnthropicMessages,
+            Dialect::OpenAIChatCompletions,
+            Dialect::GeminiGenerateContent,
+            Dialect::OpenAIResponses,
+        ] {
+            let bytes = render_collected(&events, ingress, "req1", "oag/auto")
+                .unwrap_or_else(|e| panic!("{ingress:?}: {e}"));
+            let v: serde_json::Value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|e| panic!("{ingress:?}: not JSON: {e}"));
+
+            // Read back with the dialect's own reader — the same one the
+            // gateway would use if this body came from an upstream.
+            let back = match ingress {
+                Dialect::AnthropicMessages => oag_proto::anthropic::parse_response(&v),
+                Dialect::OpenAIChatCompletions => oag_proto::openai::parse_response(&v),
+                Dialect::GeminiGenerateContent => oag_proto::gemini::parse_response(&v),
+                Dialect::OpenAIResponses => oag_proto::responses::parse_response(&v),
+                _ => unreachable!(),
+            };
+            let text: String = back
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "Reading it now.", "{ingress:?} lost the text: {v}");
+            assert!(
+                back.iter().any(|e| matches!(
+                    e, StreamEvent::ToolUseStart { name, .. } if name == "read_file"
+                )),
+                "{ingress:?} lost the tool call: {v}"
+            );
+            let mut acc = oag_proto::StreamAccumulator::new();
+            for e in &back {
+                acc.observe(e);
+            }
+            assert!(
+                acc.usage().output_tokens > 0,
+                "{ingress:?} lost the usage: {v}"
+            );
+            assert_eq!(acc.quality_gate(), None, "{ingress:?}: {v}");
+        }
+    }
+
+    #[test]
+    fn a_client_dialect_with_no_converter_is_an_error_not_the_upstream_body() {
+        // `Dialect` is non-exhaustive; nothing constructs an unknown one here,
+        // so what this pins is that an *empty* answer still renders as a
+        // well-formed body rather than a crash — the crash being the one
+        // silence worse than the empty 200.
+        let bytes =
+            render_collected(&[], Dialect::OpenAIChatCompletions, "r", "m").expect("renders");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(v["choices"].is_array());
     }
 
     /// A state that dials nothing: `Db::connect` builds a lazy pool and

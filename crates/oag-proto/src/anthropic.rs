@@ -622,55 +622,154 @@ fn render_text(st: &mut RenderState, out: &mut String, text: &str, thinking: boo
     ));
 }
 
-/// A Chat Completions response → an Anthropic Messages response.
+/// A content block under assembly by `render_from_events`.
+enum OpenBlock {
+    Text(String),
+    Thinking(String),
+    Tool {
+        id: String,
+        name: String,
+        input: String,
+    },
+}
+
+impl OpenBlock {
+    /// The finished block, as this dialect writes it.
+    fn into_json(self) -> Value {
+        match self {
+            Self::Text(text) => json!({ "type": "text", "text": text }),
+            Self::Thinking(text) => json!({ "type": "thinking", "thinking": text }),
+            Self::Tool { id, name, input } => json!({
+                "type": "tool_use",
+                "id": id,
+                "name": name,
+                // Whole again. Fragments that never became an object are the
+                // quality gate's to escalate on; here they render as empty.
+                "input": serde_json::from_str::<Value>(&input).unwrap_or_else(|_| json!({})),
+            }),
+        }
+    }
+}
+
+/// Close the open block, if any, into `content`.
+fn close_block(open: &mut Option<OpenBlock>, content: &mut Vec<Value>) {
+    if let Some(block) = open.take() {
+        content.push(block.into_json());
+    }
+}
+
+/// Canonical events → a complete Anthropic Messages response body.
+///
+/// The hub for every non-streamed answer. Whatever the upstream was — any
+/// dialect, and streamed or not — its response is read into canonical events
+/// (`parse_response` for a body, the adapter's `parse_event` for a stream),
+/// rendered into this shape, and only then converted to the client's dialect
+/// by the same converters that already take an Anthropic body:
+/// `openai::render_completion`, `gemini::render_message_response`,
+/// `responses::render_response`.
+///
+/// One hub rather than one converter per pair, because a converter per pair
+/// is how eight of the twelve pairs came to return an empty 200: each
+/// converter read exactly one upstream shape, the caller picked among them by
+/// the *client's* dialect, and a body in any other shape yielded nothing.
+///
+/// The inverse of `parse_response`, and pinned as such: parsing what this
+/// renders yields the events that were rendered.
 #[must_use]
-pub fn render_message_response(completion: &Value, request_id: &str) -> Value {
-    let choice = &completion["choices"][0];
-    let message = &choice["message"];
-    let mut content = Vec::new();
+pub fn render_from_events(events: &[StreamEvent], request_id: &str, model: &str) -> Value {
+    let mut content: Vec<Value> = Vec::new();
+    let mut open: Option<OpenBlock> = None;
+    let mut usage = Usage::default();
+    let mut stop_reason: Option<StopReason> = None;
+    let mut model = model.to_owned();
 
-    if let Some(text) = message["content"].as_str().filter(|t| !t.is_empty()) {
-        content.push(json!({ "type": "text", "text": text }));
+    for event in events {
+        match event {
+            StreamEvent::Start {
+                model: announced,
+                usage: u,
+            } => {
+                if !announced.is_empty() {
+                    model.clone_from(announced);
+                }
+                usage.merge(u);
+            }
+            StreamEvent::UsageUpdate { usage: u } => usage.merge(u),
+            StreamEvent::TextDelta { text } => {
+                if let Some(OpenBlock::Text(buf)) = open.as_mut() {
+                    buf.push_str(text);
+                } else {
+                    close_block(&mut open, &mut content);
+                    open = Some(OpenBlock::Text(text.clone()));
+                }
+            }
+            StreamEvent::ThinkingDelta { text } => {
+                if let Some(OpenBlock::Thinking(buf)) = open.as_mut() {
+                    buf.push_str(text);
+                } else {
+                    close_block(&mut open, &mut content);
+                    open = Some(OpenBlock::Thinking(text.clone()));
+                }
+            }
+            StreamEvent::ToolUseStart { id, name } => {
+                close_block(&mut open, &mut content);
+                open = Some(OpenBlock::Tool {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: String::new(),
+                });
+            }
+            StreamEvent::ToolUseDelta { id, partial_json } => {
+                if let Some(OpenBlock::Tool {
+                    id: open_id, input, ..
+                }) = open.as_mut()
+                    && open_id == id
+                {
+                    input.push_str(partial_json);
+                } else {
+                    // A fragment for a call that is not the open one.
+                    // Whole-body parses never do this; a stream could, and
+                    // the fragment is still worth more attached to a call
+                    // than dropped.
+                    close_block(&mut open, &mut content);
+                    open = Some(OpenBlock::Tool {
+                        id: id.clone(),
+                        name: id.clone(),
+                        input: partial_json.clone(),
+                    });
+                }
+            }
+            StreamEvent::ToolUseEnd { .. } => close_block(&mut open, &mut content),
+            StreamEvent::Stop { reason, usage: u } => {
+                usage.merge(u);
+                stop_reason = Some(*reason);
+            }
+            StreamEvent::Error { .. } => {}
+        }
     }
-    for call in message["tool_calls"].as_array().unwrap_or(&Vec::new()) {
-        content.push(json!({
-            "type": "tool_use",
-            "id": call["id"],
-            "name": call["function"]["name"],
-            // A parsed value here, a JSON string there.
-            "input": call["function"]["arguments"]
-                .as_str()
-                .and_then(|a| serde_json::from_str::<Value>(a).ok())
-                .unwrap_or_else(|| json!({})),
-        }));
-    }
+    close_block(&mut open, &mut content);
 
-    let u = &completion["usage"];
-    let cached = u["prompt_tokens_details"]["cached_tokens"]
-        .as_u64()
-        .unwrap_or(0);
+    // This dialect reports `tool_use` whenever the answer carries a tool call.
+    // A stream from a dialect that does not distinguish (a Responses stream
+    // completes with the same event either way) arrives here as `end_turn`,
+    // and a Chat Completions client rendered from that would see
+    // `finish_reason: "stop"` beside its `tool_calls`. Normalise at the hub,
+    // so every converter downstream sees what an Anthropic body would say.
+    let has_tool_use = content.iter().any(|b| b["type"] == "tool_use");
+    let stop_reason = match stop_reason {
+        Some(StopReason::EndTurn) if has_tool_use => Some(StopReason::ToolUse),
+        other => other,
+    };
 
     json!({
         "id": format!("msg_{request_id}"),
         "type": "message",
         "role": "assistant",
-        "model": completion["model"],
+        "model": model,
         "content": content,
-        "stop_reason": match choice["finish_reason"].as_str().unwrap_or("stop") {
-            "length" => "max_tokens",
-            "tool_calls" | "function_call" => "tool_use",
-            "content_filter" => "refusal",
-            _ => "end_turn",
-        },
+        "stop_reason": stop_reason.map_or(Value::Null, |r| json!(stop_reason_str(r))),
         "stop_sequence": Value::Null,
-        "usage": {
-            // Split back apart: this dialect reports the uncached prompt and
-            // the cached prefix separately.
-            "input_tokens": u["prompt_tokens"].as_u64().unwrap_or(0).saturating_sub(cached),
-            "output_tokens": u["completion_tokens"].as_u64().unwrap_or(0),
-            "cache_read_input_tokens": cached,
-            "cache_creation_input_tokens": 0,
-        }
+        "usage": usage_json(&usage),
     })
 }
 
@@ -1126,27 +1225,119 @@ mod tests {
     }
 
     #[test]
-    fn a_completion_response_renders_back_into_this_dialect() {
-        let completion = serde_json::json!({
-            "model": "kimi-k2",
-            "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
-                "role": "assistant", "content": null,
-                "tool_calls": [{"id": "call_1", "type": "function",
-                                "function": {"name": "f", "arguments": "{\"a\":1}"}}]
-            }}],
-            "usage": {"prompt_tokens": 900, "completion_tokens": 30,
-                      "prompt_tokens_details": {"cached_tokens": 400}}
+    fn a_response_round_trips_through_events_and_back() {
+        // The property the hub rests on: `parse_response` and
+        // `render_from_events` are inverses. Whatever a body says, reading it
+        // into events and rendering those back must say the same thing — text,
+        // thinking, a whole tool call, the stop reason, and every usage count.
+        let body = serde_json::json!({
+            "id": "msg_orig",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4",
+            "content": [
+                {"type": "thinking", "thinking": "let me look"},
+                {"type": "text", "text": "Reading it now."},
+                {"type": "tool_use", "id": "toolu_1", "name": "read_file",
+                 "input": {"path": "a.rs", "lines": [1, 2]}},
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": {"input_tokens": 1200, "output_tokens": 142,
+                      "cache_read_input_tokens": 18000, "cache_creation_input_tokens": 7}
         });
-        let out = render_message_response(&completion, "req1");
+
+        let events = parse_response(&body);
+        let out = render_from_events(&events, "req1", "fallback-model");
 
         assert_eq!(out["type"], "message");
+        assert_eq!(out["role"], "assistant");
+        assert_eq!(out["id"], "msg_req1");
+        assert_eq!(out["model"], "fallback-model", "a body announces no model");
+        assert_eq!(out["content"], body["content"], "blocks survive whole");
         assert_eq!(out["stop_reason"], "tool_use");
-        assert_eq!(out["content"][0]["type"], "tool_use");
-        // Arguments become a parsed value here, not a JSON string.
-        assert_eq!(out["content"][0]["input"]["a"], 1);
-        // And the prompt splits back into uncached and cached.
-        assert_eq!(out["usage"]["input_tokens"], 500);
-        assert_eq!(out["usage"]["cache_read_input_tokens"], 400);
+        assert_eq!(out["usage"], body["usage"]);
+
+        // And the events themselves are stable across a second pass.
+        assert_eq!(parse_response(&out), events);
+    }
+
+    #[test]
+    fn fragmented_events_assemble_into_whole_blocks() {
+        // The streamed shape: text in runs, tool arguments in pieces, usage in
+        // the opening and the close. One block per run, arguments parsed.
+        let events = [
+            StreamEvent::Start {
+                model: "served-model".to_owned(),
+                usage: Usage {
+                    input_tokens: 10,
+                    ..Usage::default()
+                },
+            },
+            StreamEvent::TextDelta {
+                text: "Hel".to_owned(),
+            },
+            StreamEvent::TextDelta {
+                text: "lo".to_owned(),
+            },
+            StreamEvent::ToolUseStart {
+                id: "call_1".to_owned(),
+                name: "f".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_1".to_owned(),
+                partial_json: "{\"a\":".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_1".to_owned(),
+                partial_json: "1}".to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_1".to_owned(),
+            },
+            StreamEvent::TextDelta {
+                text: "done".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                usage: Usage {
+                    output_tokens: 5,
+                    ..Usage::default()
+                },
+            },
+        ];
+        let out = render_from_events(&events, "r", "requested-model");
+
+        assert_eq!(
+            out["model"], "served-model",
+            "the stream's announcement wins"
+        );
+        assert_eq!(out["content"].as_array().map(Vec::len), Some(3));
+        assert_eq!(
+            out["content"][0],
+            serde_json::json!({"type": "text", "text": "Hello"})
+        );
+        assert_eq!(out["content"][1]["type"], "tool_use");
+        assert_eq!(out["content"][1]["name"], "f");
+        assert_eq!(out["content"][1]["input"]["a"], 1);
+        assert_eq!(
+            out["content"][2],
+            serde_json::json!({"type": "text", "text": "done"})
+        );
+        // The stream said `end_turn`; the answer carries a tool call. This
+        // dialect reports `tool_use` for that, and so does the hub — a Chat
+        // Completions client rendered from an `end_turn` here would have seen
+        // `finish_reason: "stop"` beside its `tool_calls`.
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["usage"]["input_tokens"], 10);
+        assert_eq!(out["usage"]["output_tokens"], 5);
+    }
+
+    #[test]
+    fn an_empty_event_list_renders_an_empty_message_not_a_crash() {
+        let out = render_from_events(&[], "r", "m");
+        assert_eq!(out["content"], serde_json::json!([]));
+        assert!(out["stop_reason"].is_null());
     }
 
     #[test]

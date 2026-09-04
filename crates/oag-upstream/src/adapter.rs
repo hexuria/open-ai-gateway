@@ -64,6 +64,22 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
         self.provider().native_dialect()
     }
 
+    /// Whether this adapter streams the upstream regardless of what the client
+    /// asked for.
+    ///
+    /// The third fact in the same family as `framing` and `dialect`, and for
+    /// the same reason: a Codex seat's backend only streams, so the adapter
+    /// forces `stream: true` on every request. Nothing downstream could tell.
+    /// The collector branched on the *client's* `stream` flag, read an SSE
+    /// transcript as a JSON body, found nothing it recognised, and handed the
+    /// raw `data:` lines back under `application/json` — while the ledger
+    /// recorded zero tokens for an answer the seat had fully generated. The
+    /// response path asks this to know it must read the stream and render a
+    /// body from it.
+    fn always_streams(&self) -> bool {
+        false
+    }
+
     /// Build the HTTP request. Sets the URL, auth header, and body.
     fn build(&self, req: &UpstreamRequest<'_>) -> Result<reqwest::Request>;
 

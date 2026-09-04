@@ -498,6 +498,79 @@ fn has_refusal(item: &Value) -> bool {
         .is_some_and(|parts| parts.iter().any(|p| p["type"].as_str() == Some("refusal")))
 }
 
+/// A complete non-streamed response → the events its stream would have carried.
+///
+/// The same fields `parse_event` reads, arriving whole under `output` rather
+/// than as lifecycle events. This did not exist while "no provider declares
+/// Responses as its native dialect" was true; the Codex adapter made it false,
+/// and a Responses body with no reader was judged unreadable and passed on as
+/// it came.
+#[must_use]
+pub fn parse_response(body: &Value) -> Vec<StreamEvent> {
+    let usage = parse_usage(&body["usage"]);
+    let mut events = vec![StreamEvent::UsageUpdate { usage }];
+    let mut tool_calls = false;
+    let mut refused = false;
+
+    for item in body["output"].as_array().unwrap_or(&Vec::new()) {
+        match item["type"].as_str().unwrap_or_default() {
+            "message" => {
+                for part in item["content"].as_array().unwrap_or(&Vec::new()) {
+                    match part["type"].as_str().unwrap_or_default() {
+                        "output_text" => events.push(StreamEvent::TextDelta {
+                            text: part["text"].as_str().unwrap_or_default().to_owned(),
+                        }),
+                        // The refusal's own words are the answer the client
+                        // gets; the stop reason says what kind of answer.
+                        "refusal" => {
+                            refused = true;
+                            events.push(StreamEvent::TextDelta {
+                                text: part["refusal"].as_str().unwrap_or_default().to_owned(),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "reasoning" => {
+                for part in item["summary"].as_array().unwrap_or(&Vec::new()) {
+                    if let Some(text) = part["text"].as_str().filter(|t| !t.is_empty()) {
+                        events.push(StreamEvent::ThinkingDelta {
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+            }
+            "function_call" => {
+                tool_calls = true;
+                let id = item["call_id"].as_str().unwrap_or_default().to_owned();
+                events.push(StreamEvent::ToolUseStart {
+                    id: id.clone(),
+                    name: item["name"].as_str().unwrap_or_default().to_owned(),
+                });
+                // Whole, as in the other non-streamed readers: a complete
+                // response carries the arguments as one JSON string.
+                events.push(StreamEvent::ToolUseDelta {
+                    id: id.clone(),
+                    partial_json: item["arguments"].as_str().unwrap_or_default().to_owned(),
+                });
+                events.push(StreamEvent::ToolUseEnd { id });
+            }
+            _ => {}
+        }
+    }
+
+    let reason = match body["incomplete_details"]["reason"].as_str() {
+        Some("max_output_tokens") => StopReason::MaxTokens,
+        Some("content_filter") => StopReason::Refusal,
+        _ if refused => StopReason::Refusal,
+        _ if tool_calls => StopReason::ToolUse,
+        _ => StopReason::EndTurn,
+    };
+    events.push(StreamEvent::Stop { reason, usage });
+    events
+}
+
 fn parse_usage(v: &Value) -> Usage {
     let cached = v["input_tokens_details"]["cached_tokens"]
         .as_u64()
@@ -1074,6 +1147,75 @@ mod tests {
         r#"{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file"}}"#,
         r#"{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":19200,"input_tokens_details":{"cached_tokens":18000},"output_tokens":142}}}"#,
     ];
+
+    #[test]
+    fn a_rendered_response_reads_back_into_the_events_that_rendered_it() {
+        // `render_response` takes an Anthropic body and `parse_response` reads
+        // the result: the round trip through this dialect must keep the text,
+        // the whole tool call, the stop reason, and the usage — which is what
+        // lets a Responses-native upstream feed the same hub as every other.
+        let anthropic = json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "gpt-5",
+            "content": [
+                {"type": "text", "text": "On it."},
+                {"type": "tool_use", "id": "call_1", "name": "read_file",
+                 "input": {"path": "a.rs"}},
+            ],
+            "stop_reason": "tool_use", "stop_sequence": null,
+            "usage": {"input_tokens": 1200, "output_tokens": 142,
+                      "cache_read_input_tokens": 18000, "cache_creation_input_tokens": 0},
+        });
+        let wire = render_response(&anthropic, "req1");
+        let events = parse_response(&wire);
+
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "On it.");
+        assert!(events.iter().any(|e| matches!(
+            e, StreamEvent::ToolUseStart { id, name } if id == "call_1" && name == "read_file"
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e, StreamEvent::ToolUseDelta { id, partial_json } if id == "call_1" && partial_json == r#"{"path":"a.rs"}"#
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                ..
+            })
+        ));
+
+        let mut acc = StreamAccumulator::new();
+        for e in &events {
+            acc.observe(e);
+        }
+        assert_eq!(acc.usage().input_tokens, 1200);
+        assert_eq!(acc.usage().cache_read_tokens, 18_000);
+        assert_eq!(acc.usage().output_tokens, 142);
+        assert_eq!(acc.quality_gate(), None);
+    }
+
+    #[test]
+    fn an_incomplete_response_names_why_it_stopped() {
+        let body = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "half"}]}],
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+        });
+        assert!(matches!(
+            parse_response(&body).last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::MaxTokens,
+                ..
+            })
+        ));
+    }
 
     fn drive(lines: &[&str]) -> (Vec<StreamEvent>, StreamAccumulator) {
         let mut acc = StreamAccumulator::new();
