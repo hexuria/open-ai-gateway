@@ -952,7 +952,29 @@ async fn forward_with_failover(
     let mut excluded: HashSet<AccountId> = HashSet::new();
     let mut last_error = Error::NoCredential { provider };
 
+    let began = std::time::Instant::now();
+    let budget = state.config.gateway.failover_budget;
+
     for switch in 0..=state.config.gateway.max_account_switches {
+        // Between attempts only. `max_account_switches` bounds how MANY
+        // credentials are tried and nothing bounded how long that took, so a
+        // provider slow to answer rather than quick to refuse could hold a
+        // caller indefinitely: the upstream client sets no total-response
+        // timeout on purpose, and `stream_idle_timeout` starts only once a
+        // response exists, so neither covers the gap before first headers.
+        //
+        // Never interrupts an attempt in flight. Giving up on a slow-but-working
+        // stream is the failure this must not cause, so the check sits here,
+        // where the only thing it can prevent is starting ANOTHER one.
+        if !may_try_another(switch, began.elapsed(), budget) {
+            tracing::warn!(
+                %request_id, switch, elapsed_ms = began.elapsed().as_millis(),
+                error = %last_error,
+                "failover budget spent; returning the last upstream error rather than trying another credential"
+            );
+            metrics::counter!("oag_failover_budget_exhausted_total").increment(1);
+            break;
+        }
         let lease = match select::lease(
             state,
             auth.route_id,
@@ -1043,6 +1065,25 @@ enum Step {
     Switch,
     /// Nothing.
     Fatal,
+}
+
+/// Whether another CREDENTIAL may be tried, given how long this request has
+/// already spent failing over.
+///
+/// Pure, and split out for the same reason as [`step_for`]: it is a decision
+/// about a caller's wait, and it should be checkable without a transport, a
+/// lease and a database behind it.
+///
+/// The first attempt is always allowed however long the request has taken. A
+/// budget that could refuse to try at all would turn a slow moment into a
+/// request that never reached an upstream, which is a worse failure than the
+/// wait it exists to bound.
+const fn may_try_another(
+    switch: u8,
+    elapsed: std::time::Duration,
+    budget: std::time::Duration,
+) -> bool {
+    switch == 0 || elapsed.as_millis() < budget.as_millis()
 }
 
 fn step_for(disposition: Disposition, retries_left: bool) -> Step {
@@ -1646,6 +1687,7 @@ fn no_viable_message(route: &str, requested: &str, ladder: &TierLadder) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -2415,6 +2457,44 @@ security:
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_first_attempt_is_never_refused_by_the_failover_budget() {
+        // A request that arrives during a slow moment must still reach an
+        // upstream. Refusing before trying at all would turn "this took a while"
+        // into "this never happened", which is worse than the wait.
+        assert!(may_try_another(
+            0,
+            Duration::from_mins(10),
+            Duration::from_mins(2)
+        ));
+    }
+
+    #[test]
+    fn another_credential_is_tried_while_the_budget_holds() {
+        assert!(may_try_another(
+            1,
+            Duration::from_secs(30),
+            Duration::from_mins(2)
+        ));
+    }
+
+    #[test]
+    fn a_spent_budget_stops_the_next_credential_not_the_current_one() {
+        // The point of the whole mechanism: once the time is gone, stop STARTING
+        // work. Anything already in flight runs to completion elsewhere — this
+        // decision is only ever consulted between attempts.
+        assert!(!may_try_another(
+            1,
+            Duration::from_mins(2),
+            Duration::from_mins(2)
+        ));
+        assert!(!may_try_another(
+            3,
+            Duration::from_secs(500),
+            Duration::from_mins(2)
+        ));
     }
 
     #[test]
