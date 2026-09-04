@@ -17,9 +17,35 @@ pub struct Db {
 /// versions of the binary migrate simultaneously.
 const MIGRATION_LOCK_ID: i64 = 0x0A6_1247_0001;
 
+/// How long one statement may run before Postgres cancels it, when the caller
+/// does not say. Generous for a request-path query, which is a primary-key
+/// probe or an indexed range; a statement still running at ten seconds is not
+/// slow, it is a connection that would otherwise never come back.
+pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl Db {
-    /// Configure the pool. Does not dial — connections open on first use.
+    /// Configure the pool with the default statement timeout. Does not dial —
+    /// connections open on first use.
     pub fn connect(url: &str, max_connections: u32) -> Result<Self> {
+        Self::connect_with(url, max_connections, DEFAULT_STATEMENT_TIMEOUT)
+    }
+
+    /// Configure the pool. Does not dial — connections open on first use.
+    ///
+    /// `statement_timeout` is set on every connection as it opens. Without one,
+    /// a primary that stops answering — a black-holed failover, a network
+    /// partition — does not fail a query, it holds it: the connection sits in
+    /// the query for as long as the kernel keeps the socket, and the pool's
+    /// `acquire_timeout` then refuses every *new* request while the old ones
+    /// keep the slots. Sixteen such queries and the replica is deaf until
+    /// somebody restarts it. A statement timeout makes that a 10-second error
+    /// the pool recovers from on its own.
+    pub fn connect_with(
+        url: &str,
+        max_connections: u32,
+        statement_timeout: Duration,
+    ) -> Result<Self> {
+        let timeout_ms = i64::try_from(statement_timeout.as_millis()).unwrap_or(i64::MAX);
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .acquire_timeout(Duration::from_secs(10))
@@ -27,6 +53,20 @@ impl Db {
             // proxy or failover-capable Postgres accumulates connections
             // pointing at a former primary.
             .max_lifetime(Duration::from_mins(30))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    // `set_config` rather than `SET`, because `SET` cannot
+                    // take a bind parameter and the value must not be spliced
+                    // into SQL text. `false` is "not local": session-level,
+                    // so it survives the pool handing the connection to a
+                    // different task, which `SET LOCAL` would not.
+                    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                        .bind(format!("{timeout_ms}ms"))
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
             // Lazy, for the same reason as Redis: a replica that cannot boot
             // until Postgres answers will crash-loop through a failover or a
             // restart, when the correct behaviour is to come up, report

@@ -104,10 +104,24 @@ pub struct DatabaseConfig {
     pub url: String,
     #[serde(default = "default_db_pool")]
     pub max_connections: u32,
+    /// Ceiling on any one statement, applied per connection as it opens.
+    ///
+    /// A primary that stops answering holds a query rather than failing it,
+    /// and a pool of held queries refuses every new request while keeping
+    /// every slot. This turns that into an error the pool recovers from. The
+    /// dashboard's whole-history aggregates over a ledger of millions of rows
+    /// are the one thing likely to reach it; those want a rollup, not a longer
+    /// timeout.
+    #[serde(default = "default_statement_timeout", with = "humantime_secs")]
+    pub statement_timeout: Duration,
 }
 
 const fn default_db_pool() -> u32 {
     16
+}
+
+const fn default_statement_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
 fn default_bedrock_region() -> String {
