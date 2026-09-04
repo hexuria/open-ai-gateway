@@ -176,6 +176,26 @@ impl StreamAccumulator {
         self.tool_buffers.last().map(|(id, _)| id.clone())
     }
 
+    /// The id of the `index`-th tool call opened in this response.
+    ///
+    /// Chat Completions addresses argument fragments by `index` after the
+    /// first, and streams parallel calls interleaved by it. `current_tool_id`
+    /// alone would hand every fragment to whichever call opened last, which is
+    /// right for one call and wrong for two.
+    #[must_use]
+    pub fn tool_id_at(&self, index: usize) -> Option<String> {
+        self.tool_buffers.get(index).map(|(id, _)| id.clone())
+    }
+
+    /// Every tool call opened in this response, in the order they opened.
+    ///
+    /// For a dialect that never signals the end of a call, the terminal chunk
+    /// is where they all end; this is the list it needs.
+    #[must_use]
+    pub fn tool_ids(&self) -> Vec<String> {
+        self.tool_buffers.iter().map(|(id, _)| id.clone()).collect()
+    }
+
     #[must_use]
     pub const fn usage(&self) -> &Usage {
         &self.usage
