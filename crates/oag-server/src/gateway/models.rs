@@ -243,7 +243,7 @@ async fn resolve(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
 ) -> Result<Resolved, Response> {
-    let (route, policy) = policy_for(state, auth)
+    let (route, policy, spend) = policy_for(state, auth)
         .await
         .map_err(|e| error_response(&e))?;
     let mode = if route.default_mode == "managed" {
@@ -251,7 +251,7 @@ async fn resolve(
     } else {
         RoutingMode::Passthrough
     };
-    let pressure = budgets_for(auth, &route).pressure();
+    let pressure = budgets_for(auth, &route, &spend).pressure();
     // An exhausted caller cannot spend: skip the credential scan, because
     // nothing it would return can be advertised.
     let channels = if pressure == BudgetPressure::Exhausted {
@@ -977,7 +977,7 @@ mod tests {
         assert_eq!(seats.0["oag"]["claude_code_aliases"], false);
     }
 
-    fn key(quota: rust_decimal::Decimal, spent: rust_decimal::Decimal) -> oag_store::AuthContext {
+    fn key(quota: rust_decimal::Decimal) -> oag_store::AuthContext {
         oag_store::AuthContext {
             api_key_id: uuid::Uuid::nil(),
             principal_id: uuid::Uuid::nil(),
@@ -985,10 +985,17 @@ mod tests {
             key_floor_tier: None,
             admin: false,
             quota_usd: Some(quota),
-            spent_usd: spent,
             principal_budget_usd: None,
             principal_hard_stop_multiple: rust_decimal::Decimal::ONE,
-            principal_spent_usd: rust_decimal::Decimal::ZERO,
+            key_hash: String::new(),
+        }
+    }
+
+    /// Spend against the key alone; the principal has spent nothing.
+    fn spent(key_usd: rust_decimal::Decimal) -> oag_store::Spend {
+        oag_store::Spend {
+            key_usd,
+            principal_usd: rust_decimal::Decimal::ZERO,
         }
     }
 
@@ -1009,14 +1016,14 @@ mod tests {
     #[test]
     fn a_key_with_budget_left_still_advertises() {
         // $30 spent $0.50 is the case a picker must not empty over.
-        let pressure = budgets_for(&key(dec!(30), dec!(0.5)), &uncapped_route()).pressure();
+        let pressure = budgets_for(&key(dec!(30)), &uncapped_route(), &spent(dec!(0.5))).pressure();
         assert_ne!(pressure, BudgetPressure::Exhausted);
         assert!(advertise(pressure, 1));
     }
 
     #[test]
     fn an_exhausted_key_advertises_nothing_not_even_virtual_names() {
-        let pressure = budgets_for(&key(dec!(30), dec!(30)), &uncapped_route()).pressure();
+        let pressure = budgets_for(&key(dec!(30)), &uncapped_route(), &spent(dec!(30))).pressure();
         assert_eq!(pressure, BudgetPressure::Exhausted);
         assert!(
             !advertise(pressure, 3),
@@ -1030,7 +1037,7 @@ mod tests {
         // picker here would hide models the gateway would still serve.
         // Which *rungs* stay on the list is RoutingPolicy::virtual_names, not
         // this gate — Constrained is not Exhausted.
-        let pressure = budgets_for(&key(dec!(30), dec!(25)), &uncapped_route()).pressure();
+        let pressure = budgets_for(&key(dec!(30)), &uncapped_route(), &spent(dec!(25))).pressure();
         assert_eq!(pressure, BudgetPressure::Constrained);
         assert!(advertise(pressure, 1));
         assert!(advertise(BudgetPressure::Normal, 1));
@@ -1049,10 +1056,9 @@ mod tests {
         route.spent_usd = dec!(10);
         let uncapped_key = oag_store::AuthContext {
             quota_usd: None,
-            spent_usd: rust_decimal::Decimal::ZERO,
-            ..key(dec!(1), dec!(0))
+            ..key(dec!(1))
         };
-        let pressure = budgets_for(&uncapped_key, &route).pressure();
+        let pressure = budgets_for(&uncapped_key, &route, &oag_store::Spend::default()).pressure();
         assert_eq!(pressure, BudgetPressure::Exhausted);
         assert!(!advertise(pressure, 1));
     }

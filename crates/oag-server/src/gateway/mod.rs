@@ -544,10 +544,13 @@ struct Plan {
 pub(crate) async fn policy_for(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
-) -> Result<(oag_store::RouteRow, RoutingPolicy)> {
+) -> Result<(oag_store::RouteRow, RoutingPolicy, oag_store::Spend)> {
     let route = oag_store::repo::route_by_id(&state.db, auth.route_id)
         .await?
         .ok_or_else(|| Error::Internal("route vanished between auth and routing".to_owned()))?;
+    // Fresh, per request, beside the route: the one read that must never be
+    // behind the ledger. See `Spend` for why it is not on `auth`.
+    let spend = oag_store::repo::spend_for(&state.db, auth.api_key_id, auth.principal_id).await?;
 
     let ladder = parse_ladder(&route.tiers)?;
 
@@ -574,7 +577,7 @@ pub(crate) async fn policy_for(
 
     let policy = RoutingPolicy::new(ladder, Box::new(oag_router::HeuristicClassifier::default()))
         .with_floor(floor);
-    Ok((route, policy))
+    Ok((route, policy, spend))
 }
 
 /// The same spend caps inference consults, so `/v1/models` can refuse to
@@ -584,10 +587,18 @@ pub(crate) async fn policy_for(
 /// through the constrained band first, but it does not get the principal's
 /// overshoot grace. An operator who writes `quota_usd = 50` means fifty. A
 /// route budget is the same shape at team scope.
-pub(crate) fn budgets_for(auth: &oag_store::AuthContext, route: &oag_store::RouteRow) -> Budgets {
+///
+/// Limits come from `auth`, which is cached; spend comes from `spend`, which
+/// is read per request. Keeping the two apart is the whole fix: a cap checked
+/// against a cached spend figure was a cap N concurrent requests all passed.
+pub(crate) fn budgets_for(
+    auth: &oag_store::AuthContext,
+    route: &oag_store::RouteRow,
+    spend: &oag_store::Spend,
+) -> Budgets {
     Budgets {
         key: BudgetState {
-            spent_usd: auth.spent_usd,
+            spent_usd: spend.key_usd,
             limit_usd: auth.quota_usd,
             hard_stop_multiple: rust_decimal::Decimal::ONE,
         },
@@ -597,7 +608,7 @@ pub(crate) fn budgets_for(auth: &oag_store::AuthContext, route: &oag_store::Rout
             hard_stop_multiple: rust_decimal::Decimal::ONE,
         },
         principal: BudgetState {
-            spent_usd: auth.principal_spent_usd,
+            spent_usd: spend.principal_usd,
             limit_usd: auth.principal_budget_usd,
             hard_stop_multiple: auth.principal_hard_stop_multiple,
         },
@@ -651,7 +662,7 @@ async fn plan_request(
     catalog: Arc<oag_router::Catalog>,
     channel: Option<oag_core::credential::CredentialKind>,
 ) -> Result<Plan> {
-    let (route, policy) = policy_for(state, auth).await?;
+    let (route, policy, spend) = policy_for(state, auth).await?;
 
     // Throttle before doing any of the expensive work below — classification,
     // model selection, credential selection. A request that is going to be
@@ -699,7 +710,7 @@ async fn plan_request(
         RoutingMode::Passthrough
     };
 
-    let budget = budgets_for(auth, &route);
+    let budget = budgets_for(auth, &route, &spend);
 
     // Logged at debug because "why did this route the way it did" is the
     // question every routing complaint turns into, and reconstructing it from
@@ -2213,10 +2224,9 @@ security:
             key_floor_tier: None,
             admin: false,
             quota_usd: None,
-            spent_usd: rust_decimal::Decimal::ZERO,
             principal_budget_usd: None,
             principal_hard_stop_multiple: rust_decimal::Decimal::ONE,
-            principal_spent_usd: rust_decimal::Decimal::ZERO,
+            key_hash: String::new(),
         }
     }
 

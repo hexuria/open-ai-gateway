@@ -383,10 +383,9 @@ mod tests {
                 key_floor_tier: None,
                 admin: false,
                 quota_usd: None,
-                spent_usd: Decimal::ZERO,
                 principal_budget_usd: None,
                 principal_hard_stop_multiple: Decimal::ONE,
-                principal_spent_usd: Decimal::ZERO,
+                key_hash: String::new(),
             },
             decision: RoutingDecision {
                 model: ModelSpec {
