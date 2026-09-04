@@ -41,17 +41,22 @@ groups:
             Requests are admitted without them, so credentials may exceed
             max_concurrency. Fix Redis; do not raise max_concurrency.
 
-      # A replica that is not ready has been taken out of rotation. One for a
-      # minute is a restart; one for longer, or several, is a dependency.
-      - alert: OagReplicaNotReady
+      # A replica has stopped answering scrapes. `up` is whether Prometheus
+      # got /metrics, not whether the replica is ready: a process that is up
+      # but unready (Postgres or Redis not answering) still serves /metrics
+      # and does not fire this. One for a minute is a restart; one for longer,
+      # or several at once, is the process or the network under it.
+      - alert: OagReplicaUnreachable
         expr: up{job="oag"} == 0
         for: 3m
         labels: { severity: page }
         annotations:
-          summary: "{{ $labels.replica }} has been unready for 3 minutes"
+          summary: "{{ $labels.replica }} has not answered a scrape for 3 minutes"
           description: >-
-            Readiness requires Postgres and Redis to answer. Check both before
-            the replica; a replica cannot make itself ready.
+            The admin listener did not answer Prometheus. Check whether the
+            process is running and whether the scrape address still resolves
+            to it. Readiness is the orchestrator's signal, read from
+            /health/ready; it is separate from this one.
 
   - name: oag-capacity
     rules:
