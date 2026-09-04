@@ -54,7 +54,7 @@ between poking an API and testing one.
 
 ## Layout
 
-Safe — run by `just api`, 74 requests:
+Safe — run by `just api`, 78 requests:
 
 | file | reqs | what it covers |
 |---|---|---|
@@ -64,11 +64,11 @@ Safe — run by `just api`, 74 requests:
 | `messages.hurl` | 7 | Anthropic dialect, content blocks, `count_tokens` |
 | `responses.hurl` | 6 | Responses dialect: string input, message list, instructions |
 | `gemini.hurl` | 6 | model and action in one path segment, `generationConfig` |
-| `errors.hurl` | 10 | 401/403/400/404/503 — every one observed, not guessed |
+| `errors.hurl` | 14 | 401/403/400/404/503 — every one observed, not guessed |
 | `admin-read.hurl` | 17 | every admin GET, ids captured rather than hardcoded |
 | `admin-points.hurl` | 8 | reference price, multipliers, the pool batch read |
 
-State-changing — opt-in only:
+State-changing — opt-in only, 49 requests:
 
 | file | reqs | notes |
 |---|---|---|
