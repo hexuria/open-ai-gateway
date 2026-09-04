@@ -1,0 +1,28 @@
+{{- if .Values.networkPolicy.enabled }}
+# See `networkPolicy` in values.yaml. Two rules: the public port from anywhere,
+# because the ingress controller is not in this namespace and this is the port
+# the gateway authenticates; the admin port only from this namespace and the
+# peers listed under `adminFrom`, because three of its routes are open by
+# design and "internal network" has to mean something.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "oag.fullname" . }}
+  labels: {{- include "oag.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- include "oag.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: public
+          protocol: TCP
+    - from:
+        - podSelector: {}
+        {{- with .Values.networkPolicy.adminFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - port: admin
+          protocol: TCP
+{{- end }}

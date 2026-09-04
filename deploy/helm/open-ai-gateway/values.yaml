@@ -95,6 +95,20 @@ service:
   adminPort: 8081
   annotations: {}
 
+# The admin port carries the dashboard, /metrics and /health/ready, and three
+# of its routes sit outside the admin-key layer by design. On a Service with
+# no policy, "internal network only" meant "every pod in the cluster". This
+# keeps the public port reachable from anywhere (the ingress controller lives
+# elsewhere) and the admin port reachable only from this namespace, plus
+# whatever `adminFrom` adds — a monitoring namespace's Prometheus, typically.
+# A CNI that does not enforce NetworkPolicy ignores this object harmlessly.
+networkPolicy:
+  enabled: true
+  # Extra `from` entries for the admin port, in NetworkPolicy peer syntax.
+  adminFrom: []
+  #  - namespaceSelector:
+  #      matchLabels: { kubernetes.io/metadata.name: monitoring }
+
 # ── scheduling ────────────────────────────────────────────────────────────────
 terminationGracePeriodSeconds: 1845
 
