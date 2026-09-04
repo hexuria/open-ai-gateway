@@ -28,6 +28,7 @@
 
 use crate::canonical::{
     CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
+    ToolResultContent,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -147,7 +148,7 @@ fn render_message_into(m: &Message, out: &mut Vec<Value>) {
             out.push(json!({
                 "type": "function_call_output",
                 "call_id": tool_use_id,
-                "output": content,
+                "output": content.as_text(),
             }));
         }
     }
@@ -320,10 +321,10 @@ fn parse_input_item(item: &Value, messages: &mut Vec<Message>) {
         "function_call_output" => {
             let block = ContentBlock::ToolResult {
                 tool_use_id: item["call_id"].as_str().unwrap_or_default().to_owned(),
-                content: match &item["output"] {
+                content: ToolResultContent::Text(match &item["output"] {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
-                },
+                }),
                 is_error: false,
             };
             match messages.last_mut() {

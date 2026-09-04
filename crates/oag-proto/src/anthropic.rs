@@ -8,7 +8,7 @@
 
 use crate::canonical::{
     CacheControl, CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool,
-    ToolChoice,
+    ToolChoice, ToolResultContent,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -114,12 +114,23 @@ fn render_block(b: &ContentBlock) -> Value {
             tool_use_id,
             content,
             is_error,
-        } => json!({
-            "type": "tool_result",
-            "tool_use_id": tool_use_id,
-            "content": content,
-            "is_error": is_error,
-        }),
+        } => {
+            // A string stays a string and blocks stay blocks: this is the one
+            // dialect that can carry an image inside a result, and the round
+            // trip through here must be byte-faithful.
+            let content = match content {
+                ToolResultContent::Text(text) => json!(text),
+                ToolResultContent::Blocks(blocks) => {
+                    Value::Array(blocks.iter().map(render_block).collect())
+                }
+            };
+            json!({
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": content,
+                "is_error": is_error,
+            })
+        }
         ContentBlock::Thinking { text, signature } => {
             let mut v = json!({ "type": "thinking", "thinking": text });
             if let Some(sig) = signature {
@@ -267,8 +278,14 @@ fn parse_block(v: &Value) -> Option<ContentBlock> {
         "tool_result" => Some(ContentBlock::ToolResult {
             tool_use_id: v["tool_use_id"].as_str()?.to_owned(),
             content: match &v["content"] {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
+                Value::String(s) => ToolResultContent::Text(s.clone()),
+                // Blocks, kept as blocks. Stringifying this array was how an
+                // image in a tool result reached the model as a JSON string
+                // of its own base64.
+                Value::Array(items) => {
+                    ToolResultContent::Blocks(items.iter().filter_map(parse_block).collect())
+                }
+                other => ToolResultContent::Text(other.to_string()),
             },
             is_error: v["is_error"].as_bool().unwrap_or(false),
         }),
@@ -1338,6 +1355,41 @@ mod tests {
         let out = render_from_events(&[], "r", "m");
         assert_eq!(out["content"], serde_json::json!([]));
         assert!(out["stop_reason"].is_null());
+    }
+
+    #[test]
+    fn a_tool_result_of_blocks_round_trips_as_blocks() {
+        // The shape a browser or screenshot tool returns: text beside an
+        // image, inside the result. Before, the array was stringified into
+        // one text block — the image's base64 became prompt text the model
+        // could not see, billed as text at ~150× the image's real cost. Now
+        // blocks in are blocks out, byte for byte, and a string stays a
+        // string.
+        let blocks = serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "toolu_1",
+            "content": [
+                {"type": "text", "text": "screenshot attached"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+            ],
+            "is_error": false,
+        });
+        let parsed = parse_block(&blocks).expect("parses");
+        assert!(matches!(
+            &parsed,
+            ContentBlock::ToolResult { content: ToolResultContent::Blocks(b), .. } if b.len() == 2
+        ));
+        assert_eq!(render_block(&parsed), blocks);
+
+        let plain = serde_json::json!({
+            "type": "tool_result", "tool_use_id": "toolu_2", "content": "just text", "is_error": true,
+        });
+        let parsed = parse_block(&plain).expect("parses");
+        assert!(matches!(
+            &parsed,
+            ContentBlock::ToolResult { content: ToolResultContent::Text(t), is_error: true, .. } if t == "just text"
+        ));
+        assert_eq!(render_block(&parsed), plain);
     }
 
     #[test]

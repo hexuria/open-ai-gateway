@@ -17,6 +17,7 @@
 
 use crate::canonical::{
     CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
+    ToolResultContent,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -159,7 +160,10 @@ fn render_message(m: &Message) -> Vec<Value> {
             out.push(json!({
                 "role": "tool",
                 "tool_call_id": tool_use_id,
-                "content": content,
+                // A string here, always: this dialect's tool message carries
+                // text, and blocks it cannot express are flattened rather
+                // than serialised into it.
+                "content": content.as_text(),
             }));
         }
     }
@@ -341,10 +345,17 @@ fn parse_one_message(m: &Value, system: &mut Vec<ContentBlock>, messages: &mut V
             // the canonical form keeps results adjacent to their turn.
             let block = ContentBlock::ToolResult {
                 tool_use_id: m["tool_call_id"].as_str().unwrap_or_default().to_owned(),
-                content: match &m["content"] {
+                content: ToolResultContent::Text(match &m["content"] {
                     Value::String(s) => s.clone(),
+                    // This dialect allows text parts here; their text is the
+                    // result, not the JSON of the array that held it.
+                    Value::Array(parts) => parts
+                        .iter()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                     other => other.to_string(),
-                },
+                }),
                 is_error: false,
             };
             match messages.last_mut() {
@@ -913,6 +924,43 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "Let me check.");
+    }
+
+    #[test]
+    fn a_tool_result_of_blocks_reaches_this_dialect_as_its_text() {
+        // This dialect's tool message takes a string. A result carrying an
+        // image flattens to the text it does carry, rather than to the JSON
+        // of the whole array — which is what put base64 into a model's prompt
+        // as text.
+        let m = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_owned(),
+                content: ToolResultContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "first".to_owned(),
+                        cache_control: None,
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/png".to_owned(),
+                        data: "iVBORw0KGgo=".to_owned(),
+                    },
+                    ContentBlock::Text {
+                        text: "second".to_owned(),
+                        cache_control: None,
+                    },
+                ]),
+                is_error: false,
+            }],
+        };
+        let out = render_message(&m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "tool");
+        assert_eq!(out[0]["content"], "first\nsecond");
+        assert!(
+            !out[0]["content"].to_string().contains("iVBOR"),
+            "no base64 as prompt text"
+        );
     }
 
     #[test]

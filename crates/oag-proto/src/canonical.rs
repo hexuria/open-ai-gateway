@@ -42,7 +42,7 @@ pub enum ContentBlock {
     },
     ToolResult {
         tool_use_id: String,
-        content: String,
+        content: ToolResultContent,
         #[serde(default)]
         is_error: bool,
     },
@@ -54,6 +54,53 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         signature: Option<String>,
     },
+}
+
+/// What a tool result carries.
+///
+/// Structural, because the Anthropic dialect lets a tool return *blocks* — a
+/// screenshot from a browser tool, say — and only a structural form can carry
+/// that back out in the same shape. The alternative, stringifying the array
+/// into a text block, is what this replaces: the base64 of an image became
+/// prompt text, billed at ~150× the image's real token cost, and arrived at
+/// the model as a JSON string it could not see.
+///
+/// The dialects whose wire format takes only a string (Chat Completions,
+/// Responses, Gemini) flatten to `as_text` on the way out. That is lossy for
+/// an image, and honestly so: those formats cannot carry one here, and a
+/// base64 dump inside a string is not carrying it either.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolResultContent {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+}
+
+impl ToolResultContent {
+    /// The result as one string, for dialects that take nothing else.
+    ///
+    /// Text blocks joined; anything a string cannot carry is left out rather
+    /// than dumped in as its serialisation.
+    #[must_use]
+    pub fn as_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+}
+
+impl From<String> for ToolResultContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -390,8 +437,18 @@ pub fn count_input_tokens(req: &CanonicalRequest) -> u64 {
 
 fn count_block(b: &ContentBlock) -> usize {
     match b {
-        ContentBlock::Text { text, .. } | ContentBlock::Thinking { text, .. } => text.len() / 4,
-        ContentBlock::ToolResult { content, .. } => content.len() / 4,
+        ContentBlock::Text { text, .. }
+        | ContentBlock::Thinking { text, .. }
+        | ContentBlock::ToolResult {
+            content: ToolResultContent::Text(text),
+            ..
+        } => text.len() / 4,
+        // Each block at its own estimate — so an image inside a result counts
+        // as an image, not as the length of its base64.
+        ContentBlock::ToolResult {
+            content: ToolResultContent::Blocks(blocks),
+            ..
+        } => blocks.iter().map(count_block).sum(),
         ContentBlock::ToolUse { name, input, .. } => (name.len() + input.to_string().len()) / 3,
         // Anthropic bills an image at roughly (width x height) / 750, which puts
         // a typical screenshot between 1,000 and 1,600 tokens. `block_len`'s
@@ -403,8 +460,16 @@ fn count_block(b: &ContentBlock) -> usize {
 
 fn block_len(b: &ContentBlock) -> usize {
     match b {
-        ContentBlock::Text { text, .. } | ContentBlock::Thinking { text, .. } => text.len(),
-        ContentBlock::ToolResult { content, .. } => content.len(),
+        ContentBlock::Text { text, .. }
+        | ContentBlock::Thinking { text, .. }
+        | ContentBlock::ToolResult {
+            content: ToolResultContent::Text(text),
+            ..
+        } => text.len(),
+        ContentBlock::ToolResult {
+            content: ToolResultContent::Blocks(blocks),
+            ..
+        } => blocks.iter().map(block_len).sum(),
         ContentBlock::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
         // Images are billed by dimension, not bytes; the base64 length would
         // wildly overstate the token cost.

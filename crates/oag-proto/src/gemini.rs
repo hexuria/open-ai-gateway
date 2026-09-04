@@ -18,6 +18,7 @@
 
 use crate::canonical::{
     CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
+    ToolResultContent,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -134,7 +135,7 @@ fn render_message(m: &Message) -> Value {
                 // thing we have when the original name is not carried.
                 "functionResponse": {
                     "name": tool_use_id,
-                    "response": { "result": content },
+                    "response": { "result": content.as_text() },
                 }
             })),
             // No wire representation; replaying it would be rejected.
@@ -299,7 +300,7 @@ fn parse_content(v: &Value) -> Option<Message> {
             if let Some(resp) = p.get("functionResponse") {
                 return Some(ContentBlock::ToolResult {
                     tool_use_id: resp["name"].as_str().unwrap_or_default().to_owned(),
-                    content: resp["response"].to_string(),
+                    content: ToolResultContent::Text(resp["response"].to_string()),
                     is_error: false,
                 });
             }
