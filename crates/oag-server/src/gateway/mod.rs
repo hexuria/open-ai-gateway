@@ -1078,6 +1078,14 @@ async fn forward_with_failover(
                 lease.release().await;
                 excluded.insert(account);
             }
+            // Not an error and not this credential's fault: move on without
+            // touching `last_error`, which still names whatever genuinely
+            // went wrong before.
+            Outcome::Raced => {
+                tracing::debug!(%request_id, %account, "half-open probe already taken; trying another credential");
+                lease.release().await;
+                excluded.insert(account);
+            }
         }
     }
 
@@ -1093,6 +1101,17 @@ enum Outcome {
     Ok(Box<Attempt>),
     /// Try a different credential.
     Switch(Error),
+    /// Another request took this credential's half-open probe between
+    /// selection and dispatch. Nothing was sent and nothing failed: try a
+    /// different credential, and say nothing about this one.
+    ///
+    /// Its own variant rather than `Switch(NoCredential)`, which is what it
+    /// was: that placeholder became `last_error`, overwriting the genuine
+    /// upstream error from the credential tried before — so a request that
+    /// failed on a real 5xx and then raced a probe told the caller "no
+    /// credential available", and sent whoever read the log to stare at a
+    /// healthy pool.
+    Raced,
     /// Stop switching credentials and try a better model instead.
     Escalate(Error),
     /// Stop: another credential cannot help.
@@ -1185,7 +1204,7 @@ async fn try_credential(
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let Some(mut dispatch) = Dispatch::claim(&state.breakers, account, now) else {
         // Raced: another request took the probe between the filter and here.
-        return Outcome::Switch(last);
+        return Outcome::Raced;
     };
 
     for attempt in 0..=state.config.gateway.same_account_retries {
