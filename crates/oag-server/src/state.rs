@@ -125,7 +125,12 @@ impl AppState {
                 10_000,
                 &config.security.signing_secret,
             ),
-            transports: TransportPool::new(2_048, Duration::from_mins(15), Duration::from_secs(10)),
+            transports: TransportPool::new(
+                2_048,
+                Duration::from_mins(15),
+                Duration::from_secs(10),
+                config.gateway.upstream_response_timeout,
+            ),
             config: Arc::new(config),
             db,
             cache,

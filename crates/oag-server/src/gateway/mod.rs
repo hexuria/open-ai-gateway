@@ -1637,6 +1637,15 @@ pub(crate) fn error_response(e: &Error) -> Response {
         }
         Error::Serde(_) => (StatusCode::BAD_REQUEST, "invalid_request", e.to_string()),
         Error::StreamIdle(_) => (StatusCode::GATEWAY_TIMEOUT, "stream_idle", e.to_string()),
+        // Its own kind, not `stream_idle`: one is a response that went quiet,
+        // the other is a response that never began. Both are 504, and a
+        // client retries either — but an operator reading the log needs to
+        // know which half of the provider is broken.
+        Error::UpstreamTimeout { .. } => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_timeout",
+            e.to_string(),
+        ),
         _ => {
             tracing::error!(error = %e, "internal error");
             (

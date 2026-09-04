@@ -200,6 +200,20 @@ pub struct GatewayConfig {
     /// we stop accepting work and give in-flight streams this long to finish.
     #[serde(with = "humantime_secs")]
     pub max_stream_duration: Duration,
+    /// How long an upstream may take to send its response *headers* after
+    /// the connection is made.
+    ///
+    /// The one deadline the request path had none of. The client's connect
+    /// timeout ends at the handshake; `stream_idle_timeout` starts only once a
+    /// response exists. Between the two, a provider that accepted and then
+    /// stalled held the request, its credential slot and its in-flight guard
+    /// indefinitely, and the breaker never learned of it because nothing had
+    /// failed. This is not a total-response timeout — a streamed completion
+    /// legitimately runs for minutes, and the deadline ends the moment
+    /// headers arrive — so it can be generous: it is a backstop against
+    /// silence, not a latency target.
+    #[serde(with = "humantime_secs")]
+    pub upstream_response_timeout: Duration,
     /// Attempts against one credential before failing over to another.
     pub same_account_retries: u8,
     /// Credentials to try before giving up on the request.
@@ -293,6 +307,11 @@ impl Default for GatewayConfig {
             stream_idle_timeout: Duration::from_mins(3),
             stream_keepalive_interval: Duration::from_secs(10),
             max_stream_duration: Duration::from_mins(30),
+            // Generous on purpose: a slow-but-healthy provider under load can
+            // take tens of seconds to begin a large reasoning response, and
+            // failing those over is worse than waiting. What this bounds is a
+            // provider that will never answer.
+            upstream_response_timeout: Duration::from_secs(90),
             same_account_retries: 2,
             max_account_switches: 3,
             // Generous: it is a backstop against an unbounded wait, not a
@@ -398,6 +417,14 @@ impl Config {
                 "gateway.max_stream_duration must exceed gateway.stream_idle_timeout".to_owned(),
             ));
         }
+        // Zero would mean "no deadline", which is the condition this setting
+        // exists to remove — and `tokio::time::timeout(0)` would refuse every
+        // request instead. Neither is a value anyone means.
+        if self.gateway.upstream_response_timeout.is_zero() {
+            return Err(crate::Error::Config(
+                "gateway.upstream_response_timeout must be positive".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -493,6 +520,27 @@ security:
         );
         // And still large enough for the payloads this gateway exists to carry.
         assert!(cfg.server.max_body_bytes >= 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_upstream_response_deadline_defaults_on_and_cannot_be_zero() {
+        // Nothing bounded the wait for a provider's response headers: the
+        // connect timeout ended at the handshake and the idle watchdog only
+        // started once a response existed. A default of zero here would
+        // re-open that gap while looking configured.
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(!cfg.gateway.upstream_response_timeout.is_zero());
+        assert!(
+            cfg.gateway.upstream_response_timeout < cfg.gateway.max_stream_duration,
+            "a headers deadline longer than the whole stream's ceiling bounds nothing"
+        );
+
+        let zero = format!("{MINIMAL}\ngateway:\n  upstream_response_timeout: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("zero is refused");
+        assert!(
+            err.to_string().contains("upstream_response_timeout"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -219,5 +219,17 @@
         }
       }
     }
+  },
+  {
+    "type": "upstream_timeout",
+    "status": 504,
+    "variant": "UpstreamTimeout",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "upstream_timeout",
+        "message": "upstream sent no response within 90s"
+      }
+    }
   }
 ]

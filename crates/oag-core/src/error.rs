@@ -167,6 +167,18 @@ pub enum Error {
     #[error("upstream stream stalled after {0:?} with no data")]
     StreamIdle(Duration),
 
+    /// The upstream accepted the connection and then sent no response headers
+    /// within the deadline.
+    ///
+    /// Distinct from [`Error::StreamIdle`], which can only fire once a response
+    /// exists: this is the gap before one does. Nothing else covered it — the
+    /// client's connect timeout ends at the handshake, and a provider that
+    /// accepts, then stalls, held the request, its credential slot and its
+    /// in-flight guard for as long as it liked, with the breaker silent because
+    /// nothing had failed yet.
+    #[error("upstream sent no response within {after:?}")]
+    UpstreamTimeout { after: Duration },
+
     #[error("serialisation: {0}")]
     Serde(#[from] serde_json::Error),
 
@@ -262,6 +274,12 @@ impl Error {
             },
             Self::StreamIdle(_) => Disposition::FailoverAccount {
                 cooldown: Duration::from_mins(1),
+            },
+            // A provider that accepts and then says nothing is behaving like
+            // a 5xx that never arrived: try another credential, and give this
+            // one the same short cooldown a 503 would earn.
+            Self::UpstreamTimeout { .. } => Disposition::FailoverAccount {
+                cooldown: Duration::from_secs(30),
             },
             // A reserved-out provider is out for as long as its window lasts,
             // so the only thing that can still serve this request is a rung
@@ -363,6 +381,9 @@ pub fn every_variant() -> Vec<Error> {
             retry_after: None,
         },
         Error::StreamIdle(Duration::from_mins(3)),
+        Error::UpstreamTimeout {
+            after: Duration::from_secs(90),
+        },
         // `unwrap_err` on a value that is unconditionally an `Err`: the clippy
         // lint is about Results that might be `Ok`, and "not json" is not an i32
         // in any build.
@@ -392,6 +413,7 @@ pub fn every_variant() -> Vec<Error> {
             | Error::UnsupportedField { .. }
             | Error::Upstream { .. }
             | Error::StreamIdle(_)
+            | Error::UpstreamTimeout { .. }
             | Error::Serde(_)
             | Error::Internal(_) => {}
         }

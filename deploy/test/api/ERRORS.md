@@ -51,6 +51,7 @@ when the body was truncated and no longer parses.
 | `quota_reserve_held` | 503 | every credential is at its reserve floor | retry after the window resets |
 | `at_capacity` | 503 | every credential is at max concurrency | retry shortly — this one really is transient |
 | `stream_idle` | 504 | the upstream went quiet mid-stream | retry |
+| `upstream_timeout` | 504 | the upstream accepted the connection and never began a response | retry |
 | `upstream_error` | *see below* | the provider refused | depends on `upstream_status` |
 | `internal_error` | 500 | a bug | retry once, then report |
 
