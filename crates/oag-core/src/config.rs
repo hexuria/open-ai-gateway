@@ -64,6 +64,21 @@ pub struct ServerConfig {
     /// ceiling; a deployment that genuinely needs more can raise it, knowing
     /// what it is multiplying by its concurrency.
     pub max_body_bytes: usize,
+    /// Ceiling on inference requests in flight on this replica. Past it, a
+    /// request is refused with `overloaded` rather than queued.
+    ///
+    /// The memory bound is this times `max_body_bytes`, roughly: a request
+    /// holds its body through parsing and translation, and nothing else
+    /// bounded how many did so at once. The Postgres pool has sixteen
+    /// connections and a ten-second acquire timeout, so without this a flood
+    /// — authenticated or not — queued everyone at `acquire()` while the
+    /// queued requests kept their memory. Shedding early keeps the replica
+    /// answering the requests it has already admitted.
+    ///
+    /// Sized for a 1 Gi replica and the default 32 MiB body: the product is
+    /// what an all-maximum-size flood could hold, and real bodies are
+    /// kilobytes. A larger replica or a smaller body limit can raise this.
+    pub max_in_flight: usize,
     /// Serve admin routes on the public listener instead of their own.
     ///
     /// Off by default, because two listeners is the safer shape: it makes "do
@@ -93,6 +108,7 @@ impl Default for ServerConfig {
             header_read_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_mins(2),
             max_body_bytes: 32 * 1024 * 1024,
+            max_in_flight: 64,
             single_listener: false,
         }
     }
@@ -594,6 +610,22 @@ security:
         let zero = format!("{MINIMAL}\ngateway:\n  client_write_timeout: 0\n");
         let err = Config::from_yaml(&zero).expect_err("zero is refused");
         assert!(err.to_string().contains("client_write_timeout"), "{err}");
+    }
+
+    #[test]
+    fn the_in_flight_ceiling_defaults_to_something_a_1gi_replica_survives() {
+        // The memory bound is ceiling × body limit. Nothing bounded the
+        // ceiling before, so the body limit alone was the whole story — and
+        // "how many at once" was whatever the flood chose.
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(cfg.server.max_in_flight > 0, "zero would refuse everything");
+        let worst_case = cfg.server.max_in_flight * cfg.server.max_body_bytes;
+        assert!(
+            worst_case <= 4 * 1024 * 1024 * 1024,
+            "{} in flight × {} bytes is not survivable",
+            cfg.server.max_in_flight,
+            cfg.server.max_body_bytes
+        );
     }
 
     #[test]

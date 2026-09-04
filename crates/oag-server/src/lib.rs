@@ -212,7 +212,34 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
 /// detail, and answering it does not require being reachable from outside.
 pub fn public_router(state: Arc<AppState>) -> Router {
     let limit = state.config.server.max_body_bytes;
-    let routes = inference_routes(&state).route("/health/live", get(health::live));
+
+    // Admission control: a ceiling on inference requests in flight, and
+    // load-shedding rather than queueing past it. A request holds its body
+    // through parsing and translation and a pooled Postgres connection
+    // through authentication; nothing bounded how many did so at once, so a
+    // flood — of oversized bodies, or of made-up keys — queued every request
+    // at the pool's ten-second acquire timeout while the queued ones kept
+    // their memory. Shed early and the replica keeps answering the requests
+    // it has already admitted.
+    //
+    // `ConcurrencyLimit` alone would queue at the semaphore, which is the
+    // same failure with the queue moved; `LoadShed` in front of it turns
+    // "no permit right now" into an immediate 503 the balancer can route
+    // around. `HandleErrorLayer` is what makes that 503 ours — the envelope
+    // and the `Retry-After` a client already knows how to read.
+    //
+    // Applied to the inference routes only. `/health/live` is added after
+    // and sits outside it: a replica that is full is alive, and a liveness
+    // probe that sheds under load is a probe that restarts a busy pod.
+    let admission = tower::ServiceBuilder::new()
+        .layer(axum::error_handling::HandleErrorLayer::new(
+            |_: tower::BoxError| async { gateway::error_response(&oag_core::Error::Overloaded) },
+        ))
+        .load_shed()
+        .concurrency_limit(state.config.server.max_in_flight);
+    let routes = inference_routes(&state)
+        .layer(admission)
+        .route("/health/live", get(health::live));
 
     // On a single-port platform there is nowhere else for the admin routes to
     // live, so they join this listener rather than vanishing entirely.
@@ -347,6 +374,14 @@ mod router_tests {
     }
 
     fn state_with(single_listener: bool, max_body_bytes: usize) -> Arc<AppState> {
+        state_shaped(single_listener, max_body_bytes, 64)
+    }
+
+    fn state_shaped(
+        single_listener: bool,
+        max_body_bytes: usize,
+        max_in_flight: usize,
+    ) -> Arc<AppState> {
         let src = format!(
             r#"
 database:
@@ -359,12 +394,98 @@ security:
 server:
   single_listener: {single_listener}
   max_body_bytes: {max_body_bytes}
+  max_in_flight: {max_in_flight}
 "#
         );
         let config = oag_core::config::Config::from_yaml(&src).expect("test config");
         let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
         let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
         Arc::new(AppState::new(config, db, cache).expect("state"))
+    }
+
+    #[tokio::test]
+    async fn a_string_that_is_not_key_shaped_is_refused_before_any_lookup() {
+        // The backends here are dead ports, and a lookup that reached them
+        // would spend seconds in connect retries before failing. A 401 in
+        // well under a second is therefore proof the lookup never started:
+        // the shape check refused the string at the door.
+        let app = public_router(state(false));
+        let started = std::time::Instant::now();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/models")
+                    .header("authorization", "Bearer sk-ant-not-one-of-ours")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "took {:?}: that was a database round trip, not a shape check",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn past_the_in_flight_ceiling_a_request_is_shed_not_queued() {
+        // A ceiling of zero has no permit to give, ever — so every request is
+        // what the (n+1)th request looks like at a ceiling of n. It must come
+        // back at once as our own 503, with a Retry-After, and not wait.
+        let app = public_router(state_shaped(false, 32 * 1024 * 1024, 0));
+        let started = std::time::Instant::now();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/models")
+                    .header(
+                        "authorization",
+                        format!("Bearer oag_live_{}", "0".repeat(64)),
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            res.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "shed, not queued"
+        );
+        let body = axum::body::to_bytes(res.into_body(), 4096)
+            .await
+            .expect("body");
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap_or("")
+                .contains("\"overloaded\""),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Liveness sits outside the ceiling: a full replica is still alive,
+        // and a probe that sheds under load restarts a busy pod.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/live")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     /// Every mutating and reading path under /admin/api.
