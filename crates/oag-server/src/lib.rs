@@ -208,6 +208,34 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
 
 /// Inference. Fronted by the load balancer.
 ///
+/// The admission control described in [`public_router`], around `routes`:
+/// at most `max_in_flight` requests inside them at once on this replica, the
+/// rest shed as `overloaded`.
+///
+/// `GlobalConcurrencyLimitLayer`, and not the plain one. axum applies a layer
+/// to every route separately, and tower's `ConcurrencyLimitLayer` hands each
+/// service it wraps a semaphore of its own — so `max_in_flight` was a ceiling
+/// per route, and a replica with six inference routes could admit six times
+/// what its memory budget was sized for. The global layer carries one
+/// semaphore and shares it with every route it wraps.
+fn admit(routes: Router<Arc<AppState>>, max_in_flight: usize) -> Router<Arc<AppState>> {
+    let admission = tower::ServiceBuilder::new()
+        .layer(axum::error_handling::HandleErrorLayer::new(
+            |_: tower::BoxError| async {
+                // Counted here, because the shed happens before any handler
+                // and no handler's counter ever sees it. This is the series
+                // the `OagReplicaShedding` alert watches.
+                ::metrics::counter!("oag_requests_total", "outcome" => "overloaded").increment(1);
+                gateway::error_response(&oag_core::Error::Overloaded)
+            },
+        ))
+        .load_shed()
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(
+            max_in_flight,
+        ));
+    routes.layer(admission)
+}
+
 /// Carries `/health/live` but not `/health/ready`: readiness is an operational
 /// detail, and answering it does not require being reachable from outside.
 pub fn public_router(state: Arc<AppState>) -> Router {
@@ -231,14 +259,7 @@ pub fn public_router(state: Arc<AppState>) -> Router {
     // Applied to the inference routes only. `/health/live` is added after
     // and sits outside it: a replica that is full is alive, and a liveness
     // probe that sheds under load is a probe that restarts a busy pod.
-    let admission = tower::ServiceBuilder::new()
-        .layer(axum::error_handling::HandleErrorLayer::new(
-            |_: tower::BoxError| async { gateway::error_response(&oag_core::Error::Overloaded) },
-        ))
-        .load_shed()
-        .concurrency_limit(state.config.server.max_in_flight);
-    let routes = inference_routes(&state)
-        .layer(admission)
+    let routes = admit(inference_routes(&state), state.config.server.max_in_flight)
         .route("/health/live", get(health::live));
 
     // On a single-port platform there is nowhere else for the admin routes to
@@ -428,6 +449,76 @@ server:
             "took {:?}: that was a database round trip, not a shape check",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn the_in_flight_ceiling_is_per_replica_not_per_route() {
+        // axum applies a layer to each route separately, and tower's plain
+        // ConcurrencyLimitLayer gives every service it wraps a semaphore of
+        // its own: a ceiling of one was one per route, and the ceiling-of-zero
+        // test below could not tell. Hold the only permit on one route; the
+        // other must shed, and must admit again once the permit comes back.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let held = Arc::clone(&gate);
+        let routes = Router::new()
+            .route(
+                "/hold",
+                get(move || {
+                    let held = Arc::clone(&held);
+                    async move {
+                        held.notified().await;
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route("/other", get(|| async { StatusCode::OK }));
+        let app = admit(routes, 1).with_state(state(false));
+
+        let holder = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/hold")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+                .status()
+            }
+        });
+        // Let the holder take the permit before the other route asks for it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let shed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/other")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            shed.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the one permit is held on a different route"
+        );
+
+        gate.notify_one();
+        assert_eq!(holder.await.expect("join"), StatusCode::OK);
+        let after = app
+            .oneshot(
+                Request::builder()
+                    .uri("/other")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(after.status(), StatusCode::OK, "the permit came back");
     }
 
     #[tokio::test]
