@@ -297,9 +297,25 @@ impl Cache {
                     .arg(ttl.as_secs()),
             );
         }
-        pipe.query_async::<Vec<u32>>(&mut conn)
-            .await
-            .map_err(|e| Error::Internal(format!("counting slots: {e}")))
+        match pipe.query_async::<Vec<u32>>(&mut conn).await {
+            Ok(counts) => Ok(counts),
+            // A single invocation loads the script on NOSCRIPT and retries; a
+            // pipeline does not. Straight after a Redis restart, a SCRIPT
+            // FLUSH, or on a node that has never seen this script, every
+            // count would otherwise fail — and selection would run open (see
+            // `slot_accounting_degraded`) until some other path happened to
+            // load it. Load it and go again, once.
+            Err(e) if e.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) => {
+                SLOTS_IN_USE_SCRIPT
+                    .load_async(&mut conn)
+                    .await
+                    .map_err(|e| Error::Internal(format!("loading slot script: {e}")))?;
+                pipe.query_async::<Vec<u32>>(&mut conn)
+                    .await
+                    .map_err(|e| Error::Internal(format!("counting slots: {e}")))
+            }
+            Err(e) => Err(Error::Internal(format!("counting slots: {e}"))),
+        }
     }
 
     /// Which credential a session is pinned to, refreshing the pin's lifetime.
@@ -711,6 +727,48 @@ mod tests {
     /// The bucket itself, against a real Redis.
     ///
     /// Skipped when `OAG_TEST_REDIS_URL` is unset, like the other Redis tests.
+    #[tokio::test]
+    async fn a_pipelined_count_survives_a_redis_that_has_not_seen_the_script() {
+        // SCRIPT FLUSH is what a restart, a failover to a fresh replica, or a
+        // new cluster node looks like to EVALSHA: NOSCRIPT. The single-key
+        // count loads and retries on its own; the pipeline had to be taught
+        // to, or every count after a restart failed until a pinned request
+        // happened to load the script through the other path.
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let cache = Cache::connect(&url).expect("cache");
+        let (a, b) = (AccountId::new(), AccountId::new());
+        let ttl = Duration::from_mins(1);
+
+        let mut conn = cache.conn().await.expect("conn");
+        let _: () = redis::cmd("SCRIPT")
+            .arg("FLUSH")
+            .query_async(&mut conn)
+            .await
+            .expect("flush the script cache");
+        assert!(
+            cache
+                .acquire_slot(a, "live", 4, ttl)
+                .await
+                .expect("acquire"),
+            "one live member on a"
+        );
+        let _: () = redis::cmd("SCRIPT")
+            .arg("FLUSH")
+            .query_async(&mut conn)
+            .await
+            .expect("flush again, so the count itself meets NOSCRIPT");
+
+        assert_eq!(
+            cache.slots_in_use_many(&[a, b], ttl).await.expect("count"),
+            vec![1, 0],
+            "loaded on NOSCRIPT and answered in order"
+        );
+        let _: () = conn.del(slot_key(a)).await.expect("cleanup");
+    }
+
     #[tokio::test]
     async fn expired_slot_members_do_not_count_as_in_use() {
         // The lockout. Eight members older than the TTL — a replica that died
