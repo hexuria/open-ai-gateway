@@ -135,6 +135,7 @@ services:
     profiles: ["observability"]
     volumes:
       - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - promdata:/prometheus
     ports: ["127.0.0.1:9090:9090"]
 

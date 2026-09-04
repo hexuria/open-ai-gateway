@@ -6,6 +6,13 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# What to page on. See alerts.yml for what each condition means and which
+# subsystem it names — several of these failures used to present as each
+# other, and the rules exist to keep the first hour of an incident out of
+# the wrong place.
+rule_files:
+  - alerts.yml
+
 scrape_configs:
   - job_name: oag
     metrics_path: /metrics
