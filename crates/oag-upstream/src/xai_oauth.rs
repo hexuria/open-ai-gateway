@@ -217,7 +217,23 @@ pub async fn refresh(
             .refresh_token
             .or_else(|| credential.refresh_token.clone()),
         // True expiry, no skew: `ensure_fresh` already refreshes ahead of it.
-        expires_at: token.expires_in.map(|s| now + s),
+        //
+        // Falling back to the expiry we already held is not cosmetic. A
+        // response that omits `expires_in` would otherwise overwrite a known
+        // expiry with `None`, and `SecretMaterial::expires_within` reads `None`
+        // as "never expires" — so the seat is never refreshed again, and is
+        // benched for good the moment the access token dies. The Codex adapter
+        // has always done this (`openai_oauth.rs`); the omission here was the
+        // divergence, not the house style.
+        //
+        // What the fallback does NOT do is repair the expiry. A refresh only
+        // ever runs because the held expiry is already due, so if the endpoint
+        // keeps omitting `expires_in` the credential stays due and re-refreshes
+        // on every request — two round trips and the fleet lock each time —
+        // until a response finally carries the field. The seat keeps working
+        // throughout, which is the trade: bounded churn on a provider that
+        // withholds the claim, in place of a permanent bench.
+        expires_at: token.expires_in.map(|s| now + s).or(credential.expires_at),
         // The caller owns the version bump; see `refresh_locked`.
         version: credential.version,
         client_id: credential.client_id.clone(),
@@ -437,7 +453,43 @@ mod tests {
             .expect("refresh ok")
             .expect("refreshable");
         assert_eq!(fresh.refresh_token.as_deref(), Some("old-refresh"));
-        assert_eq!(fresh.expires_at, None, "no claim means unknown, not zero");
+    }
+
+    #[tokio::test]
+    async fn a_response_without_expires_in_keeps_the_expiry_we_already_had() {
+        // This assertion used to read `expires_at == None`, on the reasoning
+        // that "no claim means unknown, not zero". The reasoning is right and
+        // the conclusion was backwards: nothing downstream can represent
+        // "unknown". `expires_within` treats `None` as never-expiring, so
+        // writing it here retires the credential permanently — `ensure_fresh`
+        // returns early for good, and the seat sits in a 10-minute cooldown
+        // that repeats forever with no path back.
+        //
+        // Keeping the prior expiry does not repair it: a credential that was
+        // due before the refresh is still due after, and will refresh again on
+        // the next request until a response carries `expires_in`. That churn
+        // is the accepted cost; what this pins is that the value is *kept*,
+        // not replaced with a permanently-past sentinel or with `None`.
+        //
+        // A future expiry in the fixture, deliberately. The shared
+        // `oauth_material()` holds `Some(0)`, and asserting against that could
+        // not tell "kept the known expiry" from "wrote a due-forever value".
+        let known = time::OffsetDateTime::now_utc().unix_timestamp() + 7_200;
+        // Field assignment rather than struct-update syntax: `SecretMaterial`
+        // zeroizes on drop, so it cannot be moved out of piecewise.
+        let mut held = oauth_material();
+        held.expires_at = Some(known);
+        let (base, _) = mock_oidc(200, r#"{"access_token":"new-access"}"#).await;
+
+        let fresh = refresh(&held, &base)
+            .await
+            .expect("refresh ok")
+            .expect("refreshable");
+        assert_eq!(
+            fresh.expires_at,
+            Some(known),
+            "an omitted expires_in must not erase a known expiry"
+        );
     }
 
     #[tokio::test]
