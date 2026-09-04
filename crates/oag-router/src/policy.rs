@@ -461,13 +461,21 @@ impl RoutingPolicy {
         signal: &RequestSignal,
         catalog: &Catalog,
         max_output_tokens: u32,
+        served: &std::collections::HashSet<String>,
     ) -> Option<RoutingDecision> {
         let next = self.ladder.escalate(from)?;
         let need = signal.requirements(max_output_tokens);
-        let ceiling_model = self
-            .ladder
-            .pick(&self.ladder.ceiling(), catalog, &need)
-            .cloned();
+        // The same baseline `decide` computes, for the same reason it gives
+        // fifteen lines to: the dearest model the credentials actually serve,
+        // with the ladder's top rung only as the fallback. This sibling used
+        // the ladder alone, so every escalated row's counterfactual was
+        // priced against a different baseline from the row before it — and
+        // on a short ladder, against the very model that had just served.
+        let ceiling_model = catalog.dearest_served(served, &need).cloned().or_else(|| {
+            self.ladder
+                .pick(&self.ladder.ceiling(), catalog, &need)
+                .cloned()
+        });
         self.resolve_from(
             next,
             SelectionReason::Escalated {
@@ -1005,6 +1013,7 @@ mod tests {
                 &RequestSignal::default(),
                 &catalog(),
                 1024,
+                &HashSet::new(),
             )
             .expect("escalates");
         assert_eq!(
@@ -1039,6 +1048,7 @@ mod tests {
                 },
                 &catalog(),
                 1024,
+                &HashSet::new(),
             )
             .expect("escalates");
         assert!(
@@ -1056,6 +1066,47 @@ mod tests {
     }
 
     #[test]
+    fn an_escalated_decision_prices_its_counterfactual_against_the_served_set() {
+        // `decide` learned to take the baseline from what the credentials
+        // serve; `escalate`, ten lines away, kept using the ladder's top rung.
+        // On a short ladder that made the escalated row's baseline the model
+        // that had just served, and `SUM(counterfactual - cost)` stopped
+        // meaning "versus your best model" for exactly the rows where the
+        // gateway had spent the most.
+        let p = policy();
+        let cheap = p.ladder().floor();
+        let catalog = catalog();
+        // Every model the catalogue knows is served, so the dearest served
+        // model — not the ladder's top — must be the baseline.
+        let served: HashSet<String> = catalog.iter().map(|m| m.upstream_name.clone()).collect();
+        let dearest = catalog
+            .dearest_served(&served, &RequestSignal::default().requirements(1024))
+            .expect("something is served")
+            .id
+            .clone();
+
+        let d = p
+            .escalate(
+                &cheap,
+                QualityGate::MalformedToolCall,
+                &RequestSignal::default(),
+                &catalog,
+                1024,
+                &served,
+            )
+            .expect("escalates");
+        let ceiling = d.ceiling_model.as_ref().expect("ceiling exists").id.clone();
+        assert_eq!(
+            ceiling, dearest,
+            "escalation and the first decision must agree on the baseline"
+        );
+        assert_ne!(
+            ceiling, d.model.id,
+            "the baseline is not the model that just served"
+        );
+    }
+
+    #[test]
     fn escalation_terminates_at_the_ceiling() {
         let p = policy();
         let top = p.ladder().ceiling();
@@ -1065,7 +1116,8 @@ mod tests {
                 QualityGate::Refusal,
                 &RequestSignal::default(),
                 &catalog(),
-                1024
+                1024,
+                &HashSet::new(),
             )
             .is_none(),
             "unbounded escalation would turn one bad answer into unbounded spend"

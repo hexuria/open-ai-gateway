@@ -317,6 +317,7 @@ async fn run_with_escalation(
         catalog,
         pressure,
         channel,
+        served,
     } = plan;
     let mut escalations = 0u8;
     // The gate that *caused* an escalation, not the last one observed. Recording
@@ -387,7 +388,8 @@ async fn run_with_escalation(
                 decision.model.max_output_tokens,
             )
             && let Some(from) = decision.tier.as_ref()
-            && let Some(next) = policy.escalate(from, gate, &signal, &catalog, canonical.max_tokens)
+            && let Some(next) =
+                policy.escalate(from, gate, &signal, &catalog, canonical.max_tokens, &served)
         {
             tracing::info!(
                 %request_id, from = ?decision.rung_name(), to = ?next.rung_name(), ?gate,
@@ -534,6 +536,10 @@ struct Plan {
     /// argument through the same two frames would be the same coupling written
     /// less visibly.
     channel: Option<oag_core::credential::CredentialKind>,
+    /// What the route's credentials serve, for the savings baseline. Read
+    /// once for `decide` and carried so `escalate` prices its row against the
+    /// same baseline rather than the ladder's top rung.
+    served: HashSet<String>,
 }
 
 /// Load the caller's route and build the policy it implies.
@@ -761,6 +767,7 @@ async fn plan_request(
         catalog,
         pressure: budget.pressure(),
         channel,
+        served,
     })
 }
 
