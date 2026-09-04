@@ -235,26 +235,7 @@ pub async fn lease(
         .collect();
 
     while !remaining.is_empty() {
-        let mut candidates = Vec::with_capacity(remaining.len());
-        for row in &remaining {
-            // Skip credentials this replica has watched fail repeatedly.
-            //
-            // This has to happen *before* the cascade, not inside it: a broken
-            // credential fails fast, so it always has the lowest in-flight
-            // count, so the least-loaded stage actively prefers it. Filtering
-            // afterwards would be too late.
-            //
-            // A read, deliberately. We are asking about every candidate and
-            // will send to one; spending a half-open probe here would spend it
-            // on credentials this request never touches. The probe is claimed
-            // where the request is dispatched.
-            if !state.breakers.permits(row.account_id(), now) {
-                continue;
-            }
-            if let Some(c) = candidate_for(state, row, now).await {
-                candidates.push(c);
-            }
-        }
+        let candidates = candidates_for(state, &remaining, now).await;
 
         // Random per attempt: without it every replica reading the same
         // snapshot at the same instant picks the same credential and stampedes.
@@ -460,6 +441,51 @@ fn reserve_holding_back(rows: &[AccountRow]) -> Option<i16> {
         return None;
     }
     rows.iter().filter_map(|r| r.usage_reserve_pct).max()
+}
+
+/// Everything local first, then one round trip for whoever survives.
+///
+/// The breaker filter has to happen *before* the cascade, not inside it: a
+/// broken credential fails fast, so it always has the lowest in-flight count,
+/// so the least-loaded stage actively prefers it. Filtering afterwards would
+/// be too late. A read, deliberately — we are asking about every candidate
+/// and will send to one; spending a half-open probe here would spend it on
+/// credentials this request never touches. The probe is claimed where the
+/// request is dispatched.
+///
+/// The row-local eligibility check (schedulable, cooling, rate-limited,
+/// reserved) is on the same struct and costs nothing, so it goes ahead of the
+/// Redis count too. Before, one `ZCARD` per row was awaited in sequence and
+/// then most of the answers were discarded by a predicate the row could have
+/// answered itself.
+async fn candidates_for(state: &AppState, remaining: &[&AccountRow], now: i64) -> Vec<Candidate> {
+    let probe: Vec<&AccountRow> = remaining
+        .iter()
+        .copied()
+        .filter(|r| state.breakers.permits(r.account_id(), now))
+        .filter(|r| r.to_candidate(0, 0).is_some_and(|c| is_eligible(&c, now)))
+        .collect();
+    let ids: Vec<AccountId> = probe.iter().map(|r| r.account_id()).collect();
+    let counts = match state.cache.slots_in_use_many(&ids, SLOT_TTL).await {
+        Ok(counts) if counts.len() == ids.len() => counts,
+        Ok(_) => {
+            slot_accounting_degraded("count", &Error::Internal("short pipeline reply".to_owned()));
+            vec![0; ids.len()]
+        }
+        Err(e) => {
+            slot_accounting_degraded("count", &e);
+            vec![0; ids.len()]
+        }
+    };
+    let mut candidates = Vec::with_capacity(probe.len());
+    for (row, in_flight) in probe.iter().zip(counts) {
+        metrics::gauge!("oag_slots_in_use", "account" => row.name.clone())
+            .set(f64::from(in_flight));
+        if let Some(c) = row.to_candidate(in_flight, 0) {
+            candidates.push(c);
+        }
+    }
+    candidates
 }
 
 /// How many candidates there were, when nothing was selectable because every

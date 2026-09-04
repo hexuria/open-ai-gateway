@@ -108,6 +108,16 @@ redis.call('EXPIRE', key, math.ceil(burst / rate) + 1)
 return tostring(wait)
 ";
 
+/// The scripts, prepared once. `redis::Script::new` copies the source and
+/// hashes it for `EVALSHA`; doing that per call was a SHA-1 over a few hundred
+/// bytes on every slot acquire, every count and every rate token.
+static ACQUIRE_SLOT_SCRIPT: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(ACQUIRE_SLOT));
+static SLOTS_IN_USE_SCRIPT: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(SLOTS_IN_USE));
+static TAKE_TOKEN_SCRIPT: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(TAKE_TOKEN));
+
 /// Redis, for cross-replica coordination.
 ///
 /// Connects lazily. A gateway that refuses to boot because Redis is not up yet
@@ -177,7 +187,7 @@ impl Cache {
         ttl: Duration,
     ) -> Result<bool> {
         let mut conn = self.conn().await?;
-        let taken: i64 = redis::Script::new(ACQUIRE_SLOT)
+        let taken: i64 = ACQUIRE_SLOT_SCRIPT
             .key(slot_key(account))
             .arg(request)
             .arg(limit)
@@ -212,7 +222,7 @@ impl Cache {
                 return Ok(None);
             }
         };
-        let wait: String = match redis::Script::new(TAKE_TOKEN)
+        let wait: String = match TAKE_TOKEN_SCRIPT
             .key(format!("oag:rate:{route}"))
             .arg(rate)
             .arg(burst)
@@ -252,7 +262,7 @@ impl Cache {
     /// the TTL. Seventy minutes of a healthy credential reporting itself busy.
     pub async fn slots_in_use(&self, account: AccountId, ttl: Duration) -> Result<u32> {
         let mut conn = self.conn().await?;
-        let n: u32 = redis::Script::new(SLOTS_IN_USE)
+        let n: u32 = SLOTS_IN_USE_SCRIPT
             .key(slot_key(account))
             .arg(ttl.as_secs())
             .invoke_async(&mut conn)
@@ -261,20 +271,46 @@ impl Cache {
         Ok(n)
     }
 
+    /// `slots_in_use` for several credentials in one round trip, in order.
+    ///
+    /// Selection asks about every candidate before choosing one. Asked one at
+    /// a time that was a sequential Redis round trip per credential per
+    /// attempt — and re-run per failover and per lost race, so a pool of
+    /// twenty credentials in a failover storm was hundreds of serial round
+    /// trips on one request. One pipeline, one round trip, however many.
+    pub async fn slots_in_use_many(
+        &self,
+        accounts: &[AccountId],
+        ttl: Duration,
+    ) -> Result<Vec<u32>> {
+        if accounts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn().await?;
+        let mut pipe = redis::pipe();
+        for account in accounts {
+            pipe.invoke_script(
+                SLOTS_IN_USE_SCRIPT
+                    .key(slot_key(*account))
+                    .arg(ttl.as_secs()),
+            );
+        }
+        pipe.query_async::<Vec<u32>>(&mut conn)
+            .await
+            .map_err(|e| Error::Internal(format!("counting slots: {e}")))
+    }
+
     /// Which credential a session is pinned to, refreshing the pin's lifetime.
     pub async fn sticky_get(&self, key: &str, ttl: Duration) -> Result<Option<AccountId>> {
         let mut conn = self.conn().await?;
+        // Refresh on read: an active conversation should keep its pin, and an
+        // abandoned one should let go of it. `GETEX` does both in one round
+        // trip; this was a GET and an EXPIRE, on every request with a pin.
         let raw: Option<String> = conn
-            .get(key)
+            .get_ex(key, redis::Expiry::EX(ttl.as_secs()))
             .await
             .map_err(|e| Error::Internal(format!("reading sticky pin: {e}")))?;
         let Some(raw) = raw else { return Ok(None) };
-        // Refresh on read: an active conversation should keep its pin, and an
-        // abandoned one should let go of it.
-        let _: bool = conn
-            .expire(key, i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX))
-            .await
-            .map_err(|e| Error::Internal(format!("refreshing sticky pin: {e}")))?;
         Ok(uuid::Uuid::parse_str(&raw).ok().map(AccountId::from_uuid))
     }
 
