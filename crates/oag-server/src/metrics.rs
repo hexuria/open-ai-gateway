@@ -46,6 +46,12 @@ pub fn describe() {
         "Requests moved to a different credential after an upstream failure."
     );
     describe_counter!(
+        "oag_slot_accounting_degraded_total",
+        "Requests admitted without a concurrency-slot answer from Redis, by \
+         operation. Non-zero means selection is running open: credentials can \
+         be oversubscribed until Redis returns. Alert on it."
+    );
+    describe_counter!(
         "oag_tokens_total",
         "Tokens by kind: input, output, cache read, cache write."
     );

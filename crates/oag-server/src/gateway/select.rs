@@ -272,12 +272,22 @@ pub async fn lease(
         };
 
         let limit = u32::try_from(row.max_concurrency).unwrap_or(0);
-        if state
+        let acquired = match state
             .cache
             .acquire_slot(selection.account, request_id, limit, SLOT_TTL)
             .await
-            .unwrap_or(false)
         {
+            Ok(acquired) => acquired,
+            // Fail OPEN. `unwrap_or(false)` here turned a Redis outage into
+            // "lost the race" for every candidate in turn, and the request
+            // into `AtCapacity` — a full product outage reported as a sizing
+            // problem. Admit, and count the admission.
+            Err(e) => {
+                slot_accounting_degraded("acquire", &e);
+                true
+            }
+        };
+        if acquired {
             let _ = state
                 .cache
                 .sticky_set(&sticky_key, selection.account, STICKY_TTL)
@@ -346,7 +356,7 @@ async fn try_pinned(
     if !is_eligible(&candidate, now) || !state.breakers.permits(pinned, now) {
         return None;
     }
-    let acquired = state
+    let acquired = match state
         .cache
         .acquire_slot(
             candidate.account,
@@ -355,7 +365,15 @@ async fn try_pinned(
             SLOT_TTL,
         )
         .await
-        .unwrap_or(false);
+    {
+        Ok(acquired) => acquired,
+        // Same policy as the cascade: an unanswerable Redis admits. The pin
+        // was the right credential a moment ago; a blink does not change that.
+        Err(e) => {
+            slot_accounting_degraded("acquire", &e);
+            true
+        }
+    };
 
     if acquired {
         metrics::counter!("oag_selection_total", "stage" => "sticky").increment(1);
@@ -370,12 +388,33 @@ async fn candidate_for(state: &AppState, row: &AccountRow, _now: i64) -> Option<
     // counting when it would have been swept — rather than until the key
     // itself expires, twice the TTL later, with the credential reading as
     // full the whole time and nothing acquiring on it to sweep it.
-    let in_flight = state
-        .cache
-        .slots_in_use(row.account_id(), SLOT_TTL)
-        .await
-        .unwrap_or(0);
+    let in_flight = match state.cache.slots_in_use(row.account_id(), SLOT_TTL).await {
+        Ok(n) => n,
+        // The count is what the scheduler ranks by; without it every candidate
+        // ranks as idle, which is the right degraded answer. Say so, rather
+        // than pass it off as an idle credential.
+        Err(e) => {
+            slot_accounting_degraded("count", &e);
+            0
+        }
+    };
     row.to_candidate(in_flight, 0)
+}
+
+/// Redis could not answer a slot question.
+///
+/// Counted and logged rather than folded into `false`/`0`, which is what it
+/// used to be: an unreachable Redis read as "lost the race for the last slot"
+/// on every candidate, every candidate was dropped, and the request failed
+/// `AtCapacity` — sending the operator to raise `max_concurrency` on a pool
+/// with nothing in flight. Selection now admits the request instead and
+/// counts the admission, because the rate limiter beside it has always failed
+/// open for the same reason: coordination is a courtesy, and refusing all
+/// traffic because the coordination store blinked trades a real outage for a
+/// theoretical oversubscription.
+fn slot_accounting_degraded(op: &'static str, e: &Error) {
+    metrics::counter!("oag_slot_accounting_degraded_total", "op" => op).increment(1);
+    tracing::warn!(error = %e, op, "slot accounting unavailable; admitting without it");
 }
 
 fn is_eligible(c: &Candidate, now: i64) -> bool {
@@ -530,6 +569,52 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{CountingSlots, lease as test_lease};
     use super::*;
+
+    /// A state whose Redis is a port nothing listens on: every slot question
+    /// fails at connect, immediately. `Db::connect` is lazy and never dialled.
+    fn dead_redis_state() -> Arc<AppState> {
+        let src = r#"
+database:
+  url: "postgres://oag:oag@127.0.0.1:1/oag"
+redis:
+  url: "redis://127.0.0.1:1"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+"#;
+        let config = oag_core::config::Config::from_yaml(src).expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        Arc::new(AppState::new(config, db, cache).expect("state"))
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_redis_reads_as_idle_not_as_full() {
+        // THE OUTAGE. `slots_in_use(..).unwrap_or(0)` was already the right
+        // degraded answer for the *count*; the acquire beside it read
+        // `unwrap_or(false)` — "lost the race" — and every candidate lost, so
+        // every request failed `AtCapacity` while Redis was down. The count
+        // path is the half this harness can reach without Postgres: a dead
+        // Redis must yield a candidate, ranked idle, and not an error.
+        let state = dead_redis_state();
+        let row = super::testing::account("seat", "api_key");
+
+        let candidate = candidate_for(&state, &row, 0)
+            .await
+            .expect("a candidate, not a refusal");
+        assert_eq!(candidate.in_flight, 0, "unknown is idle, not full");
+        assert!(is_eligible(&candidate, 0));
+
+        // And the acquire reports the failure as an error the caller can
+        // choose to admit on — not as `false`, which is what turned a Redis
+        // blink into a refusal of every credential in turn.
+        let err = state
+            .cache
+            .acquire_slot(row.account_id(), "req", 1, SLOT_TTL)
+            .await
+            .expect_err("a dead Redis is an error, not a lost race");
+        assert!(err.to_string().contains("redis"), "{err}");
+    }
 
     #[tokio::test]
     async fn a_dropped_lease_hands_its_slot_back() {
