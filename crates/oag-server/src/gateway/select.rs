@@ -366,9 +366,13 @@ async fn try_pinned(
 }
 
 async fn candidate_for(state: &AppState, row: &AccountRow, _now: i64) -> Option<Candidate> {
+    // Counted by the same expiry the acquire trims by, so a leaked slot stops
+    // counting when it would have been swept — rather than until the key
+    // itself expires, twice the TTL later, with the credential reading as
+    // full the whole time and nothing acquiring on it to sweep it.
     let in_flight = state
         .cache
-        .slots_in_use(row.account_id())
+        .slots_in_use(row.account_id(), SLOT_TTL)
         .await
         .unwrap_or(0);
     row.to_candidate(in_flight, 0)
