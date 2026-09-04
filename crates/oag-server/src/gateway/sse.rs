@@ -155,6 +155,7 @@ pub async fn pump(
     tx: mpsc::Sender<Chunk>,
     idle_timeout: Duration,
     max_duration: Duration,
+    client_write_timeout: Duration,
     egress: Egress,
 ) -> StreamOutcome {
     let started = Instant::now();
@@ -218,15 +219,36 @@ pub async fn pump(
         };
 
         if !outbound.is_empty() && !client_gone {
-            if tx.send(Ok(outbound)).await.is_ok() {
-                acc.mark_committed();
-            } else {
-                // Receiver dropped: the client hung up. Keep going — the
-                // provider is generating (and billing for) these tokens either
-                // way, and stopping here would make every cancelled request
-                // free in our ledger and paid on the invoice.
-                client_gone = true;
-                tracing::debug!("client disconnected; draining upstream for accounting");
+            // The channel is bounded, which bounds memory and not time: a
+            // client that stops reading fills it and the send parks here —
+            // past the idle watchdog, which measures the upstream, and past
+            // the ceiling, which is checked at the top of a loop a parked
+            // task never returns to. So the send gets its own deadline, and
+            // a client that has read nothing for that long is treated as one
+            // that hung up. Either way we keep going — the provider is
+            // generating (and billing for) these tokens regardless, and
+            // stopping here would make every abandoned request free in our
+            // ledger and paid on the invoice.
+            match tokio::time::timeout(client_write_timeout, tx.send(Ok(outbound))).await {
+                Ok(Ok(())) => acc.mark_committed(),
+                Ok(Err(_)) => {
+                    client_gone = true;
+                    tracing::debug!("client disconnected; draining upstream for accounting");
+                }
+                Err(_) => {
+                    client_gone = true;
+                    tracing::debug!(
+                        timeout_s = client_write_timeout.as_secs(),
+                        "client stopped reading; draining upstream for accounting"
+                    );
+                }
+            }
+            // The send may have been the long part. Hold the ceiling on this
+            // side of the await too, or a slow reader stretches a stream past
+            // it one chunk at a time.
+            if started.elapsed() >= max_duration {
+                error = Some(format!("stream exceeded {}s", max_duration.as_secs()));
+                break;
             }
         }
 
@@ -281,7 +303,10 @@ pub async fn pump(
         && let Some(message) = &error
         && let Some(frame) = error_frame(&egress, &mut render, message)
     {
-        let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
+        // Bounded like every other send: a client that stopped reading must
+        // not hold the task on its own error frame either.
+        let _ = tokio::time::timeout(client_write_timeout, tx.send(Ok(bytes::Bytes::from(frame))))
+            .await;
     }
 
     // A translated stream has to synthesise the sentinel the client's dialect
@@ -294,9 +319,11 @@ pub async fn pump(
     // a terminal event however the connection then behaved, and is false before
     // one however tidily the upstream hung up.
     if !client_gone && complete && matches!(egress, Egress::ChatCompletions { .. }) {
-        let _ = tx
-            .send(Ok(bytes::Bytes::from(oag_proto::openai::done_frame())))
-            .await;
+        let _ = tokio::time::timeout(
+            client_write_timeout,
+            tx.send(Ok(bytes::Bytes::from(oag_proto::openai::done_frame()))),
+        )
+        .await;
     }
     // Anthropic needs no sentinel: its stream ends with message_stop, which the
     // renderer already emitted.
@@ -675,6 +702,62 @@ mod tests {
     // ── how a stream ends ────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn a_client_that_stops_reading_does_not_park_the_pump() {
+        // A receiver that is alive but never polls. With a channel of one and
+        // several chunks to send, the second send would have blocked for as
+        // long as the client kept the connection open — past every watchdog,
+        // holding the lease, the socket and the shutdown guard. Now it waits
+        // the write deadline, gives the client up, and drains the upstream
+        // so the usage still reaches the ledger.
+        let (tx, _rx_never_read) = mpsc::channel(1);
+        let frames = vec![
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"one "}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"two "}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"three"}}"#,
+            ),
+            sse(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+            ),
+        ];
+        let started = std::time::Instant::now();
+        let outcome = pump(
+            streamed(frames),
+            anthropic(),
+            tx,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+            Egress::AnthropicMessages {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(outcome.client_gone, "a reader that never reads is gone");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "returned in {:?}: bounded by the write deadline, not the client",
+            started.elapsed()
+        );
+        assert_eq!(
+            outcome.accumulator.usage().output_tokens,
+            3,
+            "the upstream was drained to the end for accounting"
+        );
+        assert!(
+            outcome.error.is_none(),
+            "the upstream itself was fine: {:?}",
+            outcome.error
+        );
+    }
+
+    #[tokio::test]
     async fn idle_timeout_emits_dialect_error_not_done() {
         // The bug: an abnormal exit was a bare `break`, so it fell through to
         // the unconditional `[DONE]`. A stream that died mid-answer told the
@@ -689,6 +772,7 @@ mod tests {
             tx,
             Duration::from_millis(50),
             Duration::from_secs(30),
+            Duration::from_secs(5),
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -729,6 +813,7 @@ mod tests {
             tx,
             Duration::from_secs(5),
             Duration::from_secs(30),
+            Duration::from_secs(5),
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -765,6 +850,7 @@ mod tests {
             tx,
             Duration::from_secs(5),
             Duration::from_secs(30),
+            Duration::from_secs(5),
             Egress::AnthropicMessages {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -796,6 +882,7 @@ mod tests {
             tx,
             Duration::from_secs(5),
             Duration::from_secs(30),
+            Duration::from_secs(5),
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -831,6 +918,7 @@ mod tests {
             tx,
             Duration::from_secs(5),
             Duration::from_secs(30),
+            Duration::from_secs(5),
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -855,6 +943,7 @@ mod tests {
             tx,
             Duration::from_millis(50),
             Duration::from_secs(30),
+            Duration::from_secs(5),
             Egress::Passthrough {
                 dialect: Dialect::AnthropicMessages,
                 request_id: "r1".to_owned(),
@@ -886,6 +975,7 @@ mod tests {
             tx,
             // Long enough that neither watchdog can be what stops this: the cap
             // trips within milliseconds of the bytes arriving.
+            Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
             Egress::ChatCompletions {

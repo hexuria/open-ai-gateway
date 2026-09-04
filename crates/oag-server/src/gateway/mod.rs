@@ -1295,6 +1295,7 @@ fn stream_response(
 
     let idle = state.config.gateway.stream_idle_timeout;
     let max = state.config.gateway.max_stream_duration;
+    let write = state.config.gateway.client_write_timeout;
 
     // A streamed response is delivered as it arrives, so it is never abandoned
     // and never retried: there is only ever one attempt.
@@ -1312,7 +1313,7 @@ fn stream_response(
         // is what keeps the credential's slot held for exactly as long as it is
         // really in use.
         let _guard = guard;
-        let outcome = sse::pump(response, adapter, tx, idle, max, egress).await;
+        let outcome = sse::pump(response, adapter, tx, idle, max, write, egress).await;
         lease.release().await;
         meter::record(&state2, &ctx, &outcome).await;
     });

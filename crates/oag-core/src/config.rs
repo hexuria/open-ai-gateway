@@ -214,6 +214,21 @@ pub struct GatewayConfig {
     /// silence, not a latency target.
     #[serde(with = "humantime_secs")]
     pub upstream_response_timeout: Duration,
+    /// How long a client may go without reading its stream before the pump
+    /// stops waiting for it.
+    ///
+    /// The stream is pushed through a bounded channel the client's response
+    /// body drains. That bound is a memory bound, not a time bound: a client
+    /// that stops reading fills it, and the send then parks the pump task —
+    /// past `stream_idle_timeout`, which measures the upstream, and past
+    /// `max_stream_duration`, which is only checked at the top of a loop the
+    /// parked task never reaches. The task held the credential's slot, the
+    /// upstream socket and the shutdown guard for as long as the client cared
+    /// to keep the connection open without reading. A send that waits this
+    /// long is treated exactly like a client that hung up: the pump keeps
+    /// draining the upstream for accounting and stops writing to the client.
+    #[serde(with = "humantime_secs")]
+    pub client_write_timeout: Duration,
     /// Attempts against one credential before failing over to another.
     pub same_account_retries: u8,
     /// Credentials to try before giving up on the request.
@@ -312,6 +327,11 @@ impl Default for GatewayConfig {
             // failing those over is worse than waiting. What this bounds is a
             // provider that will never answer.
             upstream_response_timeout: Duration::from_secs(90),
+            // A client that has not read a single chunk in a minute is not
+            // slow, it is gone. Long enough that a paused consumer behind a
+            // busy proxy is not cut off; short enough that an abandoned
+            // connection does not hold a slot for the stream's full ceiling.
+            client_write_timeout: Duration::from_mins(1),
             same_account_retries: 2,
             max_account_switches: 3,
             // Generous: it is a backstop against an unbounded wait, not a
@@ -423,6 +443,11 @@ impl Config {
         if self.gateway.upstream_response_timeout.is_zero() {
             return Err(crate::Error::Config(
                 "gateway.upstream_response_timeout must be positive".to_owned(),
+            ));
+        }
+        if self.gateway.client_write_timeout.is_zero() {
+            return Err(crate::Error::Config(
+                "gateway.client_write_timeout must be positive".to_owned(),
             ));
         }
         Ok(())
@@ -541,6 +566,20 @@ security:
             err.to_string().contains("upstream_response_timeout"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn the_client_write_deadline_defaults_on_and_cannot_be_zero() {
+        // The other half of the same gap, on the client side: a send into the
+        // bounded channel had no deadline, so a client that stopped reading
+        // parked the pump for as long as it kept the connection open.
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(!cfg.gateway.client_write_timeout.is_zero());
+        assert!(cfg.gateway.client_write_timeout < cfg.gateway.max_stream_duration);
+
+        let zero = format!("{MINIMAL}\ngateway:\n  client_write_timeout: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("zero is refused");
+        assert!(err.to_string().contains("client_write_timeout"), "{err}");
     }
 
     #[test]
