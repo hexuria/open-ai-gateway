@@ -124,7 +124,10 @@ impl AppState {
                 cache.clone(),
                 10_000,
                 &config.security.signing_secret,
-                // Half the pool for lookups, half for the requests that pass.
+                // Twice the pool. A lookup is a primary-key probe that holds a
+                // connection for a millisecond, so this bounds the queue at
+                // the pool to one lookup per connection rather than reserving
+                // connections for them; past that, a miss sheds.
                 usize::try_from(config.database.max_connections).unwrap_or(16) * 2,
             ),
             transports: TransportPool::new(
