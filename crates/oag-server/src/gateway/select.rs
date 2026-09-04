@@ -406,6 +406,10 @@ async fn candidate_for(state: &AppState, row: &AccountRow, _now: i64) -> Option<
             0
         }
     };
+    // The gauge `metrics::describe` has declared since the beginning and
+    // nothing ever set. Set here, from the number the scheduler is about to
+    // rank by, because this is the one place the answer is already in hand.
+    metrics::gauge!("oag_slots_in_use", "account" => row.name.clone()).set(f64::from(in_flight));
     row.to_candidate(in_flight, 0)
 }
 
