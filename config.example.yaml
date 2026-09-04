@@ -38,8 +38,9 @@ redis:
   url: "redis://localhost:6379"
 
 security:
-  # BOTH REQUIRED. The gateway refuses to start without them, and refuses
-  # anything that looks like a placeholder.
+  # BOTH REQUIRED. The gateway refuses to start without them. The signing
+  # secret is refused when it looks like a placeholder; the KEK is refused
+  # unless it decodes to exactly 32 bytes, which is the only check it gets.
   #
   # They must be byte-identical across every replica. sub2api generates its
   # equivalents per instance when the environment does not supply them, so

@@ -6,7 +6,10 @@
 //! upstream directly from the response body:
 //!
 //! - **Backpressure.** A slow client fills the channel and the reader parks.
-//!   Without the bound, a slow client is an unbounded memory leak.
+//!   Without the bound, a slow client is an unbounded memory leak. The bound
+//!   is on memory, not time: a client that stops reading altogether is given
+//!   up after `Deadlines::client_write`, or the parked reader would hold the
+//!   lease and the upstream socket for as long as the connection stayed open.
 //! - **A slow client cannot stall the upstream read**, so the idle watchdog
 //!   measures the upstream and not the client.
 //! - **A client that disappears does not stop the accounting.** The provider

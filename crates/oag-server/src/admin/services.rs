@@ -257,8 +257,14 @@ async fn probe_and_record(state: &AppState, row: ServiceRow) -> ServiceRow {
 }
 
 /// GET `base_url + health_path`. Refuses link-local and metadata targets
-/// both as literals (already caught by [`health_url`]) and after DNS
+/// both as literals (already caught by [`health_url`]) and after a DNS
 /// resolution, and does not follow redirects.
+///
+/// "A" resolution, not "the": the check resolves the name once and the HTTP
+/// client then resolves it again for the connection, and nothing pins the
+/// second answer to the first. This defeats a misconfigured or careless
+/// target; a resolver that deliberately answers differently on consecutive
+/// lookups is not what it defends against.
 pub(crate) async fn probe_health(base_url: &str, health_path: &str) -> Result<(), String> {
     let target = health_url(base_url, health_path).map_err(|e| e.to_string())?;
     deny_resolved_target(&target).await?;

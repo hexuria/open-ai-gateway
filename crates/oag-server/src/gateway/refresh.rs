@@ -48,7 +48,11 @@ pub async fn ensure_fresh(state: &AppState, row: &AccountRow) -> Result<SecretMa
     let adapter = state.adapter(row.provider.parse()?)?;
 
     // 1. Process-local gate. Cheap, and it means one replica makes at most one
-    //    attempt at the distributed lock however many requests are waiting.
+    //    attempt at the distributed lock per SUCCESSFUL refresh, however many
+    //    requests are waiting: each waiter re-reads on entry and steps aside if
+    //    someone got there first. A refresh that failed is not persisted, so
+    //    after one the next waiter finds the credential still due and tries
+    //    again — serially, not concurrently, but tried.
     let gate = state.refresh_gate(account);
     let _local = gate.lock().await;
 

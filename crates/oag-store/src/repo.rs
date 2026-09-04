@@ -1099,9 +1099,12 @@ pub async fn schedulable_oauth_accounts(db: &Db) -> Result<Vec<AccountRow>> {
 }
 
 /// Store a usage-poll reading: the remaining-quota columns, and the window
-/// reset the scheduler prefers to drain first. `resets_at` also lands in
-/// `window_resets_at` — the same field the failover path fills from a provider
-/// `Retry-After`, and the poller is just another writer of it.
+/// reset the scheduler prefers to drain first. `resets_at` lands in
+/// `window_resets_at`, which this poller is the only writer of. (The failover
+/// path's `Retry-After` writes `rate_limited_until` — a different column with
+/// a different meaning: one is when a quota window turns over, the other is
+/// when a provider will take requests again.) The value is never cleared once
+/// the moment passes; readers must compare it to now, and the scheduler does.
 pub async fn record_usage_poll(
     db: &Db,
     id: AccountId,

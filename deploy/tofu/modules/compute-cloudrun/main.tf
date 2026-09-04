@@ -124,7 +124,9 @@ resource "google_cloud_run_v2_service" "this" {
       }
 
       # Secrets come from Secret Manager, never from plain env values, so they
-      # are not visible in the service description or in Terraform state.
+      # are not visible in the service description. Whether they are in
+      # Terraform state depends on who created the secret version: this
+      # module only references one.
       dynamic "env" {
         for_each = var.secret_env
         content {

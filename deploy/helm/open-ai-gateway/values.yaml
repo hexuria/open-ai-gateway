@@ -113,8 +113,11 @@ terminationGracePeriodSeconds: 1845
 preStopDelaySeconds: 15
 
 resources:
-  # `server.max_body_bytes` is buffered per in-flight request. At its 32 MiB
-  # default this limit absorbs a burst of large POSTs; raise both together.
+  # `server.max_body_bytes` is buffered per in-flight request, and
+  # `server.max_in_flight` bounds how many are. Their product is what an
+  # all-maximum-size flood could hold — 64 × 32 MiB at the defaults, more than
+  # this limit, which is survivable only because real bodies are kilobytes.
+  # Raise the three together, or lower the ceiling for a large-body workload.
   requests: { cpu: 200m, memory: 256Mi }
   limits:   { memory: 1Gi }
 

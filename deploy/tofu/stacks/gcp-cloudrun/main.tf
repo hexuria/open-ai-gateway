@@ -56,8 +56,11 @@ locals {
   vpc_subnet = var.data_mode == "managed" ? var.vpc_subnet : ""
 }
 
-# Secrets live in Secret Manager, never in the service description and never in
-# Terraform state as plain values.
+# Secrets live in Secret Manager, never in the service description. They ARE in
+# this stack's state: `google_secret_manager_secret_version.secret_data` holds
+# the value (marked sensitive, which hides it from plans, not from the state
+# file). Protect the state backend accordingly, or create the versions out of
+# band and pass their names in.
 resource "google_secret_manager_secret" "this" {
   for_each  = toset(["database-url", "redis-url", "signing-secret", "credential-kek"])
   secret_id = "${var.name}-${each.key}"

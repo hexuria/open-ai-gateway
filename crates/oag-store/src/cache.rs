@@ -520,7 +520,10 @@ fn slot_key(account: AccountId) -> String {
 //
 // Slots here expire by TTL and nothing else. A replica that dies leaves its
 // slots behind for at most one TTL, which is a bounded and self-healing error;
-// evicting by process identity is neither.
+// evicting by process identity is neither. "At most one TTL" holds because
+// `slots_in_use` counts by the same expiry the acquire trims by — before it
+// did, a leaked slot stood in the count until the key's own EXPIRE at twice
+// the TTL, and nothing acquiring on a "full" credential ever ran the trim.
 
 /// Requests-per-minute expressed as a continuous refill rate and a bucket size.
 ///
