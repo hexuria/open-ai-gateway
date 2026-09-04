@@ -48,6 +48,13 @@ jobs:
           helm version --short
           kubectl version --client -o yaml | head -3
 
+      # A one-second render check ahead of the ten-minute cluster job. The kind
+      # step below installs the chart in `inCluster` mode only, which is how an
+      # init container that rendered an empty host in the *default* mode shipped
+      # without anything noticing. This renders every mode, no cluster needed.
+      - name: the chart renders in every data mode
+        run: ./deploy/test/helm-render-verify.sh
+
       - name: rolling restart severs no stream
         env:
           # Fewer, shorter streams than the local default: enough to land a

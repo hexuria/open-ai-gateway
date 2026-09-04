@@ -23,11 +23,23 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: {{ .Values.securityContext.runAsUser }}
+      {{- if eq .Values.data.mode "inCluster" }}
       initContainers:
         # `oag migrate` fails fast on an unreachable database, which is correct
         # for a one-shot command and wrong for the first install: the Postgres
         # StatefulSet is still starting. Wait here instead of burning the Job's
         # backoff budget on it.
+        #
+        # Only in `inCluster` mode, because only there is there a StatefulSet to
+        # wait for. External mode points at a service the chart does not start,
+        # so there is nothing to wait on; its host lives in the data Secret
+        # rather than in a chart value, and this template deliberately does not
+        # parse it out (it could not at all under `data.external.existingSecret`).
+        # Rendering `PGHOST` empty instead is what made the chart's own default
+        # mode uninstallable: `nc -z "" 5432` never succeeds, so this container
+        # looped 120 times and exited 1 before the Job ever ran. A genuinely
+        # unreachable external database is the Job's `backoffLimit` to handle,
+        # which is what that budget is for.
         - name: wait-for-postgres
           image: {{ include "oag.image" . }}
           command:
@@ -35,14 +47,14 @@ spec:
             - -c
             - |
               for i in $(seq 1 120); do
-                if oag migrate --help >/dev/null 2>&1; then :; fi
                 nc -z "$PGHOST" 5432 2>/dev/null && exit 0
                 echo "waiting for $PGHOST:5432 ($i)"; sleep 2
               done
               echo "postgres never became reachable"; exit 1
           env:
             - name: PGHOST
-              value: {{ if eq .Values.data.mode "inCluster" }}{{ include "oag.fullname" . }}-postgres{{ else }}""{{ end }}
+              value: {{ include "oag.fullname" . }}-postgres
+      {{- end }}
       containers:
         - name: migrate
           image: {{ include "oag.image" . }}
