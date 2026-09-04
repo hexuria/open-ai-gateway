@@ -1,0 +1,13 @@
+# `cargo audit` reads this. Every ignore here must say why the advisory does
+# not apply, and must be re-checked when the dependency it names moves.
+[advisories]
+ignore = [
+  # rkyv 0.7 (out-of-bounds reads in archives holding Rc/Arc). It is an
+  # optional dependency of rust_decimal that this workspace never enables:
+  # it appears in Cargo.lock because the resolver records optional
+  # dependencies, but `cargo tree --workspace -e all --target all` never
+  # lists it and no rkyv artefact is ever built. The fix is rkyv 0.8, a
+  # different major that rust_decimal 1.x does not take. Re-check when
+  # rust_decimal moves to a version that drops or upgrades it.
+  "RUSTSEC-2026-0235",
+]
