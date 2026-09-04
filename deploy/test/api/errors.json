@@ -1,0 +1,223 @@
+[
+  {
+    "type": "at_capacity",
+    "status": 503,
+    "variant": "AtCapacity",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "at_capacity",
+        "message": "all 3 credentials for openai are at their concurrency limit"
+      }
+    }
+  },
+  {
+    "type": "authentication_error",
+    "status": 401,
+    "variant": "Unauthenticated",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "authentication_error",
+        "message": "authentication failed"
+      }
+    }
+  },
+  {
+    "type": "budget_exhausted",
+    "status": 402,
+    "variant": "BudgetExhausted",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "budget_exhausted",
+        "message": "the quota on this API key is exhausted"
+      }
+    }
+  },
+  {
+    "type": "internal_error",
+    "status": 500,
+    "variant": "Config",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "internal_error",
+        "message": "internal error"
+      }
+    }
+  },
+  {
+    "type": "internal_error",
+    "status": 500,
+    "variant": "Internal",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "internal_error",
+        "message": "internal error"
+      }
+    }
+  },
+  {
+    "type": "internal_error",
+    "status": 500,
+    "variant": "UnknownProvider",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "internal_error",
+        "message": "internal error"
+      }
+    }
+  },
+  {
+    "type": "invalid_model_qualifier",
+    "status": 400,
+    "variant": "ChannelNotOffered",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "invalid_model_qualifier",
+        "message": "anthropic cannot be reached through a subscription credential"
+      }
+    }
+  },
+  {
+    "type": "invalid_model_qualifier",
+    "status": 400,
+    "variant": "UnknownModelChannel",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "invalid_model_qualifier",
+        "message": "unknown model qualifier `@subscription`; use one of @api (API key), @sub (subscription)"
+      }
+    }
+  },
+  {
+    "type": "invalid_request",
+    "status": 400,
+    "variant": "Serde",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "invalid_request",
+        "message": "serialisation: expected ident at line 1 column 2"
+      }
+    }
+  },
+  {
+    "type": "no_credential",
+    "status": 503,
+    "variant": "NoCredential",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "no_credential",
+        "message": "no credential available for provider openai on this route"
+      }
+    }
+  },
+  {
+    "type": "no_credential_of_kind",
+    "status": 503,
+    "variant": "NoCredentialOfKind",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "no_credential_of_kind",
+        "message": "no API key credential for openai on this route"
+      }
+    }
+  },
+  {
+    "type": "no_viable_model",
+    "status": 400,
+    "variant": "NoViableModel",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "no_viable_model",
+        "message": "no model on the ladder satisfies the request"
+      }
+    }
+  },
+  {
+    "type": "not_found",
+    "status": 404,
+    "variant": "UnsupportedAction",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "not_found",
+        "message": "unsupported action: embed"
+      }
+    }
+  },
+  {
+    "type": "quota_reserve_held",
+    "status": 503,
+    "variant": "ReserveHeld",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "quota_reserve_held",
+        "message": "every xai credential is at or below its 20% quota reserve; lower it with `oag admin account set-reserve`, wait for the usage window to reset, or add another credential"
+      }
+    }
+  },
+  {
+    "type": "rate_limit_error",
+    "status": 429,
+    "variant": "RateLimited",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "rate_limit_error",
+        "message": "route rate limit exceeded"
+      }
+    },
+    "retry_after_header": "30"
+  },
+  {
+    "type": "stream_idle",
+    "status": 504,
+    "variant": "StreamIdle",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "stream_idle",
+        "message": "upstream stream stalled after 180s with no data"
+      }
+    }
+  },
+  {
+    "type": "unsupported_field",
+    "status": 400,
+    "variant": "UnsupportedField",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "unsupported_field",
+        "message": "Anthropic Messages cannot express `response_format`, which this request set"
+      }
+    }
+  },
+  {
+    "type": "upstream_error",
+    "status": 400,
+    "variant": "Upstream",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "upstream_error",
+        "message": "upstream openai returned 400",
+        "upstream_status": 400,
+        "upstream": {
+          "detail": "the model is not supported for this account"
+        }
+      }
+    }
+  }
+]

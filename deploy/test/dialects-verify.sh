@@ -41,18 +41,45 @@ just migrate >/dev/null
 pass "postgres, redis, schema"
 
 say "2/5  aimock @$AIMOCK_VERSION"
+# Fetch the package BEFORE the readiness clock starts.
+#
+# `npx --yes` downloads on first use, and every CI runner is a cold cache. A
+# cold fetch of this package was measured at 33s against a readiness budget of
+# 30s — so the wait was timing npm's throughput rather than whether the server
+# came up, and the job failed or passed on how busy the registry was that
+# minute. It had been winning that race until it did not.
+#
+# Pulling the download out front makes the timeout below mean what it says.
+# Failure here is not fatal on its own: if the fetch genuinely cannot happen,
+# the readiness check reports it with the log, which is a better message than a
+# bare non-zero from a prefetch.
+npx --yes --package "@copilotkit/aimock@$AIMOCK_VERSION" llmock --help \
+  >"$WORK/aimock-fetch.log" 2>&1 || true
+
 npx --yes --package "@copilotkit/aimock@$AIMOCK_VERSION" llmock \
   -p "$AIMOCK_PORT" \
   -f "$REPO_ROOT/deploy/test/aimock/fixtures.json" \
   -h 127.0.0.1 \
   >"$WORK/aimock.log" 2>&1 &
 AIMOCK_PID=$!
-for _ in $(seq 1 60); do
+# 60s. Generous on purpose: the download is already done by here, so this is
+# only process start, and a budget that is merely adequate is one that fails on
+# a slow runner for no reason anybody can act on.
+for _ in $(seq 1 120); do
   curl -fsS "http://127.0.0.1:$AIMOCK_PORT/health" >/dev/null 2>&1 && break
   sleep 0.5
 done
-curl -fsS "http://127.0.0.1:$AIMOCK_PORT/health" >/dev/null \
-  || fail "aimock never became ready; see $WORK/aimock.log"
+if ! curl -fsS "http://127.0.0.1:$AIMOCK_PORT/health" >/dev/null; then
+  # Print the log rather than pointing at it. "see $WORK/aimock.log" is fine on
+  # a laptop and useless in CI, where the file is on a runner that no longer
+  # exists by the time anyone reads the failure — which is exactly when you most
+  # need to know whether npx could not fetch the package, the port was taken, or
+  # the fixtures would not parse.
+  printf '\n\033[31m-- aimock.log --\033[0m\n'
+  cat "$WORK/aimock.log" 2>/dev/null || echo "(no log was written at all)"
+  printf '\033[31m-- end --\033[0m\n'
+  fail "aimock never became ready on :$AIMOCK_PORT"
+fi
 pass "aimock on :$AIMOCK_PORT"
 
 say "3/5  catalog, accounts, gateway"

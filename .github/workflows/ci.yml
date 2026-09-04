@@ -19,6 +19,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Cheapest check first: a formatting failure should not wait on a build.
       - run: cargo fmt --all -- --check
+      # The API explorer parses every .hurl file to build its endpoint list, so
+      # listing exercises both the tool and the files — and needs no gateway, no
+      # keys and no network. Without it this is the one part of the repo with no
+      # automated coverage at all, and a broken parser would be found by whoever
+      # next reached for the tool rather than here.
+      - name: the API explorer can read every .hurl file
+        run: ./deploy/test/api/api list > /dev/null
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
