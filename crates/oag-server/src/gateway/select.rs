@@ -260,6 +260,14 @@ pub async fn lease(
         // snapshot at the same instant picks the same credential and stampedes.
         let tie_breaker = fastrand_u64();
         let Some(selection) = oag_pool::select(&candidates, now, tie_breaker) else {
+            if let Some(full) = every_candidate_is_full(&candidates, now) {
+                metrics::counter!("oag_at_capacity_total", "provider" => provider.as_str())
+                    .increment(1);
+                return Err(Error::AtCapacity {
+                    provider,
+                    candidates: full,
+                });
+            }
             return Err(none_left());
         };
 
@@ -448,6 +456,24 @@ fn reserve_holding_back(rows: &[AccountRow]) -> Option<i16> {
         return None;
     }
     rows.iter().filter_map(|r| r.usage_reserve_pct).max()
+}
+
+/// How many candidates there were, when nothing was selectable because every
+/// one of them was eligible and simply full. `None` for any other nothing.
+///
+/// Says WHICH nothing. A pool at its concurrency limit is a wait, not a
+/// configuration problem, and it used to exit selection as `no_credential`
+/// with `oag_at_capacity_total` flat — the same signal as a route with no
+/// credentials at all, pointing the operator at the wrong fix. Only
+/// credentials that were built as candidates are classified: a breaker-skipped
+/// one never reached the list, and `breaker-verify.sh` pins that an open
+/// breaker still answers `no_credential`.
+fn every_candidate_is_full(candidates: &[Candidate], now: i64) -> Option<usize> {
+    let full = candidates
+        .iter()
+        .filter(|c| is_eligible(c, now) && c.in_flight >= c.max_concurrency)
+        .count();
+    (full > 0 && full == candidates.len()).then_some(full)
 }
 
 /// A cheap non-cryptographic random.
