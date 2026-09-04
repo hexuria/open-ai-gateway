@@ -488,13 +488,20 @@ fn every_candidate_is_full(candidates: &[Candidate], now: i64) -> Option<usize> 
 fn fastrand_u64() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0x2545_F491_4F6C_DD1D);
-    // xorshift64*, advanced atomically so concurrent callers get distinct draws.
-    let mut x = STATE.load(Ordering::Relaxed);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    x
+    // xorshift64, advanced with one atomic read-modify-write so concurrent
+    // callers get distinct draws. The comment above used to say "atomically"
+    // over a separate load and store, which is two callers reading the same
+    // state and both storing the same successor — the exact same draw, on the
+    // exact code path whose only job is to make two replicas differ.
+    let mut next = 0u64;
+    let _ = STATE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mut x| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        next = x;
+        Some(x)
+    });
+    next
 }
 
 /// A slot store that counts releases instead of dialling Redis, and a lease
