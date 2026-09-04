@@ -488,21 +488,37 @@ pub async fn set_principal_budget(
     .map_err(|e| Error::Internal(format!("setting principal budget: {e}")))
 }
 
-/// Set (or clear) one key's spend cap. Returns `(name, key_prefix)`; `None` means
-/// no key with that id.
+/// Set (or clear) one key's spend cap. Returns `(name, key_prefix, key_hash)`;
+/// `None` means no key with that id.
+///
+/// The hash is returned so the caller can evict the key's cached identity:
+/// the cap lives in `AuthContext`, which every tier holds for minutes, and a
+/// lowered cap that nothing invalidates is not enforced until the entry
+/// happens to expire — while the 200 the operator got asserted the new value.
 pub async fn set_key_quota(
     db: &Db,
     id: Uuid,
     quota_usd: Option<Decimal>,
-) -> Result<Option<(String, String)>> {
-    sqlx::query_as::<_, (String, String)>(
-        "UPDATE api_key SET quota_usd = $2 WHERE id = $1 RETURNING name, key_prefix",
+) -> Result<Option<(String, String, String)>> {
+    sqlx::query_as::<_, (String, String, String)>(
+        "UPDATE api_key SET quota_usd = $2 WHERE id = $1 RETURNING name, key_prefix, key_hash",
     )
     .bind(id)
     .bind(quota_usd)
     .fetch_optional(db.pool())
     .await
     .map_err(|e| Error::Internal(format!("setting key quota: {e}")))
+}
+
+/// Every key hash a principal owns, for evicting them all after a write to
+/// the principal's own limits — which every one of those keys carries in its
+/// cached identity.
+pub async fn key_hashes_for_principal(db: &Db, principal_id: Uuid) -> Result<Vec<String>> {
+    sqlx::query_scalar::<_, String>("SELECT key_hash FROM api_key WHERE principal_id = $1")
+        .bind(principal_id)
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("listing a principal's keys: {e}")))
 }
 
 /// A principal's budget and month-to-date spend. `None` means no such principal.

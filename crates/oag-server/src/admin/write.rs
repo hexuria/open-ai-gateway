@@ -203,6 +203,21 @@ pub async fn set_principal_budget(
     };
     match oag_store::repo::set_principal_budget(&state.db, &email, budget).await {
         Ok(Some(id)) => {
+            // The budget rides in every one of this principal's cached key
+            // identities, in every tier, for minutes. Without this the 200
+            // below asserted a limit that was not enforced until the entries
+            // happened to expire.
+            match oag_store::repo::key_hashes_for_principal(&state.db, id).await {
+                Ok(hashes) => {
+                    for hash in &hashes {
+                        state.auth.invalidate_hash(hash).await;
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e, %email,
+                    "budget written but its keys could not be evicted from the auth cache"
+                ),
+            }
             audit(&actor, "principal.budget", id, &email);
             Json(json!({ "id": id, "email": email, "monthly_budget_usd": body.monthly_budget_usd }))
                 .into_response()
@@ -224,7 +239,11 @@ pub async fn set_key_quota(
         Err(message) => return invalid(&message),
     };
     match oag_store::repo::set_key_quota(&state.db, id, quota).await {
-        Ok(Some((name, prefix))) => {
+        Ok(Some((name, prefix, hash))) => {
+            // The quota is part of the cached identity; evict it so the next
+            // request reads the new wall rather than the old one for another
+            // five minutes.
+            state.auth.invalidate_hash(&hash).await;
             audit(&actor, "key.quota", id, &name);
             Json(json!({
                 "id": id,
