@@ -79,16 +79,29 @@ for _ in $(seq 1 90); do curl -fsS "http://$ADMIN/health/ready" >/dev/null 2>&1 
 curl -fsS "http://$ADMIN/health/ready" >/dev/null || fail "gateway never became ready; see $WORK/gateway.log"
 pass "gateway on $PUBLIC  route $ROUTE"
 
+# The ledger row is written by a task detached from the response, so the reply
+# can reach this script before the row exists — and did, on a slow CI runner.
+# Every read therefore waits for a row newer than a mark taken just before the
+# request, instead of reading whichever row is newest: that also means the
+# second request's check cannot pass on the first request's row.
+mark() { psql "$OAG_DATABASE__URL" -At -c "SELECT now()"; }
 ledger() {
-  psql "$OAG_DATABASE__URL" -At -F'|' -c "SELECT model_id, tier, input_tokens, output_tokens, \
-      cost_usd, counterfactual_usd \
-      FROM usage_event WHERE model_id LIKE 'anthropic%' ORDER BY occurred_at DESC LIMIT 1"
+  local since="$1" row=""
+  for _ in $(seq 1 40); do
+    row="$(psql "$OAG_DATABASE__URL" -At -F'|' -c "SELECT model_id, tier, input_tokens, output_tokens, \
+        cost_usd, counterfactual_usd \
+        FROM usage_event WHERE model_id LIKE 'anthropic%' AND occurred_at >= '$since' \
+        ORDER BY occurred_at DESC LIMIT 1")" || return 1
+    [ -n "$row" ] && break
+    sleep 0.25
+  done
+  printf '%s\n' "$row"
 }
 
 assert_ledger() {
-  local want_out="$1"
+  local want_out="$1" since="$2"
   local row
-  row="$(ledger)" || fail "could not read the ledger"
+  row="$(ledger "$since")" || fail "could not read the ledger"
   python3 - "$row" "$want_out" <<'PY'
 import sys
 row = sys.argv[1].strip().split("|")
@@ -109,6 +122,7 @@ PY
 }
 
 say "4/4  Chat Completions client, Anthropic upstream"
+since="$(mark)"
 curl -sS --max-time 30 -o "$WORK/openai.json" -w "%{http_code}" \
   -X POST "http://$PUBLIC/v1/chat/completions" \
   -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
@@ -132,9 +146,10 @@ if usage.get("prompt_tokens") != 100 or usage.get("completion_tokens") != 12:
 PY
 grep -q 'POST /v1/messages' "$WORK/mock.log" \
   || fail "mock never saw /v1/messages — the adapter did not fire"
-assert_ledger 12
+assert_ledger 12 "$since"
 pass "non-stream translated + ledger"
 
+since="$(mark)"
 curl -sN --max-time 30 -X POST "http://$PUBLIC/v1/chat/completions" \
   -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"model":"oag/auto","messages":[{"role":"user","content":"hello"}],"stream":true}' \
@@ -173,7 +188,7 @@ if joined != expected:
 if finish != "stop":
     sys.exit(f"finish_reason={finish!r}, expected stop")
 PY
-assert_ledger $((CHUNKS * 3))
+assert_ledger $((CHUNKS * 3)) "$since"
 pass "stream translated + [DONE] + ledger"
 
 OK=1
