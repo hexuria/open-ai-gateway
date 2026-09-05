@@ -1507,7 +1507,6 @@ async fn try_credential(
 /// rung recorded no reason for having climbed, and "which rung is mis-set for
 /// this workload" could only be answered from non-streamed traffic. The
 /// collected path has threaded it for a while; this one had not.
-#[allow(clippy::too_many_arguments)]
 fn stream_response(
     state: &Arc<AppState>,
     response: reqwest::Response,
@@ -2075,7 +2074,14 @@ mod tests {
             "a constrained principal does not climb"
         );
         assert!(
-            should_climb(&classified, gate, BudgetPressure::Normal, 0, asked, model_max),
+            should_climb(
+                &classified,
+                gate,
+                BudgetPressure::Normal,
+                0,
+                asked,
+                model_max
+            ),
             "and with headroom it would have — so the budget is what cost the \
              caller the better answer, and that is the one to count"
         );

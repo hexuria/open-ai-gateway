@@ -762,5 +762,4 @@ mod tests {
             "nothing climbed, so nothing to say it climbed from"
         );
     }
-
 }

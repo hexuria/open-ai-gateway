@@ -309,21 +309,6 @@ impl RoutingPolicy {
         self.floor.as_ref().map(|t| t.name.as_str())
     }
 
-    /// Choose a model for a request.
-    ///
-    /// Order matters and is the whole policy:
-    /// 1. An explicitly named model is honoured — never surprise a caller who
-    ///    was specific. It is still floor-clamped, because a floor is an
-    ///    entitlement rather than a preference.
-    /// 2. Otherwise classify, clamp to the floor, then apply budget pressure.
-    /// 3. If the resulting rung has nothing capable enough, walk up until one
-    ///    does. Escalating on capability is not a cost failure; sending a
-    ///    200k-token prompt to a model that cannot hold it is.
-    // Eight arguments, and they are all inputs to one decision rather than a
-    // struct waiting to be extracted: mode, name, signal, budget, catalog,
-    // token cap and baseline are supplied by different callers from different
-    // sources, and bundling them would only move the argument list.
-    #[allow(clippy::too_many_arguments)]
     /// The model the savings figure is measured against.
     ///
     /// The dearer of two candidates, never simply the first that exists.
@@ -376,6 +361,21 @@ impl RoutingPolicy {
         }
     }
 
+    /// Choose a model for a request.
+    ///
+    /// Order matters and is the whole policy:
+    /// 1. An explicitly named model is honoured — never surprise a caller who
+    ///    was specific. It is still floor-clamped, because a floor is an
+    ///    entitlement rather than a preference.
+    /// 2. Otherwise classify, clamp to the floor, then apply budget pressure.
+    /// 3. If the resulting rung has nothing capable enough, walk up until one
+    ///    does. Escalating on capability is not a cost failure; sending a
+    ///    200k-token prompt to a model that cannot hold it is.
+    // Eight arguments, and they are all inputs to one decision rather than a
+    // struct waiting to be extracted: mode, name, signal, budget, catalog,
+    // token cap and baseline are supplied by different callers from different
+    // sources, and bundling them would only move the argument list.
+    #[allow(clippy::too_many_arguments)]
     pub fn decide(
         &self,
         mode: &RoutingMode,

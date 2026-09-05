@@ -452,18 +452,18 @@ const ORIGIN_BREAKDOWN_SQL: &str = r"
 
 async fn origin_breakdown(db: &oag_store::Db, window: &period::Resolved) -> Vec<OriginRow> {
     let rows: Vec<OriginTuple> = sqlx::query_as(ORIGIN_BREAKDOWN_SQL)
-    .bind(window.start)
-    .bind(window.end)
-    .fetch_all(db.pool())
-    .await
-    // Degrading to an empty section is this helper's documented contract —
-    // one sub-table must not take down the whole summary — but degrading
-    // SILENTLY was not: an empty list rendered as "no seats", indistinguishable
-    // from a query that failed. Say which it was.
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
-        Vec::new()
-    });
+        .bind(window.start)
+        .bind(window.end)
+        .fetch_all(db.pool())
+        .await
+        // Degrading to an empty section is this helper's documented contract —
+        // one sub-table must not take down the whole summary — but degrading
+        // SILENTLY was not: an empty list rendered as "no seats", indistinguishable
+        // from a query that failed. Say which it was.
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
+            Vec::new()
+        });
 
     if rows.iter().all(|r| r.0 == "gateway") {
         return Vec::new();

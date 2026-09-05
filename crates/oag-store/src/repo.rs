@@ -1207,10 +1207,7 @@ pub async fn set_points_reference(db: &Db, usd_per_mtok: Decimal) -> Result<()> 
 /// Over-revoking on a collision is the right direction for an incident tool —
 /// under-revoking is what gets someone breached — but only if it is visible.
 /// Returning the whole set is what makes it visible.
-pub async fn revoke_key_by_prefix(
-    db: &Db,
-    prefix: &str,
-) -> Result<Vec<(String, String, String)>> {
+pub async fn revoke_key_by_prefix(db: &Db, prefix: &str) -> Result<Vec<(String, String, String)>> {
     sqlx::query_as::<_, (String, String, String)>(
         "UPDATE api_key SET active = false WHERE key_prefix = $1 AND active
          RETURNING key_hash, name, key_prefix",
@@ -2470,33 +2467,7 @@ mod tests {
         };
         let db = Db::connect(&url, 4).expect("connect");
         db.migrate().await.expect("migrate");
-        let (principal, route, account) = seed(&db).await;
-        let key = capped_key(&db, principal, route, format!("race-{}", Uuid::new_v4())).await;
-        set_budgets(&db, principal, route).await;
-        old_binary_row(&db, principal, key, route, "0.25").await;
-
-        let write = move || UsageWrite {
-            request_id: Uuid::new_v4(),
-            attempt: 0,
-            principal_id: Some(principal),
-            api_key_id: Some(key),
-            route_id: Some(route),
-            account_id: Some(account.as_uuid()),
-            model_id: "kimi-k2".to_owned(),
-            tier: "cheap".to_owned(),
-            selection_reason: "default".to_owned(),
-            escalated_from_tier: None,
-            escalation_gate: None,
-            usage: oag_router::Usage::default(),
-            cost_usd: dec!(0.10),
-            counterfactual_usd: Decimal::ZERO,
-            counterfactual_model_id: None,
-            counterfactual_api_usd: Decimal::ZERO,
-            status: 200,
-            latency_ms: Some(10),
-            ttft_ms: None,
-            streamed: false,
-        };
+        let (principal, route, key, write) = budgeted_principal(&db).await;
 
         // A debit in flight: its ledger row and its counter increment, holding
         // the principal's row lock until it commits. This is what
@@ -2513,7 +2484,7 @@ mod tests {
         .bind(principal)
         .bind(key)
         .bind(route)
-        .bind(account.as_uuid())
+        .bind(write().account_id)
         .execute(&mut *debit)
         .await
         .expect("ledger row");
@@ -2588,6 +2559,46 @@ mod tests {
             .expect("load")
             .expect("exists");
         assert_eq!(row.spent_usd, ledger, "and in the route's");
+    }
+
+    /// Fixture: a budgeted principal and route with one debit already counted,
+    /// plus a builder for further debits of ten cents.
+    ///
+    /// Its own function because the race test below is long enough without it,
+    /// and because the pieces only mean something together: reconcile touches
+    /// budgeted rows only, and the pre-existing row is what proves a pass
+    /// rewrites rather than merely adds.
+    async fn budgeted_principal(
+        db: &Db,
+    ) -> (Uuid, Uuid, Uuid, impl Fn() -> UsageWrite + Send + 'static) {
+        let (principal, route, account) = seed(db).await;
+        let key = capped_key(db, principal, route, format!("race-{}", Uuid::new_v4())).await;
+        set_budgets(db, principal, route).await;
+        old_binary_row(db, principal, key, route, "0.25").await;
+
+        let write = move || UsageWrite {
+            request_id: Uuid::new_v4(),
+            attempt: 0,
+            principal_id: Some(principal),
+            api_key_id: Some(key),
+            route_id: Some(route),
+            account_id: Some(account.as_uuid()),
+            model_id: "kimi-k2".to_owned(),
+            tier: "cheap".to_owned(),
+            selection_reason: "default".to_owned(),
+            escalated_from_tier: None,
+            escalation_gate: None,
+            usage: oag_router::Usage::default(),
+            cost_usd: dec!(0.10),
+            counterfactual_usd: Decimal::ZERO,
+            counterfactual_model_id: None,
+            counterfactual_api_usd: Decimal::ZERO,
+            status: 200,
+            latency_ms: Some(10),
+            ttft_ms: None,
+            streamed: false,
+        };
+        (principal, route, key, write)
     }
 
     /// Fixture: one principal, one route, one shared credential joined to it.
@@ -3851,13 +3862,12 @@ mod tests {
         // Both rows really are inactive, and a second call finds nothing left:
         // the UPDATE is scoped to `active`, so this is not idempotent by
         // accident but by the predicate.
-        let still_active: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM api_key WHERE key_prefix = $1 AND active",
-        )
-        .bind(&shared)
-        .fetch_one(db.pool())
-        .await
-        .expect("count");
+        let still_active: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM api_key WHERE key_prefix = $1 AND active")
+                .bind(&shared)
+                .fetch_one(db.pool())
+                .await
+                .expect("count");
         assert_eq!(still_active, 0);
         assert!(
             revoke_key_by_prefix(&db, &shared)

@@ -1771,8 +1771,8 @@ async fn status(db: &Db) -> Result<()> {
     // The headline number: what the gateway saved this month.
     let spend: Option<(Decimal, Decimal, i64)> = sqlx::query_as(MONTH_HEADLINE_SQL)
         .fetch_optional(db.pool())
-    .await
-    .map_err(|e| oag_core::Error::Internal(format!("summing spend: {e}")))?;
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("summing spend: {e}")))?;
 
     if let Some((cost, counterfactual, n)) = spend {
         println!("\nthis month  {n} requests");
@@ -1856,7 +1856,6 @@ mod tests {
              is the free saving that made this figure a lie"
         );
     }
-
 
     #[derive(Parser, Debug)]
     #[command(name = "admin")]

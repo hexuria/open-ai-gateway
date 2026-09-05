@@ -228,7 +228,10 @@ mod tests {
         };
         // Not the live database: this changes a database-level setting, and on
         // a dev host `oag` is served by a running gateway.
-        assert_ne!(name, "oag", "point OAG_TEST_DATABASE_URL at a test database");
+        assert_ne!(
+            name, "oag",
+            "point OAG_TEST_DATABASE_URL at a test database"
+        );
 
         // A database name cannot be a bind parameter, and sqlx accepts only
         // `&'static str` by design, so that a dynamic statement has to be
@@ -270,10 +273,7 @@ mod tests {
         .fetch_optional(&admin)
         .await;
 
-        sqlx::raw_sql(restore)
-            .execute(&admin)
-            .await
-            .expect("reset");
+        sqlx::raw_sql(restore).execute(&admin).await.expect("reset");
 
         assert_eq!(
             forced.expect("read the database default").as_deref(),
