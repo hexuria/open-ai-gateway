@@ -71,9 +71,12 @@ groups:
           summary: "{{ $labels.provider }} credentials are at their concurrency limit"
           description: >-
             Requests are being refused at_capacity for {{ $labels.provider }}
-            at {{ $value }}/s. Add a credential or raise max_concurrency —
-            after confirming OagSlotAccountingDegraded is NOT firing, because
-            a leaked-slot lockout looks exactly like this from the pool.
+            at {{ $value }}/s. The count was real: a Redis outage admits
+            rather than refuses, so at_capacity never comes from a blind
+            pool. Add a credential or raise max_concurrency — unless
+            oag_slots_in_use for the credential stays at max_concurrency
+            while nothing is running through it, which is a leaked slot and
+            clears on its own within the slot TTL.
 
       # This replica is shedding at its in-flight ceiling. A brief burst is
       # the ceiling working; sustained shedding is under-provisioning.
