@@ -512,6 +512,22 @@ async fn origin_breakdown(
         .collect()
 }
 
+/// One row of the per-rung breakdown, formatted.
+///
+/// Its own function only because `summary` sits on the hundred-line limit and
+/// this is the part of it that is arithmetic rather than decisions.
+fn tier_row(
+    (tier, requests, spent, cf): (String, i64, rust_decimal::Decimal, rust_decimal::Decimal),
+) -> TierRow {
+    TierRow {
+        tier,
+        requests,
+        spent_usd: format!("{spent:.4}"),
+        counterfactual_usd: format!("{cf:.4}"),
+        saved_usd: format!("{:.4}", cf - spent),
+    }
+}
+
 pub async fn summary(
     State(state): State<Arc<AppState>>,
     Query(query): Query<period::Window>,
@@ -628,16 +644,7 @@ pub async fn summary(
         by_origin,
         degraded,
         subscriptions,
-        by_tier: by_tier
-            .into_iter()
-            .map(|(tier, requests, spent, cf)| TierRow {
-                tier,
-                requests,
-                spent_usd: format!("{spent:.4}"),
-                counterfactual_usd: format!("{cf:.4}"),
-                saved_usd: format!("{:.4}", cf - spent),
-            })
-            .collect(),
+        by_tier: by_tier.into_iter().map(tier_row).collect(),
     })
     .into_response()
 }

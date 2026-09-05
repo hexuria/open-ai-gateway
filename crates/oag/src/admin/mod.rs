@@ -1218,7 +1218,9 @@ async fn init(
 /// rather than as the key being half-privileged.
 async fn require_admin_principal(db: &Db, email: &str) -> Result<()> {
     match principal_role(db, email).await?.as_deref() {
-        Some("admin") => Ok(()),
+        // An admin principal, or no principal at all — the missing case is left
+        // to `mint_key`, which names both lookups it could have been.
+        Some("admin") | None => Ok(()),
         Some(role) => Err(oag_core::Error::Config(format!(
             "{email} is a {role}, so an --admin key minted for them would authenticate \
              and then be refused by every admin endpoint: the gate needs an admin key AND \
@@ -1226,8 +1228,6 @@ async fn require_admin_principal(db: &Db, email: &str) -> Result<()> {
              `oag admin principal promote --email {email}`, or drop --admin for an \
              inference key."
         ))),
-        // Left to `mint_key`, which names both lookups it could have been.
-        None => Ok(()),
     }
 }
 
@@ -2442,7 +2442,7 @@ mod tests {
             key_hash: hash.clone(),
         };
         cache
-            .auth_set(&hash, &ctx, std::time::Duration::from_secs(300), &mac)
+            .auth_set(&hash, &ctx, std::time::Duration::from_mins(5), &mac)
             .await;
         assert!(
             cache.auth_get(&hash, &mac).await.is_some(),

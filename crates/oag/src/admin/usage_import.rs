@@ -2355,14 +2355,22 @@ mod tests {
             // A price, so the row has a list value to book or to displace.
             // Without one, a seat row and an unpriceable row both read zero and
             // the assertion could not tell the two apart.
-            let model = format!("anthropic/claude-opus-5-{}", Uuid::new_v4());
+            // The upstream name is unique per run as well as the id, and the
+            // transcript below names that one. Every run of this fixture leaves
+            // its catalogue row behind, so a fixed `claude-opus-5` accumulated
+            // — and since C15 a slug several rows answer to is deliberately
+            // unpriceable, which is the correct behaviour finding the fixture
+            // rather than the other way round.
+            let slug = format!("claude-opus-5-{}", Uuid::new_v4());
+            let model = format!("anthropic/{slug}");
             sqlx::query(
                 "INSERT INTO model_catalog (id, provider, upstream_name, input_per_mtok, \
                  output_per_mtok, cache_read_per_mtok, cache_write_per_mtok, context_window, \
-                 max_output_tokens) VALUES ($1, 'anthropic', 'claude-opus-5', 15, 75, 1, 18, \
+                 max_output_tokens) VALUES ($1, 'anthropic', $2, 15, 75, 1, 18, \
                  200000, 64000)",
             )
             .bind(&model)
+            .bind(&slug)
             .execute(db.pool())
             .await
             .expect("seed catalog");
@@ -2393,7 +2401,7 @@ mod tests {
                 &session,
                 &msg,
                 "2026-01-01T00:00:00Z",
-                "claude-opus-5",
+                &slug,
                 [10_000, 2_000, 0, 0],
             );
             let dir = fixture_dir(name, &[("a.jsonl", body)]);

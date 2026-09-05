@@ -153,7 +153,6 @@ fn forbidden_key() -> Response {
 mod tests {
     use super::overloaded;
     use axum::http::StatusCode;
-    use axum::response::IntoResponse as _;
 
     /// A2, the wiring. The shed arm is actually on the path.
     ///
