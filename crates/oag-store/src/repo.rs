@@ -1797,6 +1797,64 @@ mod tests {
     /// an existing admin's email leaves their role alone. Getting this wrong locks
     /// a human operator out of the admin API — the gate wants an admin key AND an
     /// admin principal — without their key ever changing.
+    /// The plumbing a budget or quota write evicts through: every hash of a
+    /// principal's keys, and the hash of the one key a quota write touched.
+    ///
+    /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it.
+    #[tokio::test]
+    async fn a_principals_key_hashes_are_all_listed_and_a_quota_write_names_its_own() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("org-{}@gateway.local", Uuid::new_v4());
+        let route = format!("route-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO route (id, name, tiers, default_mode)
+             VALUES (gen_random_uuid(), $1, '[{\"name\":\"cheap\",\"models\":[\"kimi-k2\"]}]'::jsonb, 'passthrough')",
+        )
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("insert route");
+        let principal = upsert_principal(&db, &email, "member", None)
+            .await
+            .expect("upsert");
+
+        let one = mint_key(&db, &email, &route, "one", None)
+            .await
+            .expect("mint")
+            .expect("principal and route exist");
+        let two = mint_key(&db, &email, &route, "two", None)
+            .await
+            .expect("mint")
+            .expect("principal and route exist");
+
+        let mut listed = key_hashes_for_principal(&db, principal)
+            .await
+            .expect("list");
+        listed.sort();
+        let mut minted = vec![hash_key(&one.key), hash_key(&two.key)];
+        minted.sort();
+        assert_eq!(
+            listed, minted,
+            "both keys, by the hash the caches are keyed on"
+        );
+
+        let (_, _, touched) = set_key_quota(&db, two.id, Some(dec!(1)))
+            .await
+            .expect("set quota")
+            .expect("the key exists");
+        assert_eq!(
+            touched,
+            hash_key(&two.key),
+            "the hash of the key written, not another"
+        );
+    }
+
     #[tokio::test]
     async fn upserting_a_principal_never_demotes_an_existing_admin() {
         let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
