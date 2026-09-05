@@ -1284,7 +1284,22 @@ async fn try_credential(
                 }
             }
 
-            // Nothing came back at all: connect, TLS, DNS, or a timeout.
+            // The provider accepted the connection and then said nothing for
+            // the whole headers deadline. That is not a transport blip worth
+            // a same-credential retry: it already cost the caller the full
+            // deadline, and two more attempts here would cost it twice more
+            // before another credential was tried. The error's own
+            // disposition says fail over like a 5xx, and until now nothing
+            // on this path read it.
+            Err(e @ Error::UpstreamTimeout { .. }) => {
+                let disposition = e.disposition();
+                tracing::warn!(%request_id, %account, error = %e, ?disposition, "upstream silent");
+                state.breakers.record_failure(account);
+                apply_disposition(state, account, disposition).await;
+                return Outcome::Switch(e);
+            }
+
+            // Nothing came back at all: connect, TLS, or DNS.
             Err(e) => {
                 last = e;
                 let retrying = attempt < state.config.gateway.same_account_retries;
