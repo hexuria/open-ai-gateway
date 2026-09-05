@@ -204,6 +204,24 @@ pub struct GatewayConfig {
     pub same_account_retries: u8,
     /// Credentials to try before giving up on the request.
     pub max_account_switches: u8,
+    /// How long to keep trying DIFFERENT credentials before giving up and
+    /// returning the last upstream error.
+    ///
+    /// `max_account_switches` bounds the NUMBER of attempts and nothing bounds
+    /// their total duration, so a provider that is slow to answer rather than
+    /// quick to refuse can hold a caller for as long as it likes: the upstream
+    /// client deliberately sets no total-response timeout (a streamed
+    /// completion legitimately runs for minutes), and `stream_idle_timeout`
+    /// cannot help because it starts only once a response exists. Observed: a
+    /// client waited 300s and received zero bytes while this loop cycled
+    /// through 503s from a throttled seat, each failover correct in itself.
+    ///
+    /// Checked only BETWEEN attempts. An attempt already in flight is never
+    /// interrupted — that would cut off exactly the slow-but-working stream the
+    /// missing total-response timeout exists to protect. This only stops a NEW
+    /// credential being tried once the budget is spent.
+    #[serde(with = "humantime_secs")]
+    pub failover_budget: Duration,
     /// How often to reload the model catalog from the database.
     ///
     /// The catalog is held in memory and swapped wholesale. Without a refresh,
@@ -277,6 +295,10 @@ impl Default for GatewayConfig {
             max_stream_duration: Duration::from_mins(30),
             same_account_retries: 2,
             max_account_switches: 3,
+            // Generous: it is a backstop against an unbounded wait, not a
+            // latency target. A caller that would have been served at 100s is
+            // still served.
+            failover_budget: Duration::from_mins(2),
             catalog_refresh_interval: Duration::from_mins(1),
             usage_poll_interval: Duration::from_mins(5),
             bedrock_region: default_bedrock_region(),
