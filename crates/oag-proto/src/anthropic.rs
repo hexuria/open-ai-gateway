@@ -452,19 +452,30 @@ pub fn parse_response(body: &Value) -> Vec<StreamEvent> {
 ///
 /// This dialect is the more structured of the two: content arrives as indexed
 /// *blocks* that must be explicitly opened and closed, where Chat Completions
-/// just streams deltas. So a renderer has to track which block is open and
-/// close it before opening another — a client that receives a
-/// `content_block_delta` for a block it was never told about will drop it.
+/// just streams deltas. So a renderer has to track which blocks are open and
+/// address every delta to the right one — a client that receives a
+/// `content_block_delta` for a block it was never told about will drop it,
+/// and one that receives it under the wrong index attaches the fragment to
+/// the wrong call.
+///
+/// Text and tool blocks are held apart. There is one text block open at a
+/// time, because a text delta names no block and can only mean the current
+/// one. Tool blocks are a list keyed by call id, because a Chat Completions
+/// upstream streams parallel calls interleaved and every fragment says which
+/// call it belongs to. A single "open block" slot, as this used to be, wrote
+/// every fragment into whichever call opened last: one call shipped with
+/// `input: {}` and the other with two calls' arguments run together.
 #[derive(Debug, Clone, Default)]
 pub struct RenderState {
     id: String,
     model: String,
     started: bool,
-    /// The block index currently open, if any.
-    open_block: Option<usize>,
+    /// The text or thinking block currently open, if any.
+    open_text: Option<usize>,
+    /// Tool blocks opened and not yet closed: call id and block index, in
+    /// the order they opened.
+    open_tools: Vec<(String, usize)>,
     next_index: usize,
-    /// Whether the open block is a tool call, which closes differently.
-    open_is_tool: bool,
     usage: Usage,
     finished: bool,
 }
@@ -485,14 +496,46 @@ impl RenderState {
         format!("event: {event}\ndata: {body}\n\n")
     }
 
-    fn close_open_block(&mut self, out: &mut String) {
-        if let Some(index) = self.open_block.take() {
-            out.push_str(&Self::frame(
-                "content_block_stop",
-                &json!({ "type": "content_block_stop", "index": index }),
-            ));
+    fn block_stop(out: &mut String, index: usize) {
+        out.push_str(&Self::frame(
+            "content_block_stop",
+            &json!({ "type": "content_block_stop", "index": index }),
+        ));
+    }
+
+    fn close_text(&mut self, out: &mut String) {
+        if let Some(index) = self.open_text.take() {
+            Self::block_stop(out, index);
         }
-        self.open_is_tool = false;
+    }
+
+    /// Close the tool block for `id`, if it is open.
+    fn close_tool(&mut self, out: &mut String, id: &str) {
+        if let Some(at) = self.open_tools.iter().position(|(open, _)| open == id) {
+            let (_, index) = self.open_tools.remove(at);
+            Self::block_stop(out, index);
+        }
+    }
+
+    /// Close every open tool block, in the order they opened.
+    fn close_tools(&mut self, out: &mut String) {
+        for (_, index) in self.open_tools.drain(..) {
+            Self::block_stop(out, index);
+        }
+    }
+
+    /// The block a tool fragment belongs to.
+    ///
+    /// The one opened under its id, or, for a fragment whose id opened
+    /// nothing, the most recently opened call — the Responses parser
+    /// addresses fragments by whichever call is current, and that is the one
+    /// it means.
+    fn tool_block(&self, id: &str) -> Option<usize> {
+        self.open_tools
+            .iter()
+            .find(|(open, _)| open == id)
+            .or_else(|| self.open_tools.last())
+            .map(|(_, index)| *index)
     }
 
     fn ensure_started(&mut self, out: &mut String) {
@@ -532,13 +575,15 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
         StreamEvent::TextDelta { text } => render_text(st, &mut out, text, false),
         StreamEvent::ThinkingDelta { text } => render_text(st, &mut out, text, true),
 
+        // Opens a block and leaves any open tool block alone: another call
+        // opening says nothing about whether this one has more fragments
+        // coming. Its stop goes out when its own end does.
         StreamEvent::ToolUseStart { id, name } => {
             st.ensure_started(&mut out);
-            st.close_open_block(&mut out);
+            st.close_text(&mut out);
             let index = st.next_index;
             st.next_index += 1;
-            st.open_block = Some(index);
-            st.open_is_tool = true;
+            st.open_tools.push((id.clone(), index));
             out.push_str(&RenderState::frame(
                 "content_block_start",
                 &json!({
@@ -548,8 +593,8 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
             ));
         }
 
-        StreamEvent::ToolUseDelta { partial_json, .. } => {
-            let index = st.open_block?;
+        StreamEvent::ToolUseDelta { id, partial_json } => {
+            let index = st.tool_block(id)?;
             out.push_str(&RenderState::frame(
                 "content_block_delta",
                 &json!({
@@ -559,7 +604,7 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
             ));
         }
 
-        StreamEvent::ToolUseEnd { .. } => st.close_open_block(&mut out),
+        StreamEvent::ToolUseEnd { id } => st.close_tool(&mut out, id),
 
         StreamEvent::UsageUpdate { usage } => {
             st.usage.merge(usage);
@@ -573,7 +618,8 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
             st.finished = true;
             st.usage.merge(usage);
             st.ensure_started(&mut out);
-            st.close_open_block(&mut out);
+            st.close_text(&mut out);
+            st.close_tools(&mut out);
 
             out.push_str(&RenderState::frame(
                 "message_delta",
@@ -605,17 +651,15 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
 fn render_text(st: &mut RenderState, out: &mut String, text: &str, thinking: bool) {
     st.ensure_started(out);
 
-    // A tool block has to be closed before text can resume: this dialect has
-    // exactly one block open at a time, and interleaving them makes a client
-    // attach the text to the tool call.
-    if st.open_is_tool {
-        st.close_open_block(out);
-    }
+    // Every tool block has to be closed before text can resume: a text delta
+    // names no block, and a client with a tool block still open attaches the
+    // text to the tool call.
+    st.close_tools(out);
 
-    if st.open_block.is_none() {
+    if st.open_text.is_none() {
         let index = st.next_index;
         st.next_index += 1;
-        st.open_block = Some(index);
+        st.open_text = Some(index);
         let empty = if thinking {
             json!({ "type": "thinking", "thinking": "" })
         } else {
@@ -627,7 +671,7 @@ fn render_text(st: &mut RenderState, out: &mut String, text: &str, thinking: boo
         ));
     }
 
-    let index = st.open_block.unwrap_or(0);
+    let index = st.open_text.unwrap_or(0);
     let delta = if thinking {
         json!({ "type": "thinking_delta", "thinking": text })
     } else {
@@ -1218,6 +1262,131 @@ mod tests {
             stops[0] < starts[1],
             "the text block closes before the tool opens"
         );
+    }
+
+    #[test]
+    fn interleaved_parallel_tool_calls_keep_their_own_blocks() {
+        // The shape a Chat Completions upstream streams for parallel calls,
+        // and the one `openai::tests::parallel_tool_calls_are_addressed_by_index`
+        // declares real: two calls open, then their fragments alternate. A
+        // renderer with one "open block" slot wrote every fragment into
+        // whichever call opened last, so one call reached the client as
+        // `input: {}` and the other with both calls' arguments run together.
+        let mut st = RenderState::new("req1", "m");
+        let events = [
+            StreamEvent::ToolUseStart {
+                id: "call_a".to_owned(),
+                name: "read".to_owned(),
+            },
+            StreamEvent::ToolUseStart {
+                id: "call_b".to_owned(),
+                name: "write".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_a".to_owned(),
+                partial_json: "{\"p\":".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_b".to_owned(),
+                partial_json: "{\"q\":".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_a".to_owned(),
+                partial_json: "1}".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_b".to_owned(),
+                partial_json: "2}".to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_a".to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_b".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ];
+        let raw: String = events
+            .iter()
+            .filter_map(|e| render_event(e, &mut st))
+            .collect();
+
+        // Reassemble each block's input from the wire, by index, exactly as
+        // an SDK does — and then check that block's index maps to the call
+        // its `content_block_start` announced.
+        let mut id_at = std::collections::BTreeMap::<u64, String>::new();
+        let mut input_at = std::collections::BTreeMap::<u64, String>::new();
+        let mut stops = Vec::new();
+        for line in raw.lines() {
+            let Some(d) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            let v: Value = serde_json::from_str(d).expect("valid json");
+            let index = v["index"].as_u64().unwrap_or(u64::MAX);
+            match v["type"].as_str() {
+                Some("content_block_start") => {
+                    id_at.insert(index, v["content_block"]["id"].as_str().unwrap().to_owned());
+                }
+                Some("content_block_delta") => {
+                    input_at
+                        .entry(index)
+                        .or_default()
+                        .push_str(v["delta"]["partial_json"].as_str().unwrap());
+                }
+                Some("content_block_stop") => stops.push(index),
+                _ => {}
+            }
+        }
+        assert_eq!(id_at[&0], "call_a");
+        assert_eq!(id_at[&1], "call_b");
+        assert_eq!(input_at[&0], r#"{"p":1}"#, "{raw}");
+        assert_eq!(input_at[&1], r#"{"q":2}"#, "{raw}");
+        assert_eq!(stops, [0, 1], "each block stops once, on its own end");
+        assert!(st.open_tools.is_empty());
+    }
+
+    #[test]
+    fn text_after_tool_calls_closes_every_open_call_first() {
+        // Two calls open with no end in sight — a Chat Completions upstream
+        // ends every call at its terminal chunk — and then text arrives. Both
+        // must stop before the text block opens, or the client attaches the
+        // text to a call.
+        let (names, text) = render_all(&[
+            StreamEvent::ToolUseStart {
+                id: "call_a".to_owned(),
+                name: "a".to_owned(),
+            },
+            StreamEvent::ToolUseStart {
+                id: "call_b".to_owned(),
+                name: "b".to_owned(),
+            },
+            StreamEvent::TextDelta {
+                text: "done".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        ]);
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_start",
+                "content_block_stop",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(text, "done");
     }
 
     #[test]
