@@ -83,6 +83,24 @@ impl AppState {
     pub fn new(config: Config, db: Db, cache: Cache) -> Result<Self> {
         let kek = Kek::from_base64(&config.security.credential_kek)?;
 
+        // A slot must outlive the longest request it guards. `SLOT_TTL` is a
+        // constant and `max_stream_duration` is configuration, so the only
+        // place the two can be compared is here, where both exist.
+        //
+        // Refused rather than clamped: a slot expiring under a live request
+        // oversubscribes the credential silently — nothing observes a slot
+        // vanishing, so the first symptom is a provider's own rate limit on a
+        // deployment that believes it is within its limits.
+        if config.gateway.max_stream_duration >= crate::gateway::select::SLOT_TTL {
+            return Err(oag_core::Error::Config(format!(
+                "gateway.max_stream_duration ({:?}) must be shorter than the concurrency \
+                 slot TTL ({:?}), or a live request's slot expires under it and the \
+                 credential is oversubscribed",
+                config.gateway.max_stream_duration,
+                crate::gateway::select::SLOT_TTL,
+            )));
+        }
+
         // Normalised once, here, rather than trusted at every use site.
         //
         // Every adapter builds its request URL by concatenation —

@@ -411,7 +411,7 @@ impl Default for GatewayConfig {
         Self {
             stream_idle_timeout: Duration::from_mins(3),
             stream_keepalive_interval: Duration::from_secs(10),
-            max_stream_duration: Duration::from_mins(30),
+            max_stream_duration: Config::default_gateway_max_stream_duration(),
             // Generous on purpose: a slow-but-healthy provider under load can
             // take tens of seconds to begin a large reasoning response, and
             // failing those over is worse than waiting. What this bounds is a
@@ -507,6 +507,18 @@ impl Default for TelemetryConfig {
 }
 
 impl Config {
+    /// The shipped ceiling on one streamed response.
+    ///
+    /// Exposed so `oag-server` can assert its concurrency-slot TTL leaves room
+    /// for it: a slot that expires under a live request oversubscribes the
+    /// credential, silently. The two numbers have to be compared somewhere, and
+    /// the alternative was a test comparing a constant against a copy of this
+    /// one written out by hand.
+    #[must_use]
+    pub const fn default_gateway_max_stream_duration() -> Duration {
+        Duration::from_mins(30)
+    }
+
     /// Parse YAML and validate.
     pub fn from_yaml(src: &str) -> crate::Result<Self> {
         let cfg: Self = serde_yaml_ng::from_str(src)

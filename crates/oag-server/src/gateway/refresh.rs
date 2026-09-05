@@ -57,7 +57,14 @@ pub async fn ensure_fresh(state: &AppState, row: &AccountRow) -> Result<SecretMa
         return Ok(material);
     }
 
-    let adapter = state.adapter(row.provider.parse()?)?;
+    // The adapter this credential actually gets, not the provider's default.
+    //
+    // A Codex seat is `Provider::OpenAI` and refreshes against ChatGPT's token
+    // endpoint, not OpenAI's — `adapter_for` is what knows that, and asking
+    // `state.adapter` by provider alone handed the seat's refresh token to the
+    // wrong grant. The same mistake, in the same shape, as the dialect bug this
+    // helper's siblings already carry a comment about.
+    let adapter = crate::gateway::adapter_for(state, row.provider.parse()?, row)?;
 
     // 1. Process-local gate. Cheap, and it means one replica makes at most one
     //    attempt at the distributed lock per SUCCESSFUL refresh, however many
