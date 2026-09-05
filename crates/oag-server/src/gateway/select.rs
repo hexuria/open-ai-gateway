@@ -423,7 +423,16 @@ fn slot_accounting_degraded(op: &'static str, e: &Error) {
     }
 }
 
-fn is_eligible(c: &Candidate, now: i64) -> bool {
+/// Whether the credential could take a request at all, before asking
+/// whether it has room for one: schedulable, not cooling, not rate-limited,
+/// not parked behind its reserve.
+///
+/// Apart from the concurrency test on purpose. `every_candidate_is_full`
+/// needs "live and full", and testing that through `is_eligible` — which
+/// requires a free slot — is asking for a candidate that both has and has
+/// not got one. That predicate was a contradiction, so a saturated pool
+/// answered `no_credential` and `oag_at_capacity_total` never moved.
+fn is_live(c: &Candidate, now: i64) -> bool {
     c.schedulable
         && c.cooldown_until.is_none_or(|t| t <= now)
         && c.rate_limited_until.is_none_or(|t| t <= now)
@@ -434,7 +443,10 @@ fn is_eligible(c: &Candidate, now: i64) -> bool {
         // everyone except the traffic already drinking from the seat, which is
         // all of the traffic that matters.
         && !oag_pool::held_by_reserve(c.usage_remaining_pct, c.usage_reserve_pct)
-        && c.in_flight < c.max_concurrency
+}
+
+fn is_eligible(c: &Candidate, now: i64) -> bool {
+    is_live(c, now) && c.in_flight < c.max_concurrency
 }
 
 /// The reserve to name when a request finds nothing to run on, if a reserve is
@@ -514,7 +526,7 @@ async fn candidates_for(state: &AppState, remaining: &[&AccountRow], now: i64) -
 fn every_candidate_is_full(candidates: &[Candidate], now: i64) -> Option<usize> {
     let full = candidates
         .iter()
-        .filter(|c| is_eligible(c, now) && c.in_flight >= c.max_concurrency)
+        .filter(|c| is_live(c, now) && c.in_flight >= c.max_concurrency)
         .count();
     (full > 0 && full == candidates.len()).then_some(full)
 }
@@ -763,6 +775,49 @@ security:
         let mut off = base;
         off.schedulable = false;
         assert!(!is_eligible(&off, 100));
+    }
+
+    #[test]
+    fn a_pool_that_is_live_and_full_is_classified_as_full() {
+        // The predicate used to be `is_eligible && in_flight >= max`, and
+        // `is_eligible` already requires `in_flight < max`: no candidate
+        // could ever satisfy it, so a saturated pool exited selection as
+        // `no_credential` with `oag_at_capacity_total` flat — the same
+        // signal as a route with no credentials at all.
+        let base = Candidate {
+            account: AccountId(uuid::Uuid::nil()),
+            provider: Provider::XAI,
+            priority: 0,
+            max_concurrency: 2,
+            in_flight: 2,
+            waiting: 0,
+            schedulable: true,
+            cooldown_until: None,
+            rate_limited_until: None,
+            window_resets_at: None,
+            usage_remaining_pct: None,
+            usage_reserve_pct: None,
+            last_used_at: 0,
+        };
+        let mut other = base.clone();
+        other.account = AccountId(uuid::Uuid::new_v4());
+        assert_eq!(
+            every_candidate_is_full(&[base.clone(), other.clone()], 100),
+            Some(2),
+            "both live, both at their limit"
+        );
+
+        // One of them cooling is not a capacity problem: it resolves on its
+        // own, and the operator must not be sent to raise a limit.
+        other.cooldown_until = Some(200);
+        assert_eq!(every_candidate_is_full(&[base.clone(), other], 100), None);
+
+        // And one with a free slot is not full at all.
+        let mut roomy = base;
+        roomy.in_flight = 1;
+        assert_eq!(every_candidate_is_full(&[roomy], 100), None);
+
+        assert_eq!(every_candidate_is_full(&[], 100), None);
     }
 
     #[test]
