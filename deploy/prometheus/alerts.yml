@@ -90,16 +90,20 @@ groups:
 
   - name: oag-lifecycle
     rules:
-      # A replica has been draining longer than the stream ceiling. The drain
-      # waits for in-flight streams; one that outlives max_stream_duration is
-      # a stream nothing bounded — which should no longer be possible — or a
-      # replica the orchestrator is no longer going to kill.
+      # A replica has been draining for a long time. A healthy drain lasts as
+      # long as its longest in-flight stream, usually seconds; ten minutes of
+      # it is a stream that is not ending, or a replica the orchestrator is
+      # no longer going to kill. Well inside max_stream_duration on purpose:
+      # the drain gives up at that budget and takes the admin listener — and
+      # this series — with it, so a `for` at or past the budget could never
+      # be satisfied.
       - alert: OagDrainStuck
         expr: oag_draining == 1
-        for: 35m
+        for: 10m
         labels: { severity: warn }
         annotations:
-          summary: "{{ $labels.replica }} has been draining for 35 minutes"
+          summary: "{{ $labels.replica }} has been draining for 10 minutes"
           description: >-
-            Longer than gateway.max_stream_duration. Look for a stream the
-            pump has not returned from, then kill the pod.
+            Look for a stream the pump has not returned from. The drain
+            gives up on its own at gateway.max_stream_duration; kill the pod
+            sooner if the stream is one nobody is reading.
