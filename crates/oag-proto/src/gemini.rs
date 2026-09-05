@@ -318,9 +318,11 @@ fn parse_content(v: &Value) -> Option<Message> {
 }
 
 /// One SSE `data:` payload → canonical events.
-pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
+pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
     let v: Value = serde_json::from_str(payload)?;
-    Ok(parse_response(&v))
+    // A stream delivers the call and the finish in separate chunks, so this
+    // chunk alone cannot know a tool was called; the accumulator can.
+    Ok(parse_chunk(&v, acc.saw_tool_call()))
 }
 
 /// A complete non-streamed `generateContent` body → canonical events.
@@ -330,7 +332,21 @@ pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<St
 /// rather than a different envelope.
 #[must_use]
 pub fn parse_response(v: &Value) -> Vec<StreamEvent> {
+    parse_chunk(v, false)
+}
+
+/// One chunk, or one whole body, → canonical events.
+///
+/// `called_a_tool_before` is what an earlier chunk of the same stream
+/// established. This dialect finishes a tool-calling turn with the same
+/// `STOP` as a plain one, and reports the call in whichever chunk carried the
+/// `functionCall` part — so the stop reason has to be computed from both, or
+/// a streamed call reaches an Anthropic client as `end_turn` and a Chat
+/// Completions client as `stop`, and an agent loop dispatching on either
+/// never runs the tool.
+fn parse_chunk(v: &Value, called_a_tool_before: bool) -> Vec<StreamEvent> {
     let mut events = Vec::new();
+    let mut called_a_tool = called_a_tool_before;
 
     if let Some(usage) = v.get("usageMetadata") {
         events.push(StreamEvent::UsageUpdate {
@@ -360,6 +376,7 @@ pub fn parse_response(v: &Value) -> Vec<StreamEvent> {
             }
         }
         if let Some(call) = part.get("functionCall") {
+            called_a_tool = true;
             let name = call["name"].as_str().unwrap_or_default().to_owned();
             // Arrives whole, not streamed in fragments.
             events.push(StreamEvent::ToolUseStart {
@@ -379,6 +396,7 @@ pub fn parse_response(v: &Value) -> Vec<StreamEvent> {
             reason: match reason {
                 "MAX_TOKENS" => StopReason::MaxTokens,
                 "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" => StopReason::Refusal,
+                _ if called_a_tool => StopReason::ToolUse,
                 _ => StopReason::EndTurn,
             },
             usage: v.get("usageMetadata").map(parse_usage).unwrap_or_default(),
@@ -657,6 +675,52 @@ mod tests {
         // reassembled JSON must still be valid.
         let (_, acc) = drive(STREAM);
         assert_eq!(acc.quality_gate(), None);
+    }
+
+    #[test]
+    fn a_streamed_tool_call_finishes_as_tool_use() {
+        // The `functionCall` part and the `STOP` arrive in different chunks,
+        // and `STOP` is what this dialect says for a plain turn too. Reading
+        // the finish chunk alone said `end_turn`, so an Anthropic client took
+        // the turn as final and never ran the tool.
+        let (events, acc) = drive(STREAM);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                ..
+            })
+        ));
+        assert_eq!(acc.stop_reason(), Some(StopReason::ToolUse));
+
+        // A plain turn is still a plain turn.
+        let (events, _) = drive(&[STREAM[0], STREAM[1], STREAM[3]]);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_whole_body_with_a_function_call_stops_as_tool_use() {
+        let body = json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [
+                    { "functionCall": { "name": "ls", "args": {} } }
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        assert!(matches!(
+            parse_response(&body).last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                ..
+            })
+        ));
     }
 
     #[test]

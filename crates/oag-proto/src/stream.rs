@@ -196,6 +196,16 @@ impl StreamAccumulator {
         self.tool_buffers.iter().map(|(id, _)| id.clone()).collect()
     }
 
+    /// Whether any tool call has opened in this response so far.
+    ///
+    /// For a parser whose dialect ends a tool-calling turn with the same
+    /// event as a plain one: the stop reason it emits has to say `tool_use`
+    /// when a call was made, and the call was made in an earlier frame.
+    #[must_use]
+    pub const fn saw_tool_call(&self) -> bool {
+        self.tool_calls > 0
+    }
+
     #[must_use]
     pub const fn usage(&self) -> &Usage {
         &self.usage

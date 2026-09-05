@@ -459,20 +459,31 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
         "response.completed" | "response.incomplete" => {
             let response = &v["response"];
             let usage = parse_usage(&response["usage"]);
+            let output = response["output"].as_array();
+            // This dialect completes a tool-calling turn with the same event
+            // as a plain one, so the calls have to be looked for: in the
+            // accumulator, which saw them open in earlier frames, and in the
+            // completed response's own output, in case it did not. The
+            // whole-body reader below makes the same call from `tool_calls`;
+            // leaving it out here is how a streamed tool call reached an
+            // Anthropic client as `end_turn` and a Chat Completions client as
+            // `stop`, and an agent loop that dispatches on either treated the
+            // turn as final and never ran the tool.
+            let called_a_tool = acc.saw_tool_call()
+                || output.is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| item["type"].as_str() == Some("function_call"))
+                });
             let reason = match response["incomplete_details"]["reason"].as_str() {
                 Some("max_output_tokens") => StopReason::MaxTokens,
                 Some("content_filter") => StopReason::Refusal,
-                _ => {
-                    // A response whose only output is a refusal part.
-                    if response["output"]
-                        .as_array()
-                        .is_some_and(|items| items.iter().any(has_refusal))
-                    {
-                        StopReason::Refusal
-                    } else {
-                        StopReason::EndTurn
-                    }
+                // A response whose only output is a refusal part.
+                _ if output.is_some_and(|items| items.iter().any(has_refusal)) => {
+                    StopReason::Refusal
                 }
+                _ if called_a_tool => StopReason::ToolUse,
+                _ => StopReason::EndTurn,
             };
             vec![
                 StreamEvent::UsageUpdate { usage },
@@ -1279,6 +1290,50 @@ mod tests {
             None,
             "and the arguments must be valid JSON"
         );
+    }
+
+    #[test]
+    fn a_streamed_tool_call_completes_as_tool_use() {
+        // `response.completed` looks the same whether or not the turn called
+        // a tool, and the whole-body reader already says `tool_use` for one.
+        // The stream said `end_turn`: an Anthropic client dispatching on it
+        // took the turn as final and never ran the tool, and a Chat
+        // Completions client saw `finish_reason: "stop"` beside `tool_calls`.
+        let (events, acc) = drive(STREAM);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                ..
+            })
+        ));
+        assert_eq!(acc.stop_reason(), Some(StopReason::ToolUse));
+
+        // And a plain turn is still a plain turn.
+        let (events, _) = drive(&[STREAM[0], STREAM[1], STREAM[2], STREAM[8]]);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_completed_event_that_lists_a_call_the_stream_never_opened_still_says_tool_use() {
+        // The completed response carries its whole output, so the call is
+        // knowable even when the item events were dropped or unparseable.
+        let (events, _) = drive(&[
+            r#"{"type":"response.completed","response":{"usage":{},"output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"f","arguments":"{}"}]}}"#,
+        ]);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                ..
+            })
+        ));
     }
 
     #[test]
