@@ -102,8 +102,10 @@ pub struct RouteRow {
     pub floor_tier: Option<String>,
     pub rpm_limit: Option<i32>,
     pub monthly_budget_usd: Option<Decimal>,
-    /// Month-to-date spend on this route. Zero when the route has no budget,
-    /// because the query does not bother summing what nothing will compare.
+    /// Month-to-date spend on this route, read from the denormalised
+    /// `route.spent_usd` and zero once the month `route.spent_month` names
+    /// has passed. Kept whether or not the route has a budget: the column is
+    /// written on every debit, so reading it costs nothing.
     pub spent_usd: Decimal,
     pub active: bool,
 }
