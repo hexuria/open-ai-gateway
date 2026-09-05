@@ -1135,13 +1135,26 @@ async fn mint_key(
     let hash = repo::hash_key(&key);
     let prefix: String = key.chars().take(16).collect();
 
-    sqlx::query(
+    // `RETURNING id` and `fetch_optional`, not `execute`.
+    //
+    // The SELECT yields no rows when either lookup misses, so this INSERT
+    // inserts nothing — and `execute` reports that as a perfectly successful
+    // statement affecting zero rows. The plaintext was then printed with "This
+    // is shown once", which was true in the worst possible way: it had never
+    // been stored, so it could not be recovered and could never authenticate.
+    //
+    // The developer holding it gets 401 on every request, `oag admin key list`
+    // shows nothing, and the incident reads as broken auth rather than as a
+    // mistyped route name. The HTTP twin has always returned `Option` and said
+    // which lookup failed; this is the same answer.
+    let created: Option<Uuid> = sqlx::query_scalar(
         r"
         INSERT INTO api_key
             (id, key_hash, key_prefix, name, principal_id, route_id, floor_tier, admin)
         SELECT $1, $2, $3, $4, p.id, r.id, $7, $8
         FROM principal p, route r
         WHERE p.email = $5 AND r.name = $6
+        RETURNING id
         ",
     )
     .bind(Uuid::now_v7())
@@ -1152,9 +1165,19 @@ async fn mint_key(
     .bind(route)
     .bind(floor_tier)
     .bind(admin)
-    .execute(db.pool())
+    .fetch_optional(db.pool())
     .await
     .map_err(|e| oag_core::Error::Internal(format!("minting key: {e}")))?;
+
+    if created.is_none() {
+        // Both lookups named, because the row that is missing is the whole
+        // diagnosis and the caller cannot see which of the two it was.
+        return Err(oag_core::Error::Config(format!(
+            "no key was created: there is no principal with email {email}, or no route \
+             named {route}. `oag admin route show --route {route}` says whether the route \
+             exists; a principal is created by `oag admin init --email {email}`."
+        )));
+    }
 
     Ok(key)
 }
@@ -1787,6 +1810,78 @@ async fn status(db: &Db) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// H9. A key that was not stored is not printed.
+    ///
+    /// The INSERT selects from `principal` and `route`, so it inserts nothing
+    /// when either lookup misses — and `execute` reports that as a successful
+    /// statement affecting zero rows. The plaintext was printed anyway, under
+    /// "This is shown once", which was true in the worst possible way: never
+    /// stored, so unrecoverable and unable to ever authenticate.
+    ///
+    /// The developer holding it gets 401 on every request, `key list` shows
+    /// nothing, and the incident reads as broken auth rather than as a mistyped
+    /// route name.
+    #[tokio::test]
+    async fn minting_against_a_missing_route_or_principal_is_an_error_not_a_key() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        // A route that exists, so only the principal is missing.
+        let route = format!("h9-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]')")
+            .bind(&route)
+            .execute(db.pool())
+            .await
+            .expect("seed route");
+
+        let missing_principal = format!("nobody-{}@example.invalid", Uuid::new_v4());
+        let err = mint_key(&db, &missing_principal, &route, "k", None, false)
+            .await
+            .expect_err("no principal, so no key");
+        let message = err.to_string();
+        assert!(
+            message.contains(&missing_principal) && message.contains(&route),
+            "the operator cannot see which lookup missed, so both are named: {message}"
+        );
+
+        // And nothing was written under either name.
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM api_key k JOIN route r ON r.id = k.route_id WHERE r.name = $1",
+        )
+        .bind(&route)
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(keys, 0, "a failed mint leaves no row");
+
+        // A principal that exists and a route that does not: the same answer,
+        // because the SELECT is a cross join and either side empties it.
+        let email = format!("h9-{}@example.invalid", Uuid::new_v4());
+        sqlx::query("INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')")
+            .bind(&email)
+            .execute(db.pool())
+            .await
+            .expect("seed principal");
+        mint_key(&db, &email, "no-such-route-here", "k", None, false)
+            .await
+            .expect_err("no route, so no key");
+
+        // Both present: a key, and it is really there.
+        let key = mint_key(&db, &email, &route, "k", None, false)
+            .await
+            .expect("both exist");
+        let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM api_key WHERE key_hash = $1")
+            .bind(repo::hash_key(&key))
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(stored, 1, "the key that was printed is the key that was stored");
+    }
 
     /// C4. The CLI headline counts per-token traffic only, as the API does.
     ///
