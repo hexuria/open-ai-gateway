@@ -3653,6 +3653,69 @@ mod tests {
         assert_eq!(key_spend(&db, key).await, dec!(2.00), "replay is a no-op");
     }
 
+    /// S4. A debit reaches the counter at the ledger's own scale.
+    ///
+    /// `usage_event.cost_usd` is `numeric(14,8)` and the three denormalised
+    /// counters were `numeric(14,6)`, so `SET spent_usd = spent_usd +
+    /// ins.cost_usd` rounded every debit on assignment. A cheap-rung request
+    /// costs on the order of $0.0001; one costing less than $0.0000005 debited
+    /// nothing at all, and traffic made of such requests spent real money
+    /// against a cap that never moved.
+    ///
+    /// It also put the reconciler in an argument it could not win: 0012 exists
+    /// so a budget is enforced against a number that cannot be stale, and that
+    /// number was compared for equality against an eight-place ledger sum it
+    /// could not represent.
+    #[tokio::test]
+    async fn a_debit_keeps_every_place_the_ledger_recorded() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (key, build) = metered_key(&db).await;
+
+        // Eight places, the last two of which the old column could not hold.
+        let cost = "0.00000123";
+        record_usage(&db, &build(Uuid::new_v4(), 0, "classified", cost))
+            .await
+            .expect("record");
+
+        assert_eq!(
+            key_spend(&db, key).await,
+            dec!(0.00000123),
+            "the counter rounded the debit away: at six places this is 0.000001"
+        );
+
+        // And the property the reconciler depends on: counter == ledger sum,
+        // exactly, with no tolerance.
+        let ledger: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_event WHERE api_key_id = $1",
+        )
+        .bind(key)
+        .fetch_one(db.pool())
+        .await
+        .expect("sum");
+        assert_eq!(
+            key_spend(&db, key).await,
+            ledger,
+            "the counter and the ledger have to be comparable for equality"
+        );
+
+        // Repeated, because rounding on assignment compounds: a hundred of
+        // these is where a six-place counter and the ledger visibly part.
+        for _ in 0..99 {
+            record_usage(&db, &build(Uuid::new_v4(), 0, "classified", cost))
+                .await
+                .expect("record");
+        }
+        assert_eq!(
+            key_spend(&db, key).await,
+            dec!(0.00012300),
+            "a hundred debits of 0.00000123 are 0.000123, not 0.0001"
+        );
+    }
+
     /// S2. A prefix collision revokes several keys, and says so.
     ///
     /// `key_prefix` is the displayed half of a key and carries no unique index,
