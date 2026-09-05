@@ -96,7 +96,11 @@ pub fn describe() {
         "oag_credentials_schedulable",
         "Credentials currently eligible, by provider."
     );
-    describe_gauge!("oag_slots_in_use", "Concurrency slots held, by credential.");
+    describe_gauge!(
+        "oag_slots_in_use",
+        "Concurrency slots held by credential, fleet-wide, as last read by this replica. \
+         Every replica reports the same shared count: aggregate with max by (account), never sum."
+    );
     describe_gauge!(
         "oag_draining",
         "1 while this replica is shutting down and refusing new work."

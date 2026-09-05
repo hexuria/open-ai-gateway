@@ -491,21 +491,27 @@ async fn candidates_for(state: &AppState, remaining: &[&AccountRow], now: i64) -
         .filter(|r| r.to_candidate(0, 0).is_some_and(|c| is_eligible(&c, now)))
         .collect();
     let ids: Vec<AccountId> = probe.iter().map(|r| r.account_id()).collect();
-    let counts = match state.cache.slots_in_use_many(&ids, SLOT_TTL).await {
-        Ok(counts) if counts.len() == ids.len() => counts,
+    let (counts, counted) = match state.cache.slots_in_use_many(&ids, SLOT_TTL).await {
+        Ok(counts) if counts.len() == ids.len() => (counts, true),
         Ok(_) => {
             slot_accounting_degraded("count", &Error::Internal("short pipeline reply".to_owned()));
-            vec![0; ids.len()]
+            (vec![0; ids.len()], false)
         }
         Err(e) => {
             slot_accounting_degraded("count", &e);
-            vec![0; ids.len()]
+            (vec![0; ids.len()], false)
         }
     };
     let mut candidates = Vec::with_capacity(probe.len());
     for (row, in_flight) in probe.iter().zip(counts) {
-        metrics::gauge!("oag_slots_in_use", "account" => row.name.clone())
-            .set(f64::from(in_flight));
+        // Only a count that was read. The degraded zero is the right answer
+        // for admission and the wrong one to publish: a dashboard reading it
+        // would show every credential idle during the one outage in which
+        // nothing knows. The gauge keeps its last real value instead.
+        if counted {
+            metrics::gauge!("oag_slots_in_use", "account" => row.name.clone())
+                .set(f64::from(in_flight));
+        }
         if let Some(c) = row.to_candidate(in_flight, 0) {
             candidates.push(c);
         }
