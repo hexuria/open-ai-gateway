@@ -1656,28 +1656,48 @@ async fn price_account(
 }
 
 async fn revoke_key(db: &Db, redis_url: &str, prefix: &str) -> Result<()> {
-    let Some((hash, name, prefix)) = repo::revoke_key_by_prefix(db, prefix).await? else {
+    let revoked = repo::revoke_key_by_prefix(db, prefix).await?;
+    if revoked.is_empty() {
         println!("no active key with prefix {prefix}");
         return Ok(());
-    };
+    }
 
-    // The row update alone is not a revocation: every replica caches auth by
-    // hash, so without this the key keeps working until those entries expire.
-    oag_store::Cache::connect(redis_url)?
-        .auth_invalidate(&hash)
-        .await;
+    // Every one of them. `key_prefix` has no unique index, so this UPDATE has
+    // always been capable of matching several rows; taking the first and
+    // dropping the rest left the others deactivated in the database but still
+    // authenticating from the shared cache for its full TTL — and left the
+    // operator believing one key had been dealt with.
+    let cache = oag_store::Cache::connect(redis_url)?;
+    for (hash, name, prefix) in &revoked {
+        // The row update alone is not a revocation: every replica caches auth
+        // by hash, so without this the key keeps working until those entries
+        // expire.
+        cache.auth_invalidate(hash).await;
 
-    // Same target and shape as the server's audit line, so the CLI is not a
-    // hole in the trail.
-    tracing::warn!(
-        target: "oag::audit",
-        actor = "cli",
-        action = "key.revoke",
-        subject = %prefix,
-        name,
-        "admin write"
-    );
-    println!("revoked {name} ({prefix})");
+        // Same target and shape as the server's audit line, so the CLI is not a
+        // hole in the trail — and one line per key, because a collision that
+        // revoked someone else's key is exactly what the trail is for.
+        tracing::warn!(
+            target: "oag::audit",
+            actor = "cli",
+            action = "key.revoke",
+            subject = %prefix,
+            name,
+            "admin write"
+        );
+        println!("revoked {name} ({prefix})");
+    }
+
+    // Said loudly, because it means a key nobody asked about has just stopped
+    // working. The prefix is displayed and not unique, so this is reachable
+    // without anything being wrong with the database.
+    if revoked.len() > 1 {
+        println!(
+            "\n  NOTE: {} keys shared the prefix {prefix} and all of them were revoked.",
+            revoked.len()
+        );
+        println!("  If you meant only one, the others are named above and need re-issuing.");
+    }
     println!("  shared cache evicted; each replica's in-process cache expires within 15s");
     Ok(())
 }

@@ -1192,16 +1192,31 @@ pub async fn set_points_reference(db: &Db, usd_per_mtok: Decimal) -> Result<()> 
 
 /// Revoke by the displayed prefix, for the CLI — during an incident the prefix
 /// is what an operator can actually see.
+///
+/// Every match, and every match is returned. `key_prefix` carries no unique
+/// index and this UPDATE has no LIMIT, so a collision has always deactivated
+/// more than one row; what it did not do was say so. The caller took
+/// `fetch_optional`, which keeps the first row and drops the rest — so the
+/// other keys were deactivated in the database, their hashes were never evicted
+/// from the shared cache, and they went on authenticating from L2 for the five
+/// minutes of its TTL. An operator revoking a leaked key during an incident was
+/// told one key was revoked, and got one eviction, while some other customer's
+/// key had been switched off behind their back and the leaked one might not
+/// have stopped.
+///
+/// Over-revoking on a collision is the right direction for an incident tool —
+/// under-revoking is what gets someone breached — but only if it is visible.
+/// Returning the whole set is what makes it visible.
 pub async fn revoke_key_by_prefix(
     db: &Db,
     prefix: &str,
-) -> Result<Option<(String, String, String)>> {
+) -> Result<Vec<(String, String, String)>> {
     sqlx::query_as::<_, (String, String, String)>(
         "UPDATE api_key SET active = false WHERE key_prefix = $1 AND active
          RETURNING key_hash, name, key_prefix",
     )
     .bind(prefix)
-    .fetch_optional(db.pool())
+    .fetch_all(db.pool())
     .await
     .map_err(|e| Error::Internal(format!("revoking key by prefix: {e}")))
 }
@@ -3636,6 +3651,84 @@ mod tests {
             .await
             .expect("replay");
         assert_eq!(key_spend(&db, key).await, dec!(2.00), "replay is a no-op");
+    }
+
+    /// S2. A prefix collision revokes several keys, and says so.
+    ///
+    /// `key_prefix` is the displayed half of a key and carries no unique index,
+    /// so this UPDATE has always been able to match more than one row. The
+    /// caller took `fetch_optional`, which keeps the first and drops the rest —
+    /// so on a collision the other keys were deactivated in the database while
+    /// their hashes were never evicted from the shared cache, and they went on
+    /// authenticating from L2 for its full TTL. An operator revoking a leaked
+    /// key during an incident was told one key was dealt with, got one
+    /// eviction, and could have had the leaked one still working.
+    #[tokio::test]
+    async fn revoking_by_prefix_returns_every_key_that_shared_it() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, _) = seed(&db).await;
+
+        // Two keys, one displayed prefix. Nothing prevents this: the prefix is
+        // a display string, not an identifier.
+        let shared = format!("oag_live_{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let mut hashes = Vec::new();
+        for name in ["the-leaked-one", "someone-elses"] {
+            let raw = format!("{name}-{}", Uuid::new_v4());
+            let hash = hash_key(&raw);
+            sqlx::query(
+                "INSERT INTO api_key (id, key_hash, key_prefix, name, principal_id, route_id)
+                 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)",
+            )
+            .bind(&hash)
+            .bind(&shared)
+            .bind(name)
+            .bind(principal)
+            .bind(route)
+            .execute(db.pool())
+            .await
+            .expect("mint");
+            hashes.push(hash);
+        }
+
+        let revoked = revoke_key_by_prefix(&db, &shared).await.expect("revoke");
+        assert_eq!(
+            revoked.len(),
+            2,
+            "both keys carried the prefix and both were deactivated, so the \
+             caller has to be told about both — it is the hashes it evicts"
+        );
+        let returned: std::collections::HashSet<&str> =
+            revoked.iter().map(|(h, _, _)| h.as_str()).collect();
+        for hash in &hashes {
+            assert!(
+                returned.contains(hash.as_str()),
+                "a key was switched off in the database and its hash never came \
+                 back, so nothing evicts it and it authenticates until the TTL"
+            );
+        }
+
+        // Both rows really are inactive, and a second call finds nothing left:
+        // the UPDATE is scoped to `active`, so this is not idempotent by
+        // accident but by the predicate.
+        let still_active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM api_key WHERE key_prefix = $1 AND active",
+        )
+        .bind(&shared)
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(still_active, 0);
+        assert!(
+            revoke_key_by_prefix(&db, &shared)
+                .await
+                .expect("revoke again")
+                .is_empty(),
+            "nothing active left to revoke"
+        );
     }
 
     /// S1. The usage panels read a window, not a key's whole history.
