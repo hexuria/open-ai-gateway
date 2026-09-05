@@ -228,7 +228,15 @@ impl Catalog {
                 spec.pricing.input_per_mtok > rust_decimal::Decimal::ZERO
                     || spec.pricing.output_per_mtok > rust_decimal::Decimal::ZERO
             })
-            .max_by_key(|spec| spec.pricing.input_per_mtok + spec.pricing.output_per_mtok)
+            // Ties broken by id, because the walk is over a `HashSet` and
+            // `max_by_key` keeps whichever equal element it met last: the
+            // baseline — and the `counterfactual_model` the ledger records —
+            // has to be the same for the same inputs.
+            .max_by(|a, b| {
+                (a.pricing.input_per_mtok + a.pricing.output_per_mtok)
+                    .cmp(&(b.pricing.input_per_mtok + b.pricing.output_per_mtok))
+                    .then_with(|| b.id.as_str().cmp(a.id.as_str()))
+            })
     }
 
     #[must_use]
@@ -358,6 +366,31 @@ mod tests {
                 .as_str(),
             "openai/dear"
         );
+    }
+
+    #[test]
+    fn a_price_tie_resolves_the_same_way_every_time() {
+        // The served set is a `HashSet`, so without an explicit tie-break
+        // the baseline depended on iteration order, and the ledger recorded
+        // whichever model won that draw.
+        let catalog = Catalog::from_entries([
+            priced("openai/b-twin", "b-twin", dec!(5), dec!(30)),
+            priced("openai/a-twin", "a-twin", dec!(5), dec!(30)),
+        ]);
+        let served: std::collections::HashSet<String> = ["a-twin", "b-twin"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        for _ in 0..16 {
+            assert_eq!(
+                catalog
+                    .dearest_served(&served, &Requirements::default())
+                    .expect("a match")
+                    .id
+                    .as_str(),
+                "openai/a-twin"
+            );
+        }
     }
 
     #[test]
