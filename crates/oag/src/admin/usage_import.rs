@@ -109,6 +109,32 @@ pub enum Source {
 }
 
 impl Source {
+    /// Whether this source's message ids identify a call on their own.
+    ///
+    /// Decides whether the session is part of a row's identity, and the two
+    /// sources genuinely differ.
+    ///
+    /// Claude Code's is the provider's own message id — `msg_01...`, unique
+    /// across every session and every machine — so including the session in the
+    /// key adds nothing and costs correctness. That is finding C11: a line with
+    /// no `sessionId` falls back to the *filename*, so the same message in a
+    /// resumed session's continuation file derived a second `source_ref`,
+    /// cleared the unique index that exists to stop exactly this, and booked
+    /// one API call's tokens twice.
+    ///
+    /// Grok CLI's is `prompt_id`, and whether that is unique outside its own
+    /// session is not something this repository can demonstrate. Dropping the
+    /// session there would merge two genuinely different turns and *lose*
+    /// money, which is the same defect with the sign reversed and the worse of
+    /// the two. So it keeps the session until someone can show otherwise —
+    /// a fixture with one `prompt_id` in two Grok sessions would settle it.
+    const fn message_ids_are_global(self) -> bool {
+        match self {
+            Self::ClaudeCode => true,
+            Self::GrokCli => false,
+        }
+    }
+
     /// The `origin` its rows carry, which is also what `revert` deletes by.
     const fn origin(self) -> &'static str {
         match self {
@@ -1088,7 +1114,19 @@ fn plan(
             }
             Some(Verdict::Import) => {
                 for message in session.messages.values() {
-                    let source_ref = format!("{origin}:{session_id}:{}", message.external_id);
+                    // The session is part of the identity only where the
+                    // message id cannot stand alone — see
+                    // `Source::message_ids_are_global`, which is where the
+                    // reasoning for each source lives.
+                    //
+                    // Nothing is lost by dropping it: `origin` still says which
+                    // CLI the rows came from, and that is what `revert` matches
+                    // on. It never matched on this shape.
+                    let source_ref = if source.message_ids_are_global() {
+                        format!("{origin}:{}", message.external_id)
+                    } else {
+                        format!("{origin}:{session_id}:{}", message.external_id)
+                    };
                     let listed = source.price(prices, &message.model_slug);
                     if listed.is_none() {
                         *out.unpriced.entry(message.model_slug.clone()).or_default() += 1;
@@ -1574,6 +1612,16 @@ mod tests {
         .to_string()
     }
 
+    /// The same line with no `sessionId` at all — the shape finding C11 is
+    /// about. Real transcripts contain them: a resumed session's continuation
+    /// file, and some tool versions, simply omit the field.
+    fn line_without_session(msg_id: &str, ts: &str, model: &str, u: [u64; 4]) -> String {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&line("ignored", msg_id, ts, model, u)).expect("fixture json");
+        v.as_object_mut().expect("object").remove("sessionId");
+        v.to_string()
+    }
+
     fn at(ts: &str) -> OffsetDateTime {
         OffsetDateTime::parse(ts, &Rfc3339).expect("fixture timestamp")
     }
@@ -2042,8 +2090,57 @@ mod tests {
             Source::ClaudeCode,
             None,
         );
-        assert_eq!(first.rows[0].source_ref, "claude-code:s1:msg_a");
+        assert_eq!(first.rows[0].source_ref, "claude-code:msg_a");
         assert_eq!(first.rows[0].request_id, second.rows[0].request_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C11. The same message found in two files is still one API call.
+    ///
+    /// A transcript line carries the provider's own message id, which is
+    /// globally unique. The session is the file it happened to be found in —
+    /// and when a line has no `sessionId`, which real transcripts contain,
+    /// the scanner falls back to the *filename*. Keyed on that, a resumed
+    /// session's continuation file derived a second `source_ref` for the same
+    /// message, sailed past the unique index that exists to stop exactly this,
+    /// and booked one API call's tokens twice.
+    ///
+    /// Every fixture in this module wrote `sessionId` into every line, so
+    /// nothing here could reach the fallback.
+    #[test]
+    fn a_message_with_no_session_id_derives_one_identity_wherever_it_is_found() {
+        let body =
+            |ts: &str| line_without_session("msg_shared", ts, "claude-opus-5", [10, 20, 5000, 0]);
+
+        // The same message in two differently named files — a resumed session,
+        // which is the shape `a_resumed_session_copied_into_a_second_file_is_still_one_session`
+        // already tests for lines that DO carry a session id.
+        let dir = fixture_dir(
+            "no-session",
+            &[
+                ("first.jsonl", body("2026-01-01T00:00:00Z")),
+                ("second.jsonl", body("2026-01-01T00:00:00Z")),
+            ],
+        );
+        let planned = plan(
+            scan_claude_code(&dir).expect("scan"),
+            &LedgerIndex::default(),
+            &catalog(),
+            Source::ClaudeCode,
+            None,
+        );
+
+        let refs: std::collections::BTreeSet<&str> =
+            planned.rows.iter().map(|r| r.source_ref.as_str()).collect();
+        assert_eq!(
+            refs,
+            ["claude-code:msg_shared"].into_iter().collect(),
+            "two files, one message id, one identity — keyed on the filename \
+             this produced two, and the ledger booked the tokens twice"
+        );
+        let ids: std::collections::BTreeSet<Uuid> =
+            planned.rows.iter().map(|r| r.request_id).collect();
+        assert_eq!(ids.len(), 1, "and one request id, which is the primary key");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2061,18 +2158,21 @@ mod tests {
         let db = Db::connect(&url, 2).expect("connect");
         db.migrate().await.expect("migrate");
 
+        // Message ids unique per run, because `source_ref` is now keyed on
+        // them alone — which is what a provider's message id already is.
         let session = format!("s-{}", Uuid::new_v4());
+        let (msg_a, msg_b) = (format!("msg_a-{session}"), format!("msg_b-{session}"));
         let body = [
             line(
                 &session,
-                "msg_a",
+                &msg_a,
                 "2026-01-01T00:00:00Z",
                 "claude-opus-5",
                 [10, 20, 5000, 0],
             ),
             line(
                 &session,
-                "msg_b",
+                &msg_b,
                 "2026-01-01T00:01:00Z",
                 "claude-opus-5",
                 [11, 21, 6000, 0],
@@ -2086,7 +2186,7 @@ mod tests {
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM usage_event WHERE source_ref LIKE $1",
             )
-            .bind(format!("claude-code:{session}:%"))
+            .bind(format!("claude-code:%-{session}"))
             .fetch_one(db.pool())
             .await
             .expect("count")
@@ -2115,7 +2215,7 @@ mod tests {
 
         // And the marking is what makes the import removable on its own.
         sqlx::query("DELETE FROM usage_event WHERE source_ref LIKE $1")
-            .bind(format!("claude-code:{session}:%"))
+            .bind(format!("claude-code:%-{session}"))
             .execute(db.pool())
             .await
             .expect("cleanup");
@@ -2177,10 +2277,15 @@ mod tests {
                 .expect("seed account");
             }
 
+            // A message id unique per run: `source_ref` is keyed on it alone
+            // for this source now, so a fixed one would collide across runs of
+            // this same test — which is the property under test, seen from the
+            // other side.
             let session = format!("s-{}", Uuid::new_v4());
+            let msg = format!("msg_a-{session}");
             let body = line(
                 &session,
-                "msg_a",
+                &msg,
                 "2026-01-01T00:00:00Z",
                 "claude-opus-5",
                 [10_000, 2_000, 0, 0],
@@ -2190,7 +2295,7 @@ mod tests {
                 db,
                 sub,
                 key,
-                source_ref: format!("claude-code:{session}:msg_a"),
+                source_ref: format!("claude-code:{msg}"),
                 path: dir.to_string_lossy().into_owned(),
                 dir,
                 model,
