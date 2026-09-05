@@ -81,15 +81,29 @@ for _ in $(seq 1 90); do curl -fsS "http://$ADMIN/health/ready" >/dev/null 2>&1 
 curl -fsS "http://$ADMIN/health/ready" >/dev/null || fail "gateway never became ready; see $WORK/gateway.log"
 pass "gateway on $PUBLIC  route $ROUTE"
 
+# The ledger row is written by a task detached from the response, so the reply
+# can reach this script before the row exists — and did, on a slow CI runner.
+# Every read therefore waits for a row newer than a mark taken just before the
+# request, instead of reading whichever row is newest: that also means the
+# second request's check cannot pass on the first request's row.
+mark() { psql "$OAG_DATABASE__URL" -At -c "SELECT now()"; }
 ledger() {
-  psql "$OAG_DATABASE__URL" -At -F'|' -c "SELECT model_id, tier, input_tokens, output_tokens, \
-      cost_usd, counterfactual_usd \
-      FROM usage_event WHERE model_id LIKE 'bedrock%' ORDER BY occurred_at DESC LIMIT 1"
+  local since="$1" row=""
+  for _ in $(seq 1 40); do
+    row="$(psql "$OAG_DATABASE__URL" -At -F'|' -c "SELECT model_id, tier, input_tokens, output_tokens, \
+        cost_usd, counterfactual_usd \
+        FROM usage_event WHERE model_id LIKE 'bedrock%' AND occurred_at >= '$since' \
+        ORDER BY occurred_at DESC LIMIT 1")" || return 1
+    [ -n "$row" ] && break
+    sleep 0.25
+  done
+  printf '%s\n' "$row"
 }
 
 assert_ledger() {
+  local since="$1"
   local row
-  row="$(ledger)" || fail "could not read the bedrock ledger"
+  row="$(ledger "$since")" || fail "could not read the bedrock ledger"
   python3 - "$row" <<'PY'
 import sys
 row = sys.argv[1].strip().split("|")
@@ -107,6 +121,7 @@ PY
 MODEL='bedrock/anthropic.claude-haiku-4-5-v1:0'
 
 say "4/4  Bedrock invoke + invoke-with-response-stream through the gateway"
+since="$(mark)"
 curl -sS --max-time 30 -o "$WORK/whole.json" -w "%{http_code}" \
   -X POST "http://$PUBLIC/v1/messages" \
   -H "x-api-key: $KEY" -H 'content-type: application/json' \
@@ -116,9 +131,10 @@ curl -sS --max-time 30 -o "$WORK/whole.json" -w "%{http_code}" \
 [ "$(cat "$WORK/whole.status")" = "200" ] \
   || fail "non-stream: HTTP $(cat "$WORK/whole.status") $(cat "$WORK/whole.json")"
 grep -q 'bedrock mock' "$WORK/whole.json" || fail "non-stream body: $(cat "$WORK/whole.json")"
-assert_ledger
+assert_ledger "$since"
 pass "non-stream invoke + ledger"
 
+since="$(mark)"
 curl -sN --max-time 30 -X POST "http://$PUBLIC/v1/messages" \
   -H "x-api-key: $KEY" -H 'content-type: application/json' \
   -d "{\"model\":\"$MODEL\",\"max_tokens\":32,\"stream\":true,
@@ -130,7 +146,7 @@ grep -q 'bedrock' "$WORK/stream.txt" \
   || fail "stream had no overlay text: $(head -c 500 "$WORK/stream.txt")"
 grep -q 'event: message_delta\|event: message_stop' "$WORK/stream.txt" \
   || fail "stream never completed: $(tail -c 400 "$WORK/stream.txt")"
-assert_ledger
+assert_ledger "$since"
 pass "stream invoke-with-response-stream + ledger"
 
 OK=1

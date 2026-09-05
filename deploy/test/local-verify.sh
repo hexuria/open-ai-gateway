@@ -88,7 +88,13 @@ print('  ok  finished in %.1fs, tracking the upstream' % e)
 "
 
 say "5/5  the ledger"
-just _verify-ledger > "$WORK/ledger.txt" || fail "could not read the ledger"
+# Written by a task detached from the response; give it a moment to land
+# rather than reading the ledger the instant the stream closed.
+for _ in $(seq 1 40); do
+  just _verify-ledger > "$WORK/ledger.txt" || fail "could not read the ledger"
+  [ "$(tr -cd '|' < "$WORK/ledger.txt" | wc -c)" -ge 5 ] && break
+  sleep 0.25
+done
 cat "$WORK/ledger.txt" | sed 's/^/  /'
 python3 - "$WORK/ledger.txt" <<'PY'
 import sys

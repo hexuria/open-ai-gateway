@@ -110,17 +110,29 @@ for _ in $(seq 1 90); do curl -fsS "http://$ADMIN/health/ready" >/dev/null 2>&1 
 curl -fsS "http://$ADMIN/health/ready" >/dev/null || fail "gateway never became ready; see $WORK/gateway.log"
 pass "gateway on $PUBLIC  route $ROUTE"
 
+# The ledger row is written by a task detached from the response, so the reply
+# can reach this script before the row exists — and did, on a slow CI runner.
+# Every read therefore waits for a row newer than a mark taken just before the
+# request, instead of reading whichever row is newest: that also means the
+# second request's check cannot pass on the first request's row.
+mark() { psql "$OAG_DATABASE__URL" -At -c "SELECT now()"; }
 ledger() {
-  local like="$1"
-  psql "$OAG_DATABASE__URL" -At -F'|' -c "SELECT model_id, tier, input_tokens, output_tokens, \
-      cost_usd, counterfactual_usd \
-      FROM usage_event WHERE model_id LIKE '$like' ORDER BY occurred_at DESC LIMIT 1"
+  local like="$1" since="$2" row=""
+  for _ in $(seq 1 40); do
+    row="$(psql "$OAG_DATABASE__URL" -At -F'|' -c "SELECT model_id, tier, input_tokens, output_tokens, \
+        cost_usd, counterfactual_usd \
+        FROM usage_event WHERE model_id LIKE '$like' AND occurred_at >= '$since' \
+        ORDER BY occurred_at DESC LIMIT 1")" || return 1
+    [ -n "$row" ] && break
+    sleep 0.25
+  done
+  printf '%s\n' "$row"
 }
 
 assert_ledger() {
-  local like="$1"
+  local like="$1" since="$2"
   local row
-  row="$(ledger "$like")" || fail "could not read the ledger for $like"
+  row="$(ledger "$like" "$since")" || fail "could not read the ledger for $like"
   python3 - "$row" <<'PY'
 import sys
 row = sys.argv[1].strip().split("|")
@@ -136,6 +148,7 @@ PY
 }
 
 say "4/5  OpenAI Chat Completions"
+since="$(mark)"
 curl -sS --max-time 30 -o "$WORK/openai.json" -w "%{http_code}" \
   -X POST "http://$PUBLIC/v1/chat/completions" \
   -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
@@ -144,7 +157,7 @@ curl -sS --max-time 30 -o "$WORK/openai.json" -w "%{http_code}" \
 [ "$(cat "$WORK/openai.status")" = "200" ] \
   || fail "openai non-stream: HTTP $(cat "$WORK/openai.status") $(cat "$WORK/openai.json")"
 grep -q 'dialect mock' "$WORK/openai.json" || fail "openai body had no fixture text: $(cat "$WORK/openai.json")"
-assert_ledger 'openai%'
+assert_ledger 'openai%' "$since"
 pass "openai non-stream + ledger"
 
 curl -sN --max-time 30 -X POST "http://$PUBLIC/v1/chat/completions" \
@@ -157,6 +170,7 @@ grep -q 'dialect mock\|\[DONE\]' "$WORK/openai.sse" \
 pass "openai stream"
 
 say "5/5  Gemini generateContent"
+since="$(mark)"
 curl -sS --max-time 30 -o "$WORK/gemini.json" -w "%{http_code}" \
   -X POST "http://$PUBLIC/v1beta/models/gemini-2.0-flash:generateContent" \
   -H "x-goog-api-key: $KEY" -H 'content-type: application/json' \
@@ -165,7 +179,7 @@ curl -sS --max-time 30 -o "$WORK/gemini.json" -w "%{http_code}" \
 [ "$(cat "$WORK/gemini.status")" = "200" ] \
   || fail "gemini non-stream: HTTP $(cat "$WORK/gemini.status") $(cat "$WORK/gemini.json")"
 grep -q 'dialect mock' "$WORK/gemini.json" || fail "gemini body had no fixture text: $(cat "$WORK/gemini.json")"
-assert_ledger 'gemini%'
+assert_ledger 'gemini%' "$since"
 pass "gemini non-stream + ledger"
 
 curl -sN --max-time 30 -X POST "http://$PUBLIC/v1beta/models/gemini-2.0-flash:streamGenerateContent" \
