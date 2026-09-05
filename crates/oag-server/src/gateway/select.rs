@@ -693,11 +693,19 @@ security:
         let state = dead_redis_state();
         let row = super::testing::account("seat", "api_key");
 
+        // The cascade's reader, which pipelines every survivor's count in
+        // one round trip. `candidate_for` beside it serves only the pin.
+        let candidates = candidates_for(&state, &[&row], 0).await;
+        let [candidate] = candidates.as_slice() else {
+            panic!("one row in, one candidate out; got {}", candidates.len());
+        };
+        assert_eq!(candidate.in_flight, 0, "unknown is idle, not full");
+        assert!(is_eligible(candidate, 0));
+
         let candidate = candidate_for(&state, &row, 0)
             .await
-            .expect("a candidate, not a refusal");
-        assert_eq!(candidate.in_flight, 0, "unknown is idle, not full");
-        assert!(is_eligible(&candidate, 0));
+            .expect("the pin's reader degrades the same way");
+        assert_eq!(candidate.in_flight, 0);
 
         // And the acquire reports the failure as an error the caller can
         // choose to admit on — not as `false`, which is what turned a Redis
