@@ -71,6 +71,11 @@ gateway:
   maxStreamDurationSeconds: 1800
   streamIdleTimeoutSeconds: 180
   streamKeepaliveIntervalSeconds: 10
+  # How long an upstream may take to send response headers, and how long a
+  # client may go without reading its stream. Both are backstops against
+  # silence, not latency targets.
+  upstreamResponseTimeoutSeconds: 90
+  clientWriteTimeoutSeconds: 60
   sameAccountRetries: 2
   maxAccountSwitches: 3
   catalogRefreshIntervalSeconds: 60
@@ -126,9 +131,21 @@ terminationGracePeriodSeconds: 1845
 # keeps serving normally throughout.
 preStopDelaySeconds: 15
 
+server:
+  # Requests admitted per replica at once; past this a request is shed with a
+  # 503 and a Retry-After, never queued. `OagReplicaShedding` tells you to
+  # raise this — which is only possible if the chart can set it. Sized with
+  # `resources.limits.memory`: see the note there.
+  maxInFlight: 64
+
+database:
+  # Ceiling on any one statement. A held query on a stalled primary is turned
+  # into an error the pool recovers from.
+  statementTimeoutSeconds: 30
+
 resources:
   # `server.max_body_bytes` is buffered per in-flight request, and
-  # `server.max_in_flight` bounds how many are. Their product is what an
+  # `server.maxInFlight` above bounds how many are. Their product is what an
   # all-maximum-size flood could hold — 64 × 32 MiB at the defaults, more than
   # this limit, which is survivable only because real bodies are kilobytes.
   # Raise the three together, or lower the ceiling for a large-body workload.
