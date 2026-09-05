@@ -126,15 +126,16 @@ resource "google_cloud_run_v2_service" "this" {
       # Secrets come from Secret Manager, never from plain env values, so they
       # are not visible in the service description. Whether they are in
       # Terraform state depends on who created the secret version: this
-      # module only references one.
+      # module only references one — by number, so that a new one is a new
+      # revision (see `secret_env`).
       dynamic "env" {
         for_each = var.secret_env
         content {
           name = env.key
           value_source {
             secret_key_ref {
-              secret  = env.value
-              version = "latest"
+              secret  = env.value.secret
+              version = env.value.version
             }
           }
         }
@@ -241,8 +242,8 @@ resource "google_cloud_run_v2_job" "migrate" {
             name = env.key
             value_source {
               secret_key_ref {
-                secret  = env.value
-                version = "latest"
+                secret  = env.value.secret
+                version = env.value.version
               }
             }
           }

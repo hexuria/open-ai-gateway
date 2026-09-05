@@ -110,11 +110,22 @@ module "gateway" {
   image      = var.image
   vpc_subnet = local.vpc_subnet
 
+  # Secret AND version. The version is what rolls the service when a value
+  # changes: the data module composes the Memorystore AUTH string into the
+  # Redis URL, so turning AUTH on writes a new version, and a template that
+  # read `latest` would leave every running instance on the old, now
+  # password-less URL until something else forced a revision.
   secret_env = {
-    OAG_DATABASE__URL            = google_secret_manager_secret.this["database-url"].secret_id
-    OAG_REDIS__URL               = google_secret_manager_secret.this["redis-url"].secret_id
-    OAG_SECURITY__SIGNING_SECRET = google_secret_manager_secret.this["signing-secret"].secret_id
-    OAG_SECURITY__CREDENTIAL_KEK = google_secret_manager_secret.this["credential-kek"].secret_id
+    for key, env in {
+      "database-url"   = "OAG_DATABASE__URL"
+      "redis-url"      = "OAG_REDIS__URL"
+      "signing-secret" = "OAG_SECURITY__SIGNING_SECRET"
+      "credential-kek" = "OAG_SECURITY__CREDENTIAL_KEK"
+    } :
+    env => {
+      secret  = google_secret_manager_secret.this[key].secret_id
+      version = google_secret_manager_secret_version.this[key].version
+    }
   }
 
   env = var.gateway_env
