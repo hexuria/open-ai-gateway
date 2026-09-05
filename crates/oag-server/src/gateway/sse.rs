@@ -231,7 +231,14 @@ pub async fn pump(
         let next = loop {
             tokio::select! {
                 n = tokio::time::timeout_at(idle_deadline, body.next()) => break n,
-                _ = keepalive.tick(), if !client_gone => {
+                // Only at a frame boundary. A translated stream always is:
+                // only whole frames are rendered. A passthrough stream is
+                // whatever the last read was, and a read that ended inside a
+                // `data:` line leaves the rest in `pending` — a comment
+                // injected there lands mid-payload, and the client's parser
+                // gets a frame it cannot read. The tick is not consumed, so
+                // it fires again as soon as the frame completes.
+                _ = keepalive.tick(), if !client_gone && pending.is_empty() => {
                     // Not `mark_committed` on success: nothing of the answer
                     // went out. A refused or stalled send is a gone client,
                     // exactly as for a real chunk.
