@@ -152,10 +152,34 @@ pub async fn upsert_principal(
     };
     match oag_store::repo::upsert_principal(&state.db, &body.email, role, budget).await {
         Ok(id) => {
+            // An existing principal's budget was just rewritten, and the
+            // budget rides in every one of its cached key identities. Same
+            // eviction as `set_principal_budget`, for the same reason: the
+            // 200 below asserts a cap, and without this it was not enforced
+            // until the entries happened to expire.
+            evict_principal_keys(&state, id, &body.email).await;
             audit(&actor, "principal.upsert", id, &body.email);
             Json(json!({ "id": id, "email": body.email })).into_response()
         }
         Err(e) => failed(&e),
+    }
+}
+
+/// Drop every cached identity of `principal`'s keys, in every tier.
+///
+/// Best-effort: the write has already happened, and a principal whose keys
+/// could not be evicted is worth a warning, not a failed response.
+async fn evict_principal_keys(state: &AppState, principal: uuid::Uuid, email: &str) {
+    match oag_store::repo::key_hashes_for_principal(&state.db, principal).await {
+        Ok(hashes) => {
+            for hash in &hashes {
+                state.auth.invalidate_hash(hash).await;
+            }
+        }
+        Err(e) => tracing::warn!(
+            error = %e, %email,
+            "principal written but its keys could not be evicted from the auth cache"
+        ),
     }
 }
 
@@ -207,17 +231,7 @@ pub async fn set_principal_budget(
             // identities, in every tier, for minutes. Without this the 200
             // below asserted a limit that was not enforced until the entries
             // happened to expire.
-            match oag_store::repo::key_hashes_for_principal(&state.db, id).await {
-                Ok(hashes) => {
-                    for hash in &hashes {
-                        state.auth.invalidate_hash(hash).await;
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    error = %e, %email,
-                    "budget written but its keys could not be evicted from the auth cache"
-                ),
-            }
+            evict_principal_keys(&state, id, &email).await;
             audit(&actor, "principal.budget", id, &email);
             Json(json!({ "id": id, "email": email, "monthly_budget_usd": body.monthly_budget_usd }))
                 .into_response()
