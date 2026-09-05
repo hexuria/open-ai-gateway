@@ -2438,8 +2438,28 @@ mod tests {
         assert!(ahead, "a later month is not pulled back");
     }
 
-    /// The race the row lock exists for: debits landing while a pass runs are
+    /// The race the row lock exists for: a debit landing while a pass runs is
     /// never lost from the counter.
+    ///
+    /// The interleaving is forced, not hoped for. This used to spawn twenty-four
+    /// debits against six reconciles and assert the totals agreed, which passes
+    /// whenever no pass happens to overlap a debit's lock window — so it passed
+    /// with the fix reverted about as often as it caught it, and it was the
+    /// scheduler rather than the code that decided which. It also asked thirty
+    /// tasks to share a pool of eight, so its most common failure was a pool
+    /// timeout that had nothing to do with the property.
+    ///
+    /// The construction below is the race written down. A debit holds the
+    /// principal's row lock in an uncommitted transaction; the reconcile pass
+    /// then runs and is *observed* to be blocked on that lock before the debit
+    /// commits. That is exactly the window the bug lives in:
+    ///
+    ///   * With the lock taken first, the pass waits before computing anything,
+    ///     so its `SUM` runs after the debit committed and includes it.
+    ///   * With the obvious single statement, the pass blocks *inside* its
+    ///     UPDATE with the subquery already evaluated. Postgres re-checks the
+    ///     WHERE clause against the new row version but does not re-run the SET
+    ///     subquery, so a stale sum overwrites the debit and the money is gone.
     ///
     /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it.
     #[tokio::test]
@@ -2448,7 +2468,7 @@ mod tests {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
             return;
         };
-        let db = Db::connect(&url, 8).expect("connect");
+        let db = Db::connect(&url, 4).expect("connect");
         db.migrate().await.expect("migrate");
         let (principal, route, account) = seed(&db).await;
         let key = capped_key(&db, principal, route, format!("race-{}", Uuid::new_v4())).await;
@@ -2478,22 +2498,75 @@ mod tests {
             streamed: false,
         };
 
-        let mut tasks = Vec::new();
-        for _ in 0..24 {
+        // A debit in flight: its ledger row and its counter increment, holding
+        // the principal's row lock until it commits. This is what
+        // `record_usage` does; done by hand only because the test has to stop
+        // in the middle of it.
+        let mut debit = db.pool().begin().await.expect("begin");
+        sqlx::query(
+            "INSERT INTO usage_event (request_id, attempt, principal_id, api_key_id, route_id,
+                                      account_id, model_id, tier, selection_reason,
+                                      input_tokens, output_tokens, cost_usd, status)
+             VALUES ($1, 0, $2, $3, $4, $5, 'kimi-k2', 'cheap', 'default', 0, 0, 0.10, 200)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal)
+        .bind(key)
+        .bind(route)
+        .bind(account.as_uuid())
+        .execute(&mut *debit)
+        .await
+        .expect("ledger row");
+        sqlx::query(
+            "UPDATE principal SET spent_usd = spent_usd + 0.10,
+                                  spent_month = date_trunc('month', now())::date
+              WHERE id = $1",
+        )
+        .bind(principal)
+        .execute(&mut *debit)
+        .await
+        .expect("take the row lock");
+
+        // The pass, which must now be waiting on that lock.
+        let pass = tokio::spawn({
             let db = db.clone();
-            tasks.push(tokio::spawn(async move {
-                record_usage(&db, &write()).await.expect("record");
-            }));
+            async move { reconcile_monthly_spend(&db).await }
+        });
+
+        // Observed, not assumed. Without this the debit could commit before the
+        // pass had reached the row at all, and the test would go back to
+        // asserting whatever the scheduler felt like.
+        let mut blocked = false;
+        for _ in 0..200 {
+            // `pg_stat_activity`, not `pg_locks` filtered by relation: a
+            // transaction waiting for another's row lock waits on that
+            // transaction's id, so nothing ungranted is recorded against the
+            // table itself.
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("read the lock table");
+            if waiting > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        for _ in 0..6 {
-            let db = db.clone();
-            tasks.push(tokio::spawn(async move {
-                reconcile_monthly_spend(&db).await.expect("reconcile");
-            }));
-        }
-        for task in tasks {
-            task.await.expect("task");
-        }
+        assert!(
+            blocked,
+            "the pass never reached the locked row, so this run proved nothing"
+        );
+
+        debit.commit().await.expect("commit the debit");
+        pass.await.expect("task").expect("reconcile");
+
+        // And a second debit after the pass, so the counter is exercised in
+        // both orders relative to it.
+        record_usage(&db, &write()).await.expect("record");
 
         let ledger: Decimal = sqlx::query_scalar(
             "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_event
@@ -2503,17 +2576,18 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .expect("sum");
-        assert_eq!(ledger, dec!(2.65), "24 debits and the old row");
+        assert_eq!(ledger, dec!(0.45), "the old row and two debits");
+
         let spend = spend_for(&db, key, principal).await.expect("spend");
         assert_eq!(
             spend.principal_usd, ledger,
-            "every debit that landed mid-pass is kept"
+            "the debit that landed mid-pass is still in the counter"
         );
         let row = route_by_id(&db, route)
             .await
             .expect("load")
             .expect("exists");
-        assert_eq!(row.spent_usd, ledger);
+        assert_eq!(row.spent_usd, ledger, "and in the route's");
     }
 
     /// Fixture: one principal, one route, one shared credential joined to it.
