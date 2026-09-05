@@ -36,7 +36,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say "1/4  infrastructure"
+say "1/5  infrastructure"
 if [ -z "${OAG_DATABASE__URL:-}" ]; then
   just dev-up >/dev/null
 fi
@@ -44,7 +44,7 @@ eval "$(just _verify-env)"
 just migrate >/dev/null
 pass "postgres, redis, schema"
 
-say "2/4  Anthropic mock"
+say "2/5  Anthropic mock"
 MOCK_STREAM_SECONDS="$STREAM_SECONDS" MOCK_CHUNKS="$CHUNKS" PORT="$MOCK_PORT" \
   python3 deploy/test/mock-upstream.py >"$WORK/mock.log" 2>&1 &
 MOCK_PID=$!
@@ -55,7 +55,7 @@ done
 [ "$(seen)" = "0" ] || fail "mock never became ready; see $WORK/mock.log"
 pass "mock on :$MOCK_PORT"
 
-say "3/4  gateway, one anthropic account on an isolated route"
+say "3/5  gateway, one anthropic account on an isolated route"
 KEY="$(
   cargo run --quiet -p oag -- admin init --email translate@localhost --route "$ROUTE" 2>/dev/null \
     | grep -oE 'oag_live_[0-9a-f]+' | head -1
@@ -127,7 +127,7 @@ print(f"  ok  {model} on '{tier}': in={inp} out={out}, ${cost} vs ${counterfactu
 PY
 }
 
-say "4/4  Chat Completions client, Anthropic upstream"
+say "4/5  Chat Completions client, Anthropic upstream"
 since="$(mark)"
 curl -sS --max-time 30 -o "$WORK/openai.json" -w "%{http_code}" \
   -X POST "http://$PUBLIC/v1/chat/completions" \
@@ -196,6 +196,50 @@ if finish != "stop":
 PY
 assert_ledger $((CHUNKS * 3)) "$since"
 pass "stream translated + [DONE] + ledger"
+
+# Two fields that are invisible in the reply: the gateway either renders them on
+# the way out or it does not, and the client is told nothing either way. Both
+# were dropped in silence until 2026-09-05 — a system message written as parts,
+# and a reasoning level from a client whose dialect has no budget field.
+say "5/5  fields the reply cannot show you"
+before="$(wc -l <"$WORK/mock.log")"
+curl -sS --max-time 30 -o "$WORK/fields.json" -w "%{http_code}" \
+  -X POST "http://$PUBLIC/v1/chat/completions" \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"oag/auto","stream":false,"reasoning_effort":"high","messages":[
+        {"role":"system","content":[{"type":"text","text":"Never write prose."}]},
+        {"role":"user","content":"hello"}]}' \
+  >"$WORK/fields.status"
+[ "$(cat "$WORK/fields.status")" = "200" ] \
+  || fail "HTTP $(cat "$WORK/fields.status") $(cat "$WORK/fields.json")"
+
+tail -n "+$((before + 1))" "$WORK/mock.log" | grep '^mock-request: ' | tail -1 \
+  | sed 's/^mock-request: //' >"$WORK/upstream.json"
+[ -s "$WORK/upstream.json" ] || fail "the mock recorded no request; see $WORK/mock.log"
+
+python3 - "$WORK/upstream.json" <<'FIELDS' || fail "a field was dropped on the way to the upstream"
+import json, sys
+req = json.load(open(sys.argv[1]))
+
+# H1. The array form is legal here and used to be discarded, so the model was
+# asked the bare question with no instructions at all.
+system = req.get("system")
+text = ""
+if isinstance(system, str):
+    text = system
+elif isinstance(system, list):
+    text = " ".join(b.get("text", "") for b in system if isinstance(b, dict))
+if "Never write prose." not in text:
+    sys.exit(f"the system message did not reach the upstream: system={system!r}")
+
+# H3. This dialect speaks budgets, the client spoke levels, and the bridge only
+# ever ran in the other direction.
+thinking = req.get("thinking") or {}
+if thinking.get("type") != "enabled" or not thinking.get("budget_tokens"):
+    sys.exit(f"reasoning_effort did not become a thinking budget: thinking={thinking!r}")
+print(f"  ok  system rendered, thinking budget {thinking['budget_tokens']}")
+FIELDS
+pass "system-as-parts and reasoning_effort both reached the upstream"
 
 OK=1
 printf '\n\033[32mPASS: OpenAI client over Anthropic upstream is translated, not passed through\033[0m\n'

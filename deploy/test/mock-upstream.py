@@ -80,6 +80,13 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             request = {}
 
+        # Onto stderr, which the verify scripts keep as `mock.log`. Without
+        # it a script can only assert what came back, and a field the gateway
+        # dropped on the way *out* — a system message it failed to render, a
+        # thinking budget it never sent — is invisible in the reply.
+        sys.stderr.write("mock-request: " + json.dumps(request, separators=(",", ":")) + "\n")
+        sys.stderr.flush()
+
         status = _record_and_status()
         if status:
             payload = json.dumps(
