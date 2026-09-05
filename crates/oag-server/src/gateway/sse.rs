@@ -643,6 +643,17 @@ pub async fn collect_stream(
         pending.extend_from_slice(&chunk);
         let payloads = take_payloads(&mut pending, framing);
         collect_payloads(&payloads, &adapter, &mut acc, &mut events);
+
+        // The same bound `pump` holds, for the same reason: past this the
+        // tail is not a large frame, it is an upstream that will never send
+        // the delimiter, and this reader was the one path that let it
+        // choose how much memory a replica allocates.
+        if pending.len() > MAX_PENDING {
+            return Err(Error::Internal(format!(
+                "upstream sent {} bytes without completing an event",
+                pending.len()
+            )));
+        }
     }
 
     // Whatever is left is a partial frame; try once more in case it completed
