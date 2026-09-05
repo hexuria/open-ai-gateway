@@ -201,7 +201,9 @@ pub async fn pump(
     // docs/04-cloud.md all described this as what keeps quiet streams alive;
     // until now no code emitted one. An SSE comment (`: keepalive`) is
     // discarded by every conforming parser and needs no per-dialect renderer.
-    // Reset on every real chunk, so it only fires into silence.
+    // Reset on every real chunk, so it only fires into silence. Config
+    // validation refuses a zero interval; the clamp is only so a caller that
+    // bypassed it gets a busy stream rather than a panic.
     let mut keepalive = tokio::time::interval(keepalive_interval.max(Duration::from_millis(1)));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The first tick of an interval is immediate; a keepalive before the first

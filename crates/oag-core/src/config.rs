@@ -480,6 +480,29 @@ impl Config {
                 "gateway.client_write_timeout must be positive".to_owned(),
             ));
         }
+        // The period of a live interval. Zero is clamped in the pump so it
+        // cannot panic, but a one-millisecond keepalive is a stream of
+        // comments nobody meant; and one at or past the idle watchdog keeps
+        // nothing alive, because the watchdog fires first.
+        if self.gateway.stream_keepalive_interval.is_zero() {
+            return Err(crate::Error::Config(
+                "gateway.stream_keepalive_interval must be positive".to_owned(),
+            ));
+        }
+        if self.gateway.stream_keepalive_interval >= self.gateway.stream_idle_timeout {
+            return Err(crate::Error::Config(
+                "gateway.stream_keepalive_interval must be shorter than gateway.stream_idle_timeout"
+                    .to_owned(),
+            ));
+        }
+        // A ceiling of zero has no permit to give: every inference request
+        // is shed while both health probes, which sit outside the ceiling by
+        // design, stay green. Not a value anyone means.
+        if self.server.max_in_flight == 0 {
+            return Err(crate::Error::Config(
+                "server.max_in_flight must be positive".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -596,6 +619,33 @@ security:
             err.to_string().contains("upstream_response_timeout"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn the_keepalive_period_cannot_be_zero_or_outlast_the_idle_watchdog() {
+        // Until the pump emitted keepalives nothing read this field, so
+        // nothing checked it. Now it is the period of a live interval.
+        let zero = format!("{MINIMAL}\ngateway:\n  stream_keepalive_interval: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("zero is refused");
+        assert!(
+            err.to_string().contains("stream_keepalive_interval"),
+            "{err}"
+        );
+
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        let idle = cfg.gateway.stream_idle_timeout.as_secs();
+        let late = format!("{MINIMAL}\ngateway:\n  stream_keepalive_interval: {idle}\n");
+        let err = Config::from_yaml(&late).expect_err("a keepalive the watchdog beats is refused");
+        assert!(err.to_string().contains("stream_idle_timeout"), "{err}");
+    }
+
+    #[test]
+    fn an_in_flight_ceiling_of_zero_is_refused() {
+        // Zero permits sheds every inference request forever while both
+        // health probes report healthy: a blackhole that looks configured.
+        let zero = format!("{MINIMAL}\nserver:\n  max_in_flight: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("zero is refused");
+        assert!(err.to_string().contains("max_in_flight"), "{err}");
     }
 
     #[test]

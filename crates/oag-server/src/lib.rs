@@ -526,7 +526,13 @@ server:
         // A ceiling of zero has no permit to give, ever — so every request is
         // what the (n+1)th request looks like at a ceiling of n. It must come
         // back at once as our own 503, with a Retry-After, and not wait.
-        let app = public_router(state_shaped(false, 32 * 1024 * 1024, 0));
+        // Through `admit` directly: a zero ceiling is refused by config
+        // validation, exactly because it makes a replica that answers this
+        // way to everyone.
+        let state = state_shaped(false, 32 * 1024 * 1024, 64);
+        let app = admit(inference_routes(&state), 0)
+            .route("/health/live", get(health::live))
+            .with_state(state);
         let started = std::time::Instant::now();
         let res = app
             .clone()
