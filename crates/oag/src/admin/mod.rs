@@ -197,15 +197,25 @@ pub struct AccountAddArgs {
         conflicts_with_all = ["from", "from_grok", "from_codex"]
     )]
     provider: Option<String>,
-    /// The provider API key. Read from `OAG_ACCOUNT_SECRET` if omitted, so it
-    /// need not appear in shell history or the process table.
-    #[arg(
-        long,
-        env = "OAG_ACCOUNT_SECRET",
-        hide_env_values = true,
-        required_unless_present_any = ["from", "from_grok", "from_codex"],
-        conflicts_with_all = ["from", "from_grok", "from_codex"]
-    )]
+    /// The provider API key.
+    ///
+    /// Falls back to `OAG_ACCOUNT_SECRET`, so it need not appear in shell
+    /// history or the process table. Required with `--provider`, and read in
+    /// `add_account_from_args` rather than declared here with clap's `env`.
+    ///
+    /// That is the whole of finding C8. clap treats an env-supplied value as
+    /// explicitly present when it evaluates conflicts, so with
+    /// `OAG_ACCOUNT_SECRET` exported — the documented way to keep a key out of
+    /// shell history, recommended by this very help text — every `--from`
+    /// import failed with "the argument '--secret' cannot be used with
+    /// '--from'", naming a flag that was not on the command line. Only the
+    /// operator who followed the advice could hit it.
+    ///
+    /// Reading the variable ourselves keeps the two cases distinguishable: a
+    /// `--secret` that was typed conflicts with an importer and is refused
+    /// below, and one inherited from the environment does not, because the
+    /// operator was not asserting anything about this invocation.
+    #[arg(long)]
     secret: Option<String>,
     /// Import a signed-in CLI session as an OAuth credential.
     ///
@@ -667,6 +677,24 @@ async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddArgs) -> Resu
     } else {
         from
     };
+
+    // The exclusion clap used to express, enforced where the distinction is
+    // visible. An imported seat takes its credential from a signed-in CLI's
+    // session file, so a `--secret` typed alongside `--from` would be silently
+    // ignored — worth an error. One sitting in the environment is not: it is
+    // there for every other invocation and says nothing about this one.
+    if source.is_some() && secret.is_some() {
+        return Err(oag_core::Error::Config(
+            "--secret cannot be combined with --from: an imported seat takes its \
+             credential from the CLI session file, so a secret passed here would be \
+             ignored. A secret in OAG_ACCOUNT_SECRET is fine — this is only about the \
+             flag."
+                .to_owned(),
+        ));
+    }
+
+    // Only after the conflict check, so the fallback cannot resurrect it.
+    let secret = secret.or_else(|| std::env::var("OAG_ACCOUNT_SECRET").ok());
     match source {
         Some(AccountSource::Grok) => {
             import_grok(
@@ -701,7 +729,10 @@ async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddArgs) -> Resu
         None => {
             let (Some(provider), Some(secret)) = (provider, secret) else {
                 return Err(oag_core::Error::Config(
-                    "--provider and --secret are required without --from".to_owned(),
+                    "--provider and --secret are required without --from. The secret may \
+                     come from OAG_ACCOUNT_SECRET instead of the flag, which keeps it out \
+                     of shell history."
+                        .to_owned(),
                 ));
             };
             add_account(
@@ -2023,6 +2054,87 @@ async fn status(db: &Db) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.
+    ///
+    /// clap treats an env-supplied value as explicitly present when it
+    /// evaluates conflicts. With `env` on `--secret` and a `conflicts_with_all`
+    /// against the importers, exporting the variable — the way this command's
+    /// own help recommends keeping a key out of shell history — made every
+    /// `oag admin account add --from codex` fail with "the argument '--secret'
+    /// cannot be used with '--from'", naming a flag that was not on the command
+    /// line. Only the operator who followed the advice could hit it.
+    ///
+    /// Asserted by introspecting the parser rather than by setting the variable,
+    /// because the environment is process-global and mutating it from a test is
+    /// `unsafe` — which this crate does not permit. Two facts make the bug
+    /// unreachable, and both are checked: clap has no env binding for this
+    /// argument, and no conflict declared against the importers.
+    #[test]
+    fn clap_neither_reads_the_secret_env_var_nor_conflicts_on_it() {
+        use clap::CommandFactory as _;
+
+        let cmd = AdminCli::command();
+        let add = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "account")
+            .expect("account")
+            .get_subcommands()
+            .find(|c| c.get_name() == "add")
+            .expect("add")
+            .clone();
+        let secret = add
+            .get_arguments()
+            .find(|a| a.get_id() == "secret")
+            .expect("--secret");
+
+        assert!(
+            secret.get_env().is_none(),
+            "an env binding here is what made the conflict fire on a variable; \
+             the fallback is read in `add_account_from_args` instead"
+        );
+        // And the observable half: clap no longer refuses the combination at
+        // all. The exclusion moved into `add_account_from_args`, where a typed
+        // flag and an inherited variable can still be told apart — clap has no
+        // public accessor for an argument's conflicts, so this is asserted by
+        // parsing rather than by introspection.
+        AdminCli::try_parse_from([
+            "admin",
+            "account",
+            "add",
+            "--name",
+            "seat",
+            "--from",
+            "codex",
+            "--secret",
+            "typed-on-the-command-line",
+        ])
+        .expect("clap accepts it; the command is what refuses it");
+    }
+
+    /// And an importer parses without a secret, which is the invocation that broke.
+    #[test]
+    fn a_seat_import_parses_with_no_secret_flag() {
+        let cli = AdminCli::try_parse_from([
+            "admin",
+            "account",
+            "add",
+            "--name",
+            "codex-seat",
+            "--from",
+            "codex",
+        ])
+        .expect("an importer needs no secret");
+        let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+            panic!("expected an account add");
+        };
+        assert_eq!(args.from, Some(AccountSource::Codex));
+        assert!(
+            args.secret.is_none(),
+            "the flag was not given, so the struct must not claim it was — the \
+             environment is read later, after the conflict check"
+        );
+    }
 
     /// C5. Changing a budget at the CLI evicts the identities that cache it.
     ///
