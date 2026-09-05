@@ -1218,20 +1218,28 @@ pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
         -- Monthly counters reset at the boundary by the first write of the
         -- new month, so no job has to. A row whose month has passed and has
         -- not been written yet reads as zero (see `spend_for`, `route_by_id`).
+        --
+        -- The month only moves forward. `now()` is the transaction's start,
+        -- and a write that started before midnight can be re-evaluated,
+        -- after waiting on the row lock, against a row a new-month write has
+        -- just committed. An equality test there saw a month not its own, wrote
+        -- its own cost alone and stamped the month back — dropping the
+        -- other write's spend from the cap. A row already in a later month
+        -- is accumulated into and left where it is.
         principal_debit AS (
             UPDATE principal p
-               SET spent_usd = CASE WHEN p.spent_month = date_trunc('month', now())::date
+               SET spent_usd = CASE WHEN p.spent_month >= date_trunc('month', now())::date
                                     THEN p.spent_usd + ins.cost_usd
                                     ELSE ins.cost_usd END,
-                   spent_month = date_trunc('month', now())::date
+                   spent_month = GREATEST(p.spent_month, date_trunc('month', now())::date)
               FROM ins
              WHERE p.id = ins.principal_id
         )
         UPDATE route r
-           SET spent_usd = CASE WHEN r.spent_month = date_trunc('month', now())::date
+           SET spent_usd = CASE WHEN r.spent_month >= date_trunc('month', now())::date
                                 THEN r.spent_usd + ins.cost_usd
                                 ELSE ins.cost_usd END,
-               spent_month = date_trunc('month', now())::date
+               spent_month = GREATEST(r.spent_month, date_trunc('month', now())::date)
           FROM ins
          WHERE r.id = ins.route_id
         ",
@@ -2014,6 +2022,36 @@ mod tests {
             "reset to this month's first write"
         );
         assert_eq!(fresh.key_usd, dec!(2.00));
+
+        // The month never moves backwards. A write whose transaction began
+        // before midnight, re-evaluated against a row the first write of
+        // the new month has just committed, accumulates into that month
+        // rather than overwriting it with its own cost and stamping the old
+        // month back. Reproduced here from the row's side: a row already a
+        // month ahead of `now()` is what such a write sees.
+        sqlx::query(
+            "UPDATE principal
+                SET spent_usd = 5, spent_month = (date_trunc('month', now()) + interval '1 month')::date
+              WHERE id = $1",
+        )
+        .bind(principal)
+        .execute(db.pool())
+        .await
+        .expect("advance the principal's month");
+        record_usage(&db, &write("0.25")).await.expect("record");
+        let (ahead_usd, ahead_month): (Decimal, time::Date) =
+            sqlx::query_as("SELECT spent_usd, spent_month FROM principal WHERE id = $1")
+                .bind(principal)
+                .fetch_one(db.pool())
+                .await
+                .expect("read the row");
+        let next_month: time::Date =
+            sqlx::query_scalar("SELECT (date_trunc('month', now()) + interval '1 month')::date")
+                .fetch_one(db.pool())
+                .await
+                .expect("next month");
+        assert_eq!(ahead_usd, dec!(5.25), "accumulated into the later month");
+        assert_eq!(ahead_month, next_month, "and the month stayed where it was");
 
         // A key that no longer exists cannot spend as if uncapped.
         assert!(
