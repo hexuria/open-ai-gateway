@@ -370,6 +370,16 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
         .await
         .map_err(|e| oag_core::Error::Internal(format!("binding {public_addr}: {e}")))?;
 
+    // Above the listener branch, and deliberately: these three are what the
+    // server does besides answering requests, and they are the same three
+    // whichever way it listens. Spawned inside each arm instead, the two arms
+    // drifted — the dual-listener path, which is every real deployment, never
+    // spawned the spend reconciler at all, so the denormalised counters were
+    // reconciled with the ledger only in single-listener mode.
+    spawn_catalog_refresh(Arc::clone(&state));
+    usage_poll::spawn_usage_poll(Arc::clone(&state));
+    spawn_spend_reconcile(Arc::clone(&state));
+
     if state.config.server.single_listener {
         tracing::warn!(
             %public_addr,
@@ -378,9 +388,6 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
              admin key; the dashboard, /metrics and /health/ready never did, so on \
              this port they are unauthenticated — restrict it at the edge."
         );
-        spawn_catalog_refresh(Arc::clone(&state));
-        usage_poll::spawn_usage_poll(Arc::clone(&state));
-        spawn_spend_reconcile(Arc::clone(&state));
         listen::serve(
             public,
             public_router(state),
@@ -397,8 +404,6 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
         .map_err(|e| oag_core::Error::Internal(format!("binding {admin_addr}: {e}")))?;
 
     tracing::info!(%public_addr, %admin_addr, "listening");
-    spawn_catalog_refresh(Arc::clone(&state));
-    usage_poll::spawn_usage_poll(Arc::clone(&state));
 
     let public_srv = listen::serve(
         public,
@@ -415,6 +420,68 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
 
     tokio::join!(public_srv, admin_srv);
     Ok(())
+}
+
+/// The background tasks are spawned once, for every way of listening.
+///
+/// This reads its own source rather than running a server, because the defect
+/// it guards against is invisible at runtime without a database and two
+/// listeners: the spawns used to sit inside both arms of the `single_listener`
+/// branch, the arms drifted, and the dual-listener path — every real
+/// deployment — stopped reconciling spend with the ledger. Nothing failed, no
+/// log said so, and the counters simply diverged.
+///
+/// One call site each, above the branch, is the property. A second call site
+/// anywhere in `serve` means the two paths can differ again.
+#[cfg(test)]
+mod background_task_tests {
+    /// `serve`'s body, from its signature to the closing brace in column zero.
+    fn serve_body() -> &'static str {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("pub async fn serve(")
+            .expect("serve is declared in this file");
+        let rest = &src[start..];
+        let end = rest.find("\n}\n").expect("serve has a closing brace");
+        &rest[..end]
+    }
+
+    #[test]
+    fn every_background_task_is_spawned_exactly_once_for_both_listener_modes() {
+        let body = serve_body();
+        for task in [
+            "spawn_catalog_refresh(",
+            "spawn_usage_poll(",
+            "spawn_spend_reconcile(",
+        ] {
+            let calls = body.matches(task).count();
+            assert_eq!(
+                calls, 1,
+                "{task} is called {calls} times in `serve`; it must be called once, \
+                 above the `single_listener` branch, so both listener modes run it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_spawns_come_before_the_listener_branch() {
+        let body = serve_body();
+        let branch = body
+            .find("if state.config.server.single_listener")
+            .expect("serve still branches on single_listener");
+        for task in [
+            "spawn_catalog_refresh(",
+            "spawn_usage_poll(",
+            "spawn_spend_reconcile(",
+        ] {
+            let at = body.find(task).expect("checked by the test above");
+            assert!(
+                at < branch,
+                "{task} is spawned inside a listener arm; moved above the branch it \
+                 cannot be spawned by one mode and not the other"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

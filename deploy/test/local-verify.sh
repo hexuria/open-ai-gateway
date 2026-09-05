@@ -46,10 +46,18 @@ say "2/5  mock upstream"
 MOCK_STREAM_SECONDS="$STREAM_SECONDS" MOCK_CHUNKS=6 PORT="$MOCK_PORT" \
   python3 deploy/test/mock-upstream.py >"$WORK/mock.log" 2>&1 &
 MOCK_PID=$!
+MOCK_UP=0
 for _ in $(seq 1 20); do
-  curl -fsS -o /dev/null -X POST "http://127.0.0.1:$MOCK_PORT/v1/messages" -d '{}' 2>/dev/null && break
+  if curl -fsS -o /dev/null -X POST "http://127.0.0.1:$MOCK_PORT/v1/messages" -d '{}' 2>/dev/null; then
+    MOCK_UP=1
+    break
+  fi
   sleep 0.5
 done
+# The loop used to fall through and report success whether or not the mock ever
+# answered. It then failed ten seconds later at the gateway, or — worse, if
+# something else held the port — passed against whatever was listening.
+[ "$MOCK_UP" = "1" ] || fail "mock never answered on :$MOCK_PORT; see $WORK/mock.log"
 pass "mock on :$MOCK_PORT"
 
 say "3/5  gateway, pointed at the mock"
@@ -65,6 +73,11 @@ curl -fsS "http://$ADMIN/health/ready" >/dev/null || fail "gateway never became 
 pass "gateway on $PUBLIC"
 
 say "4/5  a real streamed completion"
+# Taken before the request, and passed to `_verify-ledger` below: the dev
+# database keeps its rows between runs, so reading whichever row is newest let
+# a run that metered nothing at all pass on the previous run's row. The other
+# three verify scripts have taken this mark for a while; this one had not.
+SINCE="$(psql "$OAG_DATABASE__URL" -At -c "SELECT now()")"
 started="$(python3 -c 'import time; print(time.time())')"
 curl -sN --max-time 120 -X POST "http://$PUBLIC/v1/messages" \
   -H "x-api-key: $KEY" -H 'content-type: application/json' \
@@ -91,15 +104,18 @@ say "5/5  the ledger"
 # Written by a task detached from the response; give it a moment to land
 # rather than reading the ledger the instant the stream closed.
 for _ in $(seq 1 40); do
-  just _verify-ledger > "$WORK/ledger.txt" || fail "could not read the ledger"
-  [ "$(tr -cd '|' < "$WORK/ledger.txt" | wc -c)" -ge 5 ] && break
+  just _verify-ledger "$SINCE" > "$WORK/ledger.txt" || fail "could not read the ledger"
+  # Seven columns, so six separators. `-ge 5` accepted a six-column row that the
+  # seven-name unpack below would then have died on with a ValueError rather
+  # than the diagnosis the script exists to print.
+  [ "$(tr -cd '|' < "$WORK/ledger.txt" | wc -c)" -ge 6 ] && break
   sleep 0.25
 done
 cat "$WORK/ledger.txt" | sed 's/^/  /'
 python3 - "$WORK/ledger.txt" <<'PY'
 import sys
 row = open(sys.argv[1]).read().strip().split("|")
-if len(row) < 6:
+if len(row) < 7:
     sys.exit("no ledger row for the request — metering did not run")
 model, tier, inp, out, cost, counterfactual, ttft = (c.strip() for c in row[:7])
 if int(inp) == 0 or int(out) == 0:

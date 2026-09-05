@@ -85,12 +85,18 @@ pass "gateway on $PUBLIC  route $ROUTE"
 # request, instead of reading whichever row is newest: that also means the
 # second request's check cannot pass on the first request's row.
 mark() { psql "$OAG_DATABASE__URL" -At -c "SELECT now()"; }
+# Abandoned and lost attempts are excluded: since 0014 contracted the ledger key
+# onto `(request_id, attempt)` they land beside the served row, and by design
+# they carry a counterfactual of zero — which the assertion below reads as "the
+# savings figure is wrong". The row these checks are about is the one the client
+# was served.
 ledger() {
   local since="$1" row=""
   for _ in $(seq 1 40); do
     row="$(psql "$OAG_DATABASE__URL" -At -F'|' -c "SELECT model_id, tier, input_tokens, output_tokens, \
         cost_usd, counterfactual_usd \
         FROM usage_event WHERE model_id LIKE 'anthropic%' AND occurred_at >= '$since' \
+          AND selection_reason NOT IN ('abandoned', 'lost') \
         ORDER BY occurred_at DESC LIMIT 1")" || return 1
     [ -n "$row" ] && break
     sleep 0.25

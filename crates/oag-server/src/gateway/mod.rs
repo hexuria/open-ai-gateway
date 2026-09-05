@@ -325,11 +325,13 @@ async fn run_with_escalation(
     // the final attempt's gate would leave this empty on exactly the rows where
     // it matters, because a successful escalation trips no gate.
     let mut triggering_gate: Option<oag_router::QualityGate> = None;
-    // The attempt a gate condemned, waiting to be metered. Held rather than
-    // written on the spot: the served row has to reach the ledger first, because
-    // until the primary key contracts onto `(request_id, attempt)` only the
-    // first row for a request survives.
+    // The attempts this request paid for and did not serve: one a gate
+    // condemned, and any the stream lost on the way to a credential that
+    // worked. Held rather than written where they happen so that all of a
+    // request's ledger writes run together on one detached task — off the
+    // request future, which a client hanging up cancels.
     let mut abandoned: Option<meter::Abandoned> = None;
+    let mut lost: Vec<meter::Lost> = Vec::new();
     let mut dispatches = Dispatches::new(request_id, started);
 
     loop {
@@ -340,19 +342,18 @@ async fn run_with_escalation(
             canonical,
             session,
             &mut dispatches,
+            &mut lost,
             channel,
         )
         .await
         {
             Ok(attempt) => attempt,
-            // The retry died, so there is no served row to come — but the
-            // attempt we abandoned to make it was still generated and
-            // invoiced. Failing the request does not make that spend go
-            // away, and this is the last chance to record it.
+            // The retry died, so there is no served row to come — but every
+            // attempt we made to get here was generated and invoiced. Failing
+            // the request does not make that spend go away, and this is the
+            // last chance to record it.
             Err(e) => {
-                if let Some(abandoned) = &abandoned {
-                    meter::record_abandoned(state, abandoned).await;
-                }
+                spawn_unserved(state, abandoned, lost);
                 return Err(e);
             }
         };
@@ -368,6 +369,13 @@ async fn run_with_escalation(
                 lease,
                 attempt,
             } => {
+                // Empty as the code stands: `Outcome::Lost` is produced only
+                // after `succeeded` has decided the client did not ask for a
+                // stream, so a streamed request cannot have captured one. This
+                // is here because that invariant lives three functions away,
+                // and the failure if it ever changes is a ledger row that
+                // silently never gets written. Costs a branch on an empty Vec.
+                spawn_unserved(state, abandoned, lost);
                 return stream_response(
                     state, response, lease, auth, &decision, request_id, started, attempt, ingress,
                     guard,
@@ -419,9 +427,13 @@ async fn run_with_escalation(
             // A rejection released its lease on the way out and was never
             // generated, so it is not owed a ledger row. A collected answer
             // still holds a lease, and the provider already invoiced those
-            // tokens — capture the abandoned attempt now and write it after
-            // the served row, so the surviving primary key keeps the answer
-            // the client actually got.
+            // tokens — capture the abandoned attempt here, while its latency
+            // and usage are still its own rather than the retry's, and let the
+            // detached task at the end of the request write it.
+            //
+            // At most one of these is ever outstanding: `MAX_ESCALATIONS` is 1,
+            // so a second pass through this branch cannot happen and no
+            // capture is overwritten.
             //
             // Released here rather than left to the drop, and awaited: the
             // rung above may pick this same credential, and a release still
@@ -452,15 +464,13 @@ async fn run_with_escalation(
 
         // No rung left to try. A refusal is now the caller's error — the same
         // one they used to get before the first attempt was allowed to climb.
-        // The attempt abandoned to make this one was still generated and
-        // invoiced, and with no served row coming this is its last chance to
-        // reach the ledger — exactly as when the retry itself died above.
+        // The attempts made to get here were still generated and invoiced, and
+        // with no served row coming this is their last chance to reach the
+        // ledger — exactly as when the retry itself died above.
         let (body, events, accumulator, lease, attempt) = match answer {
             Ok(answer) => answer,
             Err(e) => {
-                if let Some(abandoned) = &abandoned {
-                    meter::record_abandoned(state, abandoned).await;
-                }
+                spawn_unserved(state, abandoned, lost);
                 return Err(e);
             }
         };
@@ -496,11 +506,16 @@ async fn run_with_escalation(
         tokio::spawn(async move {
             let _guard = guard;
             meter::record_collected(&state2, &ctx, &accumulator, recorded_gate).await;
-            // Second, and only ever second: this is the row the surviving
-            // primary key drops, and the served one above is the row that must
-            // not be dropped.
+            // After the served row, deliberately. Since 0014 contracted the key
+            // onto `(request_id, attempt)` all of these land, so the order no
+            // longer decides which survives — but it still decides which row a
+            // reader sees first, and the answer the client got is the one that
+            // should be there before the attempts that failed to be it.
             if let Some(abandoned) = &abandoned {
                 meter::record_abandoned(&state2, abandoned).await;
+            }
+            for lost in &lost {
+                meter::record_lost(&state2, lost).await;
             }
         });
 
@@ -514,6 +529,38 @@ async fn run_with_escalation(
             always_streams,
         ));
     }
+}
+
+/// Write the rows a request that served nothing still owes.
+///
+/// There is no served row to follow here — the request failed — but every
+/// attempt captured on the way was generated by a provider and will appear on
+/// an invoice. Detached for the same reason the served path detaches: this runs
+/// on the way out of a request whose client may have hung up already, and an
+/// inline `.await` on the request's own future goes with it when it does.
+///
+/// Takes its own in-flight guard rather than the request's: a shutdown drain
+/// must still wait for these writes, and one caller has already handed the
+/// request's guard to the streaming path. Nothing to write takes no guard.
+fn spawn_unserved(
+    state: &Arc<AppState>,
+    abandoned: Option<meter::Abandoned>,
+    lost: Vec<meter::Lost>,
+) {
+    if abandoned.is_none() && lost.is_empty() {
+        return;
+    }
+    let guard = state.lifecycle.track();
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        let _guard = guard;
+        if let Some(abandoned) = &abandoned {
+            meter::record_abandoned(&state, abandoned).await;
+        }
+        for lost in &lost {
+            meter::record_lost(&state, lost).await;
+        }
+    });
 }
 
 /// What the ledger needs about one forwarding attempt.
@@ -1065,6 +1112,7 @@ async fn forward_with_failover(
     canonical: &oag_proto::CanonicalRequest,
     session: &SessionKey,
     dispatches: &mut Dispatches,
+    lost: &mut Vec<meter::Lost>,
     channel: Option<oag_core::credential::CredentialKind>,
 ) -> Result<Attempt> {
     let request_id = dispatches.request_id;
@@ -1152,8 +1200,13 @@ async fn forward_with_failover(
             // The credential generated an answer and the stream died before
             // it was whole. The provider invoiced those tokens, and the retry
             // on another credential used to be the only attempt metered, so
-            // the ledger saw one generation for every two paid for. Recorded
-            // before the lease goes, under its own dispatch number.
+            // the ledger saw one generation for every two paid for.
+            //
+            // Captured here, under its own dispatch number and while the lease
+            // that names the account is still in hand; written by the caller,
+            // on the detached task, after the served row. Writing it here put
+            // it on the request future, where the client hanging up during the
+            // retry — the very thing a lost stream makes likely — cancelled it.
             Outcome::Lost(e, accumulator) => {
                 tracing::warn!(%request_id, %account, error = %e, "switching credential after a lost answer");
                 let ctx = meter_context(
@@ -1164,7 +1217,7 @@ async fn forward_with_failover(
                     dispatches.started,
                     attempt,
                 );
-                meter::record_lost(state, &ctx, &accumulator, &e).await;
+                lost.push(meter::lose(ctx, &accumulator, &e));
                 last_error = e;
                 lease.release().await;
                 excluded.insert(account);

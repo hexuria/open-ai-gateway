@@ -320,7 +320,9 @@ async fn seat_summaries(db: &oag_store::Db, window: &period::Resolved) -> Vec<Se
     let seats: Vec<SeatTuple> = sqlx::query_as(
         r"
             SELECT a.name,
-                   COUNT(u.request_id),
+                   COUNT(u.request_id) FILTER (
+                       WHERE u.selection_reason NOT IN ('abandoned', 'lost')
+                   ),
                    COALESCE(SUM(u.counterfactual_api_usd), 0),
                    a.monthly_cost_usd,
                    a.usage_remaining_pct,
@@ -406,7 +408,9 @@ async fn origin_breakdown(db: &oag_store::Db, window: &period::Resolved) -> Vec<
     let rows: Vec<OriginTuple> = sqlx::query_as(
         r"
             SELECT u.origin, a.name, a.provider, a.kind = 'oauth',
-                   COUNT(*),
+                   COUNT(*) FILTER (
+                       WHERE u.selection_reason NOT IN ('abandoned', 'lost')
+                   ),
                    COALESCE(SUM(u.cost_usd), 0),
                    COALESCE(SUM(u.counterfactual_usd), 0)
             FROM usage_event u
@@ -471,11 +475,20 @@ pub async fn summary(
     // is a separate question, answered per seat below.
     let totals: Result<SummaryTotals, _> = sqlx::query_as(
         r"
+            -- The count filters out abandoned and lost attempts and the sums
+            -- do not. Since 0014 contracted the ledger key onto
+            -- `(request_id, attempt)`, one request can leave several rows —
+            -- every one generated and invoiced, so every one is money, but
+            -- only one of them is a request. Left unfiltered the headline
+            -- would say the gateway served more requests the more often
+            -- escalation saved a bad answer.
             -- Explicit ::bigint on the token sums: SUM over a bigint column
             -- returns numeric in Postgres, which will not decode into i64.
             -- Half-open bounds, either side NULL for unbounded: see
             -- `admin::period` for why a closed end double-counts a boundary row.
-            SELECT COUNT(*),
+            SELECT COUNT(*) FILTER (
+                       WHERE selection_reason NOT IN ('abandoned', 'lost')
+                   ),
                    COALESCE(SUM(cost_usd), 0),
                    COALESCE(SUM(counterfactual_usd), 0),
                    COALESCE(SUM(cache_read_tokens), 0)::bigint,
@@ -501,7 +514,10 @@ pub async fn summary(
 
     let by_tier: Vec<TierTotals> = match sqlx::query_as(
         r"
-            SELECT tier, COUNT(*),
+            SELECT tier,
+                   COUNT(*) FILTER (
+                       WHERE selection_reason NOT IN ('abandoned', 'lost')
+                   ),
                    COALESCE(SUM(cost_usd), 0),
                    COALESCE(SUM(counterfactual_usd), 0)
             FROM usage_event
