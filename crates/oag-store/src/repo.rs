@@ -151,6 +151,123 @@ pub async fn spend_for(db: &Db, api_key_id: Uuid, principal_id: Uuid) -> Result<
     })
 }
 
+/// What one pass of [`reconcile_monthly_spend`] rewrote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    pub principals: u64,
+    pub routes: u64,
+}
+
+/// Bring every budgeted principal's and route's monthly counter back into
+/// agreement with the ledger.
+///
+/// `record_usage` maintains the counters in the same statement as the ledger
+/// insert, so in steady state there is nothing to do. The gap is the
+/// rolling-deploy window: the release that introduced the counters backfilled
+/// them once, and the previous release keeps writing ledger rows without
+/// touching them for as long as its replicas serve — half an hour by default
+/// on every platform — so the spend of that window was invisible to the cap
+/// for the rest of the month. This closes it, and closes any drift with the
+/// same cause after it.
+///
+/// One transaction per row, and the row is locked BEFORE the sum is taken.
+/// The obvious single statement, `UPDATE ... SET spent_usd = (SELECT SUM ...)`,
+/// loses a concurrent debit: when it waits on the row lock the debit holds and
+/// then re-evaluates, Postgres re-checks the WHERE clause against the new row
+/// version but does not re-run the subquery, so the sum predates the debit and
+/// overwrites it. With the lock taken first, a concurrent `record_usage` waits
+/// on it, and its ledger row and its debit land together after the sum — which
+/// then adds to the reconciled value rather than being lost from it.
+///
+/// Budgeted rows only: they are the only ones enforced, and every other row's
+/// counter is a number nothing reads. The month only moves forward, as in the
+/// debit: a row already stamped with a later month is left alone.
+///
+/// Imported ledger rows carry no principal or route, so a sum keyed on either
+/// excludes them without asking, exactly as the backfill did.
+pub async fn reconcile_monthly_spend(db: &Db) -> Result<Reconciled> {
+    let principals = reconcile_rows(
+        db,
+        "SELECT id FROM principal WHERE monthly_budget_usd IS NOT NULL",
+        "SELECT 1 FROM principal WHERE id = $1 FOR UPDATE",
+        r"
+        UPDATE principal p
+           SET spent_usd = COALESCE((
+                   SELECT SUM(u.cost_usd) FROM usage_event u
+                    WHERE u.principal_id = p.id
+                      AND u.occurred_at >= date_trunc('month', now())
+               ), 0),
+               spent_month = date_trunc('month', now())::date
+         WHERE p.id = $1
+           AND (p.spent_month IS NULL OR p.spent_month <= date_trunc('month', now())::date)
+        ",
+    )
+    .await?;
+    let routes = reconcile_rows(
+        db,
+        "SELECT id FROM route WHERE monthly_budget_usd IS NOT NULL",
+        "SELECT 1 FROM route WHERE id = $1 FOR UPDATE",
+        r"
+        UPDATE route r
+           SET spent_usd = COALESCE((
+                   SELECT SUM(u.cost_usd) FROM usage_event u
+                    WHERE u.route_id = r.id
+                      AND u.occurred_at >= date_trunc('month', now())
+               ), 0),
+               spent_month = date_trunc('month', now())::date
+         WHERE r.id = $1
+           AND (r.spent_month IS NULL OR r.spent_month <= date_trunc('month', now())::date)
+        ",
+    )
+    .await?;
+    Ok(Reconciled { principals, routes })
+}
+
+/// The per-row half of [`reconcile_monthly_spend`]: list, then lock and
+/// rewrite each in its own transaction.
+///
+/// Static SQL, handed in: the two tables differ only in name, and sqlx will
+/// not take a table name as a parameter.
+async fn reconcile_rows(
+    db: &Db,
+    list: &'static str,
+    lock: &'static str,
+    rewrite: &'static str,
+) -> Result<u64> {
+    let ids = sqlx::query_scalar::<_, Uuid>(list)
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("listing budgeted rows: {e}")))?;
+
+    let mut rewritten = 0u64;
+    for id in ids {
+        let mut tx = db
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| Error::Internal(format!("starting reconcile: {e}")))?;
+        // A row deleted since the listing is nothing to reconcile.
+        let held = sqlx::query_scalar::<_, i32>(lock)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("locking row for reconcile: {e}")))?;
+        if held.is_none() {
+            continue;
+        }
+        let done = sqlx::query(rewrite)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("reconciling monthly spend: {e}")))?;
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("committing reconcile: {e}")))?;
+        rewritten += done.rows_affected();
+    }
+    Ok(rewritten)
+}
+
 pub async fn route_by_id(db: &Db, id: Uuid) -> Result<Option<RouteRow>> {
     sqlx::query_as::<_, RouteRow>(
         // One primary-key read. This used to SUM the route's month from the
@@ -2119,6 +2236,222 @@ mod tests {
             ),
             "a missing key is a refusal, not zeros"
         );
+    }
+
+    /// A ledger row as the previous release writes one: inserted, and no
+    /// counter touched. What every old replica does for the whole rolling
+    /// deploy after the counters exist.
+    async fn old_binary_row(db: &Db, principal: Uuid, key: Uuid, route: Uuid, cost: &str) {
+        sqlx::query(
+            "INSERT INTO usage_event (
+                 request_id, attempt, principal_id, api_key_id, route_id,
+                 model_id, tier, selection_reason,
+                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                 cost_usd, counterfactual_usd, counterfactual_api_usd,
+                 status, latency_ms, streamed)
+             VALUES (gen_random_uuid(), 0, $1, $2, $3, 'kimi-k2', 'cheap', 'classified',
+                     10, 5, 0, 0, $4, 0, $4, 200, 10, false)",
+        )
+        .bind(principal)
+        .bind(key)
+        .bind(route)
+        .bind(cost.parse::<Decimal>().expect("decimal"))
+        .execute(db.pool())
+        .await
+        .expect("insert an old-binary row");
+    }
+
+    async fn set_budgets(db: &Db, principal: Uuid, route: Uuid) {
+        sqlx::query("UPDATE principal SET monthly_budget_usd = 100 WHERE id = $1")
+            .bind(principal)
+            .execute(db.pool())
+            .await
+            .expect("budget the principal");
+        sqlx::query("UPDATE route SET monthly_budget_usd = 100 WHERE id = $1")
+            .bind(route)
+            .execute(db.pool())
+            .await
+            .expect("budget the route");
+    }
+
+    /// The rolling-deploy window, reproduced: rows the old binary wrote after
+    /// the backfill are invisible to the cap until something reconciles.
+    ///
+    /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it.
+    #[tokio::test]
+    async fn reconcile_catches_up_the_spend_an_old_binary_recorded() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+        let key = capped_key(
+            &db,
+            principal,
+            route,
+            format!("reconcile-{}", Uuid::new_v4()),
+        )
+        .await;
+        set_budgets(&db, principal, route).await;
+
+        // The new binary's write debits; the old binary's does not.
+        record_usage(
+            &db,
+            &UsageWrite {
+                request_id: Uuid::new_v4(),
+                attempt: 0,
+                principal_id: Some(principal),
+                api_key_id: Some(key),
+                route_id: Some(route),
+                account_id: Some(account.as_uuid()),
+                model_id: "kimi-k2".to_owned(),
+                tier: "cheap".to_owned(),
+                selection_reason: "default".to_owned(),
+                escalated_from_tier: None,
+                escalation_gate: None,
+                usage: oag_router::Usage::default(),
+                cost_usd: dec!(1.00),
+                counterfactual_usd: Decimal::ZERO,
+                counterfactual_model_id: None,
+                counterfactual_api_usd: Decimal::ZERO,
+                status: 200,
+                latency_ms: Some(10),
+                ttft_ms: None,
+                streamed: false,
+            },
+        )
+        .await
+        .expect("record");
+        old_binary_row(&db, principal, key, route, "0.50").await;
+
+        let before = spend_for(&db, key, principal).await.expect("spend");
+        assert_eq!(
+            before.principal_usd,
+            dec!(1.00),
+            "the old row is invisible to the cap"
+        );
+
+        let done = reconcile_monthly_spend(&db).await.expect("reconcile");
+        assert!(done.principals >= 1 && done.routes >= 1, "{done:?}");
+
+        let after = spend_for(&db, key, principal).await.expect("spend");
+        assert_eq!(
+            after.principal_usd,
+            dec!(1.50),
+            "the cap now sees the ledger"
+        );
+        let row = route_by_id(&db, route)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert_eq!(row.spent_usd, dec!(1.50));
+
+        // A second pass is a no-op in effect: same number, not doubled.
+        reconcile_monthly_spend(&db).await.expect("reconcile again");
+        let again = spend_for(&db, key, principal).await.expect("spend");
+        assert_eq!(again.principal_usd, dec!(1.50));
+
+        // The month only moves forward, here as in the debit. A row already
+        // stamped with a later month is left exactly as it is.
+        sqlx::query(
+            "UPDATE principal
+                SET spent_usd = 5, spent_month = (date_trunc('month', now()) + interval '1 month')::date
+              WHERE id = $1",
+        )
+        .bind(principal)
+        .execute(db.pool())
+        .await
+        .expect("advance the month");
+        reconcile_monthly_spend(&db).await.expect("reconcile");
+        let (usd, ahead): (Decimal, bool) = sqlx::query_as(
+            "SELECT spent_usd, spent_month > date_trunc('month', now())::date
+               FROM principal WHERE id = $1",
+        )
+        .bind(principal)
+        .fetch_one(db.pool())
+        .await
+        .expect("read");
+        assert_eq!(usd, dec!(5));
+        assert!(ahead, "a later month is not pulled back");
+    }
+
+    /// The race the row lock exists for: debits landing while a pass runs are
+    /// never lost from the counter.
+    ///
+    /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it.
+    #[tokio::test]
+    async fn reconcile_does_not_lose_a_debit_that_lands_while_it_runs() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 8).expect("connect");
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+        let key = capped_key(&db, principal, route, format!("race-{}", Uuid::new_v4())).await;
+        set_budgets(&db, principal, route).await;
+        old_binary_row(&db, principal, key, route, "0.25").await;
+
+        let write = move || UsageWrite {
+            request_id: Uuid::new_v4(),
+            attempt: 0,
+            principal_id: Some(principal),
+            api_key_id: Some(key),
+            route_id: Some(route),
+            account_id: Some(account.as_uuid()),
+            model_id: "kimi-k2".to_owned(),
+            tier: "cheap".to_owned(),
+            selection_reason: "default".to_owned(),
+            escalated_from_tier: None,
+            escalation_gate: None,
+            usage: oag_router::Usage::default(),
+            cost_usd: dec!(0.10),
+            counterfactual_usd: Decimal::ZERO,
+            counterfactual_model_id: None,
+            counterfactual_api_usd: Decimal::ZERO,
+            status: 200,
+            latency_ms: Some(10),
+            ttft_ms: None,
+            streamed: false,
+        };
+
+        let mut tasks = Vec::new();
+        for _ in 0..24 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                record_usage(&db, &write()).await.expect("record");
+            }));
+        }
+        for _ in 0..6 {
+            let db = db.clone();
+            tasks.push(tokio::spawn(async move {
+                reconcile_monthly_spend(&db).await.expect("reconcile");
+            }));
+        }
+        for task in tasks {
+            task.await.expect("task");
+        }
+
+        let ledger: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_event
+              WHERE principal_id = $1 AND occurred_at >= date_trunc('month', now())",
+        )
+        .bind(principal)
+        .fetch_one(db.pool())
+        .await
+        .expect("sum");
+        assert_eq!(ledger, dec!(2.65), "24 debits and the old row");
+        let spend = spend_for(&db, key, principal).await.expect("spend");
+        assert_eq!(
+            spend.principal_usd, ledger,
+            "every debit that landed mid-pass is kept"
+        );
+        let row = route_by_id(&db, route)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert_eq!(row.spent_usd, ledger);
     }
 
     /// Fixture: one principal, one route, one shared credential joined to it.

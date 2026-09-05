@@ -318,6 +318,44 @@ fn spawn_catalog_refresh(state: Arc<AppState>) {
     });
 }
 
+/// Keep the monthly spend counters in agreement with the ledger, on an
+/// interval, for as long as the process runs.
+///
+/// See `repo::reconcile_monthly_spend` for what this closes. Shaped like the
+/// catalog refresh: a failure is logged and the next tick tries again, because
+/// a pass that could not run leaves the counters no worse than they were.
+fn spawn_spend_reconcile(state: Arc<AppState>) {
+    let interval = state.config.gateway.spend_reconcile_interval;
+    if interval.is_zero() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick fires immediately. `oag migrate` ran this pass at
+        // the deploy; the next one is due an interval from now.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match oag_store::repo::reconcile_monthly_spend(&state.db).await {
+                Ok(done) => {
+                    ::metrics::counter!("oag_spend_reconcile_total", "outcome" => "ok")
+                        .increment(1);
+                    tracing::debug!(
+                        principals = done.principals,
+                        routes = done.routes,
+                        "monthly spend reconciled with the ledger"
+                    );
+                }
+                Err(e) => {
+                    ::metrics::counter!("oag_spend_reconcile_total", "outcome" => "error")
+                        .increment(1);
+                    tracing::warn!(error = %e, "spend reconcile failed; the counters keep their last values");
+                }
+            }
+        }
+    });
+}
+
 /// Bind the listeners and serve until shutdown.
 pub async fn serve(state: Arc<AppState>) -> Result<()> {
     let public_addr = state.config.server.public_addr.clone();
@@ -342,6 +380,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
         );
         spawn_catalog_refresh(Arc::clone(&state));
         usage_poll::spawn_usage_poll(Arc::clone(&state));
+        spawn_spend_reconcile(Arc::clone(&state));
         listen::serve(
             public,
             public_router(state),

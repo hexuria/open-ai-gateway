@@ -46,6 +46,10 @@ pub fn describe() {
         "Requests moved to a different credential after an upstream failure."
     );
     describe_counter!(
+        "oag_spend_reconcile_total",
+        "Passes bringing the monthly spend counters into agreement with the ledger, by outcome."
+    );
+    describe_counter!(
         "oag_slot_accounting_degraded_total",
         "Requests admitted without a concurrency-slot answer from Redis, by \
          operation. Non-zero means selection is running open: credentials can \
