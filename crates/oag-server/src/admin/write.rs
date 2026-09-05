@@ -152,14 +152,49 @@ pub async fn upsert_principal(
     };
     match oag_store::repo::upsert_principal(&state.db, &body.email, role, budget).await {
         Ok(id) => {
-            // An existing principal's budget was just rewritten, and the
+            // An existing principal's budget may just have changed, and the
             // budget rides in every one of its cached key identities. Same
             // eviction as `set_principal_budget`, for the same reason: the
             // 200 below asserts a cap, and without this it was not enforced
             // until the entries happened to expire.
+            //
+            // "May", not "was": the write COALESCEs, so a request that named no
+            // budget left the existing one alone. Evicting anyway is the cheap
+            // side of that uncertainty.
             evict_principal_keys(&state, id, &body.email).await;
             audit(&actor, "principal.upsert", id, &body.email);
-            Json(json!({ "id": id, "email": body.email })).into_response()
+
+            // The budget that is now in force, read back rather than echoed
+            // from the request.
+            //
+            // `upsert_principal` COALESCEs, deliberately — an idempotent bind
+            // must not silently erase a cap an operator set at the CLI — so
+            // omitting the field here means "leave it alone" and cannot mean
+            // "clear it". The reply said nothing about the budget at all, so a
+            // caller that sent no cap and got a 200 had no way to tell whether
+            // it had set one, left one, or removed one. The sibling `PATCH`
+            // treats the identical body as "clear", which makes guessing worse
+            // than useless.
+            //
+            // Clearing stays that endpoint's job, where it is the caller's
+            // stated intent; this one now at least reports what it did.
+            let effective: Option<rust_decimal::Decimal> =
+                sqlx::query_scalar("SELECT monthly_budget_usd FROM principal WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(state.db.pool())
+                    .await
+                    .ok()
+                    .flatten();
+
+            Json(json!({
+                "id": id,
+                "email": body.email,
+                "monthly_budget_usd": effective.map(|b| b.to_string()),
+                // Said plainly, because the alternative is every caller
+                // discovering it from a support thread.
+                "budget_unchanged": budget.is_none(),
+            }))
+            .into_response()
         }
         Err(e) => failed(&e),
     }
