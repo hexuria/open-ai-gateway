@@ -45,10 +45,11 @@ pub async fn fetch(
     provider: Provider,
     kind: CredentialKind,
     credential: &SecretMaterial,
+    proxy: Option<&str>,
 ) -> oag_core::Result<Option<Vec<ModelPrice>>> {
     match (provider, kind) {
         (Provider::XAI, CredentialKind::ApiKey) => {
-            xai::fetch(&credential.access_token).await.map(Some)
+            xai::fetch(&credential.access_token, proxy).await.map(Some)
         }
         // Anthropic, OpenAI and Gemini publish prices on a web page, not an
         // API; there is nothing to call, so LiteLLM stays the source for them.
@@ -91,7 +92,7 @@ mod tests {
             CredentialKind::Vertex,
             CredentialKind::ServiceAccount,
         ] {
-            let answered = fetch(Provider::XAI, kind, &material())
+            let answered = fetch(Provider::XAI, kind, &material(), None)
                 .await
                 .expect("no request is made, so nothing can fail");
             assert!(
@@ -102,10 +103,15 @@ mod tests {
 
         // And a provider with no price API is still `None` whatever it holds.
         assert!(
-            fetch(Provider::Anthropic, CredentialKind::ApiKey, &material())
-                .await
-                .expect("no request")
-                .is_none()
+            fetch(
+                Provider::Anthropic,
+                CredentialKind::ApiKey,
+                &material(),
+                None
+            )
+            .await
+            .expect("no request")
+            .is_none()
         );
     }
 }

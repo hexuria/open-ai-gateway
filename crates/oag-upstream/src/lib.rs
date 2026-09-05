@@ -23,3 +23,95 @@ pub use codex::CodexAdapter;
 pub use gemini::GeminiAdapter;
 pub use openai::OpenAICompatAdapter;
 pub use transport::{HttpTransport, Transport, TransportKey, TransportPool};
+
+/// The `reqwest::Client` every adapter builds its requests through.
+///
+/// Adapters do not *execute* requests — `transport` does, with its own
+/// per-account client and proxy — so this exists only to be a request builder.
+/// It was `reqwest::Client::new()` at each call site, once per request, which
+/// is two problems in one line.
+///
+/// `Client::new()` panics if the TLS backend cannot initialise, and this crate
+/// denies `unwrap` everywhere else for exactly that reason: a panic on the
+/// request path severs the connection with no response, and on HTTP/2 resets
+/// every other stream multiplexed onto it. Built once here, a failure is
+/// something the process can notice at first use rather than mid-request.
+///
+/// And each `Client` allocates a connection pool that this use throws away
+/// immediately — invisible per request, and one allocation and teardown per
+/// request across every adapter.
+pub(crate) fn builder_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            // `unwrap_or_default` rather than a panic: `Client::default()` is
+            // the same construction and the failure is not one we can act on
+            // here. If TLS is genuinely broken, the request fails at the
+            // transport with an error naming it.
+            reqwest::Client::builder().build().unwrap_or_default()
+        })
+        .clone()
+}
+
+/// A client for the calls that are not inference: refresh, quota, prices.
+///
+/// Proxy-aware, which is the whole reason it exists. `proxy_url` is set per
+/// credential and was applied only by `transport`, so a deployment whose egress
+/// must go through a proxy had its refresh, quota and price traffic leave by a
+/// different route — sometimes failing, sometimes succeeding and quietly
+/// bypassing the control the proxy was there to enforce. A credential's proxy
+/// is a property of the credential, not of one kind of request made with it.
+///
+/// Built per call rather than cached: these run on a poller or a refresh, not
+/// per request, and caching per proxy string would be a map to invalidate for
+/// no measurable gain.
+///
+/// # Errors
+///
+/// If the proxy URL is unusable or the client cannot be built.
+pub fn side_channel_client(
+    proxy: Option<&str>,
+    timeout: std::time::Duration,
+) -> oag_core::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if let Some(url) = proxy.map(str::trim).filter(|u| !u.is_empty()) {
+        let proxy = reqwest::Proxy::all(url).map_err(|e| {
+            oag_core::Error::Config(format!("credential proxy_url {url} is unusable: {e}"))
+        })?;
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|e| oag_core::Error::Internal(format!("building a side-channel client: {e}")))
+}
+
+#[cfg(test)]
+mod side_channel_tests {
+    use super::side_channel_client;
+    use std::time::Duration;
+
+    /// U12. A credential's proxy applies to every call made with it.
+    ///
+    /// `proxy_url` is set per credential and was applied only by `transport`,
+    /// so a deployment whose egress must go through a proxy had its refresh,
+    /// quota and price traffic leave by a different route — sometimes failing,
+    /// sometimes succeeding and quietly bypassing the control the proxy existed
+    /// to enforce. A credential's proxy is a property of the credential, not of
+    /// one kind of request made with it.
+    #[test]
+    fn a_side_channel_client_accepts_a_proxy_and_refuses_a_broken_one() {
+        side_channel_client(None, Duration::from_secs(20)).expect("no proxy is fine");
+        side_channel_client(Some("http://127.0.0.1:3128"), Duration::from_secs(20))
+            .expect("a usable proxy is configured, not ignored");
+
+        // Blank is treated as absent rather than as a proxy called "": an empty
+        // column and a NULL one mean the same thing to an operator.
+        side_channel_client(Some("   "), Duration::from_secs(20)).expect("blank is absent");
+
+        // And an unusable one is a config error, said here, rather than silent
+        // direct egress — which is the failure mode the whole finding is about.
+        let err =
+            side_channel_client(Some("not a url"), Duration::from_secs(20)).expect_err("refused");
+        assert!(err.to_string().contains("proxy_url"), "{err}");
+    }
+}

@@ -1979,7 +1979,9 @@ async fn sync_prices(db: &Db, kek: &Kek, provider: &str, account: Option<&str>) 
             row.name, row.kind
         )));
     };
-    let Some(prices) = oag_upstream::pricing::fetch(known, kind, &material).await? else {
+    let Some(prices) =
+        oag_upstream::pricing::fetch(known, kind, &material, row.proxy_url.as_deref()).await?
+    else {
         return Err(oag_core::Error::Config(format!(
             "{known} publishes no price API for a {kind:?} credential; seed it from \
              LiteLLM instead, or name an API-key credential with --account"

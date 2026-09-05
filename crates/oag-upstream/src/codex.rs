@@ -161,7 +161,7 @@ impl ProviderAdapter for CodexAdapter {
         }
 
         let cred: &SecretMaterial = req.credential;
-        let mut builder = reqwest::Client::new()
+        let mut builder = crate::builder_client()
             .post(format!("{}/responses", self.base_url))
             .header("accept", "text/event-stream")
             .header("authorization", format!("Bearer {}", cred.access_token))
@@ -190,13 +190,21 @@ impl ProviderAdapter for CodexAdapter {
         responses::parse_event(raw, acc)
     }
 
-    async fn refresh(&self, credential: &SecretMaterial) -> Result<Option<SecretMaterial>> {
+    async fn refresh(
+        &self,
+        credential: &SecretMaterial,
+        proxy: Option<&str>,
+    ) -> Result<Option<SecretMaterial>> {
         // The same OAuth refresh as an imported Codex seat: trade the pair at
         // the token endpoint. No-ops on a credential with no refresh token.
-        crate::openai_oauth::refresh(credential, &self.token_url).await
+        crate::openai_oauth::refresh(credential, &self.token_url, proxy).await
     }
 
-    async fn served_models(&self, credential: &SecretMaterial) -> Result<Option<Vec<String>>> {
+    async fn served_models(
+        &self,
+        credential: &SecretMaterial,
+        proxy: Option<&str>,
+    ) -> Result<Option<Vec<String>>> {
         // Same auth and same account scoping as `build`: the answer is
         // per-seat, so asking without `chatgpt-account-id` would be asking a
         // different question from the one inference will ask.
@@ -206,12 +214,7 @@ impl ProviderAdapter for CodexAdapter {
         // and the poller awaits it in sequence, so one unresponsive seat stops
         // every other seat's models from ever being refreshed. Ten seconds is
         // long for a list of model names and short against "never".
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| {
-                oag_core::Error::Internal(format!("building the served-models client: {e}"))
-            })?
+        let mut builder = crate::side_channel_client(proxy, std::time::Duration::from_secs(10))?
             .get(format!("{}/models", self.base_url))
             // Required, and the backend says so rather than guessing for us:
             // without it the answer is a 400 naming `('query', 'client_version')`

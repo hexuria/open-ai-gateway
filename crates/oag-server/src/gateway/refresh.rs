@@ -124,7 +124,11 @@ async fn refresh_locked(
         return Ok(current);
     }
 
-    match adapter.refresh(&current).await {
+    // The credential's own proxy. It applied to inference only, so a
+    // deployment whose egress must go through a proxy had its refresh traffic
+    // leave by another route — sometimes failing, sometimes succeeding and
+    // bypassing the control the proxy existed to enforce.
+    match adapter.refresh(&current, row.proxy_url.as_deref()).await {
         Ok(Some(mut fresh)) => {
             fresh.version = current.version.saturating_add(1);
             let sealed = state.kek.seal_json(&fresh)?;

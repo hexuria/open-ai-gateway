@@ -173,7 +173,7 @@ impl ProviderAdapter for BedrockAdapter {
             time::OffsetDateTime::now_utc(),
         );
 
-        let mut builder = reqwest::Client::new()
+        let mut builder = crate::builder_client()
             .post(url)
             .header("content-type", "application/json")
             .header("host", &host)
@@ -449,6 +449,40 @@ mod tests {
         assert!(
             auth.contains("SignedHeaders=host;"),
             "host must still be signed"
+        );
+
+        // U15. That assertion cannot fail: `SignedHeaders` is built from the
+        // headers we set, and we always set `host`. It says the name is in a
+        // list, not that the signature covers the value — which is the thing
+        // U6 was about.
+        //
+        // Signing the same request against a different endpoint has to produce
+        // a different signature. Nothing but the host differs, so if the two
+        // match, the host is not reaching the signing input and an endpoint
+        // override is being signed as though it were the default.
+        let signature = |endpoint: &str| {
+            let a = BedrockAdapter::new("us-east-1".to_owned())
+                .with_endpoint(Some(endpoint.to_owned()));
+            let req = a
+                .build(&UpstreamRequest {
+                    canonical: &c,
+                    model: &m,
+                    credential: &cr,
+                })
+                .expect("builds");
+            let auth = req.headers()["authorization"]
+                .to_str()
+                .expect("header")
+                .to_owned();
+            auth.split("Signature=")
+                .nth(1)
+                .expect("a signature")
+                .to_owned()
+        };
+        assert_ne!(
+            signature("http://127.0.0.1:9012"),
+            signature("http://127.0.0.1:9013"),
+            "the host has to reach the signing input, not merely the header list"
         );
     }
 

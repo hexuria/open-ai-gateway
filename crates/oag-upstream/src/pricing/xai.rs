@@ -31,11 +31,8 @@ const MODELS_URL: &str = "https://api.x.ai/v1/language-models";
 /// savings figure nonsense, and nothing downstream would flag it.
 const PER_MTOK_SCALE: i64 = 10_000;
 
-pub async fn fetch(access_token: &str) -> Result<Vec<ModelPrice>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| Error::Internal(format!("building price client: {e}")))?;
+pub async fn fetch(access_token: &str, proxy: Option<&str>) -> Result<Vec<ModelPrice>> {
+    let client = crate::side_channel_client(proxy, std::time::Duration::from_secs(20))?;
 
     let response = client
         .get(MODELS_URL)

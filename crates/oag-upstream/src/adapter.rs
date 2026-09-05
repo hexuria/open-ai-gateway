@@ -96,7 +96,16 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
     ///
     /// Default is "no refresh needed", which is correct for every static API
     /// key — the majority — so only OAuth-style adapters implement it.
-    async fn refresh(&self, _credential: &SecretMaterial) -> Result<Option<SecretMaterial>> {
+    ///
+    /// `proxy` is the credential's own `proxy_url`. It was applied only to
+    /// inference, so a deployment whose egress must go through a proxy had its
+    /// refresh traffic leave by another route — sometimes failing, sometimes
+    /// succeeding and bypassing the control the proxy existed to enforce.
+    async fn refresh(
+        &self,
+        _credential: &SecretMaterial,
+        _proxy: Option<&str>,
+    ) -> Result<Option<SecretMaterial>> {
         Ok(None)
     }
 
@@ -114,7 +123,11 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
     /// nothing from it — notably not that the credential serves nothing. An
     /// empty `Vec` is the different, stronger claim that it was asked and the
     /// answer was none.
-    async fn served_models(&self, _credential: &SecretMaterial) -> Result<Option<Vec<String>>> {
+    async fn served_models(
+        &self,
+        _credential: &SecretMaterial,
+        _proxy: Option<&str>,
+    ) -> Result<Option<Vec<String>>> {
         Ok(None)
     }
 }
