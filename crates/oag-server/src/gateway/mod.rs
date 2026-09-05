@@ -439,7 +439,18 @@ async fn run_with_escalation(
 
         // No rung left to try. A refusal is now the caller's error — the same
         // one they used to get before the first attempt was allowed to climb.
-        let (body, events, accumulator, lease) = answer?;
+        // The attempt abandoned to make this one was still generated and
+        // invoiced, and with no served row coming this is its last chance to
+        // reach the ledger — exactly as when the retry itself died above.
+        let (body, events, accumulator, lease) = match answer {
+            Ok(answer) => answer,
+            Err(e) => {
+                if let Some(abandoned) = &abandoned {
+                    meter::record_abandoned(state, abandoned).await;
+                }
+                return Err(e);
+            }
+        };
 
         // Either it was fine, or nothing better exists. Record the gate either
         // way: a gate we could not act on is exactly the signal that a rung is
