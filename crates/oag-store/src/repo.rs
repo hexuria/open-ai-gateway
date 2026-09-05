@@ -696,7 +696,18 @@ pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsa
                      AND u.selection_reason NOT IN ('abandoned', 'lost')
                )
         FROM principal p
-        LEFT JOIN usage_event u ON u.principal_id = p.id
+        -- The window bound belongs in the JOIN, not only inside the FILTERs.
+        -- Every figure below is month-to-date, but with the bound stated only
+        -- in the FILTERs the join still read every row this principal has ever
+        -- written, aggregating a whole history to report one month of it. On a
+        -- ledger of any age that is a sequential scan per admin request.
+        --
+        -- `ON` rather than `WHERE`, because this is a LEFT JOIN: in `WHERE` it
+        -- would drop principals who have spent nothing this month, which is
+        -- the row a budget check most needs to see.
+        LEFT JOIN usage_event u
+               ON u.principal_id = p.id
+              AND u.occurred_at >= date_trunc('month', now())
         WHERE p.email = $1
         GROUP BY p.id, p.email, p.monthly_budget_usd
         ",
@@ -1093,7 +1104,27 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                ), 0)::bigint END AS seven_day_points
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
-        LEFT JOIN usage_event u ON u.api_key_id = k.id
+        -- The widest of the four windows below, in the JOIN. Stated only
+        -- inside the FILTERs, this join read every row the key had ever
+        -- written in order to report a rolling five hours — and this is the
+        -- query a partner service calls before each model call, per member.
+        -- `usage_event_key_idx` is `(api_key_id, occurred_at DESC)`, so with a
+        -- bound here the read is a range scan of the window instead of a walk
+        -- of the key's whole history.
+        --
+        -- LEAST, because which of the two is wider changes through the month:
+        -- month-to-date is hours wide on the 1st and 31 days wide on the 31st,
+        -- while seven days is seven days. Taking the earlier keeps every
+        -- FILTER below able to see the rows it needs.
+        --
+        -- `ON` rather than `WHERE`: a LEFT JOIN, so a key that has not been
+        -- used in the window must still return its row.
+        LEFT JOIN usage_event u
+               ON u.api_key_id = k.id
+              AND u.occurred_at >= LEAST(
+                      date_trunc('month', now()),
+                      now() - interval '7 days'
+                  )
         WHERE k.id = $1
         GROUP BY k.id, k.name, k.key_prefix, p.email, k.active, k.quota_usd, k.spent_usd
         ",
@@ -3605,6 +3636,78 @@ mod tests {
             .await
             .expect("replay");
         assert_eq!(key_spend(&db, key).await, dec!(2.00), "replay is a no-op");
+    }
+
+    /// S1. The usage panels read a window, not a key's whole history.
+    ///
+    /// Both queries state their windows inside `FILTER` clauses, which decide
+    /// what each aggregate counts and nothing about what the join reads. With
+    /// no bound in the `ON`, the join walked every row the key or principal had
+    /// ever written in order to report a rolling five hours — and `key_usage`
+    /// is the query a partner service calls before each model call, per member.
+    /// The ledger-partitioning design doc classifies both as range-bounded;
+    /// that premise was wrong, which is why this asserts the plan and not the
+    /// numbers. The numbers were always right. They just cost a scan.
+    ///
+    /// What is asserted is that the window bound reaches the *index condition*
+    /// rather than being applied after rows are read. That is the difference
+    /// between a range scan and a full walk, and it is a property of the query
+    /// rather than of how much data happens to be in the table — so the test
+    /// says nothing about which plan the planner prefers today, and turning
+    /// sequential scans off is how it asks the question it actually means.
+    #[tokio::test]
+    async fn the_usage_panels_bound_the_ledger_side_of_their_joins() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (key, build) = metered_key(&db).await;
+        for _ in 0..32 {
+            record_usage(&db, &build(Uuid::new_v4(), 0, "classified", "0.01"))
+                .await
+                .expect("seed");
+        }
+
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .expect("ask for the index plan");
+
+        // The join `key_usage` makes, verbatim from its `FROM` onwards.
+        let plan: String = sqlx::query_scalar(
+            "EXPLAIN SELECT count(*) FROM api_key k
+               JOIN principal p ON p.id = k.principal_id
+               LEFT JOIN usage_event u
+                      ON u.api_key_id = k.id
+                     AND u.occurred_at >= LEAST(
+                             date_trunc('month', now()),
+                             now() - interval '7 days'
+                         )
+              WHERE k.id = $1",
+        )
+        .bind(key)
+        .fetch_all(&mut *tx)
+        .await
+        .map(|rows: Vec<String>| rows.join("\n"))
+        .expect("explain");
+        tx.rollback().await.expect("rollback");
+
+        let ledger_cond = plan
+            .lines()
+            .skip_while(|l| !l.contains("usage_event"))
+            .find(|l| l.contains("Index Cond:"))
+            .unwrap_or_else(|| panic!("the ledger side of the join is not indexed:\n{plan}"));
+        assert!(
+            ledger_cond.contains("occurred_at"),
+            "the window bound must be part of the index range, not a filter \
+             applied to every row the key has ever written:\n{plan}"
+        );
+        assert!(
+            ledger_cond.contains("api_key_id"),
+            "and it rides on `usage_event_key_idx`, which leads with the key:\n{plan}"
+        );
     }
 
     /// A lost stream and the retry that replaced it: two rows, one request.
