@@ -673,6 +673,15 @@ pub async fn key_hashes_for_principal(db: &Db, principal_id: Uuid) -> Result<Vec
 /// Month-to-date is computed from the ledger rather than a running counter: the
 /// ledger is the record, and a counter that drifts from it is a bill nobody can
 /// reconcile.
+///
+/// The spend sums every row and the request count does not, which is the split
+/// 0014 made necessary rather than an inconsistency. Since the ledger's key
+/// contracted onto `(request_id, attempt)`, one client request can leave
+/// several rows: the answer it was served, plus any attempt a quality gate
+/// abandoned or a stream lost. All of them were generated and invoiced, so all
+/// of them are money; only one of them was a request. Counting the attempts
+/// would report a principal making twice the requests they made on exactly the
+/// traffic where escalation is working.
 pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsage>> {
     sqlx::query_as::<_, (Uuid, String, Option<Decimal>, Decimal, i64)>(
         r"
@@ -684,6 +693,7 @@ pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsa
                ), 0)::numeric(14,6),
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
+                     AND u.selection_reason NOT IN ('abandoned', 'lost')
                )
         FROM principal p
         LEFT JOIN usage_event u ON u.principal_id = p.id
@@ -901,7 +911,9 @@ pub async fn key_usage_by_model(
     sqlx::query_as::<_, ModelUsageRow>(
         r"
         SELECT model_id,
-               COUNT(request_id) AS requests,
+               COUNT(*) FILTER (
+                   WHERE selection_reason NOT IN ('abandoned', 'lost')
+               ) AS requests,
                COALESCE(SUM(input_tokens), 0)::bigint AS input_tokens,
                COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
                COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
@@ -1022,6 +1034,7 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                ), 0)::numeric(14,6) AS month_usd,
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
+                     AND u.selection_reason NOT IN ('abandoned', 'lost')
                ) AS month_requests,
                date_trunc('month', now()) + interval '1 month' AS month_resets_at,
                COALESCE(SUM(u.cost_usd) FILTER (
@@ -1038,9 +1051,11 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                ) + interval '7 days' AS seven_day_frees_at,
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= now() - interval '5 hours'
+                     AND u.selection_reason NOT IN ('abandoned', 'lost')
                ) AS five_hour_requests,
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= now() - interval '7 days'
+                     AND u.selection_reason NOT IN ('abandoned', 'lost')
                ) AS seven_day_requests,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
@@ -1059,6 +1074,7 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                ) + interval '24 hours' AS day_frees_at,
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= now() - interval '24 hours'
+                     AND u.selection_reason NOT IN ('abandoned', 'lost')
                ) AS day_requests,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '24 hours'
@@ -3344,21 +3360,20 @@ mod tests {
         );
     }
 
-    /// The expand half of expand/contract, which is what this release ships.
+    /// One client request can pay for several attempts, and every one of them
+    /// reaches the ledger.
     ///
-    /// The column and a unique `(request_id, attempt)` index are added; the
-    /// primary key on `request_id` alone survives, because the previous release
-    /// is still serving during a rolling deploy and its metering names
-    /// `ON CONFLICT (request_id)`. So a second attempt for one request does not
-    /// reach the ledger yet — and what matters is that it is *dropped* rather
-    /// than raised. An error here would fail the write carrying the served
-    /// attempt's spend, which is worse than the row we are missing.
+    /// 0014 contracted the key onto `(request_id, attempt)`, which is what the
+    /// expand half in 0003 was built for. Before it, the primary key on
+    /// `request_id` alone admitted the first row and `ON CONFLICT DO NOTHING`
+    /// silently dropped the rest — so an abandoned attempt never once landed,
+    /// and a lost one landed only by displacing the answer the client got.
     ///
-    /// Both rows start landing when a later release drops the primary key. No
-    /// code changes then: the untargeted `ON CONFLICT DO NOTHING` simply has one
-    /// fewer arbiter to conflict with.
+    /// What has to keep holding across that change is idempotence: a replayed
+    /// write of the same `(request_id, attempt)` is still a no-op, because that
+    /// is what makes a retried ledger write safe.
     #[tokio::test]
-    async fn a_second_attempt_is_dropped_rather_than_erroring_while_the_old_key_survives() {
+    async fn both_attempts_of_one_request_reach_the_ledger() {
         let Some(db) = test_db() else {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
             return;
@@ -3366,27 +3381,16 @@ mod tests {
         db.migrate().await.expect("migrate");
         let (principal, route, account) = seed(&db).await;
 
-        // The rolling-deploy guard, and the reason this test exists at all.
-        // Drop this key and every insert from the previous release fails with
-        // 42P10 — for the whole overlap window, and again after a rollback.
+        // The key this release contracted onto. Asserted rather than assumed,
+        // because every row below lands or is dropped according to it.
         let pk: String = sqlx::query_scalar(
             "SELECT pg_get_constraintdef(oid) FROM pg_constraint
              WHERE conname = 'usage_event_pkey'",
         )
         .fetch_one(db.pool())
         .await
-        .expect("the previous release still meters against this key");
-        assert_eq!(pk, "PRIMARY KEY (request_id)");
-
-        // And the index the contract release will key on, built ahead of it.
-        let wide: String = sqlx::query_scalar(
-            "SELECT indexdef FROM pg_indexes
-             WHERE indexname = 'usage_event_request_attempt_key'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .expect("the wider key exists before anything depends on it");
-        assert!(wide.contains("UNIQUE"), "must be unique to be an arbiter");
+        .expect("the ledger has a primary key");
+        assert_eq!(pk, "PRIMARY KEY (request_id, attempt)");
 
         let raw = format!("meter-{}", Uuid::new_v4());
         let key: Uuid = sqlx::query_scalar(
@@ -3433,34 +3437,32 @@ mod tests {
             streamed: false,
         };
 
-        // Production order: the answer the client was served goes first,
-        // precisely because it is the one that must survive the old key.
+        // The served row still goes first, which is no longer load-bearing for
+        // survival but is the order the request path writes in.
         record_usage(&db, &write(1, "escalated", "1.75"))
             .await
             .expect("served attempt");
         record_usage(&db, &write(0, "abandoned", "0.25"))
             .await
-            .expect("a dropped row is not an error");
+            .expect("abandoned attempt");
 
-        let (rows, reason): (i64, String) = sqlx::query_as(
-            "SELECT count(*), min(selection_reason) FROM usage_event WHERE request_id = $1",
+        let reasons: Vec<String> = sqlx::query_scalar(
+            "SELECT selection_reason FROM usage_event
+              WHERE request_id = $1 ORDER BY attempt",
         )
         .bind(request_id)
-        .fetch_one(db.pool())
+        .fetch_all(db.pool())
         .await
         .expect("read back");
 
         assert_eq!(
-            rows, 1,
-            "the surviving primary key admits one row per request"
-        );
-        assert_eq!(
-            reason, "escalated",
-            "and it has to be the answer the client got, not the one we discarded"
+            reasons,
+            vec!["abandoned".to_owned(), "escalated".to_owned()],
+            "both attempts are in the ledger, each under its own dispatch number"
         );
 
         // Idempotence is the reason the conflict clause is there in the first
-        // place, and it must outlive the key change.
+        // place, and it had to outlive the key change.
         record_usage(&db, &write(1, "escalated", "1.75"))
             .await
             .expect("replay");
@@ -3470,7 +3472,7 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .expect("count");
-        assert_eq!(rows, 1, "a replayed write is still a no-op");
+        assert_eq!(rows, 2, "a replayed write is still a no-op");
     }
 
     /// A key with no spend yet, and a way to build ledger writes against it.
@@ -3561,31 +3563,19 @@ mod tests {
         );
     }
 
-    /// The debit follows the row, including when the row is dropped.
+    /// The debit follows the row, and now every attempt has one.
     ///
-    /// While the primary key on `request_id` alone survives, the second attempt
-    /// for a request never reaches the ledger. Its spend must not reach the key
-    /// either: `SUM(cost_usd)` over the ledger and `api_key.spent_usd` are two
-    /// views of the same money, and a debit with no row behind it makes them
-    /// disagree with nothing to reconcile against.
+    /// `SUM(cost_usd)` over the ledger and `api_key.spent_usd` are two views of
+    /// the same money. Before 0014 the second attempt's row was dropped and its
+    /// debit had to be dropped with it, or the two would disagree with nothing
+    /// to reconcile against. Now both rows land, so both debits must.
     #[tokio::test]
-    async fn a_dropped_attempt_does_not_debit_the_key() {
+    async fn every_attempt_that_lands_debits_the_key() {
         let Some(db) = test_db() else {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
             return;
         };
         db.migrate().await.expect("migrate");
-
-        // The premise: without this key the second insert would land, and the
-        // second debit would be right.
-        let pk: String = sqlx::query_scalar(
-            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
-             WHERE conname = 'usage_event_pkey'",
-        )
-        .fetch_one(db.pool())
-        .await
-        .expect("the previous release still meters against this key");
-        assert_eq!(pk, "PRIMARY KEY (request_id)");
 
         let (key, write) = metered_key(&db).await;
         let request_id = Uuid::new_v4();
@@ -3595,7 +3585,7 @@ mod tests {
             .expect("served attempt");
         record_usage(&db, &write(request_id, 0, "abandoned", "0.25"))
             .await
-            .expect("a dropped row is not an error");
+            .expect("abandoned attempt");
 
         let rows: i64 =
             sqlx::query_scalar("SELECT count(*) FROM usage_event WHERE request_id = $1")
@@ -3603,11 +3593,97 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .expect("count");
-        assert_eq!(rows, 1, "the surviving primary key admits one row");
+        assert_eq!(rows, 2, "both attempts are rows");
         assert_eq!(
             key_spend(&db, key).await,
-            dec!(1.75),
-            "only the attempt that made it into the ledger may debit the key"
+            dec!(2.00),
+            "the provider generated and invoiced both, so the key pays for both"
+        );
+
+        // And a replay of either still moves nothing.
+        record_usage(&db, &write(request_id, 0, "abandoned", "0.25"))
+            .await
+            .expect("replay");
+        assert_eq!(key_spend(&db, key).await, dec!(2.00), "replay is a no-op");
+    }
+
+    /// A lost stream and the retry that replaced it: two rows, one request.
+    ///
+    /// The credential generated an answer and the connection died before it was
+    /// whole; another credential served the retry. The provider will invoice
+    /// both generations, so both are rows and both are money — but the client
+    /// made one request, and every count over the ledger has to keep saying so.
+    ///
+    /// That split is the whole reason the request counts filter on
+    /// `selection_reason` and the spend sums do not. Before 0014 the question
+    /// could not arise: the lost row displaced the served one, so the ledger
+    /// held a single row that was 502, cost the retry nothing, and carried no
+    /// counterfactual — the answer the client actually got was unbillable.
+    #[tokio::test]
+    async fn a_lost_attempt_and_its_retry_are_two_rows_but_one_request() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+
+        let (key, build) = metered_key(&db).await;
+        let request_id = Uuid::new_v4();
+
+        // Attempt 0: generated, then the stream died. 502, and no
+        // counterfactual — there is one baseline per client request and the
+        // served row below is the row that carries it.
+        let mut lost = build(request_id, 0, "lost", "0.40");
+        lost.status = 502;
+
+        // Attempt 1: what the client was served, priced against the ladder's
+        // ceiling like any other served answer.
+        let mut served = build(request_id, 1, "classified", "1.10");
+        served.counterfactual_usd = dec!(9.00);
+        served.counterfactual_model_id = Some("anthropic/claude-opus-5".to_owned());
+
+        record_usage(&db, &served).await.expect("served attempt");
+        record_usage(&db, &lost).await.expect("lost attempt");
+
+        let rows: Vec<(i16, String, i16, Decimal, Decimal)> = sqlx::query_as(
+            "SELECT attempt, selection_reason, status, cost_usd, counterfactual_usd
+               FROM usage_event WHERE request_id = $1 ORDER BY attempt",
+        )
+        .bind(request_id)
+        .fetch_all(db.pool())
+        .await
+        .expect("read back");
+
+        assert_eq!(
+            rows,
+            vec![
+                (0, "lost".to_owned(), 502, dec!(0.40), Decimal::ZERO),
+                (1, "classified".to_owned(), 200, dec!(1.10), dec!(9.00)),
+            ],
+            "the lost attempt sits beside the served one rather than in place of it"
+        );
+
+        // Both were generated, so both are debited.
+        assert_eq!(
+            key_spend(&db, key).await,
+            dec!(1.50),
+            "the key pays for the generation that was lost as well as the one served"
+        );
+
+        let usage = key_usage(&db, key, None)
+            .await
+            .expect("read the key's usage")
+            .expect("the key exists");
+        assert_eq!(
+            usage.month_to_date_usd,
+            dec!(1.50),
+            "spend counts every attempt: leaving the lost one out is what made \
+             failover look free"
+        );
+        assert_eq!(
+            usage.requests, 1,
+            "and the request count does not: one client request was made, however \
+             many generations it took to answer it"
         );
     }
 
