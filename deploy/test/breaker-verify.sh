@@ -8,8 +8,16 @@
 # 408 is used on purpose. 5xx / 529 fail over and cool the account down for 30s
 # via the scheduler, so the breaker never sees five failures. 408 is
 # RetrySameAccount: one inbound request records `same_account_retries + 1`
-# (default 3) failures, two inbound requests trip the threshold of 5, and the
-# third is refused locally.
+# (default 3) failures, and the second trips the threshold of 5 partway through
+# its own retries — the fifth failure opens the breaker, and the retry loop
+# re-checks it before sending again, so the sixth attempt never leaves. Five
+# POSTs, not six. The third request is then refused locally without reaching
+# selection at all.
+#
+# That mid-request stop is finding G7: the probe was claimed once above the
+# retry loop and never re-checked, so a credential that had this moment tripped
+# its breaker still received every remaining retry — the exact traffic a breaker
+# exists to stop, aimed at the credential it had just called unhealthy.
 #
 # Needs no credentials. The mock is the Python one, not aimock: the count of
 # POSTs is the assertion, and MOCK_FAIL_STATUS is deterministic.
@@ -90,7 +98,7 @@ post() {
          "messages":[{"role":"user","content":"hello"}]}'
 }
 
-say "4/4  two failures trip it; the third never reaches the mock"
+say "4/4  the breaker trips mid-retry; the next request never reaches the mock"
 code1="$(post)"
 [ "$code1" = "408" ] || fail "first request: expected 408, got $code1 $(cat "$WORK/body.json")"
 pass "first request 408 (seen=$(seen))"
@@ -98,16 +106,20 @@ pass "first request 408 (seen=$(seen))"
 code2="$(post)"
 [ "$code2" = "408" ] || fail "second request: expected 408, got $code2 $(cat "$WORK/body.json")"
 after_two="$(seen)"
-[ "$after_two" = "6" ] || fail "expected 6 mock POSTs after two requests (2×3 attempts), got $after_two"
-pass "second request 408, mock saw 6"
+# Five, not six: the fifth failure opens the breaker and the retry loop asks it
+# before sending again, so the second request stops one attempt short. Asserting
+# six would be asserting that a tripped breaker still gets one more request.
+[ "$after_two" = "5" ] \
+  || fail "expected 5 mock POSTs after two requests (3, then 2 before the breaker opens), got $after_two"
+pass "second request 408, mock saw 5 — the sixth attempt was stopped by the breaker"
 
 code3="$(post)"
 after_three="$(seen)"
-[ "$after_three" = "6" ] || fail "breaker did not hold: mock saw $after_three POSTs, expected 6"
+[ "$after_three" = "5" ] || fail "breaker did not hold: mock saw $after_three POSTs, expected 5"
 [ "$code3" = "503" ] || fail "third request: expected 503 NoCredential, got $code3 $(cat "$WORK/body.json")"
 grep -q 'no_credential' "$WORK/body.json" \
   || fail "third request was 503 but not no_credential: $(cat "$WORK/body.json")"
-pass "third request 503 no_credential, mock still at 6"
+pass "third request 503 no_credential, mock still at 5"
 
 OK=1
 printf '\n\033[32mPASS: the breaker trips and the next request is refused locally\033[0m\n'
