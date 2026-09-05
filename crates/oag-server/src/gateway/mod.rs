@@ -348,11 +348,58 @@ async fn run_with_escalation(
         .await
         {
             Ok(attempt) => attempt,
-            // The retry died, so there is no served row to come — but every
-            // attempt we made to get here was generated and invoiced. Failing
-            // the request does not make that spend go away, and this is the
-            // last chance to record it.
             Err(e) => {
+                // Some failures here are about this rung rather than about the
+                // request, and `Error::disposition` already says which: an
+                // empty credential pool, a seat held back by its reserve, and a
+                // rung with no viable model all classify as `EscalateTier`.
+                // Nothing read that. A route whose only Anthropic seat was
+                // parked at its reserve returned 503 while a frontier rung
+                // naming a different provider sat there able to serve.
+                //
+                // Only to a rung naming a *different* provider: climbing to
+                // another rung on the same one re-runs the selection that has
+                // just failed for a reason the rung cannot change.
+                //
+                // `climb_allowed` still applies. A caller who named a model
+                // must not be quietly moved onto another provider's, however
+                // unavailable theirs is — that is the same rule that stops a
+                // quality gate doing it.
+                if matches!(e.disposition(), oag_core::Disposition::EscalateTier)
+                    && oag_router::climb_allowed(&decision.reason)
+                    && escalations < MAX_ESCALATIONS
+                    && let Some(from) = decision.tier.as_ref()
+                    && let Some(next) = policy.escalate(
+                        from,
+                        oag_router::QualityGate::NoCredential,
+                        &signal,
+                        &catalog,
+                        canonical.max_tokens,
+                        &served,
+                    )
+                    && next.model.provider != decision.model.provider
+                {
+                    tracing::info!(
+                        %request_id, from = ?decision.rung_name(), to = ?next.rung_name(),
+                        error = %e,
+                        "escalating: nothing on this rung could be dispatched to"
+                    );
+                    metrics::counter!(
+                        "oag_escalations_total",
+                        "from" => from.name.as_str().to_owned(),
+                        "gate" => "NoCredential".to_owned(),
+                    )
+                    .increment(1);
+                    canonical.model.clone_from(&next.model.upstream_name);
+                    decision = next;
+                    escalations += 1;
+                    triggering_gate = Some(oag_router::QualityGate::NoCredential);
+                    continue;
+                }
+
+                // Nowhere left to go. There is no served row to come — but
+                // every attempt made to get here was generated and invoiced,
+                // and failing the request does not make that spend go away.
                 spawn_unserved(state, abandoned, lost);
                 return Err(e);
             }
@@ -2036,7 +2083,41 @@ mod tests {
         h
     }
 
-    /// G4. Budget pressure is the only thing that suppression counts.
+    /// R1, the wiring. The selection error path consults `disposition`.
+    ///
+    /// Reads this file's own source, because reaching that branch needs a
+    /// gateway with a real route, a real ladder, and a credential pool that is
+    /// empty in the specific way the finding is about — a fixture larger and
+    /// less reliable than the thing it would prove. `oag-router` pins the
+    /// classification and the escalation this depends on; what is left is that
+    /// anything asks, and this is that.
+    #[test]
+    fn the_selection_error_path_asks_the_disposition() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split_once("async fn run_with_escalation(")
+            .expect("the loop is in this file")
+            .1;
+        let path = &body[..body.find("\n}\n").unwrap_or(body.len())];
+
+        assert!(
+            path.contains("e.disposition(), oag_core::Disposition::EscalateTier"),
+            "without this the disposition describes a behaviour the gateway does \
+             not have, which is how it got that way"
+        );
+        assert!(
+            path.contains("next.model.provider != decision.model.provider"),
+            "climbing to another rung on the same provider re-runs the selection \
+             that has just failed for a reason the rung cannot change"
+        );
+        assert!(
+            path.contains("oag_router::climb_allowed(&decision.reason)"),
+            "a caller who named a model must not be moved onto another \
+             provider's, however unavailable theirs is"
+        );
+    }
+
+    /// G4. Budget pressure is the only thing that suppression counts.    /// G4. Budget pressure is the only thing that suppression counts.
     ///
     /// `oag_escalations_suppressed_total` answers one question: how much answer
     /// quality is my budget costing me. It was incremented whenever a gate

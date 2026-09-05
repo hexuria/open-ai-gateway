@@ -166,6 +166,14 @@ pub enum QualityGate {
     EmptyResponse,
     /// Rejected the request as too long or too complex for it.
     ContextOverflow,
+    /// Nothing on this rung could be dispatched to at all — no credential for
+    /// its provider, or the only one held back by its reserve.
+    ///
+    /// Not a judgement about the answer, because there was no answer. It is
+    /// here because escalation is nonetheless the right response: a rung naming
+    /// a different provider can serve a request this one cannot, and the ledger
+    /// should say that is why the climb happened rather than blaming the model.
+    NoCredential,
 }
 
 /// Why this model was picked. Recorded on the usage row so the routing
@@ -1119,6 +1127,60 @@ mod tests {
             d.reason,
             SelectionReason::Escalated {
                 gate: QualityGate::ContextOverflow,
+                ..
+            }
+        ));
+    }
+
+    /// R1. A rung nothing can be dispatched to is a reason to climb.
+    ///
+    /// `NoCredential`, `ReserveHeld` and `NoViableModel` all classify as
+    /// `EscalateTier`, and nothing read that: the selection error went straight
+    /// back to the caller as a 503 while a rung naming a different provider sat
+    /// there able to serve. This pins the classification the gateway now acts
+    /// on; `escalate` accepting the gate is what makes acting on it possible.
+    #[test]
+    fn a_rung_with_no_usable_credential_escalates_rather_than_failing() {
+        use oag_core::{Disposition, Error, Provider};
+
+        for e in [
+            Error::NoCredential {
+                provider: Provider::Anthropic,
+            },
+            Error::ReserveHeld {
+                provider: Provider::Anthropic,
+                reserve_pct: 10,
+            },
+            Error::NoViableModel("nothing on this rung fits".to_owned()),
+        ] {
+            assert!(
+                matches!(e.disposition(), Disposition::EscalateTier),
+                "a rung that cannot be dispatched to is a rung to climb off: {e}"
+            );
+        }
+
+        // And the climb it enables: off a cheap Kimi rung, onto Anthropic.
+        let p = policy();
+        let d = p
+            .escalate(
+                &p.ladder().floor(),
+                QualityGate::NoCredential,
+                &RequestSignal::default(),
+                &catalog(),
+                1024,
+                &HashSet::new(),
+            )
+            .expect("there is a rung above");
+        assert_ne!(
+            d.model.provider,
+            Provider::Kimi,
+            "climbing to another rung on the same provider would re-run the \
+             selection that has just failed for a reason the rung cannot change"
+        );
+        assert!(matches!(
+            d.reason,
+            SelectionReason::Escalated {
+                gate: QualityGate::NoCredential,
                 ..
             }
         ));
