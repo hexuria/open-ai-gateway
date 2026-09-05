@@ -44,17 +44,66 @@ impl std::fmt::Debug for AppState {
     }
 }
 
+/// A configured base URL, in the one shape every adapter's concatenation expects.
+///
+/// Trailing slashes go, because every adapter builds its request URL by
+/// appending a path: `https://host/` became `https://host//v1/messages`, which
+/// most upstreams tolerate and some do not — a configuration bug that works in
+/// the deployment where it was typed and fails in the next one.
+///
+/// A query or a fragment is refused rather than trimmed. Appending a path after
+/// either produces a URL that means something different — `https://host/?x=1`
+/// plus `/v1/messages` is a query string containing a path, not a path — and
+/// guessing which half the operator meant is worse than saying so. Refused at
+/// startup, where it is a config error, rather than surfacing later as a 404
+/// from an upstream that never received the request.
+fn normalise_base_url(provider: &str, raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(oag_core::Error::Config(format!(
+            "the base URL for {provider} is empty"
+        )));
+    }
+    if let Some(bad) = ['?', '#'].into_iter().find(|c| trimmed.contains(*c)) {
+        return Err(oag_core::Error::Config(format!(
+            "the base URL for {provider} contains '{bad}': {trimmed}. Every request path is \
+             appended to it, so a query or fragment here would silently change what the \
+             resulting URL means."
+        )));
+    }
+    if !trimmed.contains("://") {
+        return Err(oag_core::Error::Config(format!(
+            "the base URL for {provider} has no scheme: {trimmed}"
+        )));
+    }
+    Ok(trimmed.trim_end_matches('/').to_owned())
+}
+
 impl AppState {
     pub fn new(config: Config, db: Db, cache: Cache) -> Result<Self> {
         let kek = Kek::from_base64(&config.security.credential_kek)?;
 
-        let base = |p: Provider, default: &str| -> String {
-            config
+        // Normalised once, here, rather than trusted at every use site.
+        //
+        // Every adapter builds its request URL by concatenation —
+        // `format!("{base}/v1/messages")` and its siblings — so a configured
+        // base URL with a trailing slash produced `https://host//v1/messages`.
+        // Most upstreams tolerate that and some do not, which is the worst kind
+        // of configuration bug: it works in the deployment where it was typed.
+        //
+        // A query or a fragment cannot be normalised away, because appending a
+        // path after either produces a URL that means something else entirely —
+        // `https://host/?x=1/v1/messages` is a query string, not a path. That is
+        // a config error and is refused as one, at startup, rather than
+        // becoming a 404 from an upstream at request time.
+        let base = |p: Provider, default: &str| -> Result<String> {
+            let raw = config
                 .gateway
                 .provider_base_urls
                 .get(p.as_str())
                 .cloned()
-                .unwrap_or_else(|| default.to_owned())
+                .unwrap_or_else(|| default.to_owned());
+            normalise_base_url(p.as_str(), &raw)
         };
 
         let mut adapters: HashMap<Provider, Arc<dyn ProviderAdapter>> = HashMap::new();
@@ -63,7 +112,7 @@ impl AppState {
             Arc::new(oag_upstream::AnthropicAdapter::new(base(
                 Provider::Anthropic,
                 "https://api.anthropic.com",
-            ))),
+            )?)),
         );
 
         // Region and endpoint are separate for Bedrock: the region is part of
@@ -73,7 +122,14 @@ impl AppState {
             Provider::Bedrock,
             Arc::new(
                 oag_upstream::BedrockAdapter::new(config.gateway.bedrock_region.clone())
-                    .with_endpoint(config.gateway.provider_base_urls.get("bedrock").cloned()),
+                    .with_endpoint(
+                        config
+                            .gateway
+                            .provider_base_urls
+                            .get("bedrock")
+                            .map(|raw| normalise_base_url("bedrock", raw))
+                            .transpose()?,
+                    ),
             ),
         );
 
@@ -82,7 +138,7 @@ impl AppState {
             Arc::new(oag_upstream::GeminiAdapter::new(base(
                 Provider::Gemini,
                 "https://generativelanguage.googleapis.com/v1beta",
-            ))),
+            )?)),
         );
 
         // Five providers, one adapter: they all speak Chat Completions and
@@ -94,7 +150,7 @@ impl AppState {
             Provider::Zhipu,
             Provider::XAI,
         ] {
-            let url = base(p, oag_upstream::OpenAICompatAdapter::default_base_url(p));
+            let url = base(p, oag_upstream::OpenAICompatAdapter::default_base_url(p))?;
             adapters.insert(p, Arc::new(oag_upstream::OpenAICompatAdapter::new(p, url)));
         }
 
@@ -200,5 +256,59 @@ impl AppState {
         let n = specs.len();
         self.set_catalog(Catalog::from_entries(specs)).await;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalise_base_url;
+
+    /// U5. A configured base URL is normalised once, or refused.
+    ///
+    /// Every adapter builds its request URL by concatenation, so a trailing
+    /// slash produced `https://host//v1/messages` — which most upstreams
+    /// tolerate and some do not. That is the worst kind of configuration bug:
+    /// it works in the deployment where it was typed.
+    #[test]
+    fn a_base_url_is_trimmed_or_refused_at_startup() {
+        for raw in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com///",
+            "  https://api.anthropic.com/  ",
+        ] {
+            assert_eq!(
+                normalise_base_url("anthropic", raw).expect("normalises"),
+                "https://api.anthropic.com",
+                "every spelling of the same endpoint has to reach the adapter \
+                 identically: {raw}"
+            );
+        }
+
+        // A path is legitimate and kept: Gemini's own default carries one.
+        assert_eq!(
+            normalise_base_url(
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta/"
+            )
+            .expect("normalises"),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+
+        // A query or fragment cannot be normalised away. Appending a path after
+        // either means something else entirely, and guessing which half the
+        // operator meant is worse than saying so.
+        for raw in ["https://host/?apikey=secret", "https://host/#anchor"] {
+            let err = normalise_base_url("openai", raw).expect_err("refused");
+            assert!(
+                err.to_string().contains(raw.trim()),
+                "the operator has to see which value was rejected: {err}"
+            );
+        }
+
+        // And nonsense is refused at startup rather than becoming a 404 from an
+        // upstream that never received the request.
+        assert!(normalise_base_url("openai", "api.openai.com").is_err());
+        assert!(normalise_base_url("openai", "   ").is_err());
     }
 }
