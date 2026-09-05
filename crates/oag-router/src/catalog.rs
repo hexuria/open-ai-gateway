@@ -370,25 +370,38 @@ mod tests {
 
     #[test]
     fn a_price_tie_resolves_the_same_way_every_time() {
-        // The served set is a `HashSet`, so without an explicit tie-break
-        // the baseline depended on iteration order, and the ledger recorded
-        // whichever model won that draw.
+        // The served set is a `HashSet`, so without an explicit tie-break the
+        // baseline depended on iteration order and the ledger recorded whichever
+        // model won that draw.
+        //
+        // The set is rebuilt on every pass, which is the whole point. `HashSet`
+        // draws its hash seed once, when it is constructed — so asking the same
+        // set sixteen times asks one question sixteen times, and this test used
+        // to detect a missing tie-break only when that single draw happened to
+        // put the wrong twin first. About half the time, decided at process
+        // start, which is the worst kind of test: it fails for people whose
+        // build is fine and passes for people whose build is not.
+        //
+        // A fresh set per pass is a fresh draw, so thirty-two of them miss a
+        // missing tie-break with probability 2^-32 rather than 1/2.
         let catalog = Catalog::from_entries([
             priced("openai/b-twin", "b-twin", dec!(5), dec!(30)),
             priced("openai/a-twin", "a-twin", dec!(5), dec!(30)),
         ]);
-        let served: std::collections::HashSet<String> = ["a-twin", "b-twin"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        for _ in 0..16 {
+        for pass in 0..32 {
+            let served: std::collections::HashSet<String> = ["a-twin", "b-twin"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
             assert_eq!(
                 catalog
                     .dearest_served(&served, &Requirements::default())
                     .expect("a match")
                     .id
                     .as_str(),
-                "openai/a-twin"
+                "openai/a-twin",
+                "pass {pass}: the baseline is the ledger's `counterfactual_model`, \
+                 so equal prices have to resolve to the same model every time"
             );
         }
     }

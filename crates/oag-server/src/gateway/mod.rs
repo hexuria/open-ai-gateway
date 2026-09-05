@@ -377,7 +377,16 @@ async fn run_with_escalation(
                 // silently never gets written. Costs a branch on an empty Vec.
                 spawn_unserved(state, abandoned, lost);
                 return stream_response(
-                    state, response, lease, auth, &decision, request_id, started, attempt, ingress,
+                    state,
+                    response,
+                    lease,
+                    auth,
+                    &decision,
+                    request_id,
+                    started,
+                    attempt,
+                    ingress,
+                    triggering_gate,
                     guard,
                 );
             }
@@ -453,7 +462,36 @@ async fn run_with_escalation(
             continue;
         }
 
-        if gate.is_some() && pressure != oag_router::BudgetPressure::Normal {
+        // Counted only when budget pressure was the *sole* reason we did not
+        // climb. There are four other reasons — a passthrough request must not
+        // be migrated onto a model it did not name, the caller's own
+        // `max_tokens` is not a weaker-model failure, the escalation ceiling is
+        // reached, and there may simply be no rung above — and this counter
+        // fired on all of them, so long as the principal happened to be near
+        // their cap. An operator reading it to answer "how much quality is my
+        // budget costing me" was reading a number mostly made of requests the
+        // budget had nothing to do with.
+        //
+        // The test is counterfactual and has to be: would this have climbed if
+        // the principal had headroom? Everything but the pressure is re-asked
+        // with `Normal` substituted, including `policy.escalate`, because a
+        // gate with no rung above it is not a suppression whatever the budget
+        // says.
+        if let Some(gate) = gate
+            && pressure != oag_router::BudgetPressure::Normal
+            && should_climb(
+                &decision.reason,
+                gate,
+                oag_router::BudgetPressure::Normal,
+                escalations,
+                canonical.max_tokens,
+                decision.model.max_output_tokens,
+            )
+            && let Some(from) = decision.tier.as_ref()
+            && policy
+                .escalate(from, gate, &signal, &catalog, canonical.max_tokens, &served)
+                .is_some()
+        {
             tracing::info!(
                 %request_id, ?gate,
                 "not escalating: this principal is near their budget, so a worse \
@@ -1461,6 +1499,14 @@ async fn try_credential(
 /// nothing was in flight. Now they are two `?`s over an owned lease, and the
 /// lease's guard hands the slot back on the way out.
 #[allow(clippy::too_many_arguments)]
+///
+/// `triggering_gate` is the gate that *caused* an escalation, if one happened
+/// before this attempt streamed. Without it the ledger took the gate from the
+/// accumulator alone — the gate this final attempt tripped, which is `None`
+/// precisely when escalation worked. So every streamed request that climbed a
+/// rung recorded no reason for having climbed, and "which rung is mis-set for
+/// this workload" could only be answered from non-streamed traffic. The
+/// collected path has threaded it for a while; this one had not.
 fn stream_response(
     state: &Arc<AppState>,
     response: reqwest::Response,
@@ -1471,6 +1517,7 @@ fn stream_response(
     started: Instant,
     attempt: u8,
     ingress: Dialect,
+    triggering_gate: Option<oag_router::QualityGate>,
     guard: crate::shutdown::InFlightGuard,
 ) -> Result<Response> {
     // The adapter this lease actually gets, not the provider's default one:
@@ -1516,7 +1563,10 @@ fn stream_response(
         let _guard = guard;
         let outcome = sse::pump(response, adapter, tx, deadlines, egress).await;
         lease.release().await;
-        meter::record(&state2, &ctx, &outcome).await;
+        // `triggering_gate` when we escalated to get here, otherwise whatever
+        // this attempt tripped — the same rule the collected path applies, so
+        // the ledger names a reason on both.
+        meter::record(&state2, &ctx, &outcome, triggering_gate).await;
     });
 
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
@@ -1984,6 +2034,100 @@ mod tests {
             );
         }
         h
+    }
+
+    /// G4. Budget pressure is the only thing that suppression counts.
+    ///
+    /// `oag_escalations_suppressed_total` answers one question: how much answer
+    /// quality is my budget costing me. It was incremented whenever a gate
+    /// tripped and the principal happened to be near their cap — regardless of
+    /// whether the budget had anything to do with not climbing. Four other
+    /// things stop a climb, and on a constrained principal every one of them
+    /// was counted as a budget suppression, so the number was mostly made of
+    /// requests the budget did not affect.
+    ///
+    /// The condition in `run_with_escalation` re-asks `should_climb` with
+    /// `Normal` substituted for the real pressure. This pins the substitution's
+    /// arithmetic: the cases below are the ones where the answer differs, and
+    /// the ones where it does not.
+    #[test]
+    fn only_a_climb_that_budget_alone_prevented_is_a_suppression() {
+        use oag_router::{BudgetPressure, QualityGate, SelectionReason};
+
+        let classified = SelectionReason::Classified;
+        let gate = QualityGate::Refusal;
+        // Room under the caller's own cap, so `truncated_by_client_cap` is not
+        // what is doing the work in any of these.
+        let (asked, model_max) = (1024, 8192);
+
+        // The suppression the counter is for: everything would have allowed the
+        // climb, and only the pressure stopped it.
+        assert!(
+            !should_climb(
+                &classified,
+                gate,
+                BudgetPressure::Constrained,
+                0,
+                asked,
+                model_max
+            ),
+            "a constrained principal does not climb"
+        );
+        assert!(
+            should_climb(
+                &classified,
+                gate,
+                BudgetPressure::Normal,
+                0,
+                asked,
+                model_max
+            ),
+            "and with headroom it would have — so the budget is what cost the \
+             caller the better answer, and that is the one to count"
+        );
+
+        // Not a suppression: the escalation ceiling is reached, so this request
+        // was never going to climb again whatever the budget said. Counted
+        // before, because the pressure was non-Normal and a gate had tripped.
+        assert!(
+            !should_climb(
+                &classified,
+                gate,
+                BudgetPressure::Normal,
+                MAX_ESCALATIONS,
+                asked,
+                model_max
+            ),
+            "the ceiling stops it with headroom too, so the budget is not the cause"
+        );
+
+        // Not a suppression: a passthrough request must not be migrated onto a
+        // model the caller did not name. Nothing to do with money.
+        assert!(
+            !should_climb(
+                &SelectionReason::Passthrough,
+                gate,
+                BudgetPressure::Normal,
+                0,
+                asked,
+                model_max
+            ),
+            "a named model is honoured whatever the budget is"
+        );
+
+        // Not a suppression: the answer hit the caller's own `max_tokens`,
+        // which a dearer model would hit in exactly the same place.
+        assert!(
+            !should_climb(
+                &classified,
+                QualityGate::Truncated,
+                BudgetPressure::Normal,
+                0,
+                100,
+                8192
+            ),
+            "the caller's own cap truncated it, and a rung up cannot help"
+        );
     }
 
     #[test]
@@ -2465,6 +2609,7 @@ security:
             Instant::now(),
             0,
             Dialect::AnthropicMessages,
+            None,
             state.lifecycle.track(),
         );
 
@@ -2498,6 +2643,7 @@ security:
             Instant::now(),
             0,
             Dialect::AnthropicMessages,
+            None,
             state.lifecycle.track(),
         );
 

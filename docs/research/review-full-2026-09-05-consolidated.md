@@ -96,7 +96,7 @@ column means the defect also depends on documented third-party behaviour.
 | G2 | confirmed | `sse.rs:356` | in-band error not extracted in `pump`; second frame emitted |
 | S1 | confirmed | `repo.rs:1080`, `:689` | window bounds inside `FILTER`, none in `WHERE` |
 | S2 | confirmed | `repo.rs:1152` | multi-row UPDATE read with `fetch_optional`; no unique index on prefix |
-| S3 | confirmed | `db.rs:59` | session `TimeZone` never set; Rust side is UTC |
+| S3 | **refuted 2026-09-06** | `db.rs:59` | premise false: sqlx sends `TimeZone=UTC` in its startup packet, so `pg_settings.source` for it reads `client` and the server's default never applies. Proved against a database forced to `Pacific/Auckland`. No code change; the assumption is now asserted by `the_session_timezone_is_utc_whatever_the_server_prefers` |
 | R1 | confirmed | `error.rs:300` | four dispositions never consulted by the selection error path |
 | R2 | confirmed | `catalog.rs:208`, `policy.rs:354` | `dearest_served` wins over the ladder ceiling on a partial served set |
 | R3 | confirmed | `config.rs:491` | no `client_write_timeout < max_stream_duration` check |

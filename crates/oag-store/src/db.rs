@@ -188,6 +188,62 @@ impl Db {
 mod tests {
     use super::Db;
 
+    /// The session's timezone is UTC, and it is the client that says so.
+    ///
+    /// This is a guard on an assumption, not a fix. Finding S3 of the
+    /// 2026-09-05 review said the pool sets no `TimeZone`, so
+    /// `date_trunc('month', now())` — which truncates in the session's zone —
+    /// would disagree with every Rust-side month boundary, which is UTC. On a
+    /// server defaulting to a local zone that would put two contradictory
+    /// month-to-date figures in one admin response and charge last month's
+    /// spend against this month's cap for the offset.
+    ///
+    /// The premise turned out to be wrong: sqlx sends `TimeZone=UTC` in its
+    /// startup packet on every connection. Nothing needed fixing — but the
+    /// money then depends on a driver default that no line in this repository
+    /// asks for, and that is worth an assertion rather than a comment.
+    ///
+    /// `source` is what makes this test able to fail. Asserting the zone alone
+    /// would pass against a pool that pins nothing, because the dev and CI
+    /// containers are both UTC anyway; `pg_settings.source` reads `client` only
+    /// when the connection asked, and a server that merely happens to be UTC
+    /// reports `configuration file` or `default` instead. So the day a driver
+    /// upgrade, a connection-option change or a different backend stops
+    /// supplying it, this fails here rather than in a month-end invoice —
+    /// and it does so without writing anything to any database.
+    #[tokio::test]
+    async fn the_session_timezone_is_utc_because_the_client_asked() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect_with(&url, 1, std::time::Duration::from_secs(10)).expect("pool");
+
+        let (zone, source, session_month, utc_month): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT current_setting('TimeZone'),
+                        (SELECT source FROM pg_settings WHERE name = 'TimeZone'),
+                        date_trunc('month', now())::text,
+                        date_trunc('month', now() AT TIME ZONE 'UTC')::text",
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("read the session");
+
+        assert_eq!(zone, "UTC", "every Rust-side month boundary is UTC");
+        assert_eq!(
+            source, "client",
+            "and the connection is what makes it so. `configuration file` here \
+             would mean the gateway is inheriting whatever the operator's \
+             Postgres was installed with"
+        );
+        assert_eq!(
+            session_month.trim_end_matches("+00"),
+            utc_month,
+            "so SQL and Rust agree on where the month begins"
+        );
+    }
+
     /// Migrations run without the pool's statement timeout, and hand the
     /// connection back with it restored.
     ///

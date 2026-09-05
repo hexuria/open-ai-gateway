@@ -194,6 +194,11 @@ pub async fn pump(
     let mut ttft = None;
     let mut client_gone = false;
     let mut error = None;
+    // The provider's own words, if it put an `Error` event inside its 200
+    // stream. Held apart from `error` because it decides two things the
+    // inferred failures do not: what the ledger records, and whether a second
+    // error frame goes to a client that has already been sent one.
+    let mut in_band: Option<String> = None;
 
     // A no-op frame downstream while the upstream is quiet, so an intermediary
     // with its own idle timeout does not sever a stream the model is still
@@ -277,7 +282,8 @@ pub async fn pump(
         // usage, and this ordering means a send failure cannot skip it.
         pending.extend_from_slice(&chunk);
         let payloads = take_payloads(&mut pending, framing);
-        let (saw_content, translated) = fold_payloads(&payloads, &adapter, &mut acc, &mut render);
+        let (saw_content, translated) =
+            fold_payloads(&payloads, &adapter, &mut acc, &mut render, &mut in_band);
 
         if ttft.is_none() && saw_content {
             ttft = Some(started.elapsed());
@@ -344,7 +350,7 @@ pub async fn pump(
     // exactly at EOF.
     if !pending.is_empty() {
         let payloads = take_payloads(&mut pending, framing);
-        let _ = fold_payloads(&payloads, &adapter, &mut acc, &mut render);
+        let _ = fold_payloads(&payloads, &adapter, &mut acc, &mut render, &mut in_band);
     }
 
     // Whether the response reached its own end. Every dialect marks that with a
@@ -354,6 +360,16 @@ pub async fn pump(
     // Read after the tail fold, because the frame carrying the terminal event
     // can be the one that completes exactly at EOF.
     let complete = acc.stop_reason().is_some();
+
+    // The provider's own account of the failure, when it gave one. An `Error`
+    // event inside a 200 stream says what went wrong — overloaded, out of
+    // quota, a content decision — and it outranks anything inferred here,
+    // including the truncation below: the stream did not merely end early, it
+    // ended early *for a stated reason*, and that reason is what belongs in the
+    // ledger and in the log an operator reads.
+    if let Some(message) = &in_band {
+        error = Some(format!("upstream stream error: {message}"));
+    }
 
     // An upstream that closes cleanly before the terminal event has truncated
     // the answer, and nothing in the loop can tell: the read simply ends, the
@@ -373,8 +389,15 @@ pub async fn pump(
     // the terminal event cost the client nothing, and an error appended to an
     // answer it has already seen end is a contradiction it has to resolve
     // alone.
+    //
+    // And not at all when the error arrived in-band: the fold above already
+    // rendered that `Error` event to the client through this same renderer, so
+    // synthesising another sent two error frames for one failure, the second
+    // claiming a truncation and contradicting the first — which had the truth
+    // in it.
     if !complete
         && !client_gone
+        && in_band.is_none()
         && let Some(message) = &error
         && let Some(frame) = error_frame(&egress, &mut render, message)
     {
@@ -493,11 +516,20 @@ fn last_blank_line(buf: &[u8]) -> Option<usize> {
 ///
 /// Returns whether any carried actual content — which is what times the first
 /// token — and, when a renderer is supplied, the client-dialect bytes.
+///
+/// `in_band` collects the message from any `Error` event the upstream put
+/// inside its 200 stream. `collect_stream` has always extracted that; this side
+/// did not, so the provider's own words — "overloaded", a quota message, a
+/// content decision — were dropped and the caller fell through to the generic
+/// "closed before the response was complete". The ledger then said the
+/// connection truncated when the provider had said exactly what was wrong, and
+/// the client got two error frames disagreeing about it.
 fn fold_payloads(
     payloads: &[String],
     adapter: &Arc<dyn ProviderAdapter>,
     acc: &mut StreamAccumulator,
     render: &mut Renderer,
+    in_band: &mut Option<String>,
 ) -> (bool, Vec<u8>) {
     let mut out = Vec::new();
     let mut saw_content = false;
@@ -512,6 +544,13 @@ fn fold_payloads(
                             | StreamEvent::ToolUseStart { .. }
                     ) {
                         saw_content = true;
+                    }
+                    // First one wins: what went wrong first is the cause, and
+                    // anything after it is likely a consequence.
+                    if let StreamEvent::Error { message } = e
+                        && in_band.is_none()
+                    {
+                        *in_band = Some(message.clone());
                     }
                     acc.observe(e);
                     if let Some(frame) = render.render(e) {
@@ -777,6 +816,80 @@ mod tests {
     }
 
     #[test]
+    fn an_in_band_upstream_error_is_taken_as_the_reason_the_stream_ended() {
+        // G2. An upstream can put an error inside a 200 stream — overloaded,
+        // out of quota, a content decision — and it says exactly what went
+        // wrong. `collect_stream` has always extracted that; the pump did not,
+        // so the message was dropped on the floor and the caller fell through
+        // to "upstream closed before the response was complete".
+        //
+        // Two things went wrong from there. The ledger recorded a truncated
+        // connection for a request the provider had explained. And the client
+        // got two error frames for one failure: the renderer had already
+        // emitted the provider's `Error` event during the fold, then the pump
+        // synthesised a second one contradicting it.
+        let adapter = anthropic();
+        let mut acc = StreamAccumulator::new();
+        let mut render = Renderer::None;
+        let mut in_band: Option<String> = None;
+
+        let payloads = vec![
+            r#"{"type":"message_start","message":{"model":"m","usage":{"input_tokens":5}}}"#
+                .to_owned(),
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
+                .to_owned(),
+        ];
+        let _ = fold_payloads(&payloads, &adapter, &mut acc, &mut render, &mut in_band);
+
+        assert_eq!(
+            in_band.as_deref(),
+            Some("Overloaded"),
+            "the provider said what was wrong and the fold has to carry it out"
+        );
+        assert!(
+            acc.stop_reason().is_none(),
+            "an error is not a terminal event, so the stream is incomplete — \
+             which is what used to produce the misleading truncation message"
+        );
+    }
+
+    #[test]
+    fn a_stream_that_merely_stops_still_reports_a_truncation() {
+        // The other half of G2: with no in-band error there is nothing better
+        // to say than that the upstream closed early, and that message must
+        // keep being produced. A fix that swallowed it would trade a wrong
+        // diagnosis for no diagnosis.
+        let adapter = anthropic();
+        let mut acc = StreamAccumulator::new();
+        let mut render = Renderer::None;
+        let mut in_band: Option<String> = None;
+
+        let payloads =
+            vec![r#"{"type":"message_start","message":{"model":"m","usage":{}}}"#.to_owned()];
+        let _ = fold_payloads(&payloads, &adapter, &mut acc, &mut render, &mut in_band);
+
+        assert!(in_band.is_none(), "nothing was said, so nothing is carried");
+        assert!(acc.stop_reason().is_none(), "and the answer is incomplete");
+    }
+
+    #[test]
+    fn the_first_in_band_error_is_the_one_reported() {
+        // What went wrong first is the cause; anything after it is likely a
+        // consequence of the same failure, and the operator wants the cause.
+        let adapter = anthropic();
+        let mut acc = StreamAccumulator::new();
+        let mut render = Renderer::None;
+        let mut in_band: Option<String> = None;
+
+        let payloads = vec![
+            r#"{"type":"error","error":{"message":"Overloaded"}}"#.to_owned(),
+            r#"{"type":"error","error":{"message":"connection reset"}}"#.to_owned(),
+        ];
+        let _ = fold_payloads(&payloads, &adapter, &mut acc, &mut render, &mut in_band);
+        assert_eq!(in_band.as_deref(), Some("Overloaded"));
+    }
+
+    #[test]
     fn usage_accumulates_across_frames_split_mid_json() {
         // The realistic case: a TCP read boundary lands inside an event.
         let adapter = anthropic();
@@ -789,12 +902,12 @@ mod tests {
 
         buf.extend_from_slice(head);
         let p = take_payloads(&mut buf, Framing::Sse);
-        let _ = fold_payloads(&p, &adapter, &mut acc, &mut render);
+        let _ = fold_payloads(&p, &adapter, &mut acc, &mut render, &mut None);
         assert_eq!(acc.usage().input_tokens, 0, "nothing complete yet");
 
         buf.extend_from_slice(tail);
         let p = take_payloads(&mut buf, Framing::Sse);
-        let _ = fold_payloads(&p, &adapter, &mut acc, &mut render);
+        let _ = fold_payloads(&p, &adapter, &mut acc, &mut render, &mut None);
         assert_eq!(acc.usage().input_tokens, 50, "reassembled and counted");
     }
 
@@ -811,7 +924,7 @@ mod tests {
                 .to_owned(),
         ];
         assert!(
-            !fold_payloads(&opening, &adapter, &mut acc, &mut render).0,
+            !fold_payloads(&opening, &adapter, &mut acc, &mut render, &mut None).0,
             "an opening event is not content"
         );
 
@@ -820,7 +933,7 @@ mod tests {
                 .to_owned(),
         ];
         assert!(
-            fold_payloads(&content, &adapter, &mut acc, &mut render).0,
+            fold_payloads(&content, &adapter, &mut acc, &mut render, &mut None).0,
             "a text delta is"
         );
     }
@@ -833,7 +946,7 @@ mod tests {
         let mut acc = StreamAccumulator::new();
         let mut render = Renderer::None;
         let frame = vec![r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"f"}}"#.to_owned()];
-        assert!(fold_payloads(&frame, &adapter, &mut acc, &mut render).0);
+        assert!(fold_payloads(&frame, &adapter, &mut acc, &mut render, &mut None).0);
     }
 
     // ── how a stream ends ────────────────────────────────────────────────────
