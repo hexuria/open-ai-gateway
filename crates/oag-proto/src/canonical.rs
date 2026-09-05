@@ -377,7 +377,7 @@ impl CanonicalRequest {
         self.messages
             .iter()
             .flat_map(|m| m.content.iter())
-            .any(|b| matches!(b, ContentBlock::Image { .. }))
+            .any(carries_image)
     }
 
     /// Whether the prompt carries code or a diff.
@@ -433,6 +433,23 @@ pub fn count_input_tokens(req: &CanonicalRequest) -> u64 {
     let framing = 4 * req.messages.len() + 8 * req.tools.len();
 
     (content + tools + framing) as u64
+}
+
+/// Whether the block is an image or a tool result holding one.
+///
+/// Recursive for the same reason `count_block` is: a screenshot handed back
+/// as a tool result is an image the model has to see, and a request whose
+/// only images are inside results was classified as image-free and routed
+/// to a model with no vision.
+fn carries_image(b: &ContentBlock) -> bool {
+    match b {
+        ContentBlock::Image { .. } => true,
+        ContentBlock::ToolResult {
+            content: ToolResultContent::Blocks(blocks),
+            ..
+        } => blocks.iter().any(carries_image),
+        _ => false,
+    }
 }
 
 fn count_block(b: &ContentBlock) -> usize {
@@ -634,6 +651,24 @@ mod tests {
         assert!(req.signal().has_images);
         // Half a megabyte of base64 must not read as 125k tokens.
         assert!(req.estimated_prompt_tokens() < 1_000);
+    }
+
+    #[test]
+    fn an_image_inside_a_tool_result_is_still_an_image() {
+        // A screenshot tool hands its output back as a result block. The
+        // model still has to see it, so the vision requirement has to be set.
+        let req = request(vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "toolu_1".to_owned(),
+                content: ToolResultContent::Blocks(vec![ContentBlock::Image {
+                    media_type: "image/png".to_owned(),
+                    data: "AAAA".to_owned(),
+                }]),
+                is_error: false,
+            }],
+        }]);
+        assert!(req.signal().has_images);
     }
 
     #[test]
