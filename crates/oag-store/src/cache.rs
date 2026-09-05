@@ -800,21 +800,35 @@ mod tests {
             .zadd(slot_key(account), "live", now)
             .await
             .expect("plant a live member");
+        // The boundary itself. The acquire script sweeps members at or
+        // before `now - ttl`, so the count has to exclude exactly that
+        // score and include the one after it, or the two disagree about a
+        // member on the line and a credential reads one slot fuller than
+        // the acquire will find it.
+        let ttl_secs = i64::try_from(ttl.as_secs()).expect("fits");
+        let _: () = conn
+            .zadd(slot_key(account), "on-the-line", now - ttl_secs)
+            .await
+            .expect("plant a member at exactly now - ttl");
+        let _: () = conn
+            .zadd(slot_key(account), "just-inside", now - ttl_secs + 1)
+            .await
+            .expect("plant a member one second inside");
 
         assert_eq!(
             cache.slots_in_use(account, ttl).await.expect("count"),
-            1,
-            "only the member inside the TTL is in use"
+            2,
+            "the live member and the one just inside; not the eight, not the one on the line"
         );
 
         // And the credential is still acquirable: the stale members are not
         // standing in the way of the slot they used to hold.
         assert!(
             cache
-                .acquire_slot(account, "fresh", 2, ttl)
+                .acquire_slot(account, "fresh", 3, ttl)
                 .await
                 .expect("acquire"),
-            "one live member and a limit of two leaves room"
+            "two live members and a limit of three leaves room"
         );
         let _: () = conn.del(slot_key(account)).await.expect("cleanup");
     }
