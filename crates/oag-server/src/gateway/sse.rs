@@ -519,6 +519,29 @@ fn fold_payloads(
     (saw_content, out)
 }
 
+/// Parse each payload and fold its events into `acc` and `events`.
+///
+/// `fold_payloads` with the client's half taken out: nothing is rendered,
+/// because there is no client to render for yet.
+fn collect_payloads(
+    payloads: &[String],
+    adapter: &Arc<dyn ProviderAdapter>,
+    acc: &mut StreamAccumulator,
+    events: &mut Vec<StreamEvent>,
+) {
+    for payload in payloads {
+        match adapter.parse_event(payload, acc) {
+            Ok(parsed) => {
+                for e in &parsed {
+                    acc.observe(e);
+                }
+                events.extend(parsed);
+            }
+            Err(e) => tracing::debug!(error = %e, "skipping unparseable stream frame"),
+        }
+    }
+}
+
 /// Read a non-streaming response and fold it into an accumulator.
 ///
 /// The accumulator must end up in the *same state* a streamed response would
@@ -618,17 +641,16 @@ pub async fn collect_stream(
             Ok(Some(Ok(bytes))) => bytes,
         };
         pending.extend_from_slice(&chunk);
-        for payload in take_payloads(&mut pending, framing) {
-            match adapter.parse_event(&payload, &mut acc) {
-                Ok(parsed) => {
-                    for e in &parsed {
-                        acc.observe(e);
-                    }
-                    events.extend(parsed);
-                }
-                Err(e) => tracing::debug!(error = %e, "skipping unparseable stream frame"),
-            }
-        }
+        let payloads = take_payloads(&mut pending, framing);
+        collect_payloads(&payloads, &adapter, &mut acc, &mut events);
+    }
+
+    // Whatever is left is a partial frame; try once more in case it completed
+    // exactly at EOF. As in `pump`, and for the same reason: the terminal
+    // event can be the one that lands with the close.
+    if !pending.is_empty() {
+        let payloads = take_payloads(&mut pending, framing);
+        collect_payloads(&payloads, &adapter, &mut acc, &mut events);
     }
 
     // An error the upstream put inside a 200 stream is an error, not an
@@ -639,6 +661,20 @@ pub async fn collect_stream(
         _ => None,
     }) {
         return Err(Error::Internal(format!("upstream stream error: {message}")));
+    }
+
+    // A body that ends before its terminal event is a truncated answer, and
+    // the read loop cannot tell: a connection dropped mid-generation ends the
+    // same way a finished one does. `pump` judges completion from the stop
+    // event for exactly this reason; here the same EOF was returned as `Ok`,
+    // so a Codex seat whose connection dropped mid-answer handed the client
+    // half an answer stamped complete, with the tokens the provider billed
+    // for it recorded as zero. An error is the honest outcome, and a cheap
+    // one: nothing has reached the client, so this is a clean failover.
+    if acc.stop_reason().is_none() {
+        return Err(Error::Internal(
+            "upstream closed before the response was complete".to_owned(),
+        ));
     }
 
     Ok((events, acc))
@@ -1455,6 +1491,76 @@ mod tests {
             "the seat is charged for these"
         );
         assert_eq!(acc.quality_gate(), None, "the tool call reassembled");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_closes_before_its_terminal_event_is_an_error_not_an_answer() {
+        // The Codex seat's connection drops mid-generation. The body simply
+        // ends, exactly as it does on success, and this used to return `Ok`:
+        // half an answer stamped complete, with zero output tokens recorded
+        // for the ones the provider billed. `pump` judges completion from
+        // the terminal event; so must this, and with nothing sent to the
+        // client yet the error is a clean failover.
+        let frames = [
+            r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":100}}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant"}}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"Let me "}"#,
+        ];
+        let sse = frames.iter().fold(String::new(), |mut out, f| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "data: {f}\n\n");
+            out
+        });
+        let codex: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::codex::CodexAdapter::new());
+
+        let err = collect_stream(
+            body(&sse),
+            codex,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a truncated stream is not an answer");
+        assert!(
+            err.to_string().contains("before the response was complete"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminal_event_that_lands_exactly_at_eof_still_counts() {
+        // The frame carrying `response.completed` can be the one the close
+        // lands on, held in `pending` when the read loop exits. Judging
+        // completion before folding that tail would fail a whole answer.
+        let frames = [
+            r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":100}}}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"hi"}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":100,"output_tokens":1}}}"#,
+        ];
+        let sse = frames.iter().fold(String::new(), |mut out, f| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "data: {f}\n\n");
+            out
+        });
+        // Split so the last frame's delimiter arrives in its own read.
+        let cut = sse.len() - 1;
+        let chunks = vec![
+            bytes::Bytes::from(sse[..cut].to_owned()),
+            bytes::Bytes::from(sse[cut..].to_owned()),
+        ];
+        let codex: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::codex::CodexAdapter::new());
+
+        let (_, acc) = collect_stream(
+            into_response(futures_util::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::io::Error>),
+            )),
+            codex,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("the answer is whole");
+        assert_eq!(acc.usage().output_tokens, 1);
     }
 
     /// Build one AWS event-stream message carrying `inner`.
