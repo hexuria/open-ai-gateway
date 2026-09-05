@@ -103,6 +103,13 @@ pub struct StreamAccumulator {
     stop_reason: Option<StopReason>,
     /// Partial tool arguments, keyed by call id.
     tool_buffers: Vec<(String, String)>,
+    /// The tool call opened and not yet ended, if any.
+    ///
+    /// Anthropic closes every content block with the same `content_block_stop`
+    /// and says nothing about which kind it was closing. Without this, a text
+    /// block's stop found the most recent tool id still sitting in
+    /// `tool_buffers` and closed a call that had already ended.
+    open_tool: Option<String>,
     /// Set when nothing here was read from the response at all.
     unparsed: bool,
 }
@@ -134,13 +141,15 @@ impl StreamAccumulator {
             StreamEvent::ToolUseStart { id, .. } => {
                 self.tool_calls = self.tool_calls.saturating_add(1);
                 self.tool_buffers.push((id.clone(), String::new()));
+                self.open_tool = Some(id.clone());
             }
             StreamEvent::ToolUseDelta { id, partial_json } => {
                 if let Some((_, buf)) = self.tool_buffers.iter_mut().find(|(k, _)| k == id) {
                     buf.push_str(partial_json);
                 }
             }
-            StreamEvent::ToolUseEnd { .. } | StreamEvent::Error { .. } => {}
+            StreamEvent::ToolUseEnd { .. } => self.open_tool = None,
+            StreamEvent::Error { .. } => {}
         }
     }
 
@@ -185,6 +194,16 @@ impl StreamAccumulator {
     #[must_use]
     pub fn tool_id_at(&self, index: usize) -> Option<String> {
         self.tool_buffers.get(index).map(|(id, _)| id.clone())
+    }
+
+    /// The tool call that is open right now: started and not yet ended.
+    ///
+    /// For a dialect whose block-close event does not say what kind of block it
+    /// closed, this is the difference between "close the call" and "close
+    /// whatever was last a call".
+    #[must_use]
+    pub fn open_tool_id(&self) -> Option<String> {
+        self.open_tool.clone()
     }
 
     /// Every tool call opened in this response, in the order they opened.
@@ -251,10 +270,15 @@ impl StreamAccumulator {
                 // A tool call whose accumulated arguments are not valid JSON is
                 // the classic small-model failure on an agentic prompt, and the
                 // single most valuable thing to escalate on.
-                let malformed = self
-                    .tool_buffers
-                    .iter()
-                    .any(|(_, buf)| serde_json::from_str::<serde_json::Value>(buf).is_err());
+                // An empty buffer is not malformed. A zero-parameter tool
+                // streams `arguments: ""`, which `from_str` rejects — so a
+                // perfectly valid call condemned the answer, and the gateway
+                // paid for a second attempt that produced the same call again.
+                // Empty means "no arguments", which is `{}`.
+                let malformed = self.tool_buffers.iter().any(|(_, buf)| {
+                    !buf.trim().is_empty()
+                        && serde_json::from_str::<serde_json::Value>(buf).is_err()
+                });
                 malformed.then_some(QualityGate::MalformedToolCall)
             }
         }
@@ -265,6 +289,56 @@ impl StreamAccumulator {
 mod tests {
     use super::*;
     use oag_router::QualityGate;
+
+    /// P8. A tool that takes no arguments is not a malformed tool call.
+    #[test]
+    fn a_zero_parameter_tool_call_is_not_condemned_as_malformed() {
+        // A tool with no parameters streams `arguments: ""`, which `from_str`
+        // rejects — so the gate condemned a perfectly valid call, and the
+        // gateway paid for a second attempt that produced the same call again.
+        // Empty means "no arguments", which is `{}`.
+        let mut acc = StreamAccumulator::new();
+        for e in [
+            StreamEvent::ToolUseStart {
+                id: "call_1".to_owned(),
+                name: "get_time".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_1".to_owned(),
+                partial_json: String::new(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "call_1".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ] {
+            acc.observe(&e);
+        }
+        assert_eq!(acc.quality_gate(), None, "a valid call with no arguments");
+
+        // Arguments that are genuinely broken still are.
+        let mut acc = StreamAccumulator::new();
+        for e in [
+            StreamEvent::ToolUseStart {
+                id: "call_1".to_owned(),
+                name: "read_file".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_1".to_owned(),
+                partial_json: r#"{"path": "#.to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ] {
+            acc.observe(&e);
+        }
+        assert_eq!(acc.quality_gate(), Some(QualityGate::MalformedToolCall));
+    }
 
     fn usage(input: u64, output: u64, cache_read: u64) -> Usage {
         Usage {
