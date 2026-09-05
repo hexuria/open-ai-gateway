@@ -160,7 +160,14 @@ impl AuthCache {
     /// doing both would issue two DELs for one key.
     pub async fn invalidate_hash(&self, hash: &str) {
         self.l1.invalidate(hash).await;
-        self.cache.auth_invalidate(hash).await;
+        // Best-effort at this layer, and deliberately: the callers here are
+        // keeping the cache tidy after a write that has already happened. The
+        // one caller for whom the outcome is a statement to a human — the CLI's
+        // revoke, which prints "shared cache evicted" — goes to
+        // `Cache::auth_invalidate` directly and reads the result.
+        if let Err(e) = self.cache.auth_invalidate(hash).await {
+            tracing::warn!(error = %e, "an identity could not be evicted from the shared cache");
+        }
     }
 
     /// Drop every L1 entry on this replica.

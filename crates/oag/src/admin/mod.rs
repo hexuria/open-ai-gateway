@@ -485,7 +485,7 @@ pub async fn run(
             email,
             route,
             budget_usd,
-        } => init(db, &email, &route, budget_usd).await,
+        } => init(db, redis_url, &email, &route, budget_usd).await,
         AdminCommand::Status => status(db).await,
         AdminCommand::Doctor { route } => doctor::run(db, config, &route).await,
         AdminCommand::Providers => print_providers(db).await,
@@ -1059,8 +1059,17 @@ async fn print_providers(db: &Db) -> Result<()> {
     Ok(())
 }
 
-async fn init(db: &Db, email: &str, route: &str, budget: Option<Decimal>) -> Result<()> {
+async fn init(
+    db: &Db,
+    redis_url: &str,
+    email: &str,
+    route: &str,
+    budget: Option<Decimal>,
+) -> Result<()> {
     let principal_id = upsert_principal(db, email, "admin", budget).await?;
+    if budget.is_some() {
+        evict_principal_keys(db, redis_url, principal_id, email).await;
+    }
     let route_id = upsert_route(db, route).await?;
     println!("principal {email} -> {principal_id}");
     println!("route     {route} -> {route_id}");
@@ -1173,6 +1182,51 @@ async fn promote_principal(db: &Db, email: &str) -> Result<()> {
     println!("{email} promoted from {role} to admin");
     println!("  Existing keys are unaffected; an admin key still needs `--admin`.");
     Ok(())
+}
+
+/// Drop every cached identity belonging to `principal`'s keys.
+///
+/// A budget lives in the cached auth context, not only in the row, so lowering
+/// a cap without evicting leaves it unenforced for the cache's full five
+/// minutes — on every replica, with nothing in the CLI's output hinting that a
+/// flush is needed. The HTTP path for the same write has always evicted
+/// explicitly; this is the same call from the other surface.
+///
+/// Best-effort, and warns rather than fails: the write has already happened,
+/// and a principal whose keys could not be evicted is worth saying so about,
+/// not worth failing a command that succeeded.
+async fn evict_principal_keys(db: &Db, redis_url: &str, principal: Uuid, email: &str) {
+    let hashes = match repo::key_hashes_for_principal(db, principal).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::warn!(error = %e, %email, "could not list this principal's keys to evict");
+            return;
+        }
+    };
+    if hashes.is_empty() {
+        return;
+    }
+    let cache = match oag_store::Cache::connect(redis_url) {
+        Ok(cache) => cache,
+        Err(e) => {
+            tracing::warn!(error = %e, %email, "could not reach the cache to evict");
+            println!("  NOTE: the new budget is not enforced until the auth cache expires (5m).");
+            return;
+        }
+    };
+    let mut failed = 0usize;
+    for hash in &hashes {
+        if cache.auth_invalidate(hash).await.is_err() {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        println!(
+            "  NOTE: {failed} of {} cached identities could not be evicted; the new budget \
+             is not enforced for them until the cache expires (5m).",
+            hashes.len()
+        );
+    }
 }
 
 async fn upsert_principal(
@@ -1639,7 +1693,19 @@ async fn insert_account(
     .await
     .map_err(|e| oag_core::Error::Internal(format!("creating account: {e}")))?;
 
-    sqlx::query(
+    // `rows_affected`, because the SELECT is the whole statement's source: a
+    // route name that does not match yields no rows, the INSERT writes nothing,
+    // and `execute` calls that a success. The command then printed "attached to
+    // route 'prod'" over a credential joined to nothing — schedulable, listed
+    // as ready, and unreachable from any route, so every request through the
+    // gateway failed `no_viable_model` while the CLI insisted the credential
+    // was fine.
+    //
+    // The account row itself is left in place rather than rolled back. It holds
+    // a sealed secret the operator has just supplied and may not have kept, and
+    // destroying that to tidy up a typo is the worse of the two failures — the
+    // message below says exactly what is missing and the fix is one command.
+    let attached = sqlx::query(
         "INSERT INTO account_route (account_id, route_id) SELECT $1, id FROM route WHERE name = $2",
     )
     .bind(id)
@@ -1647,6 +1713,15 @@ async fn insert_account(
     .execute(db.pool())
     .await
     .map_err(|e| oag_core::Error::Internal(format!("attaching account to route: {e}")))?;
+
+    if attached.rows_affected() == 0 {
+        return Err(oag_core::Error::Config(format!(
+            "credential '{name}' was created but there is no route named '{route}', so it is \
+             attached to nothing and no request can reach it. Create the route with \
+             `oag admin init --route {route}`, then re-run this command; the credential \
+             already stored is safe to delete or reuse."
+        )));
+    }
 
     Ok(id)
 }
@@ -1834,11 +1909,15 @@ async fn revoke_key(db: &Db, redis_url: &str, prefix: &str) -> Result<()> {
     // authenticating from the shared cache for its full TTL — and left the
     // operator believing one key had been dealt with.
     let cache = oag_store::Cache::connect(redis_url)?;
+    let mut evicted = true;
     for (hash, name, prefix) in &revoked {
         // The row update alone is not a revocation: every replica caches auth
         // by hash, so without this the key keeps working until those entries
         // expire.
-        cache.auth_invalidate(hash).await;
+        if let Err(e) = cache.auth_invalidate(hash).await {
+            evicted = false;
+            tracing::warn!(error = %e, %prefix, "the shared cache was not evicted");
+        }
 
         // Same target and shape as the server's audit line, so the CLI is not a
         // hole in the trail — and one line per key, because a collision that
@@ -1864,7 +1943,19 @@ async fn revoke_key(db: &Db, redis_url: &str, prefix: &str) -> Result<()> {
         );
         println!("  If you meant only one, the others are named above and need re-issuing.");
     }
-    println!("  shared cache evicted; each replica's in-process cache expires within 15s");
+    // Said only when it happened. `auth_invalidate` used to swallow both an
+    // unreachable Redis and a failed DEL, so this line printed either way — and
+    // during a leaked-key incident it is the sentence the operator acts on. The
+    // difference between the two outcomes is fifteen seconds and five minutes.
+    if evicted {
+        println!("  shared cache evicted; each replica's in-process cache expires within 15s");
+    } else {
+        println!();
+        println!("  WARNING: the shared cache was NOT evicted — see the log above.");
+        println!("  The key is inactive in the database but every replica will keep");
+        println!("  accepting it from the cache for up to 5 minutes. Retry with");
+        println!("  `oag admin cache flush` once the cache is reachable.");
+    }
     Ok(())
 }
 
@@ -1932,6 +2023,139 @@ async fn status(db: &Db) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// C5. Changing a budget at the CLI evicts the identities that cache it.
+    ///
+    /// A budget lives in the cached auth context, not only in the row. The HTTP
+    /// path for this write has always evicted explicitly; `init` did not, so a
+    /// lowered cap was unenforced on every replica for the cache's full five
+    /// minutes, with nothing in the output hinting that a flush was needed. An
+    /// operator who has just capped a runaway principal has every reason to
+    /// believe they have capped them.
+    #[tokio::test]
+    async fn lowering_a_budget_at_the_cli_evicts_the_cached_identities() {
+        let (Ok(url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL or OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("c5-{}@example.invalid", Uuid::new_v4());
+        let route = format!("c5-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]')")
+            .bind(&route)
+            .execute(db.pool())
+            .await
+            .expect("route");
+        let principal: Uuid = sqlx::query_scalar(
+            "INSERT INTO principal (id, email, role, monthly_budget_usd)
+             VALUES (gen_random_uuid(), $1, 'member', 100) RETURNING id",
+        )
+        .bind(&email)
+        .fetch_one(db.pool())
+        .await
+        .expect("principal");
+        let key = mint_key(&db, &email, &route, "c5", None, false)
+            .await
+            .expect("mint");
+        let hash = repo::hash_key(&key);
+
+        // An identity in the shared cache, as a live request would leave.
+        let cache = oag_store::Cache::connect(&redis_url).expect("cache");
+        let mac = oag_store::AuthMac::new("test-signing-secret-for-c5-eviction-0001");
+        let ctx = oag_store::AuthContext {
+            api_key_id: Uuid::new_v4(),
+            principal_id: principal,
+            route_id: Uuid::new_v4(),
+            key_floor_tier: None,
+            admin: false,
+            quota_usd: None,
+            principal_budget_usd: Some(Decimal::from(100)),
+            principal_hard_stop_multiple: Decimal::from(2),
+            key_hash: hash.clone(),
+        };
+        cache
+            .auth_set(&hash, &ctx, std::time::Duration::from_secs(300), &mac)
+            .await;
+        assert!(
+            cache.auth_get(&hash, &mac).await.is_some(),
+            "the fixture has to be cached for the eviction to mean anything"
+        );
+
+        evict_principal_keys(&db, &redis_url, principal, &email).await;
+
+        assert!(
+            cache.auth_get(&hash, &mac).await.is_none(),
+            "the new cap is not enforced until this entry is gone, and five \
+             minutes of an uncapped principal is the whole finding"
+        );
+    }
+
+    /// C3. A credential attached to nothing is an error, not a success line.
+    ///
+    /// The `account_route` insert selects from `route`, so a name that does not
+    /// match yields no rows and the INSERT writes nothing — which `execute`
+    /// reports as success. The command then printed "attached to route 'prod'"
+    /// over a credential joined to nothing: schedulable, listed as ready,
+    /// unreachable from any route, and every request through the gateway
+    /// failing `no_viable_model` while the CLI insisted the credential was fine.
+    #[tokio::test]
+    async fn adding_a_credential_to_a_missing_route_is_an_error() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let kek = oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=")
+            .expect("kek");
+
+        let name = format!("c3-{}", Uuid::new_v4());
+        let err = add_account(
+            &db,
+            &kek,
+            &name,
+            "anthropic",
+            "not-a-real-secret-for-tests",
+            "no-such-route",
+            4,
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect_err("no route, so nothing to attach to");
+        let message = err.to_string();
+        assert!(
+            message.contains("no-such-route") && message.contains(&name),
+            "the operator needs both halves to act on it: {message}"
+        );
+
+        // The credential itself survives: it holds a secret the operator has
+        // just supplied and may not have kept, and destroying that to tidy up a
+        // typo is the worse failure.
+        let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM account WHERE name = $1")
+            .bind(&name)
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(stored, 1, "the sealed secret is not thrown away");
+
+        // And it is joined to nothing, which is what the error said.
+        let joins: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM account_route ar
+               JOIN account a ON a.id = ar.account_id WHERE a.name = $1",
+        )
+        .bind(&name)
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(joins, 0);
+    }
 
     /// C6. Adding a route does not hand out the admin role.
     ///
