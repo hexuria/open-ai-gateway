@@ -50,6 +50,9 @@ pub enum AdminCommand {
     /// Routing policy for a named route.
     #[command(subcommand)]
     Route(RouteCommand),
+    /// Principals: the identities keys are minted against.
+    #[command(subcommand)]
+    Principal(PrincipalCommand),
     /// Model catalog: seed, overlay prices, list.
     #[command(subcommand)]
     Catalog(CatalogCommand),
@@ -109,6 +112,19 @@ pub enum AdminCommand {
     /// Drop the shared auth cache.
     #[command(hide = true)]
     FlushCache,
+}
+
+/// The one command that changes a principal's authority.
+#[derive(Subcommand, Debug)]
+pub enum PrincipalCommand {
+    /// Grant the admin role.
+    ///
+    /// Deliberately separate from `init`, which used to grant it as a side
+    /// effect of adding a route. There is no `demote`: see `promote_principal`.
+    Promote {
+        #[arg(long)]
+        email: String,
+    },
 }
 
 /// A CLI whose session we can import as an OAuth seat.
@@ -476,6 +492,9 @@ pub async fn run(
         AdminCommand::Account(cmd) => account_cmd(db, kek, cmd).await,
         AdminCommand::Key(cli) => key_cmd(db, redis_url, cli).await,
         AdminCommand::Route(cmd) => route_cmd(db, cmd).await,
+        AdminCommand::Principal(PrincipalCommand::Promote { email }) => {
+            promote_principal(db, &email).await
+        }
         AdminCommand::Catalog(cmd) => catalog_cmd(db, kek, cmd).await,
         AdminCommand::Usage(cmd) => usage_cmd(db, cmd).await,
         AdminCommand::Cache(CacheCommand::Flush) | AdminCommand::FlushCache => {
@@ -711,6 +730,14 @@ async fn key_cmd(db: &Db, redis_url: &str, cli: KeyCli) -> Result<()> {
             floor_tier,
             admin,
         }) => {
+            // The admin gate wants BOTH the key's flag and the principal's
+            // role, so an admin key on a member principal is refused by every
+            // admin endpoint it is presented to. Nothing checked, nothing
+            // warned, and the troubleshooting doc sent the operator back to the
+            // command that had just produced the unusable key.
+            if admin {
+                require_admin_principal(db, &email).await?;
+            }
             let key = mint_key(db, &email, &route, &name, floor_tier.as_deref(), admin).await?;
             print_key(&key);
             Ok(())
@@ -724,6 +751,9 @@ async fn key_cmd(db: &Db, redis_url: &str, cli: KeyCli) -> Result<()> {
                         .to_owned(),
                 ));
             };
+            if cli.admin {
+                require_admin_principal(db, &email).await?;
+            }
             let key = mint_key(
                 db,
                 &email,
@@ -1052,6 +1082,99 @@ async fn init(db: &Db, email: &str, route: &str, budget: Option<Decimal>) -> Res
     Ok(())
 }
 
+/// Create a principal, or update the budget of one that exists.
+///
+/// **The role is written on insert and never on conflict.** `init` asks for
+/// `admin`, which is right for the principal it is creating — promoting the
+/// first admin is what the command is for — and wrong for one that already
+/// exists. `ON CONFLICT ... SET role = EXCLUDED.role` meant that adding a
+/// second route with
+/// `oag admin init --email someone@corp.com --route staging` silently granted
+/// admin to whoever that email named and then minted them an admin key. Nothing
+/// in the output said a role had changed, because from the command's point of
+/// view nothing had: it had asked for an admin and been given one.
+///
+/// The store's own `upsert_principal` has always omitted `role` here and says
+/// why at length — an idempotent bind must not be able to change authority. The
+/// same argument applies in this direction; only the sign is different. Granting
+/// a role is now `oag admin principal promote`, where it is the whole of the
+/// caller's stated intent rather than a side effect of adding a route.
+///
+/// The budget is still `COALESCE`d rather than overwritten, so an `init` that
+/// omits `--budget-usd` cannot erase one an operator set.
+/// The role this principal holds, or `None` if there is no such principal.
+/// Refuse to mint an admin key for a principal who is not an admin.
+///
+/// The gate is an AND of two facts and a key can only carry one of them. A key
+/// minted with `--admin` against a member principal authenticates fine and is
+/// refused by every admin endpoint, which reads as the admin API being broken
+/// rather than as the key being half-privileged.
+async fn require_admin_principal(db: &Db, email: &str) -> Result<()> {
+    match principal_role(db, email).await?.as_deref() {
+        Some("admin") => Ok(()),
+        Some(role) => Err(oag_core::Error::Config(format!(
+            "{email} is a {role}, so an --admin key minted for them would authenticate \
+             and then be refused by every admin endpoint: the gate needs an admin key AND \
+             an admin principal. Grant the role first with \
+             `oag admin principal promote --email {email}`, or drop --admin for an \
+             inference key."
+        ))),
+        // Left to `mint_key`, which names both lookups it could have been.
+        None => Ok(()),
+    }
+}
+
+async fn principal_role(db: &Db, email: &str) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>("SELECT role FROM principal WHERE email = $1")
+        .bind(email)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("reading principal role: {e}")))
+}
+
+/// Grant the admin role. The one place a role changes.
+///
+/// Separate from `init` because granting authority should be the whole of what
+/// a command does, not a consequence of asking it to add a route — see
+/// [`upsert_principal`]. Idempotent: promoting an admin is a no-op that says so.
+///
+/// There is deliberately no `demote`. The admin gate wants both an admin key and
+/// an admin principal, so removing the role from the last admin locks every
+/// human out of the admin API with no way back in through it — and the CLI is
+/// reached by whoever holds the database, which is a different and larger
+/// permission. A role that needs removing can be removed there, deliberately,
+/// by someone who has just had to think about it.
+async fn promote_principal(db: &Db, email: &str) -> Result<()> {
+    let Some(role) = principal_role(db, email).await? else {
+        return Err(oag_core::Error::Config(format!(
+            "no principal with email {email}. `oag admin init --email {email}` creates one."
+        )));
+    };
+    if role == "admin" {
+        println!("{email} is already an admin");
+        return Ok(());
+    }
+    sqlx::query("UPDATE principal SET role = 'admin', updated_at = now() WHERE email = $1")
+        .bind(email)
+        .execute(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("promoting principal: {e}")))?;
+
+    // Same target and shape as every other admin write, because granting
+    // authority is the one an auditor most wants to find.
+    tracing::warn!(
+        target: "oag::audit",
+        actor = "cli",
+        action = "principal.promote",
+        subject = %email,
+        from = %role,
+        "admin write"
+    );
+    println!("{email} promoted from {role} to admin");
+    println!("  Existing keys are unaffected; an admin key still needs `--admin`.");
+    Ok(())
+}
+
 async fn upsert_principal(
     db: &Db,
     email: &str,
@@ -1063,7 +1186,6 @@ async fn upsert_principal(
         INSERT INTO principal (id, email, role, monthly_budget_usd)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (email) DO UPDATE SET
-            role = EXCLUDED.role,
             monthly_budget_usd = COALESCE(EXCLUDED.monthly_budget_usd, principal.monthly_budget_usd),
             updated_at = now()
         RETURNING id
@@ -1811,6 +1933,119 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    /// C6. Adding a route does not hand out the admin role.
+    ///
+    /// `init`'s upsert set `role = EXCLUDED.role` with the role hard-coded to
+    /// `admin`, so `oag admin init --email someone@corp.com --route staging` —
+    /// a command whose stated job is adding a route — silently promoted whoever
+    /// that email named and then minted them an admin key. Nothing in the
+    /// output mentioned a role, because from the command's point of view
+    /// nothing had changed: it asked for an admin and got one.
+    ///
+    /// The store's own `upsert_principal` has always omitted `role` here, for
+    /// the mirror-image reason: an idempotent bind must not be able to *remove*
+    /// authority either.
+    #[tokio::test]
+    async fn init_against_an_existing_principal_leaves_their_role_alone() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("c6-{}@example.invalid", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO principal (id, email, role, monthly_budget_usd)
+             VALUES (gen_random_uuid(), $1, 'member', 50)",
+        )
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("seed a member");
+
+        // The call `init` makes, asking for admin as it always has.
+        upsert_principal(&db, &email, "admin", None)
+            .await
+            .expect("upsert");
+        assert_eq!(
+            principal_role(&db, &email).await.expect("role").as_deref(),
+            Some("member"),
+            "adding a route is not a grant of authority"
+        );
+
+        // The budget is still protected from an init that omits it.
+        let budget: Option<Decimal> =
+            sqlx::query_scalar("SELECT monthly_budget_usd FROM principal WHERE email = $1")
+                .bind(&email)
+                .fetch_one(db.pool())
+                .await
+                .expect("budget");
+        assert_eq!(budget, Some(Decimal::from(50)), "COALESCE still guards it");
+
+        // And a principal that does not exist yet is still created as asked —
+        // promoting the first admin is what `init` is for.
+        let fresh = format!("c6-first-{}@example.invalid", Uuid::new_v4());
+        upsert_principal(&db, &fresh, "admin", None)
+            .await
+            .expect("upsert");
+        assert_eq!(
+            principal_role(&db, &fresh).await.expect("role").as_deref(),
+            Some("admin")
+        );
+
+        // Granting is its own command, and it is idempotent.
+        promote_principal(&db, &email).await.expect("promote");
+        assert_eq!(
+            principal_role(&db, &email).await.expect("role").as_deref(),
+            Some("admin")
+        );
+        promote_principal(&db, &email).await.expect("promote again");
+    }
+
+    /// C7. An `--admin` key is refused for a principal who is not an admin.
+    ///
+    /// The admin gate is an AND of two facts — the key's flag and the
+    /// principal's role — and a key can only carry one of them. Minted against
+    /// a member, an admin key authenticates fine and is then refused by every
+    /// admin endpoint, which reads as the admin API being broken rather than as
+    /// the key being half-privileged. Nothing checked it, nothing warned, and
+    /// the CLI had no command that could set a role.
+    #[tokio::test]
+    async fn an_admin_key_is_refused_for_a_principal_who_is_not_one() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("c7-{}@example.invalid", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')",
+        )
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("seed a member");
+
+        let err = require_admin_principal(&db, &email)
+            .await
+            .expect_err("a member cannot hold an admin key");
+        let message = err.to_string();
+        assert!(
+            message.contains("oag admin principal promote"),
+            "the operator needs the command that fixes it, not just the refusal: {message}"
+        );
+
+        // An inference key for the same principal is unaffected: only the
+        // combination is refused.
+        promote_principal(&db, &email).await.expect("promote");
+        require_admin_principal(&db, &email)
+            .await
+            .expect("an admin may hold an admin key");
+    }
+
     /// H9. A key that was not stored is not printed.
     ///
     /// The INSERT selects from `principal` and `route`, so it inserts nothing
@@ -1862,11 +2097,13 @@ mod tests {
         // A principal that exists and a route that does not: the same answer,
         // because the SELECT is a cross join and either side empties it.
         let email = format!("h9-{}@example.invalid", Uuid::new_v4());
-        sqlx::query("INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')")
-            .bind(&email)
-            .execute(db.pool())
-            .await
-            .expect("seed principal");
+        sqlx::query(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')",
+        )
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("seed principal");
         mint_key(&db, &email, "no-such-route-here", "k", None, false)
             .await
             .expect_err("no route, so no key");
@@ -1880,7 +2117,10 @@ mod tests {
             .fetch_one(db.pool())
             .await
             .expect("count");
-        assert_eq!(stored, 1, "the key that was printed is the key that was stored");
+        assert_eq!(
+            stored, 1,
+            "the key that was printed is the key that was stored"
+        );
     }
 
     /// C4. The CLI headline counts per-token traffic only, as the API does.
