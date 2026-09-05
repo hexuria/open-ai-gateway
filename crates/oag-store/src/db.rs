@@ -107,10 +107,7 @@ impl Db {
         // ten seconds — and cancelled at that point they leave the deploy red
         // with the schema half moved. Lifted for this session, put back below
         // before the connection returns to the pool.
-        sqlx::query("SELECT set_config('statement_timeout', '0', false)")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("lifting statement timeout: {e}")))?;
+        Self::lift_statement_timeout(&mut conn).await?;
 
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(MIGRATION_LOCK_ID)
@@ -151,12 +148,34 @@ impl Db {
 
         // Back to the request path's value: the pool will hand this
         // connection to a query that expects the bound.
-        let _ = sqlx::query("SELECT set_config('statement_timeout', $1, false)")
-            .bind(format!("{}ms", self.statement_timeout_ms))
-            .execute(&mut *conn)
-            .await;
+        self.restore_statement_timeout(&mut conn).await;
 
         result
+    }
+
+    /// Remove the session's statement timeout, for the migration.
+    ///
+    /// Its own function so the test can see the lifted value: from outside
+    /// `migrate` only the restored one is observable, and a test of that
+    /// alone passes with the lift deleted.
+    async fn lift_statement_timeout(conn: &mut sqlx::PgConnection) -> Result<()> {
+        sqlx::query("SELECT set_config('statement_timeout', '0', false)")
+            .execute(conn)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Internal(format!("lifting statement timeout: {e}")))
+    }
+
+    /// Put the request path's statement timeout back on the session.
+    ///
+    /// Best-effort: the connection is about to return to a pool whose
+    /// `after_connect` cannot run again for it, and there is nothing better
+    /// to do with a failure here than let the next query find out.
+    async fn restore_statement_timeout(&self, conn: &mut sqlx::PgConnection) {
+        let _ = sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+            .bind(format!("{}ms", self.statement_timeout_ms))
+            .execute(conn)
+            .await;
     }
 
     /// Whether the database is actually reachable.
@@ -199,6 +218,22 @@ mod tests {
             .await
             .expect("show");
         assert_eq!(after, "1234ms", "restored before the connection went back");
+
+        // The half a restore-only test cannot see: what the migration itself
+        // ran under. The two halves, on the pool's one connection.
+        let mut conn = db.pool().acquire().await.expect("the one connection");
+        Db::lift_statement_timeout(&mut conn).await.expect("lift");
+        let lifted: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("show");
+        assert_eq!(lifted, "0", "no bound while the migration runs");
+        db.restore_statement_timeout(&mut conn).await;
+        let restored: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("show");
+        assert_eq!(restored, "1234ms");
     }
 
     /// The rollback case, reproduced directly.
