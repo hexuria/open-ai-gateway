@@ -803,10 +803,10 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
 
     let counts = match counts {
         Ok(c) => c,
-        // Deliberately not `.unwrap_or_default()` like the reads above. An
-        // empty result renders as "nothing configured", which is a real and
-        // actionable state — and is exactly the wrong answer to give when the
-        // truth is that the query failed.
+        // A failed read is a failure, never an empty result. An empty result
+        // renders as "nothing configured", which is a real and actionable
+        // state — and is exactly the wrong answer to give when the truth is
+        // that the query failed.
         Err(e) => return failed(&oag_core::Error::Internal(format!("providers: {e}"))),
     };
 
