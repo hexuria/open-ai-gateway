@@ -616,12 +616,17 @@ pub async fn collect(
 /// is `pump` without a client to write to — the same framing, the same parser,
 /// the same watchdogs — and it returns what `collect` returns for a JSON body,
 /// so the caller need not care which it got.
+///
+/// On failure the accumulator comes back with the error. By the time any
+/// failure here fires the provider may have generated — and invoiced — most
+/// of an answer, and an error that dropped the count of it is how a lost
+/// stream reached the ledger as a free one.
 pub async fn collect_stream(
     response: reqwest::Response,
     adapter: Arc<dyn ProviderAdapter>,
     idle_timeout: Duration,
     max_duration: Duration,
-) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), Error> {
+) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), (Error, StreamAccumulator)> {
     let started = Instant::now();
     let framing = adapter.framing();
     let mut body = response.bytes_stream();
@@ -631,21 +636,24 @@ pub async fn collect_stream(
 
     loop {
         if started.elapsed() >= max_duration {
-            return Err(Error::Internal(format!(
-                "upstream stream exceeded {}s",
-                max_duration.as_secs()
-            )));
+            return Err((
+                Error::Internal(format!(
+                    "upstream stream exceeded {}s",
+                    max_duration.as_secs()
+                )),
+                acc,
+            ));
         }
         let chunk = match tokio::time::timeout(idle_timeout, body.next()).await {
             Err(_) => {
-                return Err(Error::Internal(format!(
-                    "upstream idle for {}s",
-                    idle_timeout.as_secs()
-                )));
+                return Err((
+                    Error::Internal(format!("upstream idle for {}s", idle_timeout.as_secs())),
+                    acc,
+                ));
             }
             Ok(None) => break,
             Ok(Some(Err(e))) => {
-                return Err(Error::Internal(format!("upstream read failed: {e}")));
+                return Err((Error::Internal(format!("upstream read failed: {e}")), acc));
             }
             Ok(Some(Ok(bytes))) => bytes,
         };
@@ -658,10 +666,13 @@ pub async fn collect_stream(
         // the delimiter, and this reader was the one path that let it
         // choose how much memory a replica allocates.
         if pending.len() > MAX_PENDING {
-            return Err(Error::Internal(format!(
-                "upstream sent {} bytes without completing an event",
-                pending.len()
-            )));
+            return Err((
+                Error::Internal(format!(
+                    "upstream sent {} bytes without completing an event",
+                    pending.len()
+                )),
+                acc,
+            ));
         }
     }
 
@@ -680,7 +691,10 @@ pub async fn collect_stream(
         StreamEvent::Error { message } => Some(message.clone()),
         _ => None,
     }) {
-        return Err(Error::Internal(format!("upstream stream error: {message}")));
+        return Err((
+            Error::Internal(format!("upstream stream error: {message}")),
+            acc,
+        ));
     }
 
     // A body that ends before its terminal event is a truncated answer, and
@@ -692,8 +706,9 @@ pub async fn collect_stream(
     // for it recorded as zero. An error is the honest outcome, and a cheap
     // one: nothing has reached the client, so this is a clean failover.
     if acc.stop_reason().is_none() {
-        return Err(Error::Internal(
-            "upstream closed before the response was complete".to_owned(),
+        return Err((
+            Error::Internal("upstream closed before the response was complete".to_owned()),
+            acc,
         ));
     }
 
@@ -1542,9 +1557,15 @@ mod tests {
         .await
         .expect_err("a truncated stream is not an answer");
         assert!(
-            err.to_string().contains("before the response was complete"),
-            "{err}"
+            err.0
+                .to_string()
+                .contains("before the response was complete"),
+            "{}",
+            err.0
         );
+        // And what it cost is still known: the input side was read from the
+        // first frame, and it is what the ledger will be charged for.
+        assert_eq!(err.1.usage().input_tokens, 100);
     }
 
     #[tokio::test]

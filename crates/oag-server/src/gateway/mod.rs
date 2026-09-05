@@ -330,10 +330,17 @@ async fn run_with_escalation(
     // until the primary key contracts onto `(request_id, attempt)` only the
     // first row for a request survives.
     let mut abandoned: Option<meter::Abandoned> = None;
+    let mut dispatches = Dispatches::new(request_id, started);
 
     loop {
         let attempt = match forward_with_failover(
-            state, auth, &decision, canonical, session, request_id, channel,
+            state,
+            auth,
+            &decision,
+            canonical,
+            session,
+            &mut dispatches,
+            channel,
         )
         .await
         {
@@ -356,9 +363,14 @@ async fn run_with_escalation(
         let answer = match attempt {
             // Streaming: the bytes are already on their way to the client, so
             // there is nothing left to judge. See the note on MAX_ESCALATIONS.
-            Attempt::Streaming { response, lease } => {
+            Attempt::Streaming {
+                response,
+                lease,
+                attempt,
+            } => {
                 return stream_response(
-                    state, response, lease, auth, &decision, request_id, started, ingress, guard,
+                    state, response, lease, auth, &decision, request_id, started, attempt, ingress,
+                    guard,
                 );
             }
             Attempt::Rejected(e) => Err(e),
@@ -367,7 +379,8 @@ async fn run_with_escalation(
                 events,
                 accumulator,
                 lease,
-            } => Ok((body, events, accumulator, lease)),
+                attempt,
+            } => Ok((body, events, accumulator, lease, attempt)),
         };
 
         let gate = match &answer {
@@ -375,7 +388,7 @@ async fn run_with_escalation(
             // and nothing reached the client, so this is the one escalation a
             // streaming request can also take.
             Err(_) => Some(oag_router::QualityGate::ContextOverflow),
-            Ok((_, _, accumulator, _)) => accumulator.quality_gate(),
+            Ok((_, _, accumulator, _, _)) => accumulator.quality_gate(),
         };
 
         // Retry one rung up when the answer was unusable and a rung is left.
@@ -413,9 +426,9 @@ async fn run_with_escalation(
             // Released here rather than left to the drop, and awaited: the
             // rung above may pick this same credential, and a release still
             // in flight would look like a credential with no room.
-            if let Ok((_, _, accumulator, lease)) = &answer {
+            if let Ok((_, _, accumulator, lease, attempt)) = &answer {
                 abandoned = Some(meter::abandon(
-                    meter_context(auth, &decision, lease, request_id, started, escalations),
+                    meter_context(auth, &decision, lease, request_id, started, *attempt),
                     accumulator,
                     gate,
                 ));
@@ -442,7 +455,7 @@ async fn run_with_escalation(
         // The attempt abandoned to make this one was still generated and
         // invoiced, and with no served row coming this is its last chance to
         // reach the ledger — exactly as when the retry itself died above.
-        let (body, events, accumulator, lease) = match answer {
+        let (body, events, accumulator, lease, attempt) = match answer {
             Ok(answer) => answer,
             Err(e) => {
                 if let Some(abandoned) = &abandoned {
@@ -455,7 +468,7 @@ async fn run_with_escalation(
         // Either it was fine, or nothing better exists. Record the gate either
         // way: a gate we could not act on is exactly the signal that a rung is
         // mis-set for this workload.
-        let ctx = meter_context(auth, &decision, &lease, request_id, started, escalations);
+        let ctx = meter_context(auth, &decision, &lease, request_id, started, attempt);
         // Read while the lease is still here: both are facts about the adapter
         // this account got, and `release` below takes the account with it.
         // Falling back to the provider's dialect once it is gone is exactly the
@@ -509,6 +522,39 @@ async fn run_with_escalation(
 /// path, the collected path, and the attempt a quality gate abandons. A second
 /// copy of this literal is how one of them ends up attributing spend to the
 /// wrong account.
+/// The count of times this request has been sent to a provider, shared by
+/// the loops that send it.
+///
+/// The ledger's identity is `(request_id, attempt)`, and two loops dispatch:
+/// escalation climbs rungs, and failover inside it switches credentials. The
+/// number used to be the escalation index alone, so two dispatches on one
+/// rung — a credential that generated an answer and then lost the stream,
+/// and the credential that served the retry — shared a row identity, and
+/// only one of them reached the ledger. Every dispatch now takes the next
+/// number, whichever loop asked.
+struct Dispatches {
+    request_id: RequestId,
+    started: Instant,
+    next: u8,
+}
+
+impl Dispatches {
+    const fn new(request_id: RequestId, started: Instant) -> Self {
+        Self {
+            request_id,
+            started,
+            next: 0,
+        }
+    }
+
+    /// The number for the dispatch about to happen.
+    fn take(&mut self) -> u8 {
+        let attempt = self.next;
+        self.next = self.next.saturating_add(1);
+        attempt
+    }
+}
+
 fn meter_context(
     auth: &oag_store::AuthContext,
     decision: &RoutingDecision,
@@ -809,6 +855,8 @@ enum Attempt {
     Streaming {
         response: reqwest::Response,
         lease: select::Lease,
+        /// Which dispatch of this request produced it; see [`Dispatches`].
+        attempt: u8,
     },
     /// Read in full, so the answer can still be judged and retried.
     Collected {
@@ -821,6 +869,8 @@ enum Attempt {
         events: Vec<oag_proto::StreamEvent>,
         accumulator: oag_proto::StreamAccumulator,
         lease: select::Lease,
+        /// Which dispatch of this request produced it; see [`Dispatches`].
+        attempt: u8,
     },
     /// The model refused the request itself — too long, or beyond what it can
     /// do. No credential can help and the lease is already released, but a
@@ -1014,9 +1064,10 @@ async fn forward_with_failover(
     decision: &RoutingDecision,
     canonical: &oag_proto::CanonicalRequest,
     session: &SessionKey,
-    request_id: RequestId,
+    dispatches: &mut Dispatches,
     channel: Option<oag_core::credential::CredentialKind>,
 ) -> Result<Attempt> {
+    let request_id = dispatches.request_id;
     let provider = decision.model.provider;
     let mut excluded: HashSet<AccountId> = HashSet::new();
     let mut last_error = Error::NoCredential { provider };
@@ -1071,8 +1122,9 @@ async fn forward_with_failover(
             }
         };
         let account = lease.account.account_id();
+        let attempt = dispatches.take();
 
-        match try_credential(state, decision, canonical, &lease, request_id).await {
+        match try_credential(state, decision, canonical, &lease, request_id, attempt).await {
             Outcome::Ok(attempt) => {
                 if switch > 0 {
                     metrics::counter!("oag_failovers_total").increment(1);
@@ -1093,6 +1145,26 @@ async fn forward_with_failover(
             }
             Outcome::Switch(e) => {
                 tracing::warn!(%request_id, %account, error = %e, "switching credential");
+                last_error = e;
+                lease.release().await;
+                excluded.insert(account);
+            }
+            // The credential generated an answer and the stream died before
+            // it was whole. The provider invoiced those tokens, and the retry
+            // on another credential used to be the only attempt metered, so
+            // the ledger saw one generation for every two paid for. Recorded
+            // before the lease goes, under its own dispatch number.
+            Outcome::Lost(e, accumulator) => {
+                tracing::warn!(%request_id, %account, error = %e, "switching credential after a lost answer");
+                let ctx = meter_context(
+                    auth,
+                    decision,
+                    &lease,
+                    request_id,
+                    dispatches.started,
+                    attempt,
+                );
+                meter::record_lost(state, &ctx, &accumulator, &e).await;
                 last_error = e;
                 lease.release().await;
                 excluded.insert(account);
@@ -1120,6 +1192,9 @@ enum Outcome {
     Ok(Box<Attempt>),
     /// Try a different credential.
     Switch(Error),
+    /// Try a different credential, and meter what this one generated first:
+    /// the answer was read far enough to cost something before it was lost.
+    Lost(Error, oag_proto::StreamAccumulator),
     /// Another request took this credential's half-open probe between
     /// selection and dispatch. Nothing was sent and nothing failed: try a
     /// different credential, and say nothing about this one.
@@ -1197,6 +1272,9 @@ async fn try_credential(
     canonical: &oag_proto::CanonicalRequest,
     lease: &select::Lease,
     request_id: RequestId,
+    // `attempt` in the ledger's sense — this request's dispatch ordinal — as
+    // distinct from the same-credential retry index the loop below counts.
+    ordinal: u8,
 ) -> Outcome {
     let provider = decision.model.provider;
     let account = lease.account.account_id();
@@ -1253,7 +1331,8 @@ async fn try_credential(
         dispatch.sent();
         match transport.execute(request).await {
             Ok(response) if response.status().is_success() => {
-                return succeeded(state, provider, lease, response, canonical.stream).await;
+                return succeeded(state, provider, lease, response, canonical.stream, ordinal)
+                    .await;
             }
 
             Ok(response) => {
@@ -1337,6 +1416,7 @@ fn stream_response(
     decision: &RoutingDecision,
     request_id: RequestId,
     started: Instant,
+    attempt: u8,
     ingress: Dialect,
     guard: crate::shutdown::InFlightGuard,
 ) -> Result<Response> {
@@ -1365,8 +1445,9 @@ fn stream_response(
     };
 
     // A streamed response is delivered as it arrives, so it is never abandoned
-    // and never retried: there is only ever one attempt.
-    let ctx = meter_context(auth, decision, &lease, request_id, started, 0);
+    // and never retried — but a credential may have been switched, and lost,
+    // before it, so its dispatch number is not always zero.
+    let ctx = meter_context(auth, decision, &lease, request_id, started, attempt);
 
     let state2 = Arc::clone(state);
 
@@ -1412,6 +1493,7 @@ async fn succeeded(
     lease: &select::Lease,
     response: reqwest::Response,
     stream: bool,
+    attempt: u8,
 ) -> Outcome {
     let account = lease.account.account_id();
     // No `touch_account` here any more. It was a Postgres write awaited
@@ -1432,6 +1514,7 @@ async fn succeeded(
         return Outcome::Ok(Box::new(Attempt::Streaming {
             response,
             lease: lease.clone(),
+            attempt,
         }));
     }
     // The ADAPTER's facts, not the provider's: a Codex seat is
@@ -1448,9 +1531,16 @@ async fn succeeded(
     let collected = if adapter.always_streams() {
         let idle = state.config.gateway.stream_idle_timeout;
         let max = state.config.gateway.max_stream_duration;
-        sse::collect_stream(response, adapter, idle, max)
-            .await
-            .map(|(events, accumulator)| (bytes::Bytes::new(), events, accumulator))
+        match sse::collect_stream(response, adapter, idle, max).await {
+            Ok((events, accumulator)) => Ok((bytes::Bytes::new(), events, accumulator)),
+            // The stream failed after the provider had generated some of the
+            // answer: that much is invoiced whether or not it was whole, so
+            // it goes out with the error rather than being dropped with it.
+            Err((e, accumulator)) if accumulator.usage().output_tokens > 0 => {
+                return Outcome::Lost(e, accumulator);
+            }
+            Err((e, _)) => Err(e),
+        }
     } else {
         sse::collect(response, adapter.dialect()).await
     };
@@ -1460,6 +1550,7 @@ async fn succeeded(
             events,
             accumulator,
             lease: lease.clone(),
+            attempt,
         })),
         Err(e) => Outcome::Switch(e),
     }
@@ -2319,6 +2410,7 @@ security:
             &decision_for(oag_core::Provider::Vertex),
             RequestId::new(),
             Instant::now(),
+            0,
             Dialect::AnthropicMessages,
             state.lifecycle.track(),
         );
@@ -2351,6 +2443,7 @@ security:
             &decision_for(oag_core::Provider::Anthropic),
             RequestId::new(),
             Instant::now(),
+            0,
             Dialect::AnthropicMessages,
             state.lifecycle.track(),
         );

@@ -289,6 +289,8 @@ The ledger's `selection_reason` records which mechanism decided:
 | `classified` | managed mode chose the rung; the client's model name was not consulted |
 | `passthrough` | the client's named model was honoured |
 | `floor_pinned` | the key's `--floor-tier` decided it |
+| `abandoned` | this attempt was generated and paid for, then judged unusable and retried a rung up; the served row for the same request follows it |
+| `lost` | this attempt was generated and paid for, then its stream died before the answer was whole; another credential served the retry |
 
 Read it on the dashboard's usage view or `GET /admin/api/usage`, matching on the
 `x-oag-request-id` from the response.

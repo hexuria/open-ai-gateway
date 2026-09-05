@@ -17,14 +17,18 @@ pub struct Context {
     pub decision: RoutingDecision,
     pub account: AccountId,
     pub started: Instant,
-    /// Which forwarding attempt this row accounts for, counted from zero.
+    /// Which dispatch of this request the row accounts for, counted from
+    /// zero across both loops that dispatch: escalation up the ladder and
+    /// credential failover within a rung.
     ///
-    /// One client request can pay for two: a quality gate can abandon a cheap
-    /// answer and retry a rung up. Both are real spend, so both need a row, and
-    /// the request id alone cannot tell them apart.
+    /// One client request can pay for several: a quality gate can abandon a
+    /// cheap answer and retry a rung up, and a credential can generate an
+    /// answer and lose the stream before the retry that served. All of it is
+    /// real spend, so each needs a row, and the request id alone cannot tell
+    /// them apart.
     ///
     /// Recorded now, load-bearing after the ledger's primary key contracts onto
-    /// `(request_id, attempt)`. Until then the second row is dropped.
+    /// `(request_id, attempt)`. Until then the later rows are dropped.
     pub attempt: i16,
     /// Whether the credential that served this request is a flat-rate seat.
     ///
@@ -44,6 +48,9 @@ enum Fate {
     Served,
     /// Paid for, judged unusable, and replaced by a retry a rung up.
     Abandoned,
+    /// Paid for, then lost: the stream died before the answer was whole, and
+    /// a retry on another credential produced the one the client got.
+    Lost,
 }
 
 /// Append one row and emit the matching metrics.
@@ -129,7 +136,7 @@ fn usage_write(
                 .as_ref()
                 .map(|m| m.id.as_str().to_owned()),
         ),
-        Fate::Abandoned => (Decimal::ZERO, None),
+        Fate::Abandoned | Fate::Lost => (Decimal::ZERO, None),
     };
 
     // `escalated_from_tier` is set only when we actually climbed a rung;
@@ -160,6 +167,9 @@ fn usage_write(
             // else records: `model_id` and `tier` still say what ran, and
             // `escalation_gate` says what was wrong with what it produced.
             Fate::Abandoned => "abandoned".to_owned(),
+            // Likewise: what ran and what it cost are the facts, and that
+            // the client never saw it is the one only this row records.
+            Fate::Lost => "lost".to_owned(),
         },
         escalated_from_tier: escalated_from,
         escalation_gate: gate.map(|g| format!("{g:?}")),
@@ -237,6 +247,26 @@ pub async fn record_abandoned(state: &AppState, abandoned: &Abandoned) {
         Fate::Abandoned,
     )
     .await;
+}
+
+/// Record an attempt the provider generated and the stream then lost.
+///
+/// A collected stream that fails after its first frames — a Codex seat's
+/// connection dropping mid-generation — still cost what it generated, and
+/// the retry on another credential is a second generation, not a free
+/// replacement. This row is the first one. Status 502, because that is what
+/// the attempt was; the served row that follows says what the client got.
+pub async fn record_lost(
+    state: &AppState,
+    ctx: &Context,
+    accumulator: &oag_proto::StreamAccumulator,
+    error: &oag_core::Error,
+) {
+    let outcome = StreamOutcome {
+        error: Some(error.to_string()),
+        ..collected(ctx, accumulator)
+    };
+    record_with_gate(state, ctx, &outcome, None, false, Fate::Lost).await;
 }
 
 /// The outcome of a response that arrived in one piece.
@@ -468,6 +498,24 @@ mod tests {
         assert_eq!(row.model_id, ctx.decision.model.id.as_str());
         assert!(!row.model_id.contains('@'), "{}", row.model_id);
         assert!(row.account_id.is_some(), "the channel is recorded here");
+    }
+
+    #[test]
+    fn a_lost_attempt_is_charged_and_books_no_saving() {
+        // The stream died after generating: the tokens are invoiced, so the
+        // row carries their cost, and it is not the answer the client got,
+        // so it carries no baseline — a second full-price counterfactual
+        // would book the lost generation as savings.
+        let ctx = context(1);
+        let mut lost = outcome(300);
+        lost.error = Some("upstream closed before the response was complete".to_owned());
+        let row = usage_write(&ctx, &lost, None, false, Fate::Lost);
+        assert!(row.cost_usd > Decimal::ZERO, "the provider invoiced these");
+        assert_eq!(row.counterfactual_usd, Decimal::ZERO);
+        assert_eq!(row.counterfactual_model_id, None);
+        assert_eq!(row.selection_reason, "lost");
+        assert_eq!(row.status, 502);
+        assert_eq!(row.attempt, 1, "its own dispatch, not the retry's");
     }
 
     #[test]
