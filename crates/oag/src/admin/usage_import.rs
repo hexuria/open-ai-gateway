@@ -848,7 +848,10 @@ fn judge(
 /// that a catalog seeded from either direction resolves.
 #[derive(Debug, Default)]
 struct Prices {
-    by_name: HashMap<String, (String, Pricing)>,
+    /// `None` marks a spelling that two different catalogue rows both answer
+    /// to — see the note in `index`. Absent and ambiguous are different
+    /// answers, and both mean "cannot price this".
+    by_name: HashMap<String, Option<(String, Pricing)>>,
 }
 
 impl Prices {
@@ -869,14 +872,41 @@ impl Prices {
                 row.id.as_str(),
                 row.id.rsplit('/').next().unwrap_or(&row.id),
             ] {
-                by_name.insert(key.to_owned(), entry.clone());
+                // A key two different models both answer to prices neither.
+                //
+                // `insert` returned the displaced entry and it was thrown away,
+                // so the last row in catalogue order won a coin toss the caller
+                // could not see — and a transcript slug that matched it was
+                // priced against the wrong model, silently, on every row of the
+                // import. The tail-of-the-id key is the one that collides in
+                // practice: `openai/gpt-5` and `azure/gpt-5` both end `gpt-5`.
+                //
+                // Marked rather than dropped, because the *unambiguous* keys of
+                // both models still work: only the spelling that cannot
+                // identify one model is refused, and the import reports it as
+                // unpriced, which it already knows how to do.
+                match by_name.entry(key.to_owned()) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(Some(entry.clone()));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        let collides = slot.get().as_ref().is_some_and(|(id, _)| *id != row.id);
+                        if collides {
+                            slot.insert(None);
+                        }
+                    }
+                }
             }
         }
         Self { by_name }
     }
 
     fn get(&self, slug: &str) -> Option<&(String, Pricing)> {
-        self.by_name.get(slug)
+        // `None` is a key two models answered to. The caller treats an
+        // unpriceable model exactly as it treats an unknown one — it counts it
+        // and reports it — which is the honest outcome for a slug that does not
+        // identify a model.
+        self.by_name.get(slug).and_then(Option::as_ref)
     }
 }
 
@@ -1636,6 +1666,31 @@ mod tests {
         dir
     }
 
+    /// A catalogue row, for tests that care only about its identity and price.
+    fn model_row(
+        id: &str,
+        upstream: &str,
+        input: Decimal,
+        output: Decimal,
+    ) -> oag_store::rows::ModelRow {
+        oag_store::rows::ModelRow {
+            id: id.to_owned(),
+            provider: id.split('/').next().unwrap_or("openai").to_owned(),
+            upstream_name: upstream.to_owned(),
+            input_per_mtok: input,
+            output_per_mtok: output,
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: None,
+            context_window: 200_000,
+            max_output_tokens: 64_000,
+            supports_vision: true,
+            supports_tools: true,
+            supports_reasoning: true,
+            supports_prompt_cache: true,
+            display_label: None,
+        }
+    }
+
     fn catalog() -> Prices {
         Prices::index(
             &[oag_store::rows::ModelRow {
@@ -2095,7 +2150,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// C11. The same message found in two files is still one API call.
+    /// C15. A spelling two models answer to prices neither.
+    ///
+    /// The index accepts three keys per row — the provider's own spelling, the
+    /// canonical id, and the tail of the id — and the tail is the one that
+    /// collides: `openai/gpt-5` and `azure/gpt-5` both end `gpt-5`. `insert`
+    /// returned the displaced entry and it was thrown away, so the last row in
+    /// catalogue order won a coin toss the caller could not see, and every
+    /// transcript row matching that slug was priced against whichever model
+    /// that happened to be.
+    #[test]
+    fn a_slug_two_models_answer_to_is_not_priced_by_a_coin_toss() {
+        let rows = vec![
+            model_row(
+                "openai/gpt-5",
+                "gpt-5-2026",
+                Decimal::from(10),
+                Decimal::from(30),
+            ),
+            model_row(
+                "openai/gpt-5-mini",
+                "gpt-5",
+                Decimal::from(1),
+                Decimal::from(3),
+            ),
+        ];
+        let prices = Prices::index(&rows, "openai");
+
+        // `gpt-5` is the tail of the first row's id AND the second row's
+        // upstream name. Two models, one spelling, no answer.
+        assert!(
+            prices.get("gpt-5").is_none(),
+            "pricing this against either model is a guess, and a guess that \
+             lands in the ledger as money"
+        );
+
+        // Every unambiguous spelling still resolves, which is the reason for
+        // marking the key rather than dropping the rows.
+        assert_eq!(
+            prices.get("openai/gpt-5").map(|(id, _)| id.as_str()),
+            Some("openai/gpt-5")
+        );
+        assert_eq!(
+            prices.get("gpt-5-2026").map(|(id, _)| id.as_str()),
+            Some("openai/gpt-5")
+        );
+        assert_eq!(
+            prices.get("openai/gpt-5-mini").map(|(id, _)| id.as_str()),
+            Some("openai/gpt-5-mini")
+        );
+    }
+
+    /// C11. The same message found in two files is still one API call.    /// C11. The same message found in two files is still one API call.
     ///
     /// A transcript line carries the provider's own message id, which is
     /// globally unique. The session is the file it happened to be found in —

@@ -138,6 +138,13 @@ pub enum AccountSource {
 
 #[derive(Subcommand, Debug)]
 pub enum AccountCommand {
+    /// Rename a credential. The way out of a duplicate name.
+    Rename {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
     /// Register an upstream credential.
     Add {
         #[command(flatten)]
@@ -551,6 +558,7 @@ async fn account_cmd(db: &Db, kek: &Kek, cmd: AccountCommand) -> Result<()> {
     match cmd {
         AccountCommand::Add { args } => add_account_from_args(db, kek, args).await,
         AccountCommand::List => list_accounts(db).await,
+        AccountCommand::Rename { from, to } => rename_account(db, &from, &to).await,
         AccountCommand::Disable { name } => set_account_schedulable(db, &name, false).await,
         AccountCommand::Enable { name } => set_account_schedulable(db, &name, true).await,
         AccountCommand::SetCost { name, monthly_cost } => {
@@ -1045,8 +1053,33 @@ async fn show_route(db: &Db, route: &str) -> Result<()> {
     Ok(())
 }
 
+/// What to say when a catalog listing has nothing to show.
+///
+/// Two different emptinesses, and they had one message between them.
+/// `catalog list --provider xai` against a catalog full of Anthropic models
+/// said "catalog is empty; seed it with `oag admin catalog seed`" — so the
+/// operator seeded a catalog that was already seeded, got the same message, and
+/// concluded the seed was broken. The filter is the answer and it was in the
+/// arguments the whole time.
+///
+/// Its own function so the decision can be tested: capturing stdout is a
+/// fixture larger than the thing it would prove.
+fn empty_catalog_lines(total_before_filter: usize, provider: Option<&str>) -> Vec<String> {
+    match provider {
+        Some(p) if total_before_filter > 0 => vec![
+            format!(
+                "no {p} models in the catalog, though it holds {total_before_filter} \
+                 from other providers"
+            ),
+            "  `oag admin catalog list` shows them all".to_owned(),
+        ],
+        _ => vec!["catalog is empty; seed it with `oag admin catalog seed`".to_owned()],
+    }
+}
+
 async fn list_catalog(db: &Db, provider: Option<&str>, limit: Option<usize>) -> Result<()> {
     let mut rows = repo::catalog(db).await?;
+    let total_before_filter = rows.len();
     if let Some(p) = provider {
         let want: oag_core::Provider = p.parse()?;
         rows.retain(|m| m.provider == want.as_str());
@@ -1057,7 +1090,15 @@ async fn list_catalog(db: &Db, provider: Option<&str>, limit: Option<usize>) -> 
         rows.truncate(n);
     }
     if rows.is_empty() {
-        println!("catalog is empty; seed it with `oag admin catalog seed`");
+        // Which of the two emptinesses this is. `--provider xai` against a
+        // catalog full of Anthropic models used to print "catalog is empty;
+        // seed it with `oag admin catalog seed`" — so the operator seeded a
+        // catalog that was already seeded, got the same message, and concluded
+        // the seed was broken. The filter is the answer and it is right there
+        // in the arguments.
+        for line in empty_catalog_lines(total_before_filter, provider) {
+            println!("{line}");
+        }
         return Ok(());
     }
     println!(
@@ -1725,6 +1766,30 @@ async fn insert_account(
         .expires_at
         .and_then(|e| time::OffsetDateTime::from_unix_timestamp(e).ok());
 
+    // `account.name` carries no unique constraint, and every CLI command that
+    // addresses a credential does so by name: `disable`, `enable`, `set-cost`,
+    // `set-reserve`. A second credential with an existing name is therefore
+    // creatable and then unaddressable — `disable` updates both or neither, and
+    // nothing in the CLI can tell them apart or rename one.
+    //
+    // Refused here rather than by a unique index, because an index would fail
+    // to build on any deployment that already has a pair, which is precisely
+    // the deployment that needs the tool. `account rename` is the way out for
+    // those, and this is the way in for everyone else.
+    let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM account WHERE name = $1)")
+        .bind(name)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("checking the credential name: {e}")))?;
+    if taken {
+        return Err(oag_core::Error::Config(format!(
+            "a credential named '{name}' already exists. Names are how every other \
+             command addresses one, so two would leave both unaddressable. Pick another \
+             name, or rename the existing one with `oag admin account rename --from {name} \
+             --to <new>`."
+        )));
+    }
+
     let id = Uuid::now_v7();
     sqlx::query(
         r"
@@ -1803,6 +1868,56 @@ const MONTH_HEADLINE_SQL: &str = r"
     WHERE occurred_at >= date_trunc('month', now())
       AND NOT (cost_usd = 0 AND counterfactual_api_usd > 0)
 ";
+
+/// Rename a credential, which is the only way out of a duplicate pair.
+///
+/// Exists because `account.name` has no unique constraint and never gained one:
+/// an index would fail to build on exactly the deployments that already hold a
+/// pair. Renaming is what makes those addressable again.
+async fn rename_account(db: &Db, from: &str, to: &str) -> Result<()> {
+    if from == to {
+        return Err(oag_core::Error::Config(
+            "the new name is the same as the old one".to_owned(),
+        ));
+    }
+    let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM account WHERE name = $1)")
+        .bind(to)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("checking the credential name: {e}")))?;
+    if taken {
+        return Err(oag_core::Error::Config(format!(
+            "a credential named '{to}' already exists"
+        )));
+    }
+
+    // `rows_affected`, and it is allowed to be more than one: renaming is the
+    // command for undoing a duplicate, so refusing to act on a pair would
+    // refuse the only case it exists for. It says how many it moved, because
+    // moving two when you meant one is worth knowing immediately.
+    let moved = sqlx::query("UPDATE account SET name = $2, updated_at = now() WHERE name = $1")
+        .bind(from)
+        .bind(to)
+        .execute(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("renaming credential: {e}")))?;
+
+    match moved.rows_affected() {
+        0 => Err(oag_core::Error::Config(format!(
+            "no credential named '{from}'; see `oag admin account list`"
+        ))),
+        1 => {
+            println!("renamed {from} -> {to}");
+            Ok(())
+        }
+        n => {
+            println!("renamed {n} credentials named '{from}' -> '{to}'");
+            println!("  They were duplicates and are now one name again — which is still");
+            println!("  ambiguous. Rename them apart one at a time, or disable the spare.");
+            Ok(())
+        }
+    }
+}
 
 async fn set_mode(db: &Db, route: &str, mode: &str) -> Result<()> {
     if !matches!(mode, "passthrough" | "managed") {
@@ -2081,7 +2196,117 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.
+    /// C13. "No xai models" and "no models" are different answers.
+    ///
+    /// `catalog list --provider xai` against a catalog full of Anthropic models
+    /// printed "catalog is empty; seed it with `oag admin catalog seed`" — so
+    /// the operator seeded a catalog that was already seeded, got the same
+    /// message, and concluded the seed was broken.
+    #[test]
+    fn an_empty_filtered_catalog_is_not_an_empty_catalog() {
+        let seeded = |lines: &[String]| lines.iter().any(|l| l.contains("catalog seed"));
+
+        assert!(
+            seeded(&empty_catalog_lines(0, None)),
+            "a genuinely empty catalog is the one to offer seeding for"
+        );
+        assert!(
+            seeded(&empty_catalog_lines(0, Some("xai"))),
+            "and so is one that is empty before any filter"
+        );
+
+        let filtered = empty_catalog_lines(17, Some("xai"));
+        assert!(
+            !seeded(&filtered),
+            "but a catalog holding 17 models of other providers is not empty, and \
+             telling the operator to seed it sends them in a circle: {filtered:?}"
+        );
+        assert!(
+            filtered[0].contains("xai") && filtered[0].contains("17"),
+            "the filter and what it excluded are both the answer: {filtered:?}"
+        );
+    }
+
+    /// C14. A duplicate credential name is refused, and renaming is the way out.    /// C14. A duplicate credential name is refused, and renaming is the way out.
+    ///
+    /// `account.name` carries no unique constraint, and every command that
+    /// addresses a credential does so by name — `disable`, `enable`,
+    /// `set-cost`, `set-reserve`. A second credential with an existing name was
+    /// creatable and then unaddressable: `disable` updated both or neither, and
+    /// nothing could tell them apart or rename one.
+    ///
+    /// Refused at the command rather than by an index, because an index would
+    /// fail to build on any deployment that already holds a pair — which is
+    /// exactly the deployment that needs the tool.
+    #[tokio::test]
+    async fn a_duplicate_credential_name_is_refused_and_renaming_is_the_way_out() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let kek = oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=")
+            .expect("kek");
+
+        let route = format!("c14-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]')")
+            .bind(&route)
+            .execute(db.pool())
+            .await
+            .expect("route");
+
+        let name = format!("c14-{}", Uuid::new_v4());
+        let add = |n: String, r: String| {
+            let (db, kek) = (db.clone(), kek.clone());
+            async move {
+                add_account(
+                    &db,
+                    &kek,
+                    &n,
+                    "anthropic",
+                    "not-a-real-secret",
+                    &r,
+                    4,
+                    0,
+                    None,
+                    None,
+                )
+                .await
+            }
+        };
+        add(name.clone(), route.clone()).await.expect("first");
+
+        let err = add(name.clone(), route.clone())
+            .await
+            .expect_err("the name is taken");
+        assert!(
+            err.to_string().contains("account rename"),
+            "the refusal has to name the way out: {err}"
+        );
+
+        // Exactly one credential holds the name, so every by-name command still
+        // addresses one thing.
+        let held: i64 = sqlx::query_scalar("SELECT count(*) FROM account WHERE name = $1")
+            .bind(&name)
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(held, 1);
+
+        // And renaming frees it.
+        let freed = format!("{name}-old");
+        rename_account(&db, &name, &freed).await.expect("rename");
+        add(name.clone(), route.clone())
+            .await
+            .expect("the name is free again");
+        assert!(
+            rename_account(&db, &freed, &name).await.is_err(),
+            "renaming onto a name in use would recreate the pair"
+        );
+    }
+
+    /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.    /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.
     ///
     /// clap treats an env-supplied value as explicitly present when it
     /// evaluates conflicts. With `env` on `--secret` and a `conflicts_with_all`
