@@ -124,8 +124,18 @@ impl AppState {
                 cache.clone(),
                 10_000,
                 &config.security.signing_secret,
+                // Twice the pool. A lookup is a primary-key probe that holds a
+                // connection for a millisecond, so this bounds the queue at
+                // the pool to one lookup per connection rather than reserving
+                // connections for them; past that, a miss sheds.
+                usize::try_from(config.database.max_connections).unwrap_or(16) * 2,
             ),
-            transports: TransportPool::new(2_048, Duration::from_mins(15), Duration::from_secs(10)),
+            transports: TransportPool::new(
+                2_048,
+                Duration::from_mins(15),
+                Duration::from_secs(10),
+                config.gateway.upstream_response_timeout,
+            ),
             config: Arc::new(config),
             db,
             cache,

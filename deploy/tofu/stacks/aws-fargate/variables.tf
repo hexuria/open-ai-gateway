@@ -67,6 +67,17 @@ variable "certificate_arn" {
   description = "ACM cert for HTTPS on the ALB. Empty serves plain HTTP, which is only defensible behind Cloudflare or on a private network."
 }
 
+# The module refuses to plan a plaintext listener unless told, in writing,
+# that something in front terminates TLS. This is the way to tell it. Without
+# this pass-through the refusal had no override at all from the stack, and a
+# certificate-free deployment — the one the `certificate_arn` description
+# calls defensible behind Cloudflare or on a private network — could not plan.
+variable "allow_plaintext_listener" {
+  type        = bool
+  default     = false
+  description = "Permit an HTTP-only ALB listener. Only for a deployment that terminates TLS in front of the ALB."
+}
+
 variable "internal" {
   type        = bool
   default     = true

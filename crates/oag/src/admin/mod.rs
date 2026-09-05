@@ -1124,7 +1124,8 @@ async fn mint_key(
     let mut raw = [0u8; 32];
     rand::thread_rng().fill(&mut raw);
     let key = format!(
-        "oag_live_{}",
+        "{}{}",
+        oag_store::repo::KEY_PREFIX,
         raw.iter().fold(String::with_capacity(64), |mut acc, b| {
             let _ = write!(acc, "{b:02x}");
             acc

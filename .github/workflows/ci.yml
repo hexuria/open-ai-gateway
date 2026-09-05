@@ -4,6 +4,13 @@ on:
   push: { branches: [main] }
   pull_request:
 
+# Read-only by default. Without this the job token carries whatever the
+# repository's default grants, and `actions/checkout` persists it into
+# .git/config for the rest of the job — where every `cargo` invocation and
+# every third-party action can read it.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -13,6 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -61,6 +70,8 @@ jobs:
       OAG_SECURITY__CREDENTIAL_KEK: Y2ktb25seS1rZWstMzItYnl0ZXMtMDEyMzQ1Njc4OTA=
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p oag -- migrate
@@ -103,6 +114,8 @@ jobs:
       OAG_REDIS__URL: redis://127.0.0.1:6379
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: extractions/setup-just@v2

@@ -17,6 +17,7 @@
 
 use crate::canonical::{
     CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
+    ToolResultContent,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -159,7 +160,10 @@ fn render_message(m: &Message) -> Vec<Value> {
             out.push(json!({
                 "role": "tool",
                 "tool_call_id": tool_use_id,
-                "content": content,
+                // A string here, always: this dialect's tool message carries
+                // text, and blocks it cannot express are flattened rather
+                // than serialised into it.
+                "content": content.as_text(),
             }));
         }
     }
@@ -341,10 +345,17 @@ fn parse_one_message(m: &Value, system: &mut Vec<ContentBlock>, messages: &mut V
             // the canonical form keeps results adjacent to their turn.
             let block = ContentBlock::ToolResult {
                 tool_use_id: m["tool_call_id"].as_str().unwrap_or_default().to_owned(),
-                content: match &m["content"] {
+                content: ToolResultContent::Text(match &m["content"] {
                     Value::String(s) => s.clone(),
+                    // This dialect allows text parts here; their text is the
+                    // result, not the JSON of the array that held it.
+                    Value::Array(parts) => parts
+                        .iter()
+                        .filter_map(|p| p["text"].as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                     other => other.to_string(),
-                },
+                }),
                 is_error: false,
             };
             match messages.last_mut() {
@@ -433,12 +444,16 @@ fn split_data_url(url: &str) -> Option<(String, String)> {
 }
 
 /// One SSE `data:` payload → canonical events.
-pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
+pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
     if payload == "[DONE]" {
         return Ok(vec![]);
     }
     let v: Value = serde_json::from_str(payload)?;
     let mut events = Vec::new();
+    // Calls opened by *this* payload. The accumulator only learns of them once
+    // the caller folds these events in, after we return — so a fragment or a
+    // finish in the same chunk as the opening has to find the id here.
+    let mut opened: Vec<String> = Vec::new();
 
     // A usage-only chunk has an empty `choices` array; it arrives last when
     // `stream_options.include_usage` was set.
@@ -472,7 +487,9 @@ pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<St
 
     for call in delta["tool_calls"].as_array().unwrap_or(&Vec::new()) {
         // A tool call announces its id and name once, then streams arguments.
-        if let Some(id) = call["id"].as_str().filter(|i| !i.is_empty()) {
+        let announced = call["id"].as_str().filter(|i| !i.is_empty());
+        if let Some(id) = announced {
+            opened.push(id.to_owned());
             events.push(StreamEvent::ToolUseStart {
                 id: id.to_owned(),
                 name: call["function"]["name"]
@@ -485,16 +502,43 @@ pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<St
             .as_str()
             .filter(|a| !a.is_empty())
         {
+            // Later fragments carry only an `index`; resolve it against the
+            // calls opened so far — in this payload first, then in the ones
+            // the accumulator has already folded in. A fragment that names
+            // nothing findable is dropped on the floor by `observe`, which is
+            // how every argument after the first used to vanish: the delta
+            // went out with an empty id, no buffer matched, the arguments
+            // never reassembled, and the quality gate condemned every tool
+            // call from a Chat Completions upstream as malformed JSON.
+            let index = call["index"].as_u64().and_then(|i| usize::try_from(i).ok());
+            let id = announced
+                .map(str::to_owned)
+                .or_else(|| index.and_then(|i| resolve_opened(&opened, acc, i)))
+                .or_else(|| opened.last().cloned())
+                .or_else(|| acc.current_tool_id())
+                .unwrap_or_default();
             events.push(StreamEvent::ToolUseDelta {
-                // Later fragments carry only an index, so fall back to the
-                // call currently open.
-                id: call["id"].as_str().unwrap_or_default().to_owned(),
+                id,
                 partial_json: args.to_owned(),
             });
         }
     }
 
     if let Some(reason) = choice["finish_reason"].as_str().filter(|r| !r.is_empty()) {
+        // This dialect never says a call has ended; the finish is the end of
+        // all of them. Say so per call, before the stop, so a renderer that
+        // waits for the end to emit the call (Gemini) or to close its block
+        // (Anthropic) is not left holding it.
+        let mut ended = acc.tool_ids();
+        ended.extend(
+            opened
+                .iter()
+                .filter(|id| !acc.tool_ids().contains(id))
+                .cloned(),
+        );
+        for id in ended {
+            events.push(StreamEvent::ToolUseEnd { id });
+        }
         events.push(StreamEvent::Stop {
             reason: parse_finish_reason(reason),
             usage: Usage::default(),
@@ -502,6 +546,17 @@ pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<St
     }
 
     Ok(events)
+}
+
+/// The id of the `index`-th call, counting the accumulator's calls first and
+/// this payload's after them — the order they will have been opened in.
+fn resolve_opened(opened: &[String], acc: &StreamAccumulator, index: usize) -> Option<String> {
+    acc.tool_id_at(index).or_else(|| {
+        let already = acc.tool_ids().len();
+        index
+            .checked_sub(already)
+            .and_then(|i| opened.get(i).cloned())
+    })
 }
 
 /// A complete non-streamed response → the events its stream would have carried.
@@ -869,6 +924,147 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "Let me check.");
+    }
+
+    #[test]
+    fn a_tool_result_of_blocks_reaches_this_dialect_as_its_text() {
+        // This dialect's tool message takes a string. A result carrying an
+        // image flattens to the text it does carry, rather than to the JSON
+        // of the whole array — which is what put base64 into a model's prompt
+        // as text.
+        let m = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_owned(),
+                content: ToolResultContent::Blocks(vec![
+                    ContentBlock::Text {
+                        text: "first".to_owned(),
+                        cache_control: None,
+                    },
+                    ContentBlock::Image {
+                        media_type: "image/png".to_owned(),
+                        data: "iVBORw0KGgo=".to_owned(),
+                    },
+                    ContentBlock::Text {
+                        text: "second".to_owned(),
+                        cache_control: None,
+                    },
+                ]),
+                is_error: false,
+            }],
+        };
+        let out = render_message(&m);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "tool");
+        assert_eq!(out[0]["content"], "first\nsecond");
+        assert!(
+            !out[0]["content"].to_string().contains("iVBOR"),
+            "no base64 as prompt text"
+        );
+    }
+
+    #[test]
+    fn tool_arguments_reassemble_and_the_call_is_ended() {
+        // The fixture splits `{"path": "a.rs"}` across two chunks that carry
+        // only an `index`. Before, each fragment went out with an empty id, no
+        // buffer matched, the arguments never joined up, and the quality gate
+        // read the call as malformed JSON — the classic escalation trigger,
+        // fired by a perfectly good answer from every Chat Completions
+        // upstream.
+        let (events, acc) = drive(STREAM);
+
+        let delta_ids: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseDelta { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            delta_ids,
+            ["call_1", "call_1"],
+            "every fragment names its call"
+        );
+
+        let ends: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseEnd { id } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, ["call_1"], "the finish ends the call, once");
+
+        let end_at = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ToolUseEnd { .. }))
+            .expect("an end");
+        let stop_at = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Stop { .. }))
+            .expect("a stop");
+        assert!(end_at < stop_at, "the call ends before the stream stops");
+
+        assert_eq!(
+            acc.quality_gate(),
+            None,
+            "reassembled arguments are valid JSON, so nothing to escalate on"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_calls_are_addressed_by_index() {
+        // Two calls interleaved by index. `current_tool_id` alone would hand
+        // every fragment to whichever opened last, corrupting both.
+        let lines = &[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"write","arguments":""}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"p\":"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"q\":"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let (events, acc) = drive(lines);
+
+        let mut by_id = std::collections::BTreeMap::<&str, String>::new();
+        for e in &events {
+            if let StreamEvent::ToolUseDelta { id, partial_json } = e {
+                by_id.entry(id.as_str()).or_default().push_str(partial_json);
+            }
+        }
+        assert_eq!(by_id["call_a"], r#"{"p":1}"#);
+        assert_eq!(by_id["call_b"], r#"{"q":2}"#);
+        assert_eq!(acc.quality_gate(), None);
+
+        let ends: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseEnd { id } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, ["call_a", "call_b"]);
+    }
+
+    #[test]
+    fn a_call_opened_and_finished_in_one_chunk_is_still_ended() {
+        // The accumulator has not seen this payload's events when the finish
+        // arrives in the same chunk, so the id has to come from the payload.
+        let lines = &[
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let (events, _) = drive(lines);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolUseDelta { id, .. } if id == "call_x"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolUseEnd { id } if id == "call_x"))
+        );
     }
 
     #[test]

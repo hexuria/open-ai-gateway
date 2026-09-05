@@ -2,7 +2,7 @@
 
 use crate::Db;
 use crate::rows::{
-    AccountRow, AuthContext, ChannelStatusRow, ModelRow, RouteRow, ServiceRow, UsageWrite,
+    AccountRow, AuthContext, ChannelStatusRow, ModelRow, RouteRow, ServiceRow, Spend, UsageWrite,
 };
 use oag_core::{AccountId, Error, Result};
 use rust_decimal::Decimal;
@@ -15,6 +15,36 @@ use uuid::Uuid;
 /// The key is never stored in the clear, so this is also the only way to find
 /// one. sub2api stores inbound keys plaintext and matches on column equality,
 /// which turns read access to one table into every client's credential.
+/// What every key this gateway has ever issued looks like: the prefix, then
+/// 32 bytes of entropy as lowercase hex. See `mint_key`.
+pub const KEY_PREFIX: &str = "oag_live_";
+/// `KEY_PREFIX` plus 64 hex digits.
+pub const KEY_LEN: usize = 9 + 64;
+
+/// Whether `raw` has the shape of a key `mint_key` could have produced.
+///
+/// A syntactic check, and the *only* thing that runs before the database on
+/// the inference surface. Every issued key has exactly this shape, so a
+/// string without it is not an unknown key — it is not a key — and refusing
+/// it here costs nothing. Without this, a flood of arbitrary strings in the
+/// `Authorization` header bought a Redis GET and a Postgres probe apiece from
+/// anyone who could reach the port, ahead of any rate limit: the one lookup
+/// on the request path that no valid credential was needed to trigger.
+///
+/// What this is not: a negative cache. A random key per request misses a
+/// negative cache exactly as it misses the positive one, and a fleet-wide
+/// "this key does not exist" entry would lock a freshly minted key out for
+/// its TTL. Shape is the cheap filter; a permit around the lookup itself
+/// (`AuthCache`) is the bound on what gets past it.
+#[must_use]
+pub fn is_issued_key_shape(raw: &str) -> bool {
+    raw.len() == KEY_LEN
+        && raw.starts_with(KEY_PREFIX)
+        && raw[KEY_PREFIX.len()..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 #[must_use]
 pub fn hash_key(raw: &str) -> String {
     use std::fmt::Write as _;
@@ -34,6 +64,13 @@ pub async fn authenticate(db: &Db, raw_key: &str) -> Result<Option<AuthContext>>
     let hash = hash_key(raw_key);
     let now = OffsetDateTime::now_utc();
 
+    // Identity and limits only. Spend is not here, on purpose: this row is
+    // what the auth cache holds for minutes, and a spend figure cached for
+    // minutes is a cap that N concurrent requests all pass together. Spend is
+    // read fresh by `spend_for`, per request, from the columns `record_usage`
+    // maintains. (This query used to SUM the principal's month from the
+    // ledger on every cache miss, and then cache the answer — the worst of
+    // both: a scan, and stale.)
     let row = sqlx::query_as::<
         _,
         (
@@ -42,22 +79,15 @@ pub async fn authenticate(db: &Db, raw_key: &str) -> Result<Option<AuthContext>>
             Uuid,
             Option<String>,
             Option<Decimal>,
-            Decimal,
             Option<Decimal>,
-            Decimal,
             Decimal,
             bool,
         ),
     >(
         r"
         SELECT k.id, k.principal_id, k.route_id, k.floor_tier,
-               k.quota_usd, k.spent_usd,
+               k.quota_usd,
                p.monthly_budget_usd, p.hard_stop_multiple,
-               COALESCE((
-                   SELECT SUM(u.cost_usd) FROM usage_event u
-                   WHERE u.principal_id = p.id
-                     AND u.occurred_at >= date_trunc('month', now())
-               ), 0),
                k.admin
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
@@ -79,26 +109,60 @@ pub async fn authenticate(db: &Db, raw_key: &str) -> Result<Option<AuthContext>>
         route_id: r.2,
         key_floor_tier: r.3,
         quota_usd: r.4,
-        spent_usd: r.5,
-        principal_budget_usd: r.6,
-        principal_hard_stop_multiple: r.7,
-        principal_spent_usd: r.8,
-        admin: r.9,
+        principal_budget_usd: r.5,
+        principal_hard_stop_multiple: r.6,
+        admin: r.7,
+        key_hash: hash,
     }))
+}
+
+/// The caller's spend, fresh.
+///
+/// One primary-key read on each of two rows, never a SUM: `record_usage`
+/// maintains `api_key.spent_usd` (lifetime) and `principal.spent_usd` (the
+/// month named by `spent_month`) in the same statement as the ledger insert,
+/// so this is exactly as current as the ledger is. A month that has rolled
+/// over reads as zero until the first write of the new month resets the row.
+///
+/// `Err(Unauthenticated)` rather than zeros when the key is gone: a key
+/// deleted between authentication and here must not spend as if uncapped for
+/// the rest of the cache window.
+pub async fn spend_for(db: &Db, api_key_id: Uuid, principal_id: Uuid) -> Result<Spend> {
+    let row = sqlx::query_as::<_, (Decimal, Decimal)>(
+        r"
+        SELECT k.spent_usd,
+               CASE WHEN p.spent_month = date_trunc('month', now())::date
+                    THEN p.spent_usd ELSE 0 END
+          FROM api_key k
+          JOIN principal p ON p.id = $2
+         WHERE k.id = $1
+        ",
+    )
+    .bind(api_key_id)
+    .bind(principal_id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("reading spend: {e}")))?;
+
+    let (key_usd, principal_usd) = row.ok_or(Error::Unauthenticated)?;
+    Ok(Spend {
+        key_usd,
+        principal_usd,
+    })
 }
 
 pub async fn route_by_id(db: &Db, id: Uuid) -> Result<Option<RouteRow>> {
     sqlx::query_as::<_, RouteRow>(
-        // The CASE matters: a route with no budget skips the aggregate
-        // entirely, so the common path costs one primary-key lookup. Routes
-        // that do have a budget pay an index range scan on
-        // usage_event_route_idx, which is what that index is for.
+        // One primary-key read. This used to SUM the route's month from the
+        // ledger whenever the route had a budget — on every inference request,
+        // every /v1/models call and every count_tokens call, uncached, over a
+        // range that grew all month. Setting `monthly_budget_usd`, an ordinary
+        // documented control, changed the asymptotic cost of the request path.
+        // `record_usage` now maintains the column; the CASE reads it as zero
+        // once the month it names has passed.
         "SELECT id, name, tiers, default_mode, floor_tier, rpm_limit, monthly_budget_usd, active,
-                CASE WHEN monthly_budget_usd IS NULL THEN 0 ELSE COALESCE((
-                    SELECT SUM(u.cost_usd) FROM usage_event u
-                    WHERE u.route_id = route.id
-                      AND u.occurred_at >= date_trunc('month', now())
-                ), 0) END AS spent_usd
+                CASE WHEN spent_month = date_trunc('month', now())::date
+                     THEN spent_usd ELSE 0 END AS spent_usd
          FROM route WHERE id = $1",
     )
     .bind(id)
@@ -401,7 +465,7 @@ pub async fn mint_key(
     let mut raw = [0u8; 32];
     rand::thread_rng().fill(&mut raw);
     let key = format!(
-        "oag_live_{}",
+        "{KEY_PREFIX}{}",
         raw.iter().fold(String::with_capacity(64), |mut acc, b| {
             let _ = write!(acc, "{b:02x}");
             acc
@@ -454,21 +518,37 @@ pub async fn set_principal_budget(
     .map_err(|e| Error::Internal(format!("setting principal budget: {e}")))
 }
 
-/// Set (or clear) one key's spend cap. Returns `(name, key_prefix)`; `None` means
-/// no key with that id.
+/// Set (or clear) one key's spend cap. Returns `(name, key_prefix, key_hash)`;
+/// `None` means no key with that id.
+///
+/// The hash is returned so the caller can evict the key's cached identity:
+/// the cap lives in `AuthContext`, which every tier holds for minutes, and a
+/// lowered cap that nothing invalidates is not enforced until the entry
+/// happens to expire — while the 200 the operator got asserted the new value.
 pub async fn set_key_quota(
     db: &Db,
     id: Uuid,
     quota_usd: Option<Decimal>,
-) -> Result<Option<(String, String)>> {
-    sqlx::query_as::<_, (String, String)>(
-        "UPDATE api_key SET quota_usd = $2 WHERE id = $1 RETURNING name, key_prefix",
+) -> Result<Option<(String, String, String)>> {
+    sqlx::query_as::<_, (String, String, String)>(
+        "UPDATE api_key SET quota_usd = $2 WHERE id = $1 RETURNING name, key_prefix, key_hash",
     )
     .bind(id)
     .bind(quota_usd)
     .fetch_optional(db.pool())
     .await
     .map_err(|e| Error::Internal(format!("setting key quota: {e}")))
+}
+
+/// Every key hash a principal owns, for evicting them all after a write to
+/// the principal's own limits — which every one of those keys carries in its
+/// cached identity.
+pub async fn key_hashes_for_principal(db: &Db, principal_id: Uuid) -> Result<Vec<String>> {
+    sqlx::query_scalar::<_, String>("SELECT key_hash FROM api_key WHERE principal_id = $1")
+        .bind(principal_id)
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("listing a principal's keys: {e}")))
 }
 
 /// A principal's budget and month-to-date spend. `None` means no such principal.
@@ -962,15 +1042,6 @@ pub async fn revoke_key_by_prefix(
     .map_err(|e| Error::Internal(format!("revoking key by prefix: {e}")))
 }
 
-pub async fn touch_account(db: &Db, id: AccountId) -> Result<()> {
-    sqlx::query("UPDATE account SET last_used_at = now() WHERE id = $1")
-        .bind(id.as_uuid())
-        .execute(db.pool())
-        .await
-        .map_err(|e| Error::Internal(format!("touching account: {e}")))?;
-    Ok(())
-}
-
 /// Put a credential in cooldown after a failure.
 pub async fn cool_down(db: &Db, id: AccountId, until: OffsetDateTime, reason: &str) -> Result<()> {
     sqlx::query(
@@ -1019,9 +1090,12 @@ pub async fn schedulable_oauth_accounts(db: &Db) -> Result<Vec<AccountRow>> {
 }
 
 /// Store a usage-poll reading: the remaining-quota columns, and the window
-/// reset the scheduler prefers to drain first. `resets_at` also lands in
-/// `window_resets_at` — the same field the failover path fills from a provider
-/// `Retry-After`, and the poller is just another writer of it.
+/// reset the scheduler prefers to drain first. `resets_at` lands in
+/// `window_resets_at`, which this poller is the only writer of. (The failover
+/// path's `Retry-After` writes `rate_limited_until` — a different column with
+/// a different meaning: one is when a quota window turns over, the other is
+/// when a provider will take requests again.) The value is never cleared once
+/// the moment passes; readers must compare it to now, and the scheduler does.
 pub async fn record_usage_poll(
     db: &Db,
     id: AccountId,
@@ -1116,16 +1190,58 @@ pub async fn record_usage(db: &Db, w: &UsageWrite) -> Result<()> {
                 status, latency_ms, ttft_ms, streamed
             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
             ON CONFLICT DO NOTHING
-            RETURNING api_key_id, cost_usd
+            RETURNING api_key_id, principal_id, route_id, account_id, cost_usd
+        ),
+        -- The credential's recency, for the scheduler's last-resort tie-break.
+        -- This was its own UPDATE on the response path, awaited between the
+        -- upstream answering and the first byte going out; here it costs
+        -- nothing the ledger write was not already paying.
+        account_touch AS (
+            UPDATE account a
+               SET last_used_at = now()
+              FROM ins
+             WHERE a.id = ins.account_id
+        ),
+        -- Spend is denormalised for the cap checks, which must not run a SUM
+        -- over the ledger on every request — and must not read a cached copy
+        -- either. Debiting the amount the ledger accepted, rather than the
+        -- amount passed in, is what keeps each counter and the rows it stands
+        -- for from drifting apart. All three in one statement with the
+        -- insert, for the same reason the first one was: the row and the
+        -- debits are one fact.
+        key_debit AS (
+            UPDATE api_key k
+               SET spent_usd = k.spent_usd + ins.cost_usd, last_used_at = now()
+              FROM ins
+             WHERE k.id = ins.api_key_id
+        ),
+        -- Monthly counters reset at the boundary by the first write of the
+        -- new month, so no job has to. A row whose month has passed and has
+        -- not been written yet reads as zero (see `spend_for`, `route_by_id`).
+        --
+        -- The month only moves forward. `now()` is the transaction's start,
+        -- and a write that started before midnight can be re-evaluated,
+        -- after waiting on the row lock, against a row a new-month write has
+        -- just committed. An equality test there saw a month not its own, wrote
+        -- its own cost alone and stamped the month back — dropping the
+        -- other write's spend from the cap. A row already in a later month
+        -- is accumulated into and left where it is.
+        principal_debit AS (
+            UPDATE principal p
+               SET spent_usd = CASE WHEN p.spent_month >= date_trunc('month', now())::date
+                                    THEN p.spent_usd + ins.cost_usd
+                                    ELSE ins.cost_usd END,
+                   spent_month = GREATEST(p.spent_month, date_trunc('month', now())::date)
+              FROM ins
+             WHERE p.id = ins.principal_id
         )
-        -- Key spend is denormalised for the quota check, which must not run a
-        -- SUM over the ledger on every request. Debiting the amount the ledger
-        -- accepted, rather than the amount passed in, is what keeps the counter
-        -- and the rows it stands for from drifting apart.
-        UPDATE api_key k
-           SET spent_usd = k.spent_usd + ins.cost_usd, last_used_at = now()
+        UPDATE route r
+           SET spent_usd = CASE WHEN r.spent_month >= date_trunc('month', now())::date
+                                THEN r.spent_usd + ins.cost_usd
+                                ELSE ins.cost_usd END,
+               spent_month = GREATEST(r.spent_month, date_trunc('month', now())::date)
           FROM ins
-         WHERE k.id = ins.api_key_id
+         WHERE r.id = ins.route_id
         ",
     )
     .bind(w.request_id)
@@ -1552,6 +1668,28 @@ mod tests {
     }
 
     #[test]
+    fn only_a_key_this_gateway_could_have_minted_has_the_issued_shape() {
+        let minted = format!("{KEY_PREFIX}{}", "0123456789abcdef".repeat(4));
+        assert_eq!(minted.len(), KEY_LEN);
+        assert!(is_issued_key_shape(&minted));
+
+        // Every way a string can fail to be one of ours, each refused
+        // without a lookup: wrong prefix, wrong length either way, a
+        // character outside lowercase hex, and the fake key errors.hurl
+        // sends to prove a 401.
+        assert!(!is_issued_key_shape("sk-ant-0123456789abcdef"));
+        assert!(!is_issued_key_shape(&minted[..KEY_LEN - 1]));
+        assert!(!is_issued_key_shape(&format!("{minted}0")));
+        assert!(!is_issued_key_shape(&minted.to_uppercase()));
+        assert!(!is_issued_key_shape(&format!(
+            "{KEY_PREFIX}{}",
+            "g".repeat(64)
+        )));
+        assert!(!is_issued_key_shape("oag_live_definitely_not_a_real_key"));
+        assert!(!is_issued_key_shape(""));
+    }
+
+    #[test]
     fn different_keys_hash_differently() {
         assert_ne!(hash_key("oag_live_a"), hash_key("oag_live_b"));
     }
@@ -1659,6 +1797,64 @@ mod tests {
     /// an existing admin's email leaves their role alone. Getting this wrong locks
     /// a human operator out of the admin API — the gate wants an admin key AND an
     /// admin principal — without their key ever changing.
+    /// The plumbing a budget or quota write evicts through: every hash of a
+    /// principal's keys, and the hash of the one key a quota write touched.
+    ///
+    /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it.
+    #[tokio::test]
+    async fn a_principals_key_hashes_are_all_listed_and_a_quota_write_names_its_own() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("org-{}@gateway.local", Uuid::new_v4());
+        let route = format!("route-{}", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO route (id, name, tiers, default_mode)
+             VALUES (gen_random_uuid(), $1, '[{\"name\":\"cheap\",\"models\":[\"kimi-k2\"]}]'::jsonb, 'passthrough')",
+        )
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("insert route");
+        let principal = upsert_principal(&db, &email, "member", None)
+            .await
+            .expect("upsert");
+
+        let one = mint_key(&db, &email, &route, "one", None)
+            .await
+            .expect("mint")
+            .expect("principal and route exist");
+        let two = mint_key(&db, &email, &route, "two", None)
+            .await
+            .expect("mint")
+            .expect("principal and route exist");
+
+        let mut listed = key_hashes_for_principal(&db, principal)
+            .await
+            .expect("list");
+        listed.sort();
+        let mut minted = vec![hash_key(&one.key), hash_key(&two.key)];
+        minted.sort();
+        assert_eq!(
+            listed, minted,
+            "both keys, by the hash the caches are keyed on"
+        );
+
+        let (_, _, touched) = set_key_quota(&db, two.id, Some(dec!(1)))
+            .await
+            .expect("set quota")
+            .expect("the key exists");
+        assert_eq!(
+            touched,
+            hash_key(&two.key),
+            "the hash of the key written, not another"
+        );
+    }
+
     #[tokio::test]
     async fn upserting_a_principal_never_demotes_an_existing_admin() {
         let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
@@ -1733,13 +1929,13 @@ mod tests {
 
     /// `route_by_id` against a real Postgres.
     ///
-    /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it. The month
-    /// boundary and the route filter are the kind of thing that cannot be
-    /// tested without a database, and the aggregate is skipped entirely for
-    /// routes with no budget — a behaviour worth pinning, since getting it
-    /// wrong means an index scan over the ledger on every single request.
+    /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it. This used to
+    /// pin that the route's month was summed from the ledger — on every
+    /// request, for any route with a budget. It now pins the opposite: the
+    /// spend is a column `record_usage` maintains, and the read is one
+    /// primary-key lookup gated on the month the column names.
     #[tokio::test]
-    async fn route_spend_counts_this_month_and_this_route_only() {
+    async fn route_spend_is_its_column_read_as_zero_once_its_month_has_passed() {
         let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
             return;
@@ -1747,66 +1943,182 @@ mod tests {
         let db = Db::connect(&url, 2).expect("connect");
         db.migrate().await.expect("migrate");
 
-        let capped: Uuid = sqlx::query_scalar(
-            "INSERT INTO route (id, name, tiers, default_mode, monthly_budget_usd)
-             VALUES (gen_random_uuid(), $1, '[{\"name\":\"cheap\",\"models\":[\"kimi-k2\"]}]'::jsonb, 'managed', 500)
-             RETURNING id",
-        )
-        .bind(format!("capped-{}", Uuid::new_v4()))
-        .fetch_one(db.pool())
-        .await
-        .expect("insert capped route");
+        let insert = |name: &str, month: &str| {
+            let db = db.clone();
+            let name = format!("{name}-{}", Uuid::new_v4());
+            let month = month.to_owned();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "INSERT INTO route (id, name, tiers, default_mode, monthly_budget_usd,
+                                        spent_usd, spent_month)
+                     VALUES (gen_random_uuid(), $1,
+                             '[{\"name\":\"cheap\",\"models\":[\"kimi-k2\"]}]'::jsonb,
+                             'managed', 500, 200.75,
+                             CASE $2 WHEN 'this' THEN date_trunc('month', now())::date
+                                     WHEN 'last' THEN (date_trunc('month', now()) - interval '1 month')::date
+                                     ELSE NULL END)
+                     RETURNING id",
+                )
+                .bind(name)
+                .bind(month)
+                .fetch_one(db.pool())
+                .await
+                .expect("insert route")
+            }
+        };
+        let current = insert("current", "this").await;
+        let stale = insert("stale", "last").await;
+        let never = insert("never", "none").await;
 
-        let other: Uuid = sqlx::query_scalar(
-            "INSERT INTO route (id, name, tiers, default_mode)
-             VALUES (gen_random_uuid(), $1, '[{\"name\":\"cheap\",\"models\":[\"kimi-k2\"]}]'::jsonb, 'managed')
-             RETURNING id",
-        )
-        .bind(format!("uncapped-{}", Uuid::new_v4()))
-        .fetch_one(db.pool())
-        .await
-        .expect("insert uncapped route");
-
-        for (route, cost, ago) in [
-            (capped, "120.50", "0 days"),
-            (capped, "80.25", "0 days"),
-            // Two months back: a monthly cap must not see it.
-            (capped, "999.00", "2 months"),
-            // A different route's spend must not leak in.
-            (other, "777.00", "0 days"),
-        ] {
-            sqlx::query(
-                "INSERT INTO usage_event
-                   (request_id, route_id, cost_usd, occurred_at, model_id, tier, selection_reason, status)
-                 VALUES (gen_random_uuid(), $1, $2::numeric, now() - $3::interval,
-                         'kimi-k2', 'cheap', 'classified', 200)",
-            )
-            .bind(route)
-            .bind(cost)
-            .bind(ago)
-            .execute(db.pool())
-            .await
-            .expect("insert usage");
-        }
-
-        let row = route_by_id(&db, capped)
-            .await
-            .expect("load")
-            .expect("exists");
+        let spent = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                route_by_id(&db, id)
+                    .await
+                    .expect("load")
+                    .expect("exists")
+                    .spent_usd
+            }
+        };
         assert_eq!(
-            row.spent_usd.to_string(),
-            "200.75000000",
-            "only this month, only this route"
+            spent(current).await,
+            dec!(200.75),
+            "this month's column, as is"
         );
+        assert!(
+            spent(stale).await.is_zero(),
+            "a column naming last month reads as zero: the month rolled over"
+        );
+        assert!(spent(never).await.is_zero(), "never spent");
+    }
 
-        // No budget means no aggregate: the value is zero regardless of the
-        // 777.00 sitting in the ledger for that route.
-        let row = route_by_id(&db, other)
+    /// One ledger write moves all three counters, in one statement, and the
+    /// monthly two reset at the boundary without a job.
+    ///
+    /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it.
+    #[tokio::test]
+    async fn one_recorded_usage_debits_the_key_the_principal_and_the_route_together() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+        let key = capped_key(&db, principal, route, format!("debit-{}", Uuid::new_v4())).await;
+
+        let write = |cost: &str| UsageWrite {
+            request_id: Uuid::new_v4(),
+            attempt: 0,
+            principal_id: Some(principal),
+            api_key_id: Some(key),
+            route_id: Some(route),
+            account_id: Some(account.as_uuid()),
+            model_id: "kimi-k2".to_owned(),
+            tier: "cheap".to_owned(),
+            selection_reason: "default".to_owned(),
+            escalated_from_tier: None,
+            escalation_gate: None,
+            usage: oag_router::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            cost_usd: cost.parse().expect("decimal"),
+            counterfactual_usd: Decimal::ZERO,
+            counterfactual_model_id: None,
+            counterfactual_api_usd: Decimal::ZERO,
+            status: 200,
+            latency_ms: Some(10),
+            ttft_ms: None,
+            streamed: false,
+        };
+
+        record_usage(&db, &write("1.25")).await.expect("record");
+        record_usage(&db, &write("0.50")).await.expect("record");
+
+        // THE FIX. This read is what the cap is enforced against, and it is
+        // exactly as current as the ledger: not a five-minute-old snapshot,
+        // not a SUM.
+        let spend = spend_for(&db, key, principal).await.expect("spend");
+        assert_eq!(spend.key_usd, dec!(1.75), "lifetime, on the key");
+        assert_eq!(
+            spend.principal_usd,
+            dec!(1.75),
+            "this month, on the principal"
+        );
+        let row = route_by_id(&db, route)
             .await
             .expect("load")
             .expect("exists");
-        assert_eq!(row.monthly_budget_usd, None);
-        assert!(row.spent_usd.is_zero(), "uncapped routes skip the sum");
+        assert_eq!(row.spent_usd, dec!(1.75), "this month, on the route");
+
+        // The month rolls over. Nothing runs at midnight; the column simply
+        // names a month that is not this one, and reads as zero — then the
+        // first write of the new month resets it to that write alone, while
+        // the key's lifetime counter carries on.
+        sqlx::query(
+            "UPDATE principal SET spent_month = (date_trunc('month', now()) - interval '1 month')::date
+              WHERE id = $1",
+        )
+        .bind(principal)
+        .execute(db.pool())
+        .await
+        .expect("age the principal's month");
+        let rolled = spend_for(&db, key, principal).await.expect("spend");
+        assert!(
+            rolled.principal_usd.is_zero(),
+            "last month's spend is not this month's"
+        );
+        assert_eq!(rolled.key_usd, dec!(1.75), "the key's cap is lifetime");
+
+        record_usage(&db, &write("0.25")).await.expect("record");
+        let fresh = spend_for(&db, key, principal).await.expect("spend");
+        assert_eq!(
+            fresh.principal_usd,
+            dec!(0.25),
+            "reset to this month's first write"
+        );
+        assert_eq!(fresh.key_usd, dec!(2.00));
+
+        // The month never moves backwards. A write whose transaction began
+        // before midnight, re-evaluated against a row the first write of
+        // the new month has just committed, accumulates into that month
+        // rather than overwriting it with its own cost and stamping the old
+        // month back. Reproduced here from the row's side: a row already a
+        // month ahead of `now()` is what such a write sees.
+        sqlx::query(
+            "UPDATE principal
+                SET spent_usd = 5, spent_month = (date_trunc('month', now()) + interval '1 month')::date
+              WHERE id = $1",
+        )
+        .bind(principal)
+        .execute(db.pool())
+        .await
+        .expect("advance the principal's month");
+        record_usage(&db, &write("0.25")).await.expect("record");
+        let (ahead_usd, ahead_month): (Decimal, time::Date) =
+            sqlx::query_as("SELECT spent_usd, spent_month FROM principal WHERE id = $1")
+                .bind(principal)
+                .fetch_one(db.pool())
+                .await
+                .expect("read the row");
+        let next_month: time::Date =
+            sqlx::query_scalar("SELECT (date_trunc('month', now()) + interval '1 month')::date")
+                .fetch_one(db.pool())
+                .await
+                .expect("next month");
+        assert_eq!(ahead_usd, dec!(5.25), "accumulated into the later month");
+        assert_eq!(ahead_month, next_month, "and the month stayed where it was");
+
+        // A key that no longer exists cannot spend as if uncapped.
+        assert!(
+            matches!(
+                spend_for(&db, Uuid::new_v4(), principal).await,
+                Err(Error::Unauthenticated)
+            ),
+            "a missing key is a refusal, not zeros"
+        );
     }
 
     /// Fixture: one principal, one route, one shared credential joined to it.

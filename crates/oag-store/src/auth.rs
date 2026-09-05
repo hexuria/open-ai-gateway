@@ -10,9 +10,16 @@
 //!
 //! Three details that matter more than the tiers:
 //!
-//! **Negative caching.** A miss is cached too. Without it, a scan of random
-//! keys reaches Postgres on every request and an attacker gets a free
-//! amplification lever against the database.
+//! **Negative caching, and what it cannot do.** A miss is cached in L1, so a
+//! client retrying one bad key does not re-ask Postgres each time. It does
+//! NOT stop a scan of random keys, and this comment used to say it did: a
+//! fresh key per request misses a negative cache exactly as it misses the
+//! positive one. What stops the scan is elsewhere — the inference layer
+//! refuses anything not shaped like an issued key before it gets here
+//! (`repo::is_issued_key_shape`), and the Postgres lookup itself sits behind
+//! a fixed number of permits (`lookup_permits`), so a flood of well-shaped
+//! unknown keys sheds `Overloaded` at the door rather than queueing the whole
+//! replica at `PgPool::acquire`.
 //!
 //! **Single-flight.** On an L1 miss, concurrent requests for the same key
 //! coalesce into one load. Without it, a popular key expiring means every
@@ -49,6 +56,13 @@ pub struct AuthCache {
     /// `Arc` so that the per-request clone into the single-flight closure does
     /// not copy the secret.
     mac: Arc<AuthMac>,
+    /// How many Postgres lookups may be in flight at once. A cache hit never
+    /// touches this; a miss takes a permit or is refused. Refused, not queued:
+    /// the pool behind it has its own queue with a ten-second timeout, and a
+    /// flood of unknown keys used to fill that queue with lookups no valid
+    /// credential was needed to start, while every real request waited
+    /// behind them.
+    lookups: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for AuthCache {
@@ -63,8 +77,18 @@ impl AuthCache {
     /// `signing_secret` is `security.signing_secret`: it authenticates the L2
     /// entries, and every replica must pass the same one or they will ignore
     /// each other's cache writes.
+    ///
+    /// `lookup_permits` bounds concurrent Postgres lookups; size it against the
+    /// pool, not the traffic — twice `database.max_connections` leaves the
+    /// other half of the pool for the requests that authenticated.
     #[must_use]
-    pub fn new(db: Db, cache: Cache, max_entries: u64, signing_secret: &str) -> Self {
+    pub fn new(
+        db: Db,
+        cache: Cache,
+        max_entries: u64,
+        signing_secret: &str,
+        lookup_permits: usize,
+    ) -> Self {
         Self {
             l1: moka::future::Cache::builder()
                 .max_capacity(max_entries)
@@ -73,6 +97,7 @@ impl AuthCache {
             db,
             cache,
             mac: Arc::new(AuthMac::new(signing_secret)),
+            lookups: Arc::new(tokio::sync::Semaphore::new(lookup_permits.max(1))),
         }
     }
 
@@ -87,6 +112,7 @@ impl AuthCache {
         let db = self.db.clone();
         let cache = self.cache.clone();
         let mac = Arc::clone(&self.mac);
+        let lookups = Arc::clone(&self.lookups);
         let key = hash.clone();
 
         self.l1
@@ -94,6 +120,13 @@ impl AuthCache {
                 if let Some(ctx) = cache.auth_get(&key, &mac).await {
                     return Ok::<_, oag_core::Error>(Some(Arc::new(ctx)));
                 }
+                // A miss in both caches is the one step here that costs a
+                // pooled connection. Take a permit or refuse — `try_acquire`,
+                // never `acquire`: queueing here is queueing at the pool with
+                // extra steps, and the whole point is not to.
+                let Ok(_permit) = lookups.try_acquire() else {
+                    return Err(oag_core::Error::Overloaded);
+                };
                 let found = repo::authenticate(&db, raw_key).await?;
                 if let Some(ctx) = &found {
                     cache.auth_set(&key, ctx, L2_TTL, &mac).await;
@@ -101,7 +134,14 @@ impl AuthCache {
                 Ok(found.map(Arc::new))
             })
             .await
-            .map_err(|e| oag_core::Error::Internal(format!("auth lookup: {e}")))
+            // The shed has to come back out as itself. Folding every load
+            // error into `Internal` turned a refused permit into a 500 with no
+            // `Retry-After` and an ERROR log per shed — a non-retryable answer
+            // to the one condition that exists to be retried elsewhere.
+            .map_err(|e| match &*e {
+                oag_core::Error::Overloaded => oag_core::Error::Overloaded,
+                other => oag_core::Error::Internal(format!("auth lookup: {other}")),
+            })
     }
 
     /// Drop a key from every tier on this replica, and from Redis.
@@ -134,5 +174,42 @@ impl AuthCache {
     #[must_use]
     pub fn l1_len(&self) -> u64 {
         self.l1.entry_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cache over backends nothing listens on: Redis misses fast, and the
+    /// Postgres lookup behind the permit is never reached.
+    fn dead_backends(lookup_permits: usize) -> AuthCache {
+        let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag", 1).expect("lazy pool");
+        let cache = Cache::connect("redis://127.0.0.1:1").expect("lazy client");
+        AuthCache::new(
+            db,
+            cache,
+            16,
+            "a-signing-secret-long-enough-for-the-mac",
+            lookup_permits,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_shed_lookup_is_overloaded_not_internal() {
+        // Every error out of the single-flight load used to be rewritten as
+        // `Internal`, the refused permit included. That answered a shed with
+        // a 500 and no `Retry-After`, logged it as an error, and counted it
+        // as one — a non-retryable answer to the one condition whose whole
+        // point is to be retried on a replica with room.
+        let auth = dead_backends(1);
+        let held = auth.lookups.try_acquire().expect("the only permit");
+
+        let err = auth
+            .authenticate("oag_sk_deadbeefdeadbeefdeadbeefdeadbeef")
+            .await
+            .expect_err("no permit, no lookup");
+        assert!(matches!(err, oag_core::Error::Overloaded), "{err:?}");
+        drop(held);
     }
 }

@@ -11,13 +11,16 @@
 //! - A tool *call* is a `functionCall` part; a tool *result* is a
 //!   `functionResponse` part, addressed by function **name** rather than by a
 //!   call id — so a conversation with two concurrent calls to the same function
-//!   cannot be represented faithfully. We key on name and accept the limit.
+//!   cannot be represented faithfully on the wire. Canonical ids are the name
+//!   plus an ordinal for repeats (`call_id`), so the canonical side at least
+//!   keeps the calls apart; the result still goes back by name.
 //! - Generation settings live under `generationConfig`, not at the top level.
 //! - Usage is `usageMetadata`, and its prompt count *includes* the cached
 //!   prefix, like Chat Completions and unlike Anthropic.
 
 use crate::canonical::{
     CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
+    ToolResultContent,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -131,10 +134,11 @@ fn render_message(m: &Message) -> Value {
                 ..
             } => Some(json!({
                 // Addressed by name in this dialect; the id is the closest
-                // thing we have when the original name is not carried.
+                // thing we have when the original name is not carried, once
+                // the ordinal `parse_chunk` may have added is taken off.
                 "functionResponse": {
-                    "name": tool_use_id,
-                    "response": { "result": content },
+                    "name": function_name(tool_use_id),
+                    "response": { "result": content.as_text() },
                 }
             })),
             // No wire representation; replaying it would be rejected.
@@ -299,7 +303,7 @@ fn parse_content(v: &Value) -> Option<Message> {
             if let Some(resp) = p.get("functionResponse") {
                 return Some(ContentBlock::ToolResult {
                     tool_use_id: resp["name"].as_str().unwrap_or_default().to_owned(),
-                    content: resp["response"].to_string(),
+                    content: ToolResultContent::Text(resp["response"].to_string()),
                     is_error: false,
                 });
             }
@@ -317,9 +321,12 @@ fn parse_content(v: &Value) -> Option<Message> {
 }
 
 /// One SSE `data:` payload → canonical events.
-pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
+pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
     let v: Value = serde_json::from_str(payload)?;
-    Ok(parse_response(&v))
+    // A stream delivers the call and the finish in separate chunks, so this
+    // chunk alone cannot know a tool was called, or how many were; the
+    // accumulator can.
+    Ok(parse_chunk(&v, acc.tool_call_count()))
 }
 
 /// A complete non-streamed `generateContent` body → canonical events.
@@ -329,7 +336,46 @@ pub fn parse_event(payload: &str, _acc: &mut StreamAccumulator) -> Result<Vec<St
 /// rather than a different envelope.
 #[must_use]
 pub fn parse_response(v: &Value) -> Vec<StreamEvent> {
+    parse_chunk(v, 0)
+}
+
+/// The canonical id for the `ordinal`-th call of a response, to `name`.
+///
+/// This dialect has no wire id: a call is its function's name, and a result
+/// is addressed back by that name. The first call keeps the bare name, so the
+/// common single-call turn round-trips unchanged; every later one carries its
+/// ordinal, because two parallel calls to the same function under one id had
+/// the accumulator fold both argument payloads into one buffer and the hub
+/// emit two `tool_use` blocks a client could not tell apart. `#` because a
+/// function name cannot contain it, which is what lets [`function_name`] take
+/// the suffix back off.
+fn call_id(name: &str, ordinal: usize) -> String {
+    if ordinal == 0 {
+        name.to_owned()
+    } else {
+        format!("{name}#{ordinal}")
+    }
+}
+
+/// The function a canonical tool id names: the inverse of [`call_id`].
+fn function_name(tool_use_id: &str) -> &str {
+    tool_use_id
+        .split_once('#')
+        .map_or(tool_use_id, |(name, _)| name)
+}
+
+/// One chunk, or one whole body, → canonical events.
+///
+/// `prior_calls` is how many tool calls earlier chunks of the same stream
+/// carried. It settles two things this chunk cannot alone. The stop reason:
+/// this dialect finishes a tool-calling turn with the same `STOP` as a plain
+/// one and reports the call in whichever chunk carried the `functionCall`
+/// part, and a streamed call read from the finish chunk alone reached an
+/// Anthropic client as `end_turn` and a Chat Completions client as `stop`.
+/// And the call ids, which are ordinals (see [`call_id`]).
+fn parse_chunk(v: &Value, prior_calls: usize) -> Vec<StreamEvent> {
     let mut events = Vec::new();
+    let mut calls = prior_calls;
 
     if let Some(usage) = v.get("usageMetadata") {
         events.push(StreamEvent::UsageUpdate {
@@ -360,16 +406,18 @@ pub fn parse_response(v: &Value) -> Vec<StreamEvent> {
         }
         if let Some(call) = part.get("functionCall") {
             let name = call["name"].as_str().unwrap_or_default().to_owned();
+            let id = call_id(&name, calls);
+            calls += 1;
             // Arrives whole, not streamed in fragments.
             events.push(StreamEvent::ToolUseStart {
-                id: name.clone(),
-                name: name.clone(),
+                id: id.clone(),
+                name,
             });
             events.push(StreamEvent::ToolUseDelta {
-                id: name.clone(),
+                id: id.clone(),
                 partial_json: call["args"].to_string(),
             });
-            events.push(StreamEvent::ToolUseEnd { id: name });
+            events.push(StreamEvent::ToolUseEnd { id });
         }
     }
 
@@ -378,6 +426,7 @@ pub fn parse_response(v: &Value) -> Vec<StreamEvent> {
             reason: match reason {
                 "MAX_TOKENS" => StopReason::MaxTokens,
                 "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" => StopReason::Refusal,
+                _ if calls > 0 => StopReason::ToolUse,
                 _ => StopReason::EndTurn,
             },
             usage: v.get("usageMetadata").map(parse_usage).unwrap_or_default(),
@@ -399,12 +448,47 @@ pub fn parse_response(v: &Value) -> Vec<StreamEvent> {
 pub struct RenderState {
     usage: Usage,
     finished: bool,
+    /// Tool calls opened but not yet ended, in the order they opened.
+    ///
+    /// This dialect delivers a call whole — one `functionCall` part carrying
+    /// the name and the complete, parsed arguments — while canonical events
+    /// deliver it as an opening, a series of JSON fragments, and an end. So the
+    /// fragments are held here and the part is emitted at the end. A list
+    /// rather than a single slot because a Chat Completions upstream streams
+    /// parallel calls interleaved, and the fragments arrive addressed by id.
+    pending: Vec<PendingCall>,
+}
+
+/// A tool call under assembly.
+#[derive(Debug, Clone)]
+struct PendingCall {
+    id: String,
+    name: String,
+    args: String,
+}
+
+impl PendingCall {
+    /// The `functionCall` part, with the arguments parsed if they parse.
+    ///
+    /// Arguments that never became valid JSON are the quality gate's business
+    /// (`StreamAccumulator::quality_gate` escalates on exactly that); here they
+    /// render as an empty object rather than fail the whole frame.
+    fn part(&self) -> Value {
+        let args: Value = serde_json::from_str(&self.args).unwrap_or_else(|_| json!({}));
+        json!({ "functionCall": { "name": self.name, "args": args } })
+    }
 }
 
 impl RenderState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Take the call with this id out of the pending list, if it is there.
+    fn take_pending(&mut self, id: &str) -> Option<PendingCall> {
+        let at = self.pending.iter().position(|c| c.id == id)?;
+        Some(self.pending.remove(at))
     }
 
     fn chunk(&self, parts: &[Value], finish: Option<&str>) -> String {
@@ -440,16 +524,39 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
             Some(st.chunk(&[json!({ "text": text, "thought": true })], None))
         }
 
-        // This dialect delivers a call whole, so the opening event alone has
-        // nothing to say; the arguments arrive with the delta.
-        StreamEvent::ToolUseStart { .. } | StreamEvent::ToolUseEnd { .. } => None,
+        // This dialect delivers a call whole, so nothing goes out until the
+        // call ends. The opening carries the one thing the end does not — the
+        // function's *name* — so it is recorded here. Rendering each fragment
+        // as its own part, as this used to, put the canonical id where the
+        // name belongs and `{}` where the arguments belong, once per fragment:
+        // a client saw three calls to a function that does not exist.
+        StreamEvent::ToolUseStart { id, name } => {
+            st.pending.push(PendingCall {
+                id: id.clone(),
+                name: name.clone(),
+                args: String::new(),
+            });
+            None
+        }
 
         StreamEvent::ToolUseDelta { id, partial_json } => {
-            let args: Value = serde_json::from_str(partial_json).unwrap_or_else(|_| json!({}));
-            Some(st.chunk(
-                &[json!({ "functionCall": { "name": id, "args": args } })],
-                None,
-            ))
+            match st.pending.iter_mut().find(|c| c.id == *id) {
+                Some(call) => call.args.push_str(partial_json),
+                // A fragment for a call that was never opened. Nothing sends
+                // that today; if something does, holding it under its id is
+                // still better than losing it.
+                None => st.pending.push(PendingCall {
+                    id: id.clone(),
+                    name: id.clone(),
+                    args: partial_json.clone(),
+                }),
+            }
+            None
+        }
+
+        StreamEvent::ToolUseEnd { id } => {
+            let call = st.take_pending(id)?;
+            Some(st.chunk(&[call.part()], None))
         }
 
         StreamEvent::Stop { reason, usage } => {
@@ -458,8 +565,11 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
             }
             st.finished = true;
             st.usage.merge(usage);
+            // A call the upstream never ended is ended by the stop. Its part
+            // rides on the terminal chunk, ahead of the finish reason.
+            let parts: Vec<Value> = st.pending.drain(..).map(|c| c.part()).collect();
             Some(st.chunk(
-                &[],
+                &parts,
                 Some(match reason {
                     StopReason::MaxTokens => "MAX_TOKENS",
                     StopReason::Refusal => "SAFETY",
@@ -595,6 +705,82 @@ mod tests {
         // reassembled JSON must still be valid.
         let (_, acc) = drive(STREAM);
         assert_eq!(acc.quality_gate(), None);
+    }
+
+    #[test]
+    fn a_streamed_tool_call_finishes_as_tool_use() {
+        // The `functionCall` part and the `STOP` arrive in different chunks,
+        // and `STOP` is what this dialect says for a plain turn too. Reading
+        // the finish chunk alone said `end_turn`, so an Anthropic client took
+        // the turn as final and never ran the tool.
+        let (events, acc) = drive(STREAM);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                ..
+            })
+        ));
+        assert_eq!(acc.stop_reason(), Some(StopReason::ToolUse));
+
+        // A plain turn is still a plain turn.
+        let (events, _) = drive(&[STREAM[0], STREAM[1], STREAM[3]]);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parallel_calls_to_one_function_get_distinct_ids() {
+        // Two `functionCall` parts naming the same function, one chunk each.
+        // Under one id the accumulator folded both argument payloads into
+        // one buffer — invalid JSON, so the quality gate escalated a good
+        // answer — and the hub emitted two `tool_use` blocks a client could
+        // not address a result to.
+        let (events, acc) = drive(&[
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.rs"}}}]}}]}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"b.rs"}}}]}}]}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}]}"#,
+        ]);
+        let starts: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseStart { id, name } => Some((id.as_str(), name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            [("read_file", "read_file"), ("read_file#1", "read_file")]
+        );
+        assert_eq!(acc.quality_gate(), None, "each call's arguments are whole");
+
+        // And the ordinal comes back off on the way to the upstream.
+        assert_eq!(function_name("read_file#1"), "read_file");
+        assert_eq!(function_name("read_file"), "read_file");
+    }
+
+    #[test]
+    fn a_whole_body_with_a_function_call_stops_as_tool_use() {
+        let body = json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [
+                    { "functionCall": { "name": "ls", "args": {} } }
+                ]},
+                "finishReason": "STOP"
+            }]
+        });
+        assert!(matches!(
+            parse_response(&body).last(),
+            Some(StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -774,6 +960,144 @@ mod tests {
                 dialect: Dialect::GeminiGenerateContent,
             }
         ));
+    }
+
+    /// The `parts` of every candidate in the frames `raw` holds, in order.
+    fn parts_of(raw: &str) -> Vec<Value> {
+        raw.split("\n\n")
+            .filter(|f| !f.trim().is_empty())
+            .map(|f| f.strip_prefix("data: ").expect("data prefix"))
+            .map(|p| serde_json::from_str::<Value>(p).expect("json"))
+            .flat_map(|v| {
+                v["candidates"][0]["content"]["parts"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fragmented_tool_call_renders_as_one_whole_function_call() {
+        // The shape every Anthropic and Chat Completions upstream produces: an
+        // opening with the name, the arguments in fragments, an end. Before,
+        // each fragment went out as its own `functionCall` part, with the
+        // canonical *id* where the name belongs and `{}` for the arguments —
+        // three calls to a function named `toolu_1` that takes nothing.
+        let mut st = RenderState::new();
+        let events = [
+            StreamEvent::ToolUseStart {
+                id: "toolu_1".to_owned(),
+                name: "read_file".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "toolu_1".to_owned(),
+                partial_json: "{\"pa".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "toolu_1".to_owned(),
+                partial_json: "th\": \"a.".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "toolu_1".to_owned(),
+                partial_json: "rs\"}".to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "toolu_1".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ];
+        let raw: String = events
+            .iter()
+            .filter_map(|e| render_event(e, &mut st))
+            .collect();
+
+        let parts = parts_of(&raw);
+        let calls: Vec<&Value> = parts
+            .iter()
+            .filter(|p| p.get("functionCall").is_some())
+            .collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one part for one call, not one per fragment: {raw}"
+        );
+        assert_eq!(calls[0]["functionCall"]["name"], "read_file");
+        assert_eq!(calls[0]["functionCall"]["args"], json!({ "path": "a.rs" }));
+    }
+
+    #[test]
+    fn a_call_the_upstream_never_ended_is_flushed_by_the_stop() {
+        let mut st = RenderState::new();
+        let events = [
+            StreamEvent::ToolUseStart {
+                id: "call_1".to_owned(),
+                name: "ls".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "call_1".to_owned(),
+                partial_json: "{}".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                usage: Usage::default(),
+            },
+        ];
+        let raw: String = events
+            .iter()
+            .filter_map(|e| render_event(e, &mut st))
+            .collect();
+        let parts = parts_of(&raw);
+        assert_eq!(parts.len(), 1, "{raw}");
+        assert_eq!(parts[0]["functionCall"]["name"], "ls");
+        assert!(raw.contains("\"finishReason\":\"STOP\""), "{raw}");
+        assert!(st.pending.is_empty(), "nothing left holding");
+    }
+
+    #[test]
+    fn interleaved_parallel_calls_each_assemble_under_their_own_id() {
+        let mut st = RenderState::new();
+        let events = [
+            StreamEvent::ToolUseStart {
+                id: "a".to_owned(),
+                name: "read".to_owned(),
+            },
+            StreamEvent::ToolUseStart {
+                id: "b".to_owned(),
+                name: "write".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "a".to_owned(),
+                partial_json: "{\"p\":".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "b".to_owned(),
+                partial_json: "{\"q\":".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "a".to_owned(),
+                partial_json: "1}".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "b".to_owned(),
+                partial_json: "2}".to_owned(),
+            },
+            StreamEvent::ToolUseEnd { id: "a".to_owned() },
+            StreamEvent::ToolUseEnd { id: "b".to_owned() },
+        ];
+        let raw: String = events
+            .iter()
+            .filter_map(|e| render_event(e, &mut st))
+            .collect();
+        let parts = parts_of(&raw);
+        assert_eq!(parts.len(), 2, "{raw}");
+        assert_eq!(parts[0]["functionCall"]["name"], "read");
+        assert_eq!(parts[0]["functionCall"]["args"], json!({ "p": 1 }));
+        assert_eq!(parts[1]["functionCall"]["name"], "write");
+        assert_eq!(parts[1]["functionCall"]["args"], json!({ "q": 2 }));
     }
 
     #[test]

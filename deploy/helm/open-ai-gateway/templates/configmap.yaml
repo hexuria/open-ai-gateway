@@ -7,6 +7,10 @@ data:
   OAG_GATEWAY__MAX_STREAM_DURATION: {{ .Values.gateway.maxStreamDurationSeconds | quote }}
   OAG_GATEWAY__STREAM_IDLE_TIMEOUT: {{ .Values.gateway.streamIdleTimeoutSeconds | quote }}
   OAG_GATEWAY__STREAM_KEEPALIVE_INTERVAL: {{ .Values.gateway.streamKeepaliveIntervalSeconds | quote }}
+  OAG_GATEWAY__UPSTREAM_RESPONSE_TIMEOUT: {{ .Values.gateway.upstreamResponseTimeoutSeconds | quote }}
+  OAG_GATEWAY__CLIENT_WRITE_TIMEOUT: {{ .Values.gateway.clientWriteTimeoutSeconds | quote }}
+  OAG_SERVER__MAX_IN_FLIGHT: {{ .Values.server.maxInFlight | quote }}
+  OAG_DATABASE__STATEMENT_TIMEOUT: {{ .Values.database.statementTimeoutSeconds | quote }}
   OAG_GATEWAY__SAME_ACCOUNT_RETRIES: {{ .Values.gateway.sameAccountRetries | quote }}
   OAG_GATEWAY__MAX_ACCOUNT_SWITCHES: {{ .Values.gateway.maxAccountSwitches | quote }}
   OAG_GATEWAY__CATALOG_REFRESH_INTERVAL: {{ .Values.gateway.catalogRefreshIntervalSeconds | quote }}

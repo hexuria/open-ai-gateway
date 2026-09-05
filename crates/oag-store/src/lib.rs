@@ -18,6 +18,7 @@ pub use cache::{AuthMac, Cache};
 pub use db::Db;
 pub use health::{Readiness, readiness};
 pub use repo::{NewService, ServiceUpdate};
+pub use rows::Spend;
 pub use rows::{
     AccountRow, AuthContext, ChannelStatusRow, ModelRow, RouteRow, ServiceRow, UsageWrite,
 };

@@ -1,0 +1,112 @@
+# What to page on, and what each page means.
+#
+# There were no alert rules before this file. Every metric below existed, and
+# an operator watching a dashboard could have seen each of these conditions —
+# but nothing woke anyone, and the audit found that the first hour of most
+# incidents here would be spent in the wrong subsystem. Each rule names the
+# subsystem that is actually at fault, because several of these failures used
+# to present as each other.
+groups:
+  - name: oag-money
+    rules:
+      # A ledger row failed to write. The response was already delivered and
+      # the provider has already billed; this spend is not in the ledger and
+      # will not be found later. Zero tolerance, because every one is money.
+      - alert: OagUsageWriteFailed
+        expr: increase(oag_usage_write_failures_total[5m]) > 0
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "usage ledger write failed on {{ $labels.replica }}"
+          description: >-
+            {{ $value }} ledger writes failed in the last 5 minutes. The
+            corresponding spend was billed by the provider and is missing from
+            usage_event. Check Postgres health and the replica's logs for
+            "FAILED TO RECORD USAGE".
+
+  - name: oag-coordination
+    rules:
+      # Redis could not answer a slot question and selection admitted anyway.
+      # Requests are flowing — that is the point of failing open — but every
+      # credential can now be oversubscribed until Redis returns. This is a
+      # Redis alert, not a capacity alert, however it looks from the pool.
+      - alert: OagSlotAccountingDegraded
+        expr: increase(oag_slot_accounting_degraded_total[5m]) > 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "selection running open: Redis unavailable on {{ $labels.replica }}"
+          description: >-
+            Concurrency slots could not be read or acquired ({{ $labels.op }}).
+            Requests are admitted without them, so credentials may exceed
+            max_concurrency. Fix Redis; do not raise max_concurrency.
+
+      # A replica has stopped answering scrapes. `up` is whether Prometheus
+      # got /metrics, not whether the replica is ready: a process that is up
+      # but unready (Postgres or Redis not answering) still serves /metrics
+      # and does not fire this. One for a minute is a restart; one for longer,
+      # or several at once, is the process or the network under it.
+      - alert: OagReplicaUnreachable
+        expr: up{job="oag"} == 0
+        for: 3m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $labels.replica }} has not answered a scrape for 3 minutes"
+          description: >-
+            The admin listener did not answer Prometheus. Check whether the
+            process is running and whether the scrape address still resolves
+            to it. Readiness is the orchestrator's signal, read from
+            /health/ready; it is separate from this one.
+
+  - name: oag-capacity
+    rules:
+      # Every credential for a provider is at max_concurrency. Distinct from
+      # no_credential (nothing configured) and from the Redis alert above
+      # (the count is unavailable): here the count is real and it is full.
+      - alert: OagProviderAtCapacity
+        expr: sum by (provider) (rate(oag_at_capacity_total[5m])) > 0.1
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.provider }} credentials are at their concurrency limit"
+          description: >-
+            Requests are being refused at_capacity for {{ $labels.provider }}
+            at {{ $value }}/s. The count was real: a Redis outage admits
+            rather than refuses, so at_capacity never comes from a blind
+            pool. Add a credential or raise max_concurrency — unless
+            oag_slots_in_use for the credential stays at max_concurrency
+            while nothing is running through it, which is a leaked slot and
+            clears on its own within the slot TTL.
+
+      # This replica is shedding at its in-flight ceiling. A brief burst is
+      # the ceiling working; sustained shedding is under-provisioning.
+      - alert: OagReplicaShedding
+        expr: sum by (replica) (rate(oag_requests_total{outcome="overloaded"}[5m])) > 1
+        for: 5m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.replica }} is shedding load"
+          description: >-
+            More than one request per second refused as overloaded for five
+            minutes. Add replicas or raise server.max_in_flight if memory
+            allows (ceiling × max_body_bytes is the worst case).
+
+  - name: oag-lifecycle
+    rules:
+      # A replica has been draining for a long time. A healthy drain lasts as
+      # long as its longest in-flight stream, usually seconds; ten minutes of
+      # it is a stream that is not ending, or a replica the orchestrator is
+      # no longer going to kill. Well inside max_stream_duration on purpose:
+      # the drain gives up at that budget and takes the admin listener — and
+      # this series — with it, so a `for` at or past the budget could never
+      # be satisfied.
+      - alert: OagDrainStuck
+        expr: oag_draining == 1
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "{{ $labels.replica }} has been draining for 10 minutes"
+          description: >-
+            Look for a stream the pump has not returned from. The drain
+            gives up on its own at gateway.max_stream_duration; kill the pod
+            sooner if the stream is one nobody is reading.

@@ -81,6 +81,22 @@ variable "ingress" {
   default = "INGRESS_TRAFFIC_ALL"
 }
 
+# Who may invoke the service at the platform layer. Empty by default, on
+# purpose: this stack runs the gateway single-listener, so whoever can invoke
+# the service reaches the dashboard, `/metrics` and `/health/ready` as well as
+# inference, and only inference authenticates itself. A default of `allUsers`
+# published those three to the internet — and, because an IAM member grant is
+# additive, added them to every existing deploy whose operator had narrowed
+# the invoker by hand. A fresh deploy with nothing in front of it needs
+# `["allUsers"]` here or it answers 403 to everyone; set it, knowingly.
+# Fronting the service with a Google load balancer or IAP? Name that
+# principal and set `ingress` to match; the two are one decision.
+variable "invoker_members" {
+  type        = list(string)
+  default     = []
+  description = "Principals granted roles/run.invoker. [\"allUsers\"] for a public service with nothing in front of it."
+}
+
 variable "cloudflare_zone_id" {
   type    = string
   default = ""

@@ -71,13 +71,21 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Command::Migrate => {
-            let db = Db::connect(&config.database.url, config.database.max_connections)?;
+            let db = Db::connect_with(
+                &config.database.url,
+                config.database.max_connections,
+                config.database.statement_timeout,
+            )?;
             db.migrate().await?;
             tracing::info!("migrations applied");
             Ok(())
         }
         Command::Admin(cmd) => {
-            let db = Db::connect(&config.database.url, config.database.max_connections)?;
+            let db = Db::connect_with(
+                &config.database.url,
+                config.database.max_connections,
+                config.database.statement_timeout,
+            )?;
             let kek = oag_core::Kek::from_base64(&config.security.credential_kek)?;
             admin::run(*cmd, &db, &kek, &config.redis.url, &config).await
         }
@@ -85,7 +93,11 @@ async fn run() -> Result<()> {
             let handle = oag_server::metrics::install()?;
             oag_server::metrics::describe();
 
-            let db = Db::connect(&config.database.url, config.database.max_connections)?;
+            let db = Db::connect_with(
+                &config.database.url,
+                config.database.max_connections,
+                config.database.statement_timeout,
+            )?;
             let cache = Cache::connect(&config.redis.url)?;
 
             let state = Arc::new(AppState::new(config, db, cache)?);

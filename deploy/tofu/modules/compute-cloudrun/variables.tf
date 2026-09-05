@@ -7,10 +7,20 @@ variable "env" {
   default     = {}
   description = "Plain environment. Never secrets — use secret_env."
 }
+# The VERSION is pinned, not `latest`. A revision's environment is fixed when
+# the revision is created, and Cloud Run only creates one when the template
+# changes; `latest` in the template does not change when a new version is
+# added, so a rotated secret — Memorystore AUTH being turned on, say — went to
+# no running instance until something unrelated forced a deploy, and every
+# live instance kept dialling the old URL. Naming the version puts the
+# rotation in the template, where it rolls the service.
 variable "secret_env" {
-  type        = map(string)
+  type = map(object({
+    secret  = string
+    version = string
+  }))
   default     = {}
-  description = "env var name -> Secret Manager secret id."
+  description = "env var name -> Secret Manager secret id and the version to read."
 }
 
 variable "vpc_subnet" {

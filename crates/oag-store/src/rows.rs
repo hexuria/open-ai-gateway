@@ -102,8 +102,10 @@ pub struct RouteRow {
     pub floor_tier: Option<String>,
     pub rpm_limit: Option<i32>,
     pub monthly_budget_usd: Option<Decimal>,
-    /// Month-to-date spend on this route. Zero when the route has no budget,
-    /// because the query does not bother summing what nothing will compare.
+    /// Month-to-date spend on this route, read from the denormalised
+    /// `route.spent_usd` and zero once the month `route.spent_month` names
+    /// has passed. Kept whether or not the route has a budget: the column is
+    /// written on every debit, so reading it costs nothing.
     pub spent_usd: Decimal,
     pub active: bool,
 }
@@ -133,10 +135,34 @@ pub struct AuthContext {
     #[serde(default)]
     pub admin: bool,
     pub quota_usd: Option<Decimal>,
-    pub spent_usd: Decimal,
     pub principal_budget_usd: Option<Decimal>,
     pub principal_hard_stop_multiple: Decimal,
-    pub principal_spent_usd: Decimal,
+    /// sha256 of the key, so a write that changes this identity's limits can
+    /// evict it from every cache tier without the plaintext — see
+    /// `AuthCache::invalidate_hash`. `#[serde(default)]` for the same reason
+    /// as `admin`: an L2 entry written by an older binary must still open.
+    #[serde(default)]
+    pub key_hash: String,
+}
+
+/// What the caller has spent: the key's lifetime total and the principal's
+/// month to date.
+///
+/// Deliberately NOT a field of [`AuthContext`]. That struct is cached for
+/// minutes, and it used to carry these two numbers — so the spend cap was
+/// enforced against a snapshot up to five minutes old, and N concurrent
+/// requests all read the same stale figure, all evaluated the wall as not yet
+/// reached, and all went through. `record_usage` increments the columns on
+/// every attempt and touches no cache; the only eviction was revocation. Read
+/// fresh, per request, by `repo::spend_for`, from columns the ledger write
+/// maintains — a primary-key read, not a SUM over the ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Spend {
+    /// Lifetime, against `api_key.quota_usd`, which is a wall at the number
+    /// written on it.
+    pub key_usd: Decimal,
+    /// Month to date, against `principal.monthly_budget_usd`.
+    pub principal_usd: Decimal,
 }
 
 impl AuthContext {

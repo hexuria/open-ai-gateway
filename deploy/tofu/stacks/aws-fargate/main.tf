@@ -199,6 +199,7 @@ module "gateway" {
   max_count                   = var.max_count
   internal                    = var.internal
   certificate_arn             = var.certificate_arn
+  allow_plaintext_listener    = var.allow_plaintext_listener
   run_migrations              = var.run_migrations
 
   # The secret VERSIONS, not just the secrets: the migrate container resolves

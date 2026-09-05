@@ -166,7 +166,15 @@ pub fn select(candidates: &[Candidate], now: i64, tie_breaker: u64) -> Option<Se
     // evaporate, while the others keep theirs. Credentials with no window are
     // never preferred here, so a metered subscription is drained before an
     // unmetered key.
-    let soonest = least_loaded.iter().filter_map(|c| c.window_resets_at).min();
+    // Only a window still ahead of us counts. `window_resets_at` is written by
+    // the usage poller and never cleared once the reset passes, so a seat that
+    // reset an hour ago still carries the timestamp — and without this filter
+    // it won this stage forever, as the "soonest" reset, while looking on the
+    // dashboard like the stage doing exactly its job.
+    let soonest = least_loaded
+        .iter()
+        .filter_map(|c| c.window_resets_at.filter(|t| *t > now))
+        .min();
     let pool: Vec<&Candidate> = match soonest {
         Some(t) => {
             let expiring: Vec<&Candidate> = least_loaded
@@ -394,6 +402,24 @@ mod tests {
         let picked = select(&[later, expiring.clone()], NOW, 0).expect("selects");
         assert_eq!(picked.account, expiring.account);
         assert_eq!(picked.stage, Stage::SoonestReset);
+    }
+
+    #[test]
+    fn a_window_that_already_reset_is_not_about_to() {
+        // `window_resets_at` is written by the usage poller and never
+        // cleared once the moment passes. A seat whose window reset an hour
+        // ago therefore still carried the timestamp — and won this stage
+        // forever as the "soonest" reset, the dashboard reporting
+        // `stage="SoonestReset"` as if the feature were working. An elapsed
+        // window is no window: the decision falls through to recency.
+        let mut elapsed = candidate(0);
+        elapsed.window_resets_at = Some(NOW - 3_600);
+        elapsed.last_used_at = NOW - 1;
+        let mut plain = candidate(0);
+        plain.last_used_at = NOW - 10_000;
+        let picked = select(&[elapsed, plain.clone()], NOW, 0).expect("selects");
+        assert_eq!(picked.stage, Stage::LeastRecentlyUsed, "not SoonestReset");
+        assert_eq!(picked.account, plain.account, "recency decided it");
     }
 
     #[test]

@@ -133,10 +133,22 @@ impl ProviderAdapter for BedrockAdapter {
             "invoke"
         };
         // The model id contains characters that must survive verbatim in the
-        // path (`anthropic.claude-sonnet-4-v1:0`), including the colon.
+        // path (`anthropic.claude-sonnet-4-v1:0`), including the colon — and
+        // `url` does keep `:` literal, which `the_model_id_survives_in_the_path`
+        // pins.
         let path = format!("/model/{}/{action}", req.model.upstream_name);
         let host = self.host();
         let origin = self.origin();
+
+        // Parse first, then sign what the parser will send. The signer's
+        // contract is "the exact wire bytes, which it encodes once on top"; the
+        // one way to guarantee the string it signs is the string on the wire is
+        // to read it back out of the URL rather than sign the pre-parse
+        // `format!` above and trust that `url` leaves every byte alone. For a
+        // colon it does; for a space or a non-ASCII byte it would not, and the
+        // signature would be one pass short of what AWS rebuilds.
+        let url = reqwest::Url::parse(&format!("{origin}{path}"))
+            .map_err(|e| oag_core::Error::Internal(format!("bedrock url: {e}")))?;
 
         let signed = sigv4::sign(
             &creds,
@@ -144,7 +156,7 @@ impl ProviderAdapter for BedrockAdapter {
             "bedrock",
             sigv4::SigningRequest {
                 method: "POST",
-                path: &path,
+                path: url.path(),
                 host: &host,
                 body: &bytes,
             },
@@ -152,7 +164,7 @@ impl ProviderAdapter for BedrockAdapter {
         );
 
         let mut builder = reqwest::Client::new()
-            .post(format!("{origin}{path}"))
+            .post(url)
             .header("content-type", "application/json")
             .header("host", &host)
             .header("x-amz-date", &signed.amz_date)
@@ -282,6 +294,64 @@ mod tests {
         );
         assert!(url.contains("anthropic.claude-sonnet-4-v1:0"), "{url}");
         assert!(url.ends_with("/invoke"), "{url}");
+    }
+
+    #[test]
+    fn the_signature_is_computed_over_the_exact_wire_path() {
+        // The composition the signer depends on: the string it encodes once is
+        // byte-for-byte the path reqwest puts on the wire. Neither half can
+        // prove that alone — the sigv4 tests never see a URL, and the URL test
+        // above never sees a signature — so recompute the signature here from
+        // the built request's own wire path, `x-amz-date`, host and body, and
+        // require it to match the `authorization` header the adapter attached.
+        // A pre-encoded model id in `path`, or a signer handed anything other
+        // than `url.path()`, breaks this and nothing else.
+        let a = BedrockAdapter::new("eu-west-1");
+        let c = request(false);
+        let m = model();
+        let raw = "AKIDEXAMPLE:wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let cr = cred(raw);
+        let req = a
+            .build(&UpstreamRequest {
+                canonical: &c,
+                model: &m,
+                credential: &cr,
+            })
+            .expect("builds");
+
+        let header = |name: &str| {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map_or_else(|| panic!("{name} header"), str::to_owned)
+        };
+        let at = time::PrimitiveDateTime::parse(
+            &header("x-amz-date"),
+            &time::macros::format_description!("[year][month][day]T[hour][minute][second]Z"),
+        )
+        .expect("amz date")
+        .assume_utc();
+        let body = req.body().and_then(reqwest::Body::as_bytes).expect("body");
+
+        let wire_path = req.url().path();
+        assert!(
+            wire_path.contains(':'),
+            "the wire keeps the literal colon: {wire_path}"
+        );
+
+        let recomputed = sigv4::sign(
+            &BedrockAdapter::credentials(raw).expect("creds"),
+            "eu-west-1",
+            "bedrock",
+            sigv4::SigningRequest {
+                method: "POST",
+                path: wire_path,
+                host: &header("host"),
+                body,
+            },
+            at,
+        );
+        assert_eq!(header("authorization"), recomputed.authorization);
     }
 
     #[test]

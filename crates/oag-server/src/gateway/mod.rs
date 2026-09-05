@@ -251,6 +251,7 @@ async fn handle(
 
     let cache_blocks = extract_cache_blocks(&canonical);
     let session = SessionKey::resolve(
+        &auth.principal_id.to_string(),
         canonical.client_session.as_deref(),
         &cache_blocks,
         &auth.api_key_id.to_string(),
@@ -317,6 +318,7 @@ async fn run_with_escalation(
         catalog,
         pressure,
         channel,
+        served,
     } = plan;
     let mut escalations = 0u8;
     // The gate that *caused* an escalation, not the last one observed. Recording
@@ -328,10 +330,17 @@ async fn run_with_escalation(
     // until the primary key contracts onto `(request_id, attempt)` only the
     // first row for a request survives.
     let mut abandoned: Option<meter::Abandoned> = None;
+    let mut dispatches = Dispatches::new(request_id, started);
 
     loop {
         let attempt = match forward_with_failover(
-            state, auth, &decision, canonical, session, request_id, channel,
+            state,
+            auth,
+            &decision,
+            canonical,
+            session,
+            &mut dispatches,
+            channel,
         )
         .await
         {
@@ -354,17 +363,24 @@ async fn run_with_escalation(
         let answer = match attempt {
             // Streaming: the bytes are already on their way to the client, so
             // there is nothing left to judge. See the note on MAX_ESCALATIONS.
-            Attempt::Streaming { response, lease } => {
+            Attempt::Streaming {
+                response,
+                lease,
+                attempt,
+            } => {
                 return stream_response(
-                    state, response, lease, auth, &decision, request_id, started, ingress, guard,
+                    state, response, lease, auth, &decision, request_id, started, attempt, ingress,
+                    guard,
                 );
             }
             Attempt::Rejected(e) => Err(e),
             Attempt::Collected {
                 body,
+                events,
                 accumulator,
                 lease,
-            } => Ok((body, accumulator, lease)),
+                attempt,
+            } => Ok((body, events, accumulator, lease, attempt)),
         };
 
         let gate = match &answer {
@@ -372,7 +388,7 @@ async fn run_with_escalation(
             // and nothing reached the client, so this is the one escalation a
             // streaming request can also take.
             Err(_) => Some(oag_router::QualityGate::ContextOverflow),
-            Ok((_, accumulator, _)) => accumulator.quality_gate(),
+            Ok((_, _, accumulator, _, _)) => accumulator.quality_gate(),
         };
 
         // Retry one rung up when the answer was unusable and a rung is left.
@@ -386,7 +402,8 @@ async fn run_with_escalation(
                 decision.model.max_output_tokens,
             )
             && let Some(from) = decision.tier.as_ref()
-            && let Some(next) = policy.escalate(from, gate, &signal, &catalog, canonical.max_tokens)
+            && let Some(next) =
+                policy.escalate(from, gate, &signal, &catalog, canonical.max_tokens, &served)
         {
             tracing::info!(
                 %request_id, from = ?decision.rung_name(), to = ?next.rung_name(), ?gate,
@@ -409,9 +426,9 @@ async fn run_with_escalation(
             // Released here rather than left to the drop, and awaited: the
             // rung above may pick this same credential, and a release still
             // in flight would look like a credential with no room.
-            if let Ok((_, accumulator, lease)) = &answer {
+            if let Ok((_, _, accumulator, lease, attempt)) = &answer {
                 abandoned = Some(meter::abandon(
-                    meter_context(auth, &decision, lease, request_id, started, escalations),
+                    meter_context(auth, &decision, lease, request_id, started, *attempt),
                     accumulator,
                     gate,
                 ));
@@ -435,38 +452,66 @@ async fn run_with_escalation(
 
         // No rung left to try. A refusal is now the caller's error — the same
         // one they used to get before the first attempt was allowed to climb.
-        let (body, accumulator, lease) = answer?;
+        // The attempt abandoned to make this one was still generated and
+        // invoiced, and with no served row coming this is its last chance to
+        // reach the ledger — exactly as when the retry itself died above.
+        let (body, events, accumulator, lease, attempt) = match answer {
+            Ok(answer) => answer,
+            Err(e) => {
+                if let Some(abandoned) = &abandoned {
+                    meter::record_abandoned(state, abandoned).await;
+                }
+                return Err(e);
+            }
+        };
 
         // Either it was fine, or nothing better exists. Record the gate either
         // way: a gate we could not act on is exactly the signal that a rung is
         // mis-set for this workload.
-        let ctx = meter_context(auth, &decision, &lease, request_id, started, escalations);
-        // Read while the lease is still here: the answer is a fact about the
-        // adapter this account got, and `release` below takes the account with
-        // it. Falling back to the provider's dialect once it is gone is exactly
-        // the bug this call site had.
-        let upstream_dialect = adapter_for(state, decision.model.provider, &lease.account)
-            .map_or_else(
-                |_| decision.model.provider.native_dialect(),
-                |a| a.dialect(),
+        let ctx = meter_context(auth, &decision, &lease, request_id, started, attempt);
+        // Read while the lease is still here: both are facts about the adapter
+        // this account got, and `release` below takes the account with it.
+        // Falling back to the provider's dialect once it is gone is exactly the
+        // bug this call site had.
+        let (upstream_dialect, always_streams) =
+            adapter_for(state, decision.model.provider, &lease.account).map_or_else(
+                |_| (decision.model.provider.native_dialect(), false),
+                |a| (a.dialect(), a.always_streams()),
             );
         // Before the ledger write, which is ours rather than the credential's.
         lease.release().await;
+
+        // The ledger writes run as their own task, exactly as the streamed
+        // path's do. This future is the request handler's: a client that hangs
+        // up while the writes are in flight cancels it, and an inline `.await`
+        // here went with it — no row, no debit, while the provider had already
+        // generated and invoiced the answer. Detached, the writes finish
+        // whatever the connection does. The guard rides along so a shutdown
+        // drain waits for them rather than exiting out from under the ledger.
+        //
         // `triggering_gate` when we escalated, otherwise whatever this attempt
         // tripped — so the ledger always names the reason, never nothing.
-        meter::record_collected(state, &ctx, &accumulator, triggering_gate.or(gate)).await;
-        // Second, and only ever second: this is the row the surviving primary key
-        // drops, and the served one above is the row that must not be dropped.
-        if let Some(abandoned) = &abandoned {
-            meter::record_abandoned(state, abandoned).await;
-        }
+        let recorded_gate = triggering_gate.or(gate);
+        let state2 = Arc::clone(state);
+        tokio::spawn(async move {
+            let _guard = guard;
+            meter::record_collected(&state2, &ctx, &accumulator, recorded_gate).await;
+            // Second, and only ever second: this is the row the surviving
+            // primary key drops, and the served one above is the row that must
+            // not be dropped.
+            if let Some(abandoned) = &abandoned {
+                meter::record_abandoned(&state2, abandoned).await;
+            }
+        });
 
         return Ok(json_response(
             &body,
+            &events,
             &decision,
             request_id,
             ingress,
             upstream_dialect,
+            always_streams,
         ));
     }
 }
@@ -477,6 +522,39 @@ async fn run_with_escalation(
 /// path, the collected path, and the attempt a quality gate abandons. A second
 /// copy of this literal is how one of them ends up attributing spend to the
 /// wrong account.
+/// The count of times this request has been sent to a provider, shared by
+/// the loops that send it.
+///
+/// The ledger's identity is `(request_id, attempt)`, and two loops dispatch:
+/// escalation climbs rungs, and failover inside it switches credentials. The
+/// number used to be the escalation index alone, so two dispatches on one
+/// rung — a credential that generated an answer and then lost the stream,
+/// and the credential that served the retry — shared a row identity, and
+/// only one of them reached the ledger. Every dispatch now takes the next
+/// number, whichever loop asked.
+struct Dispatches {
+    request_id: RequestId,
+    started: Instant,
+    next: u8,
+}
+
+impl Dispatches {
+    const fn new(request_id: RequestId, started: Instant) -> Self {
+        Self {
+            request_id,
+            started,
+            next: 0,
+        }
+    }
+
+    /// The number for the dispatch about to happen.
+    fn take(&mut self) -> u8 {
+        let attempt = self.next;
+        self.next = self.next.saturating_add(1);
+        attempt
+    }
+}
+
 fn meter_context(
     auth: &oag_store::AuthContext,
     decision: &RoutingDecision,
@@ -516,6 +594,10 @@ struct Plan {
     /// argument through the same two frames would be the same coupling written
     /// less visibly.
     channel: Option<oag_core::credential::CredentialKind>,
+    /// What the route's credentials serve, for the savings baseline. Read
+    /// once for `decide` and carried so `escalate` prices its row against the
+    /// same baseline rather than the ladder's top rung.
+    served: HashSet<String>,
 }
 
 /// Load the caller's route and build the policy it implies.
@@ -526,10 +608,13 @@ struct Plan {
 pub(crate) async fn policy_for(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
-) -> Result<(oag_store::RouteRow, RoutingPolicy)> {
+) -> Result<(oag_store::RouteRow, RoutingPolicy, oag_store::Spend)> {
     let route = oag_store::repo::route_by_id(&state.db, auth.route_id)
         .await?
         .ok_or_else(|| Error::Internal("route vanished between auth and routing".to_owned()))?;
+    // Fresh, per request, beside the route: the one read that must never be
+    // behind the ledger. See `Spend` for why it is not on `auth`.
+    let spend = oag_store::repo::spend_for(&state.db, auth.api_key_id, auth.principal_id).await?;
 
     let ladder = parse_ladder(&route.tiers)?;
 
@@ -556,7 +641,7 @@ pub(crate) async fn policy_for(
 
     let policy = RoutingPolicy::new(ladder, Box::new(oag_router::HeuristicClassifier::default()))
         .with_floor(floor);
-    Ok((route, policy))
+    Ok((route, policy, spend))
 }
 
 /// The same spend caps inference consults, so `/v1/models` can refuse to
@@ -566,10 +651,18 @@ pub(crate) async fn policy_for(
 /// through the constrained band first, but it does not get the principal's
 /// overshoot grace. An operator who writes `quota_usd = 50` means fifty. A
 /// route budget is the same shape at team scope.
-pub(crate) fn budgets_for(auth: &oag_store::AuthContext, route: &oag_store::RouteRow) -> Budgets {
+///
+/// Limits come from `auth`, which is cached; spend comes from `spend`, which
+/// is read per request. Keeping the two apart is the whole fix: a cap checked
+/// against a cached spend figure was a cap N concurrent requests all passed.
+pub(crate) fn budgets_for(
+    auth: &oag_store::AuthContext,
+    route: &oag_store::RouteRow,
+    spend: &oag_store::Spend,
+) -> Budgets {
     Budgets {
         key: BudgetState {
-            spent_usd: auth.spent_usd,
+            spent_usd: spend.key_usd,
             limit_usd: auth.quota_usd,
             hard_stop_multiple: rust_decimal::Decimal::ONE,
         },
@@ -579,7 +672,7 @@ pub(crate) fn budgets_for(auth: &oag_store::AuthContext, route: &oag_store::Rout
             hard_stop_multiple: rust_decimal::Decimal::ONE,
         },
         principal: BudgetState {
-            spent_usd: auth.principal_spent_usd,
+            spent_usd: spend.principal_usd,
             limit_usd: auth.principal_budget_usd,
             hard_stop_multiple: auth.principal_hard_stop_multiple,
         },
@@ -633,7 +726,7 @@ async fn plan_request(
     catalog: Arc<oag_router::Catalog>,
     channel: Option<oag_core::credential::CredentialKind>,
 ) -> Result<Plan> {
-    let (route, policy) = policy_for(state, auth).await?;
+    let (route, policy, spend) = policy_for(state, auth).await?;
 
     // Throttle before doing any of the expensive work below — classification,
     // model selection, credential selection. A request that is going to be
@@ -681,7 +774,7 @@ async fn plan_request(
         RoutingMode::Passthrough
     };
 
-    let budget = budgets_for(auth, &route);
+    let budget = budgets_for(auth, &route, &spend);
 
     // Logged at debug because "why did this route the way it did" is the
     // question every routing complaint turns into, and reconstructing it from
@@ -732,6 +825,7 @@ async fn plan_request(
         catalog,
         pressure: budget.pressure(),
         channel,
+        served,
     })
 }
 
@@ -761,12 +855,22 @@ enum Attempt {
     Streaming {
         response: reqwest::Response,
         lease: select::Lease,
+        /// Which dispatch of this request produced it; see [`Dispatches`].
+        attempt: u8,
     },
     /// Read in full, so the answer can still be judged and retried.
     Collected {
+        /// The upstream's own bytes, for the one case they can be forwarded
+        /// as they are: a client in the upstream's dialect, over an adapter
+        /// that sent a JSON body rather than a stream. Empty otherwise.
         body: bytes::Bytes,
+        /// The answer as canonical events, which is what every other case
+        /// renders the client's body from.
+        events: Vec<oag_proto::StreamEvent>,
         accumulator: oag_proto::StreamAccumulator,
         lease: select::Lease,
+        /// Which dispatch of this request produced it; see [`Dispatches`].
+        attempt: u8,
     },
     /// The model refused the request itself — too long, or beyond what it can
     /// do. No credential can help and the lease is already released, but a
@@ -850,54 +954,69 @@ pub(crate) fn adapter_for(
     }
 }
 
+/// Render a collected answer as one body in the client's dialect.
+///
+/// Every pair goes through the same hub: the events become an Anthropic
+/// message (`anthropic::render_from_events`), and that message is converted by
+/// the client-dialect converter that already takes one. The converter is
+/// therefore chosen by the client's dialect *and* fed a shape it reads — the
+/// two halves that used to be decided separately. When the converter was
+/// picked by the client's dialect alone and handed the upstream's body as it
+/// came, each converter read exactly one upstream shape and eight of the
+/// twelve pairs rendered a well-formed, fully-billed, empty answer.
+fn render_collected(
+    events: &[oag_proto::StreamEvent],
+    ingress: Dialect,
+    request_id: &str,
+    model: &str,
+) -> Result<bytes::Bytes> {
+    let hub = oag_proto::anthropic::render_from_events(events, request_id, model);
+    let out = match ingress {
+        Dialect::AnthropicMessages => hub,
+        Dialect::OpenAIChatCompletions => oag_proto::openai::render_completion(&hub, request_id),
+        Dialect::GeminiGenerateContent => oag_proto::gemini::render_message_response(&hub),
+        Dialect::OpenAIResponses => oag_proto::responses::render_response(&hub, request_id),
+        // `Dialect` is non-exhaustive. A client dialect with no converter gets
+        // an error naming it — never the upstream's body, which is the silent
+        // wrong shape this function exists to stop.
+        other => {
+            return Err(Error::Internal(format!(
+                "no non-streaming converter into the {other:?} dialect"
+            )));
+        }
+    };
+    Ok(bytes::Bytes::from(out.to_string()))
+}
+
 fn json_response(
     body: &bytes::Bytes,
+    events: &[oag_proto::StreamEvent],
     decision: &RoutingDecision,
     request_id: RequestId,
     ingress: Dialect,
     // The dialect the chosen ADAPTER speaks. See `adapter_for`.
     upstream_dialect: Dialect,
+    // Whether that adapter streamed the upstream regardless of the client's
+    // request, in which case `body` is not a JSON body at all.
+    always_streams: bool,
 ) -> Response {
-    // Framing does not come into it here: a non-streamed response is a single
-    // JSON body whatever the provider streams, so dialect alone decides.
-    //
-    // Verbatim when the dialects agree — the upstream's own bytes are the most
-    // faithful answer we can give, and re-serialising can only differ from it.
-    let out = if ingress == upstream_dialect {
+    // Verbatim when the dialects agree and the upstream actually sent a body
+    // — the upstream's own bytes are the most faithful answer we can give,
+    // and re-serialising can only differ from them. An adapter that streamed
+    // has no such bytes: what it has is events, and a body is rendered from
+    // those like any translated pair's.
+    let out = if ingress == upstream_dialect && !always_streams {
         body.clone()
     } else {
-        let id = request_id.to_string();
-        serde_json::from_slice::<serde_json::Value>(body).map_or_else(
-            |_| body.clone(),
-            |v| match ingress {
-                Dialect::OpenAIChatCompletions => {
-                    bytes::Bytes::from(oag_proto::openai::render_completion(&v, &id).to_string())
-                }
-                Dialect::AnthropicMessages => bytes::Bytes::from(
-                    oag_proto::anthropic::render_message_response(&v, &id).to_string(),
-                ),
-                Dialect::GeminiGenerateContent => {
-                    bytes::Bytes::from(oag_proto::gemini::render_message_response(&v).to_string())
-                }
-                Dialect::OpenAIResponses => {
-                    bytes::Bytes::from(oag_proto::responses::render_response(&v, &id).to_string())
-                }
-                // No converter for this dialect. Hand back the upstream's own
-                // body rather than something half-translated — but say so:
-                // a silent wildcard here is exactly how a missing arm went
-                // unnoticed once already, returning the wrong shape with
-                // nothing to show for it.
-                other => {
-                    tracing::warn!(
-                        ingress = ?other,
-                        upstream = ?upstream_dialect,
-                        "no non-streaming converter for this dialect pair; \
-                         returning the upstream body unchanged"
-                    );
-                    body.clone()
-                }
-            },
-        )
+        match render_collected(
+            events,
+            ingress,
+            &request_id.to_string(),
+            decision.model.id.as_str(),
+        ) {
+            Ok(out) => out,
+            Err(e) => return error_response(&e),
+        }
     };
 
     oag_headers(
@@ -945,9 +1064,10 @@ async fn forward_with_failover(
     decision: &RoutingDecision,
     canonical: &oag_proto::CanonicalRequest,
     session: &SessionKey,
-    request_id: RequestId,
+    dispatches: &mut Dispatches,
     channel: Option<oag_core::credential::CredentialKind>,
 ) -> Result<Attempt> {
+    let request_id = dispatches.request_id;
     let provider = decision.model.provider;
     let mut excluded: HashSet<AccountId> = HashSet::new();
     let mut last_error = Error::NoCredential { provider };
@@ -1002,8 +1122,9 @@ async fn forward_with_failover(
             }
         };
         let account = lease.account.account_id();
+        let attempt = dispatches.take();
 
-        match try_credential(state, decision, canonical, &lease, request_id).await {
+        match try_credential(state, decision, canonical, &lease, request_id, attempt).await {
             Outcome::Ok(attempt) => {
                 if switch > 0 {
                     metrics::counter!("oag_failovers_total").increment(1);
@@ -1028,6 +1149,34 @@ async fn forward_with_failover(
                 lease.release().await;
                 excluded.insert(account);
             }
+            // The credential generated an answer and the stream died before
+            // it was whole. The provider invoiced those tokens, and the retry
+            // on another credential used to be the only attempt metered, so
+            // the ledger saw one generation for every two paid for. Recorded
+            // before the lease goes, under its own dispatch number.
+            Outcome::Lost(e, accumulator) => {
+                tracing::warn!(%request_id, %account, error = %e, "switching credential after a lost answer");
+                let ctx = meter_context(
+                    auth,
+                    decision,
+                    &lease,
+                    request_id,
+                    dispatches.started,
+                    attempt,
+                );
+                meter::record_lost(state, &ctx, &accumulator, &e).await;
+                last_error = e;
+                lease.release().await;
+                excluded.insert(account);
+            }
+            // Not an error and not this credential's fault: move on without
+            // touching `last_error`, which still names whatever genuinely
+            // went wrong before.
+            Outcome::Raced => {
+                tracing::debug!(%request_id, %account, "half-open probe already taken; trying another credential");
+                lease.release().await;
+                excluded.insert(account);
+            }
         }
     }
 
@@ -1043,6 +1192,20 @@ enum Outcome {
     Ok(Box<Attempt>),
     /// Try a different credential.
     Switch(Error),
+    /// Try a different credential, and meter what this one generated first:
+    /// the answer was read far enough to cost something before it was lost.
+    Lost(Error, oag_proto::StreamAccumulator),
+    /// Another request took this credential's half-open probe between
+    /// selection and dispatch. Nothing was sent and nothing failed: try a
+    /// different credential, and say nothing about this one.
+    ///
+    /// Its own variant rather than `Switch(NoCredential)`, which is what it
+    /// was: that placeholder became `last_error`, overwriting the genuine
+    /// upstream error from the credential tried before — so a request that
+    /// failed on a real 5xx and then raced a probe told the caller "no
+    /// credential available", and sent whoever read the log to stare at a
+    /// healthy pool.
+    Raced,
     /// Stop switching credentials and try a better model instead.
     Escalate(Error),
     /// Stop: another credential cannot help.
@@ -1109,6 +1272,9 @@ async fn try_credential(
     canonical: &oag_proto::CanonicalRequest,
     lease: &select::Lease,
     request_id: RequestId,
+    // `attempt` in the ledger's sense — this request's dispatch ordinal — as
+    // distinct from the same-credential retry index the loop below counts.
+    ordinal: u8,
 ) -> Outcome {
     let provider = decision.model.provider;
     let account = lease.account.account_id();
@@ -1135,7 +1301,7 @@ async fn try_credential(
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let Some(mut dispatch) = Dispatch::claim(&state.breakers, account, now) else {
         // Raced: another request took the probe between the filter and here.
-        return Outcome::Switch(last);
+        return Outcome::Raced;
     };
 
     for attempt in 0..=state.config.gateway.same_account_retries {
@@ -1165,7 +1331,8 @@ async fn try_credential(
         dispatch.sent();
         match transport.execute(request).await {
             Ok(response) if response.status().is_success() => {
-                return succeeded(state, provider, lease, response, canonical.stream).await;
+                return succeeded(state, provider, lease, response, canonical.stream, ordinal)
+                    .await;
             }
 
             Ok(response) => {
@@ -1196,7 +1363,22 @@ async fn try_credential(
                 }
             }
 
-            // Nothing came back at all: connect, TLS, DNS, or a timeout.
+            // The provider accepted the connection and then said nothing for
+            // the whole headers deadline. That is not a transport blip worth
+            // a same-credential retry: it already cost the caller the full
+            // deadline, and two more attempts here would cost it twice more
+            // before another credential was tried. The error's own
+            // disposition says fail over like a 5xx, and until now nothing
+            // on this path read it.
+            Err(e @ Error::UpstreamTimeout { .. }) => {
+                let disposition = e.disposition();
+                tracing::warn!(%request_id, %account, error = %e, ?disposition, "upstream silent");
+                state.breakers.record_failure(account);
+                apply_disposition(state, account, disposition).await;
+                return Outcome::Switch(e);
+            }
+
+            // Nothing came back at all: connect, TLS, or DNS.
             Err(e) => {
                 last = e;
                 let retrying = attempt < state.config.gateway.same_account_retries;
@@ -1234,6 +1416,7 @@ fn stream_response(
     decision: &RoutingDecision,
     request_id: RequestId,
     started: Instant,
+    attempt: u8,
     ingress: Dialect,
     guard: crate::shutdown::InFlightGuard,
 ) -> Result<Response> {
@@ -1254,12 +1437,17 @@ fn stream_response(
     // response in memory.
     let (tx, rx) = mpsc::channel::<sse::Chunk>(64);
 
-    let idle = state.config.gateway.stream_idle_timeout;
-    let max = state.config.gateway.max_stream_duration;
+    let deadlines = sse::Deadlines {
+        idle: state.config.gateway.stream_idle_timeout,
+        max: state.config.gateway.max_stream_duration,
+        client_write: state.config.gateway.client_write_timeout,
+        keepalive: state.config.gateway.stream_keepalive_interval,
+    };
 
     // A streamed response is delivered as it arrives, so it is never abandoned
-    // and never retried: there is only ever one attempt.
-    let ctx = meter_context(auth, decision, &lease, request_id, started, 0);
+    // and never retried — but a credential may have been switched, and lost,
+    // before it, so its dispatch number is not always zero.
+    let ctx = meter_context(auth, decision, &lease, request_id, started, attempt);
 
     let state2 = Arc::clone(state);
 
@@ -1273,7 +1461,7 @@ fn stream_response(
         // is what keeps the credential's slot held for exactly as long as it is
         // really in use.
         let _guard = guard;
-        let outcome = sse::pump(response, adapter, tx, idle, max, egress).await;
+        let outcome = sse::pump(response, adapter, tx, deadlines, egress).await;
         lease.release().await;
         meter::record(&state2, &ctx, &outcome).await;
     });
@@ -1305,9 +1493,15 @@ async fn succeeded(
     lease: &select::Lease,
     response: reqwest::Response,
     stream: bool,
+    attempt: u8,
 ) -> Outcome {
     let account = lease.account.account_id();
-    let _ = oag_store::repo::touch_account(&state.db, account).await;
+    // No `touch_account` here any more. It was a Postgres write awaited
+    // between "the upstream answered" and "the first byte reaches the client"
+    // — on the one latency the user feels — to stamp `last_used_at`, which
+    // the ledger write now stamps in the same statement as the row. Recency
+    // for the scheduler's tie-break moves from "last dispatched to" to "last
+    // completed on", which is a finer definition of used anyway.
     state.breakers.record_success(account);
     metrics::counter!(
         "oag_requests_total",
@@ -1320,22 +1514,43 @@ async fn succeeded(
         return Outcome::Ok(Box::new(Attempt::Streaming {
             response,
             lease: lease.clone(),
+            attempt,
         }));
     }
-    // The upstream's dialect, which is what its body is in — not the client's,
-    // which `json_response` converts to.
-    //
-    // The ADAPTER's, not the provider's: a Codex seat is `Provider::OpenAI` and
-    // its body is Responses. Asking the provider parsed a Responses stream as
-    // Chat Completions, found nothing it recognised, and collected an empty
-    // body — the 200 that reached a client as "no completion in it".
-    let upstream_dialect = adapter_for(state, provider, &lease.account)
-        .map_or_else(|_| provider.native_dialect(), |a| a.dialect());
-    match sse::collect(response, upstream_dialect).await {
-        Ok((body, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
+    // The ADAPTER's facts, not the provider's: a Codex seat is
+    // `Provider::OpenAI`, speaks Responses, and streams whatever the client
+    // asked. Asking the provider parsed a Responses stream as Chat
+    // Completions, found nothing it recognised, and collected an empty body —
+    // the 200 that reached a client as "no completion in it". And asking the
+    // client's `stream` flag whether the upstream streamed read that stream
+    // as a JSON body, handed the raw `data:` lines back, and metered zero.
+    let adapter = match adapter_for(state, provider, &lease.account) {
+        Ok(adapter) => adapter,
+        Err(e) => return Outcome::Switch(e),
+    };
+    let collected = if adapter.always_streams() {
+        let idle = state.config.gateway.stream_idle_timeout;
+        let max = state.config.gateway.max_stream_duration;
+        match sse::collect_stream(response, adapter, idle, max).await {
+            Ok((events, accumulator)) => Ok((bytes::Bytes::new(), events, accumulator)),
+            // The stream failed after the provider had generated some of the
+            // answer: that much is invoiced whether or not it was whole, so
+            // it goes out with the error rather than being dropped with it.
+            Err((e, accumulator)) if accumulator.usage().output_tokens > 0 => {
+                return Outcome::Lost(e, accumulator);
+            }
+            Err((e, _)) => Err(e),
+        }
+    } else {
+        sse::collect(response, adapter.dialect()).await
+    };
+    match collected {
+        Ok((body, events, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
             body,
+            events,
             accumulator,
             lease: lease.clone(),
+            attempt,
         })),
         Err(e) => Outcome::Switch(e),
     }
@@ -1537,6 +1752,11 @@ pub(crate) fn error_response(e: &Error) -> Response {
             "rate_limit_error",
             e.to_string(),
         ),
+        // 503 with its own kind: a client should retry, and a balancer with
+        // another replica behind it will land the retry somewhere with room.
+        // `at_capacity` means every credential is busy and waiting helps;
+        // this means this replica is busy and *another* one helps.
+        Error::Overloaded => (StatusCode::SERVICE_UNAVAILABLE, "overloaded", e.to_string()),
         Error::UnsupportedAction { .. } => (StatusCode::NOT_FOUND, "not_found", e.to_string()),
         Error::NoCredential { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1586,6 +1806,15 @@ pub(crate) fn error_response(e: &Error) -> Response {
         }
         Error::Serde(_) => (StatusCode::BAD_REQUEST, "invalid_request", e.to_string()),
         Error::StreamIdle(_) => (StatusCode::GATEWAY_TIMEOUT, "stream_idle", e.to_string()),
+        // Its own kind, not `stream_idle`: one is a response that went quiet,
+        // the other is a response that never began. Both are 504, and a
+        // client retries either — but an operator reading the log needs to
+        // know which half of the provider is broken.
+        Error::UpstreamTimeout { .. } => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "upstream_timeout",
+            e.to_string(),
+        ),
         _ => {
             tracing::error!(error = %e, "internal error");
             (
@@ -1634,6 +1863,10 @@ pub(crate) fn error_response(e: &Error) -> Response {
             retry_after,
             ..
         } => Some(retry_after.unwrap_or(std::time::Duration::from_secs(1))),
+        // Shed load clears in the time it takes one admitted request to
+        // finish; a second is the honest lower bound, and a balancer retrying
+        // elsewhere needs no more of a hint than "not immediately, here".
+        Error::Overloaded => Some(std::time::Duration::from_secs(1)),
         _ => None,
     };
     if let Some(wait) = wait {
@@ -2020,6 +2253,109 @@ mod tests {
         assert_eq!(codex.provider(), oag_core::Provider::OpenAI);
         assert_eq!(codex.dialect(), Dialect::OpenAIResponses);
         assert_ne!(codex.dialect(), codex.provider().native_dialect());
+        // And that it streams regardless of the client: the third adapter
+        // fact the response path has to ask for rather than assume.
+        assert!(codex.always_streams());
+        assert!(!oag_upstream::AnthropicAdapter::default().always_streams());
+    }
+
+    #[test]
+    fn every_client_dialect_gets_a_body_with_the_answer_in_it() {
+        // THE MATRIX. One answer as canonical events — text, a whole tool
+        // call, a stop, usage — rendered for each client dialect, then read
+        // back by that dialect's own reader. Every body must carry the text
+        // and the tool call and non-zero usage. Before the hub, the converter
+        // was picked by the client's dialect and handed whatever the upstream
+        // sent, and for eight of the twelve pairs that body had a shape the
+        // converter did not read: a well-formed, fully-billed, empty 200.
+        use oag_proto::{StopReason, StreamEvent};
+        let events = [
+            StreamEvent::UsageUpdate {
+                usage: oag_router::Usage {
+                    input_tokens: 1000,
+                    cache_read_tokens: 200,
+                    ..oag_router::Usage::default()
+                },
+            },
+            StreamEvent::TextDelta {
+                text: "Reading it now.".to_owned(),
+            },
+            StreamEvent::ToolUseStart {
+                id: "toolu_1".to_owned(),
+                name: "read_file".to_owned(),
+            },
+            StreamEvent::ToolUseDelta {
+                id: "toolu_1".to_owned(),
+                partial_json: r#"{"path":"a.rs"}"#.to_owned(),
+            },
+            StreamEvent::ToolUseEnd {
+                id: "toolu_1".to_owned(),
+            },
+            StreamEvent::Stop {
+                reason: StopReason::ToolUse,
+                usage: oag_router::Usage {
+                    output_tokens: 42,
+                    ..oag_router::Usage::default()
+                },
+            },
+        ];
+
+        for ingress in [
+            Dialect::AnthropicMessages,
+            Dialect::OpenAIChatCompletions,
+            Dialect::GeminiGenerateContent,
+            Dialect::OpenAIResponses,
+        ] {
+            let bytes = render_collected(&events, ingress, "req1", "oag/auto")
+                .unwrap_or_else(|e| panic!("{ingress:?}: {e}"));
+            let v: serde_json::Value = serde_json::from_slice(&bytes)
+                .unwrap_or_else(|e| panic!("{ingress:?}: not JSON: {e}"));
+
+            // Read back with the dialect's own reader — the same one the
+            // gateway would use if this body came from an upstream.
+            let back = match ingress {
+                Dialect::AnthropicMessages => oag_proto::anthropic::parse_response(&v),
+                Dialect::OpenAIChatCompletions => oag_proto::openai::parse_response(&v),
+                Dialect::GeminiGenerateContent => oag_proto::gemini::parse_response(&v),
+                Dialect::OpenAIResponses => oag_proto::responses::parse_response(&v),
+                _ => unreachable!(),
+            };
+            let text: String = back
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::TextDelta { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "Reading it now.", "{ingress:?} lost the text: {v}");
+            assert!(
+                back.iter().any(|e| matches!(
+                    e, StreamEvent::ToolUseStart { name, .. } if name == "read_file"
+                )),
+                "{ingress:?} lost the tool call: {v}"
+            );
+            let mut acc = oag_proto::StreamAccumulator::new();
+            for e in &back {
+                acc.observe(e);
+            }
+            assert!(
+                acc.usage().output_tokens > 0,
+                "{ingress:?} lost the usage: {v}"
+            );
+            assert_eq!(acc.quality_gate(), None, "{ingress:?}: {v}");
+        }
+    }
+
+    #[test]
+    fn a_client_dialect_with_no_converter_is_an_error_not_the_upstream_body() {
+        // `Dialect` is non-exhaustive; nothing constructs an unknown one here,
+        // so what this pins is that an *empty* answer still renders as a
+        // well-formed body rather than a crash — the crash being the one
+        // silence worse than the empty 200.
+        let bytes =
+            render_collected(&[], Dialect::OpenAIChatCompletions, "r", "m").expect("renders");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(v["choices"].is_array());
     }
 
     /// A state that dials nothing: `Db::connect` builds a lazy pool and
@@ -2049,10 +2385,9 @@ security:
             key_floor_tier: None,
             admin: false,
             quota_usd: None,
-            spent_usd: rust_decimal::Decimal::ZERO,
             principal_budget_usd: None,
             principal_hard_stop_multiple: rust_decimal::Decimal::ONE,
-            principal_spent_usd: rust_decimal::Decimal::ZERO,
+            key_hash: String::new(),
         }
     }
 
@@ -2075,6 +2410,7 @@ security:
             &decision_for(oag_core::Provider::Vertex),
             RequestId::new(),
             Instant::now(),
+            0,
             Dialect::AnthropicMessages,
             state.lifecycle.track(),
         );
@@ -2107,6 +2443,7 @@ security:
             &decision_for(oag_core::Provider::Anthropic),
             RequestId::new(),
             Instant::now(),
+            0,
             Dialect::AnthropicMessages,
             state.lifecycle.track(),
         );

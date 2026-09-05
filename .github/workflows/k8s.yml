@@ -19,6 +19,11 @@ on:
     # can move underneath us without any file here changing.
     - cron: "17 3 * * *"
 
+# Read-only: this job builds an image into a local kind cluster and pushes
+# nothing. See ci.yml for why the token is scoped and not persisted.
+permissions:
+  contents: read
+
 jobs:
   drain:
     runs-on: ubuntu-latest
@@ -29,6 +34,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: helm/kind-action@v1
         with:
@@ -47,6 +54,13 @@ jobs:
           kind version
           helm version --short
           kubectl version --client -o yaml | head -3
+
+      # A one-second render check ahead of the ten-minute cluster job. The kind
+      # step below installs the chart in `inCluster` mode only, which is how an
+      # init container that rendered an empty host in the *default* mode shipped
+      # without anything noticing. This renders every mode, no cluster needed.
+      - name: the chart renders in every data mode
+        run: ./deploy/test/helm-render-verify.sh
 
       - name: rolling restart severs no stream
         env:

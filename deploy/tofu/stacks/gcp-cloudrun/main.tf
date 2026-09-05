@@ -56,8 +56,11 @@ locals {
   vpc_subnet = var.data_mode == "managed" ? var.vpc_subnet : ""
 }
 
-# Secrets live in Secret Manager, never in the service description and never in
-# Terraform state as plain values.
+# Secrets live in Secret Manager, never in the service description. They ARE in
+# this stack's state: `google_secret_manager_secret_version.secret_data` holds
+# the value (marked sensitive, which hides it from plans, not from the state
+# file). Protect the state backend accordingly, or create the versions out of
+# band and pass their names in.
 resource "google_secret_manager_secret" "this" {
   for_each  = toset(["database-url", "redis-url", "signing-secret", "credential-kek"])
   secret_id = "${var.name}-${each.key}"
@@ -107,11 +110,22 @@ module "gateway" {
   image      = var.image
   vpc_subnet = local.vpc_subnet
 
+  # Secret AND version. The version is what rolls the service when a value
+  # changes: the data module composes the Memorystore AUTH string into the
+  # Redis URL, so turning AUTH on writes a new version, and a template that
+  # read `latest` would leave every running instance on the old, now
+  # password-less URL until something else forced a revision.
   secret_env = {
-    OAG_DATABASE__URL            = google_secret_manager_secret.this["database-url"].secret_id
-    OAG_REDIS__URL               = google_secret_manager_secret.this["redis-url"].secret_id
-    OAG_SECURITY__SIGNING_SECRET = google_secret_manager_secret.this["signing-secret"].secret_id
-    OAG_SECURITY__CREDENTIAL_KEK = google_secret_manager_secret.this["credential-kek"].secret_id
+    for key, env in {
+      "database-url"   = "OAG_DATABASE__URL"
+      "redis-url"      = "OAG_REDIS__URL"
+      "signing-secret" = "OAG_SECURITY__SIGNING_SECRET"
+      "credential-kek" = "OAG_SECURITY__CREDENTIAL_KEK"
+    } :
+    env => {
+      secret  = google_secret_manager_secret.this[key].secret_id
+      version = google_secret_manager_secret_version.this[key].version
+    }
   }
 
   env = var.gateway_env
@@ -125,14 +139,21 @@ module "gateway" {
   service_account_email = google_service_account.gateway.email
   run_migrations        = var.run_migrations
 
-  # Both are load-bearing for migration ordering; neither is redundant. The
-  # module only ever depended on the secret *containers* via `.secret_id`, never
-  # on their versions — and the job's `secret_key_ref { version = "latest" }`
-  # resolves to nothing when no version exists yet.
-  depends_on = [
-    google_secret_manager_secret_version.this,
-    time_sleep.iam_propagation,
-  ]
+  # The secret versions are already an ordering: `secret_env` names each one
+  # by number, so the module cannot be built before they exist. IAM
+  # propagation is not visible to the graph at all, hence the sleep.
+  depends_on = [time_sleep.iam_propagation]
+}
+
+# The invoker grant that used to be a manual console step. See
+# `invoker_members` for what it publishes and why it is empty by default.
+resource "google_cloud_run_v2_service_iam_member" "invoker" {
+  for_each = toset(var.invoker_members)
+  project  = var.project_id
+  location = var.region
+  name     = module.gateway.service_name
+  role     = "roles/run.invoker"
+  member   = each.value
 }
 
 resource "google_secret_manager_secret_iam_member" "read" {

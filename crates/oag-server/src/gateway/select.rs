@@ -235,31 +235,20 @@ pub async fn lease(
         .collect();
 
     while !remaining.is_empty() {
-        let mut candidates = Vec::with_capacity(remaining.len());
-        for row in &remaining {
-            // Skip credentials this replica has watched fail repeatedly.
-            //
-            // This has to happen *before* the cascade, not inside it: a broken
-            // credential fails fast, so it always has the lowest in-flight
-            // count, so the least-loaded stage actively prefers it. Filtering
-            // afterwards would be too late.
-            //
-            // A read, deliberately. We are asking about every candidate and
-            // will send to one; spending a half-open probe here would spend it
-            // on credentials this request never touches. The probe is claimed
-            // where the request is dispatched.
-            if !state.breakers.permits(row.account_id(), now) {
-                continue;
-            }
-            if let Some(c) = candidate_for(state, row, now).await {
-                candidates.push(c);
-            }
-        }
+        let candidates = candidates_for(state, &remaining, now).await;
 
         // Random per attempt: without it every replica reading the same
         // snapshot at the same instant picks the same credential and stampedes.
         let tie_breaker = fastrand_u64();
         let Some(selection) = oag_pool::select(&candidates, now, tie_breaker) else {
+            if let Some(full) = every_candidate_is_full(&candidates, now) {
+                metrics::counter!("oag_at_capacity_total", "provider" => provider.as_str())
+                    .increment(1);
+                return Err(Error::AtCapacity {
+                    provider,
+                    candidates: full,
+                });
+            }
             return Err(none_left());
         };
 
@@ -272,12 +261,22 @@ pub async fn lease(
         };
 
         let limit = u32::try_from(row.max_concurrency).unwrap_or(0);
-        if state
+        let acquired = match state
             .cache
             .acquire_slot(selection.account, request_id, limit, SLOT_TTL)
             .await
-            .unwrap_or(false)
         {
+            Ok(acquired) => acquired,
+            // Fail OPEN. `unwrap_or(false)` here turned a Redis outage into
+            // "lost the race" for every candidate in turn, and the request
+            // into `AtCapacity` — a full product outage reported as a sizing
+            // problem. Admit, and count the admission.
+            Err(e) => {
+                slot_accounting_degraded("acquire", &e);
+                true
+            }
+        };
+        if acquired {
             let _ = state
                 .cache
                 .sticky_set(&sticky_key, selection.account, STICKY_TTL)
@@ -346,7 +345,7 @@ async fn try_pinned(
     if !is_eligible(&candidate, now) || !state.breakers.permits(pinned, now) {
         return None;
     }
-    let acquired = state
+    let acquired = match state
         .cache
         .acquire_slot(
             candidate.account,
@@ -355,7 +354,15 @@ async fn try_pinned(
             SLOT_TTL,
         )
         .await
-        .unwrap_or(false);
+    {
+        Ok(acquired) => acquired,
+        // Same policy as the cascade: an unanswerable Redis admits. The pin
+        // was the right credential a moment ago; a blink does not change that.
+        Err(e) => {
+            slot_accounting_degraded("acquire", &e);
+            true
+        }
+    };
 
     if acquired {
         metrics::counter!("oag_selection_total", "stage" => "sticky").increment(1);
@@ -366,15 +373,66 @@ async fn try_pinned(
 }
 
 async fn candidate_for(state: &AppState, row: &AccountRow, _now: i64) -> Option<Candidate> {
-    let in_flight = state
-        .cache
-        .slots_in_use(row.account_id())
-        .await
-        .unwrap_or(0);
+    // Counted by the same expiry the acquire trims by, so a leaked slot stops
+    // counting when it would have been swept — rather than until the key
+    // itself expires, twice the TTL later, with the credential reading as
+    // full the whole time and nothing acquiring on it to sweep it.
+    let in_flight = match state.cache.slots_in_use(row.account_id(), SLOT_TTL).await {
+        Ok(n) => n,
+        // The count is what the scheduler ranks by; without it every candidate
+        // ranks as idle, which is the right degraded answer. Say so, rather
+        // than pass it off as an idle credential.
+        Err(e) => {
+            slot_accounting_degraded("count", &e);
+            0
+        }
+    };
+    // The gauge `metrics::describe` has declared since the beginning and
+    // nothing ever set. Set here, from the number the scheduler is about to
+    // rank by, because this is the one place the answer is already in hand.
+    metrics::gauge!("oag_slots_in_use", "account" => row.name.clone()).set(f64::from(in_flight));
     row.to_candidate(in_flight, 0)
 }
 
-fn is_eligible(c: &Candidate, now: i64) -> bool {
+/// Redis could not answer a slot question.
+///
+/// Counted and logged rather than folded into `false`/`0`, which is what it
+/// used to be: an unreachable Redis read as "lost the race for the last slot"
+/// on every candidate, every candidate was dropped, and the request failed
+/// `AtCapacity` — sending the operator to raise `max_concurrency` on a pool
+/// with nothing in flight. Selection now admits the request instead and
+/// counts the admission, because the rate limiter beside it has always failed
+/// open for the same reason: coordination is a courtesy, and refusing all
+/// traffic because the coordination store blinked trades a real outage for a
+/// theoretical oversubscription.
+fn slot_accounting_degraded(op: &'static str, e: &Error) {
+    use std::sync::atomic::AtomicU64;
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    metrics::counter!("oag_slot_accounting_degraded_total", "op" => op).increment(1);
+    // Every request asks a slot question or two, so an outage is thousands of
+    // these a minute. The first, and then one in a hundred, at warn; the rest
+    // at debug. The counter above is the signal; the log line is the context.
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed);
+    if seen.is_multiple_of(100) {
+        tracing::warn!(
+            error = %e, op, occurrences = seen + 1,
+            "slot accounting unavailable; admitting without it"
+        );
+    } else {
+        tracing::debug!(error = %e, op, "slot accounting unavailable; admitting without it");
+    }
+}
+
+/// Whether the credential could take a request at all, before asking
+/// whether it has room for one: schedulable, not cooling, not rate-limited,
+/// not parked behind its reserve.
+///
+/// Apart from the concurrency test on purpose. `every_candidate_is_full`
+/// needs "live and full", and testing that through `is_eligible` — which
+/// requires a free slot — is asking for a candidate that both has and has
+/// not got one. That predicate was a contradiction, so a saturated pool
+/// answered `no_credential` and `oag_at_capacity_total` never moved.
+fn is_live(c: &Candidate, now: i64) -> bool {
     c.schedulable
         && c.cooldown_until.is_none_or(|t| t <= now)
         && c.rate_limited_until.is_none_or(|t| t <= now)
@@ -385,7 +443,10 @@ fn is_eligible(c: &Candidate, now: i64) -> bool {
         // everyone except the traffic already drinking from the seat, which is
         // all of the traffic that matters.
         && !oag_pool::held_by_reserve(c.usage_remaining_pct, c.usage_reserve_pct)
-        && c.in_flight < c.max_concurrency
+}
+
+fn is_eligible(c: &Candidate, now: i64) -> bool {
+    is_live(c, now) && c.in_flight < c.max_concurrency
 }
 
 /// The reserve to name when a request finds nothing to run on, if a reserve is
@@ -407,6 +468,75 @@ fn reserve_holding_back(rows: &[AccountRow]) -> Option<i16> {
     rows.iter().filter_map(|r| r.usage_reserve_pct).max()
 }
 
+/// Everything local first, then one round trip for whoever survives.
+///
+/// The breaker filter has to happen *before* the cascade, not inside it: a
+/// broken credential fails fast, so it always has the lowest in-flight count,
+/// so the least-loaded stage actively prefers it. Filtering afterwards would
+/// be too late. A read, deliberately — we are asking about every candidate
+/// and will send to one; spending a half-open probe here would spend it on
+/// credentials this request never touches. The probe is claimed where the
+/// request is dispatched.
+///
+/// The row-local eligibility check (schedulable, cooling, rate-limited,
+/// reserved) is on the same struct and costs nothing, so it goes ahead of the
+/// Redis count too. Before, one `ZCARD` per row was awaited in sequence and
+/// then most of the answers were discarded by a predicate the row could have
+/// answered itself.
+async fn candidates_for(state: &AppState, remaining: &[&AccountRow], now: i64) -> Vec<Candidate> {
+    let probe: Vec<&AccountRow> = remaining
+        .iter()
+        .copied()
+        .filter(|r| state.breakers.permits(r.account_id(), now))
+        .filter(|r| r.to_candidate(0, 0).is_some_and(|c| is_eligible(&c, now)))
+        .collect();
+    let ids: Vec<AccountId> = probe.iter().map(|r| r.account_id()).collect();
+    let (counts, counted) = match state.cache.slots_in_use_many(&ids, SLOT_TTL).await {
+        Ok(counts) if counts.len() == ids.len() => (counts, true),
+        Ok(_) => {
+            slot_accounting_degraded("count", &Error::Internal("short pipeline reply".to_owned()));
+            (vec![0; ids.len()], false)
+        }
+        Err(e) => {
+            slot_accounting_degraded("count", &e);
+            (vec![0; ids.len()], false)
+        }
+    };
+    let mut candidates = Vec::with_capacity(probe.len());
+    for (row, in_flight) in probe.iter().zip(counts) {
+        // Only a count that was read. The degraded zero is the right answer
+        // for admission and the wrong one to publish: a dashboard reading it
+        // would show every credential idle during the one outage in which
+        // nothing knows. The gauge keeps its last real value instead.
+        if counted {
+            metrics::gauge!("oag_slots_in_use", "account" => row.name.clone())
+                .set(f64::from(in_flight));
+        }
+        if let Some(c) = row.to_candidate(in_flight, 0) {
+            candidates.push(c);
+        }
+    }
+    candidates
+}
+
+/// How many candidates there were, when nothing was selectable because every
+/// one of them was eligible and simply full. `None` for any other nothing.
+///
+/// Says WHICH nothing. A pool at its concurrency limit is a wait, not a
+/// configuration problem, and it used to exit selection as `no_credential`
+/// with `oag_at_capacity_total` flat — the same signal as a route with no
+/// credentials at all, pointing the operator at the wrong fix. Only
+/// credentials that were built as candidates are classified: a breaker-skipped
+/// one never reached the list, and `breaker-verify.sh` pins that an open
+/// breaker still answers `no_credential`.
+fn every_candidate_is_full(candidates: &[Candidate], now: i64) -> Option<usize> {
+    let full = candidates
+        .iter()
+        .filter(|c| is_live(c, now) && c.in_flight >= c.max_concurrency)
+        .count();
+    (full > 0 && full == candidates.len()).then_some(full)
+}
+
 /// A cheap non-cryptographic random.
 ///
 /// Only used to spread ties across equally-good credentials, so it needs to be
@@ -415,13 +545,20 @@ fn reserve_holding_back(rows: &[AccountRow]) -> Option<i16> {
 fn fastrand_u64() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0x2545_F491_4F6C_DD1D);
-    // xorshift64*, advanced atomically so concurrent callers get distinct draws.
-    let mut x = STATE.load(Ordering::Relaxed);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    x
+    // xorshift64, advanced with one atomic read-modify-write so concurrent
+    // callers get distinct draws. The comment above used to say "atomically"
+    // over a separate load and store, which is two callers reading the same
+    // state and both storing the same successor — the exact same draw, on the
+    // exact code path whose only job is to make two replicas differ.
+    let mut next = 0u64;
+    let _ = STATE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mut x| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        next = x;
+        Some(x)
+    });
+    next
 }
 
 /// A slot store that counts releases instead of dialling Redis, and a lease
@@ -527,6 +664,60 @@ mod tests {
     use super::testing::{CountingSlots, lease as test_lease};
     use super::*;
 
+    /// A state whose Redis is a port nothing listens on: every slot question
+    /// fails at connect, immediately. `Db::connect` is lazy and never dialled.
+    fn dead_redis_state() -> Arc<AppState> {
+        let src = r#"
+database:
+  url: "postgres://oag:oag@127.0.0.1:1/oag"
+redis:
+  url: "redis://127.0.0.1:1"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+"#;
+        let config = oag_core::config::Config::from_yaml(src).expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        Arc::new(AppState::new(config, db, cache).expect("state"))
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_redis_reads_as_idle_not_as_full() {
+        // THE OUTAGE. `slots_in_use(..).unwrap_or(0)` was already the right
+        // degraded answer for the *count*; the acquire beside it read
+        // `unwrap_or(false)` — "lost the race" — and every candidate lost, so
+        // every request failed `AtCapacity` while Redis was down. The count
+        // path is the half this harness can reach without Postgres: a dead
+        // Redis must yield a candidate, ranked idle, and not an error.
+        let state = dead_redis_state();
+        let row = super::testing::account("seat", "api_key");
+
+        // The cascade's reader, which pipelines every survivor's count in
+        // one round trip. `candidate_for` beside it serves only the pin.
+        let candidates = candidates_for(&state, &[&row], 0).await;
+        let [candidate] = candidates.as_slice() else {
+            panic!("one row in, one candidate out; got {}", candidates.len());
+        };
+        assert_eq!(candidate.in_flight, 0, "unknown is idle, not full");
+        assert!(is_eligible(candidate, 0));
+
+        let candidate = candidate_for(&state, &row, 0)
+            .await
+            .expect("the pin's reader degrades the same way");
+        assert_eq!(candidate.in_flight, 0);
+
+        // And the acquire reports the failure as an error the caller can
+        // choose to admit on — not as `false`, which is what turned a Redis
+        // blink into a refusal of every credential in turn.
+        let err = state
+            .cache
+            .acquire_slot(row.account_id(), "req", 1, SLOT_TTL)
+            .await
+            .expect_err("a dead Redis is an error, not a lost race");
+        assert!(err.to_string().contains("redis"), "{err}");
+    }
+
     #[tokio::test]
     async fn a_dropped_lease_hands_its_slot_back() {
         // The whole point of the guard: an early return anywhere between
@@ -598,6 +789,49 @@ mod tests {
         let mut off = base;
         off.schedulable = false;
         assert!(!is_eligible(&off, 100));
+    }
+
+    #[test]
+    fn a_pool_that_is_live_and_full_is_classified_as_full() {
+        // The predicate used to be `is_eligible && in_flight >= max`, and
+        // `is_eligible` already requires `in_flight < max`: no candidate
+        // could ever satisfy it, so a saturated pool exited selection as
+        // `no_credential` with `oag_at_capacity_total` flat — the same
+        // signal as a route with no credentials at all.
+        let base = Candidate {
+            account: AccountId(uuid::Uuid::nil()),
+            provider: Provider::XAI,
+            priority: 0,
+            max_concurrency: 2,
+            in_flight: 2,
+            waiting: 0,
+            schedulable: true,
+            cooldown_until: None,
+            rate_limited_until: None,
+            window_resets_at: None,
+            usage_remaining_pct: None,
+            usage_reserve_pct: None,
+            last_used_at: 0,
+        };
+        let mut other = base.clone();
+        other.account = AccountId(uuid::Uuid::new_v4());
+        assert_eq!(
+            every_candidate_is_full(&[base.clone(), other.clone()], 100),
+            Some(2),
+            "both live, both at their limit"
+        );
+
+        // One of them cooling is not a capacity problem: it resolves on its
+        // own, and the operator must not be sent to raise a limit.
+        other.cooldown_until = Some(200);
+        assert_eq!(every_candidate_is_full(&[base.clone(), other], 100), None);
+
+        // And one with a free slot is not full at all.
+        let mut roomy = base;
+        roomy.in_flight = 1;
+        assert_eq!(every_candidate_is_full(&[roomy], 100), None);
+
+        assert_eq!(every_candidate_is_full(&[], 100), None);
     }
 
     #[test]

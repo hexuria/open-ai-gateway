@@ -64,6 +64,21 @@ pub struct ServerConfig {
     /// ceiling; a deployment that genuinely needs more can raise it, knowing
     /// what it is multiplying by its concurrency.
     pub max_body_bytes: usize,
+    /// Ceiling on inference requests in flight on this replica. Past it, a
+    /// request is refused with `overloaded` rather than queued.
+    ///
+    /// The memory bound is this times `max_body_bytes`, roughly: a request
+    /// holds its body through parsing and translation, and nothing else
+    /// bounded how many did so at once. The Postgres pool has sixteen
+    /// connections and a ten-second acquire timeout, so without this a flood
+    /// — authenticated or not — queued everyone at `acquire()` while the
+    /// queued requests kept their memory. Shedding early keeps the replica
+    /// answering the requests it has already admitted.
+    ///
+    /// Sized for a 1 Gi replica and the default 32 MiB body: the product is
+    /// what an all-maximum-size flood could hold, and real bodies are
+    /// kilobytes. A larger replica or a smaller body limit can raise this.
+    pub max_in_flight: usize,
     /// Serve admin routes on the public listener instead of their own.
     ///
     /// Off by default, because two listeners is the safer shape: it makes "do
@@ -93,6 +108,7 @@ impl Default for ServerConfig {
             header_read_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_mins(2),
             max_body_bytes: 32 * 1024 * 1024,
+            max_in_flight: 64,
             single_listener: false,
         }
     }
@@ -104,10 +120,24 @@ pub struct DatabaseConfig {
     pub url: String,
     #[serde(default = "default_db_pool")]
     pub max_connections: u32,
+    /// Ceiling on any one statement, applied per connection as it opens.
+    ///
+    /// A primary that stops answering holds a query rather than failing it,
+    /// and a pool of held queries refuses every new request while keeping
+    /// every slot. This turns that into an error the pool recovers from. The
+    /// dashboard's whole-history aggregates over a ledger of millions of rows
+    /// are the one thing likely to reach it; those want a rollup, not a longer
+    /// timeout.
+    #[serde(default = "default_statement_timeout", with = "humantime_secs")]
+    pub statement_timeout: Duration,
 }
 
 const fn default_db_pool() -> u32 {
     16
+}
+
+const fn default_statement_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
 fn default_bedrock_region() -> String {
@@ -200,6 +230,35 @@ pub struct GatewayConfig {
     /// we stop accepting work and give in-flight streams this long to finish.
     #[serde(with = "humantime_secs")]
     pub max_stream_duration: Duration,
+    /// How long an upstream may take to send its response *headers* after
+    /// the connection is made.
+    ///
+    /// The one deadline the request path had none of. The client's connect
+    /// timeout ends at the handshake; `stream_idle_timeout` starts only once a
+    /// response exists. Between the two, a provider that accepted and then
+    /// stalled held the request, its credential slot and its in-flight guard
+    /// indefinitely, and the breaker never learned of it because nothing had
+    /// failed. This is not a total-response timeout — a streamed completion
+    /// legitimately runs for minutes, and the deadline ends the moment
+    /// headers arrive — so it can be generous: it is a backstop against
+    /// silence, not a latency target.
+    #[serde(with = "humantime_secs")]
+    pub upstream_response_timeout: Duration,
+    /// How long a client may go without reading its stream before the pump
+    /// stops waiting for it.
+    ///
+    /// The stream is pushed through a bounded channel the client's response
+    /// body drains. That bound is a memory bound, not a time bound: a client
+    /// that stops reading fills it, and the send then parks the pump task —
+    /// past `stream_idle_timeout`, which measures the upstream, and past
+    /// `max_stream_duration`, which is only checked at the top of a loop the
+    /// parked task never reaches. The task held the credential's slot, the
+    /// upstream socket and the shutdown guard for as long as the client cared
+    /// to keep the connection open without reading. A send that waits this
+    /// long is treated exactly like a client that hung up: the pump keeps
+    /// draining the upstream for accounting and stops writing to the client.
+    #[serde(with = "humantime_secs")]
+    pub client_write_timeout: Duration,
     /// Attempts against one credential before failing over to another.
     pub same_account_retries: u8,
     /// Credentials to try before giving up on the request.
@@ -293,6 +352,16 @@ impl Default for GatewayConfig {
             stream_idle_timeout: Duration::from_mins(3),
             stream_keepalive_interval: Duration::from_secs(10),
             max_stream_duration: Duration::from_mins(30),
+            // Generous on purpose: a slow-but-healthy provider under load can
+            // take tens of seconds to begin a large reasoning response, and
+            // failing those over is worse than waiting. What this bounds is a
+            // provider that will never answer.
+            upstream_response_timeout: Duration::from_secs(90),
+            // A client that has not read a single chunk in a minute is not
+            // slow, it is gone. Long enough that a paused consumer behind a
+            // busy proxy is not cut off; short enough that an abandoned
+            // connection does not hold a slot for the stream's full ceiling.
+            client_write_timeout: Duration::from_mins(1),
             same_account_retries: 2,
             max_account_switches: 3,
             // Generous: it is a backstop against an unbounded wait, not a
@@ -398,6 +467,42 @@ impl Config {
                 "gateway.max_stream_duration must exceed gateway.stream_idle_timeout".to_owned(),
             ));
         }
+        // Zero would mean "no deadline", which is the condition this setting
+        // exists to remove — and `tokio::time::timeout(0)` would refuse every
+        // request instead. Neither is a value anyone means.
+        if self.gateway.upstream_response_timeout.is_zero() {
+            return Err(crate::Error::Config(
+                "gateway.upstream_response_timeout must be positive".to_owned(),
+            ));
+        }
+        if self.gateway.client_write_timeout.is_zero() {
+            return Err(crate::Error::Config(
+                "gateway.client_write_timeout must be positive".to_owned(),
+            ));
+        }
+        // The period of a live interval. Zero is clamped in the pump so it
+        // cannot panic, but a one-millisecond keepalive is a stream of
+        // comments nobody meant; and one at or past the idle watchdog keeps
+        // nothing alive, because the watchdog fires first.
+        if self.gateway.stream_keepalive_interval.is_zero() {
+            return Err(crate::Error::Config(
+                "gateway.stream_keepalive_interval must be positive".to_owned(),
+            ));
+        }
+        if self.gateway.stream_keepalive_interval >= self.gateway.stream_idle_timeout {
+            return Err(crate::Error::Config(
+                "gateway.stream_keepalive_interval must be shorter than gateway.stream_idle_timeout"
+                    .to_owned(),
+            ));
+        }
+        // A ceiling of zero has no permit to give: every inference request
+        // is shed while both health probes, which sit outside the ceiling by
+        // design, stay green. Not a value anyone means.
+        if self.server.max_in_flight == 0 {
+            return Err(crate::Error::Config(
+                "server.max_in_flight must be positive".to_owned(),
+            ));
+        }
         Ok(())
     }
 }
@@ -493,6 +598,84 @@ security:
         );
         // And still large enough for the payloads this gateway exists to carry.
         assert!(cfg.server.max_body_bytes >= 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_upstream_response_deadline_defaults_on_and_cannot_be_zero() {
+        // Nothing bounded the wait for a provider's response headers: the
+        // connect timeout ended at the handshake and the idle watchdog only
+        // started once a response existed. A default of zero here would
+        // re-open that gap while looking configured.
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(!cfg.gateway.upstream_response_timeout.is_zero());
+        assert!(
+            cfg.gateway.upstream_response_timeout < cfg.gateway.max_stream_duration,
+            "a headers deadline longer than the whole stream's ceiling bounds nothing"
+        );
+
+        let zero = format!("{MINIMAL}\ngateway:\n  upstream_response_timeout: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("zero is refused");
+        assert!(
+            err.to_string().contains("upstream_response_timeout"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_keepalive_period_cannot_be_zero_or_outlast_the_idle_watchdog() {
+        // Until the pump emitted keepalives nothing read this field, so
+        // nothing checked it. Now it is the period of a live interval.
+        let zero = format!("{MINIMAL}\ngateway:\n  stream_keepalive_interval: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("zero is refused");
+        assert!(
+            err.to_string().contains("stream_keepalive_interval"),
+            "{err}"
+        );
+
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        let idle = cfg.gateway.stream_idle_timeout.as_secs();
+        let late = format!("{MINIMAL}\ngateway:\n  stream_keepalive_interval: {idle}\n");
+        let err = Config::from_yaml(&late).expect_err("a keepalive the watchdog beats is refused");
+        assert!(err.to_string().contains("stream_idle_timeout"), "{err}");
+    }
+
+    #[test]
+    fn an_in_flight_ceiling_of_zero_is_refused() {
+        // Zero permits sheds every inference request forever while both
+        // health probes report healthy: a blackhole that looks configured.
+        let zero = format!("{MINIMAL}\nserver:\n  max_in_flight: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("zero is refused");
+        assert!(err.to_string().contains("max_in_flight"), "{err}");
+    }
+
+    #[test]
+    fn the_client_write_deadline_defaults_on_and_cannot_be_zero() {
+        // The other half of the same gap, on the client side: a send into the
+        // bounded channel had no deadline, so a client that stopped reading
+        // parked the pump for as long as it kept the connection open.
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(!cfg.gateway.client_write_timeout.is_zero());
+        assert!(cfg.gateway.client_write_timeout < cfg.gateway.max_stream_duration);
+
+        let zero = format!("{MINIMAL}\ngateway:\n  client_write_timeout: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("zero is refused");
+        assert!(err.to_string().contains("client_write_timeout"), "{err}");
+    }
+
+    #[test]
+    fn the_in_flight_ceiling_defaults_to_something_a_1gi_replica_survives() {
+        // The memory bound is ceiling × body limit. Nothing bounded the
+        // ceiling before, so the body limit alone was the whole story — and
+        // "how many at once" was whatever the flood chose.
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert!(cfg.server.max_in_flight > 0, "zero would refuse everything");
+        let worst_case = cfg.server.max_in_flight * cfg.server.max_body_bytes;
+        assert!(
+            worst_case <= 4 * 1024 * 1024 * 1024,
+            "{} in flight × {} bytes is not survivable",
+            cfg.server.max_in_flight,
+            cfg.server.max_body_bytes
+        );
     }
 
     #[test]

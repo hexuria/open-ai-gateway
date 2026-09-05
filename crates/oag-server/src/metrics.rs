@@ -46,6 +46,12 @@ pub fn describe() {
         "Requests moved to a different credential after an upstream failure."
     );
     describe_counter!(
+        "oag_slot_accounting_degraded_total",
+        "Requests admitted without a concurrency-slot answer from Redis, by \
+         operation. Non-zero means selection is running open: credentials can \
+         be oversubscribed until Redis returns. Alert on it."
+    );
+    describe_counter!(
         "oag_tokens_total",
         "Tokens by kind: input, output, cache read, cache write."
     );
@@ -90,7 +96,11 @@ pub fn describe() {
         "oag_credentials_schedulable",
         "Credentials currently eligible, by provider."
     );
-    describe_gauge!("oag_slots_in_use", "Concurrency slots held, by credential.");
+    describe_gauge!(
+        "oag_slots_in_use",
+        "Concurrency slots held by credential, fleet-wide, as last read by this replica. \
+         Every replica reports the same shared count: aggregate with max by (account), never sum."
+    );
     describe_gauge!(
         "oag_draining",
         "1 while this replica is shutting down and refusing new work."

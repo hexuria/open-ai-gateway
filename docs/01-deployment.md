@@ -159,7 +159,9 @@ requirements:
 
 **Signing secrets must be supplied externally and be identical everywhere.**
 The gateway refuses to boot without `security.signing_secret` and
-`security.credential_kek`, and refuses anything that looks like a placeholder.
+`security.credential_kek`. The signing secret is also refused when it looks
+like a placeholder; the KEK is checked for being exactly 32 bytes of base64,
+which is what stops a copied example — no other placeholder check applies to it.
 sub2api generates its equivalents per instance when the environment does not
 supply them, so replica A mints tokens replica B rejects.
 

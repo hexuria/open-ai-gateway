@@ -343,7 +343,14 @@ async fn seat_summaries(db: &oag_store::Db, window: &period::Resolved) -> Vec<Se
     .bind(window.end)
     .fetch_all(db.pool())
     .await
-    .unwrap_or_default();
+    // Degrading to an empty section is this helper's documented contract —
+    // one sub-table must not take down the whole summary — but degrading
+    // SILENTLY was not: an empty list rendered as "no seats", indistinguishable
+    // from a query that failed. Say which it was.
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
+        Vec::new()
+    });
 
     seats
         .into_iter()
@@ -414,7 +421,14 @@ async fn origin_breakdown(db: &oag_store::Db, window: &period::Resolved) -> Vec<
     .bind(window.end)
     .fetch_all(db.pool())
     .await
-    .unwrap_or_default();
+    // Degrading to an empty section is this helper's documented contract —
+    // one sub-table must not take down the whole summary — but degrading
+    // SILENTLY was not: an empty list rendered as "no seats", indistinguishable
+    // from a query that failed. Say which it was.
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
+        Vec::new()
+    });
 
     if rows.iter().all(|r| r.0 == "gateway") {
         return Vec::new();
@@ -485,7 +499,7 @@ pub async fn summary(
         Err(e) => return failed(&oag_core::Error::Internal(format!("summary: {e}"))),
     };
 
-    let by_tier: Vec<TierTotals> = sqlx::query_as(
+    let by_tier: Vec<TierTotals> = match sqlx::query_as(
         r"
             SELECT tier, COUNT(*),
                    COALESCE(SUM(cost_usd), 0),
@@ -501,7 +515,14 @@ pub async fn summary(
     .bind(window.end)
     .fetch_all(state.db.pool())
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        // Not `.unwrap_or_default()`, which this was: an empty list rendered
+        // as "nothing here", a real and actionable state, and exactly the
+        // wrong answer when the truth is that the query failed. The
+        // `providers` handler below stated the rule; its neighbours broke it.
+        Err(e) => return failed(&oag_core::Error::Internal(format!("admin read: {e}"))),
+    };
 
     let saved = counterfactual - spent;
     let pct = if counterfactual > rust_decimal::Decimal::ZERO {
@@ -560,7 +581,7 @@ pub struct AccountView {
 }
 
 pub async fn accounts(State(state): State<Arc<AppState>>) -> Response {
-    let rows: Vec<AccountRowTuple> = sqlx::query_as(
+    let rows: Vec<AccountRowTuple> = match sqlx::query_as(
         r"
         SELECT id, name, provider, kind, schedulable, cooldown_until,
                rate_limited_until, priority, max_concurrency, owner_principal_id,
@@ -570,7 +591,14 @@ pub async fn accounts(State(state): State<Arc<AppState>>) -> Response {
     )
     .fetch_all(state.db.pool())
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        // Not `.unwrap_or_default()`, which this was: an empty list rendered
+        // as "nothing here", a real and actionable state, and exactly the
+        // wrong answer when the truth is that the query failed. The
+        // `providers` handler below stated the rule; its neighbours broke it.
+        Err(e) => return failed(&oag_core::Error::Internal(format!("admin read: {e}"))),
+    };
 
     let now = time::OffsetDateTime::now_utc();
     let out: Vec<AccountView> = rows
@@ -608,7 +636,7 @@ pub async fn accounts(State(state): State<Arc<AppState>>) -> Response {
 /// and a list endpoint has no use for it — the revoke path reads it server-side
 /// and never returns it either.
 pub async fn keys(State(state): State<Arc<AppState>>) -> Response {
-    let rows: Vec<KeyRowTuple> = sqlx::query_as(
+    let rows: Vec<KeyRowTuple> = match sqlx::query_as(
         r"
         SELECT k.id, k.name, k.key_prefix, p.email, r.name,
                k.active, k.admin, k.last_used_at
@@ -621,7 +649,14 @@ pub async fn keys(State(state): State<Arc<AppState>>) -> Response {
     )
     .fetch_all(state.db.pool())
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        // Not `.unwrap_or_default()`, which this was: an empty list rendered
+        // as "nothing here", a real and actionable state, and exactly the
+        // wrong answer when the truth is that the query failed. The
+        // `providers` handler below stated the rule; its neighbours broke it.
+        Err(e) => return failed(&oag_core::Error::Internal(format!("admin read: {e}"))),
+    };
 
     let out: Vec<KeyView> = rows
         .into_iter()
@@ -677,7 +712,7 @@ pub struct RouteView {
 }
 
 pub async fn routes(State(state): State<Arc<AppState>>) -> Response {
-    let rows: Vec<RouteRowTuple> = sqlx::query_as(
+    let rows: Vec<RouteRowTuple> = match sqlx::query_as(
         r"
             SELECT r.id, r.name, r.default_mode, r.floor_tier, r.tiers,
                    COUNT(ar.account_id), r.active
@@ -687,7 +722,14 @@ pub async fn routes(State(state): State<Arc<AppState>>) -> Response {
     )
     .fetch_all(state.db.pool())
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        // Not `.unwrap_or_default()`, which this was: an empty list rendered
+        // as "nothing here", a real and actionable state, and exactly the
+        // wrong answer when the truth is that the query failed. The
+        // `providers` handler below stated the rule; its neighbours broke it.
+        Err(e) => return failed(&oag_core::Error::Internal(format!("admin read: {e}"))),
+    };
 
     Json(
         rows.into_iter()
@@ -761,10 +803,10 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
 
     let counts = match counts {
         Ok(c) => c,
-        // Deliberately not `.unwrap_or_default()` like the reads above. An
-        // empty result renders as "nothing configured", which is a real and
-        // actionable state — and is exactly the wrong answer to give when the
-        // truth is that the query failed.
+        // A failed read is a failure, never an empty result. An empty result
+        // renders as "nothing configured", which is a real and actionable
+        // state — and is exactly the wrong answer to give when the truth is
+        // that the query failed.
         Err(e) => return failed(&oag_core::Error::Internal(format!("providers: {e}"))),
     };
 
@@ -836,7 +878,7 @@ pub async fn usage(State(state): State<Arc<AppState>>, Query(page): Query<Page>)
     // denial-of-service handed to whoever holds an admin key.
     let limit = page.limit.unwrap_or(50).clamp(1, 500);
 
-    let rows: Vec<UsageRowTuple> = sqlx::query_as(
+    let rows: Vec<UsageRowTuple> = match sqlx::query_as(
         r"
         SELECT request_id, occurred_at, model_id, tier, selection_reason,
                escalated_from_tier, escalation_gate, cost_usd, counterfactual_usd,
@@ -848,7 +890,14 @@ pub async fn usage(State(state): State<Arc<AppState>>, Query(page): Query<Page>)
     .bind(limit)
     .fetch_all(state.db.pool())
     .await
-    .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        // Not `.unwrap_or_default()`, which this was: an empty list rendered
+        // as "nothing here", a real and actionable state, and exactly the
+        // wrong answer when the truth is that the query failed. The
+        // `providers` handler below stated the rule; its neighbours broke it.
+        Err(e) => return failed(&oag_core::Error::Internal(format!("admin read: {e}"))),
+    };
 
     Json(
         rows.into_iter()

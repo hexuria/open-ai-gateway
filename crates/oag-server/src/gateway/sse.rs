@@ -6,7 +6,10 @@
 //! upstream directly from the response body:
 //!
 //! - **Backpressure.** A slow client fills the channel and the reader parks.
-//!   Without the bound, a slow client is an unbounded memory leak.
+//!   Without the bound, a slow client is an unbounded memory leak. The bound
+//!   is on memory, not time: a client that stops reading altogether is given
+//!   up after `Deadlines::client_write`, or the parked reader would hold the
+//!   lease and the upstream socket for as long as the connection stayed open.
 //! - **A slow client cannot stall the upstream read**, so the idle watchdog
 //!   measures the upstream and not the client.
 //! - **A client that disappears does not stop the accounting.** The provider
@@ -148,20 +151,64 @@ pub enum Egress {
     Responses { request_id: String, model: String },
 }
 
+/// The clocks a pump runs against.
+///
+/// Four, and each measures a different party: `idle` the upstream's silence,
+/// `client_write` the client's, `max` the whole stream, and `keepalive` how
+/// often our own silence is broken for intermediaries. They arrived one at a
+/// time as four positional `Duration`s, which is how a caller swaps two and
+/// gets a watchdog that never fires with no compile error to show for it.
+#[derive(Debug, Clone, Copy)]
+pub struct Deadlines {
+    /// How long the upstream may send nothing before the stream is failed.
+    pub idle: Duration,
+    /// Ceiling on the whole stream, checked on both sides of every await.
+    pub max: Duration,
+    /// How long a send to the client may wait before the client is given up.
+    pub client_write: Duration,
+    /// How often a no-op frame goes downstream while the upstream is quiet.
+    pub keepalive: Duration,
+}
+
 /// Read `response`, forward it to `tx`, and account for usage.
+///
+/// Long, deliberately: this is one state machine over a handful of locals
+/// that every branch reads, and slicing it into helpers would thread those
+/// locals through five signatures to save the lint.
+#[allow(clippy::too_many_lines)]
 pub async fn pump(
     response: reqwest::Response,
     adapter: Arc<dyn ProviderAdapter>,
     tx: mpsc::Sender<Chunk>,
-    idle_timeout: Duration,
-    max_duration: Duration,
+    deadlines: Deadlines,
     egress: Egress,
 ) -> StreamOutcome {
+    let Deadlines {
+        idle: idle_timeout,
+        max: max_duration,
+        client_write: client_write_timeout,
+        keepalive: keepalive_interval,
+    } = deadlines;
     let started = Instant::now();
     let mut acc = StreamAccumulator::new();
     let mut ttft = None;
     let mut client_gone = false;
     let mut error = None;
+
+    // A no-op frame downstream while the upstream is quiet, so an intermediary
+    // with its own idle timeout does not sever a stream the model is still
+    // thinking on. Three Terraform modules, a Cloudflare precondition and
+    // docs/04-cloud.md all described this as what keeps quiet streams alive;
+    // until now no code emitted one. An SSE comment (`: keepalive`) is
+    // discarded by every conforming parser and needs no per-dialect renderer.
+    // Reset on every real chunk, so it only fires into silence. Config
+    // validation refuses a zero interval; the clamp is only so a caller that
+    // bypassed it gets a busy stream rather than a panic.
+    let mut keepalive = tokio::time::interval(keepalive_interval.max(Duration::from_millis(1)));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick of an interval is immediate; a keepalive before the first
+    // byte would be noise, so it is consumed here.
+    keepalive.tick().await;
 
     // Ask the adapter how this provider delimits events, once, up front.
     let framing = adapter.framing();
@@ -177,7 +224,36 @@ pub async fn pump(
             break;
         }
 
-        let next = tokio::time::timeout(idle_timeout, body.next()).await;
+        // The idle deadline is fixed before the wait, not re-armed per
+        // keepalive tick: a keepalive is our silence, not the upstream's, and
+        // must not keep resetting the watchdog that measures the upstream.
+        // `StreamExt::next` is cancellation-safe, so dropping it to service a
+        // tick loses nothing.
+        let idle_deadline = tokio::time::Instant::now() + idle_timeout;
+        let next = loop {
+            tokio::select! {
+                n = tokio::time::timeout_at(idle_deadline, body.next()) => break n,
+                // Only at a frame boundary. A translated stream always is:
+                // only whole frames are rendered. A passthrough stream is
+                // whatever the last read was, and a read that ended inside a
+                // `data:` line leaves the rest in `pending` — a comment
+                // injected there lands mid-payload, and the client's parser
+                // gets a frame it cannot read. The tick is not consumed, so
+                // it fires again as soon as the frame completes.
+                _ = keepalive.tick(), if !client_gone && pending.is_empty() => {
+                    // Not `mark_committed` on success: nothing of the answer
+                    // went out. A refused or stalled send is a gone client,
+                    // exactly as for a real chunk.
+                    let frame = bytes::Bytes::from_static(b": keepalive\n\n");
+                    let sent = tokio::time::timeout(client_write_timeout, tx.send(Ok(frame))).await;
+                    if !matches!(sent, Ok(Ok(()))) {
+                        client_gone = true;
+                        tracing::debug!("client gone during keepalive; draining upstream for accounting");
+                    }
+                }
+            }
+        };
+        keepalive.reset();
 
         let chunk = match next {
             // The watchdog measures the *upstream*, so a slow client can never
@@ -218,15 +294,36 @@ pub async fn pump(
         };
 
         if !outbound.is_empty() && !client_gone {
-            if tx.send(Ok(outbound)).await.is_ok() {
-                acc.mark_committed();
-            } else {
-                // Receiver dropped: the client hung up. Keep going — the
-                // provider is generating (and billing for) these tokens either
-                // way, and stopping here would make every cancelled request
-                // free in our ledger and paid on the invoice.
-                client_gone = true;
-                tracing::debug!("client disconnected; draining upstream for accounting");
+            // The channel is bounded, which bounds memory and not time: a
+            // client that stops reading fills it and the send parks here —
+            // past the idle watchdog, which measures the upstream, and past
+            // the ceiling, which is checked at the top of a loop a parked
+            // task never returns to. So the send gets its own deadline, and
+            // a client that has read nothing for that long is treated as one
+            // that hung up. Either way we keep going — the provider is
+            // generating (and billing for) these tokens regardless, and
+            // stopping here would make every abandoned request free in our
+            // ledger and paid on the invoice.
+            match tokio::time::timeout(client_write_timeout, tx.send(Ok(outbound))).await {
+                Ok(Ok(())) => acc.mark_committed(),
+                Ok(Err(_)) => {
+                    client_gone = true;
+                    tracing::debug!("client disconnected; draining upstream for accounting");
+                }
+                Err(_) => {
+                    client_gone = true;
+                    tracing::debug!(
+                        timeout_s = client_write_timeout.as_secs(),
+                        "client stopped reading; draining upstream for accounting"
+                    );
+                }
+            }
+            // The send may have been the long part. Hold the ceiling on this
+            // side of the await too, or a slow reader stretches a stream past
+            // it one chunk at a time.
+            if started.elapsed() >= max_duration {
+                error = Some(format!("stream exceeded {}s", max_duration.as_secs()));
+                break;
             }
         }
 
@@ -281,7 +378,10 @@ pub async fn pump(
         && let Some(message) = &error
         && let Some(frame) = error_frame(&egress, &mut render, message)
     {
-        let _ = tx.send(Ok(bytes::Bytes::from(frame))).await;
+        // Bounded like every other send: a client that stopped reading must
+        // not hold the task on its own error frame either.
+        let _ = tokio::time::timeout(client_write_timeout, tx.send(Ok(bytes::Bytes::from(frame))))
+            .await;
     }
 
     // A translated stream has to synthesise the sentinel the client's dialect
@@ -294,9 +394,11 @@ pub async fn pump(
     // a terminal event however the connection then behaved, and is false before
     // one however tidily the upstream hung up.
     if !client_gone && complete && matches!(egress, Egress::ChatCompletions { .. }) {
-        let _ = tx
-            .send(Ok(bytes::Bytes::from(oag_proto::openai::done_frame())))
-            .await;
+        let _ = tokio::time::timeout(
+            client_write_timeout,
+            tx.send(Ok(bytes::Bytes::from(oag_proto::openai::done_frame()))),
+        )
+        .await;
     }
     // Anthropic needs no sentinel: its stream ends with message_stop, which the
     // renderer already emitted.
@@ -426,6 +528,29 @@ fn fold_payloads(
     (saw_content, out)
 }
 
+/// Parse each payload and fold its events into `acc` and `events`.
+///
+/// `fold_payloads` with the client's half taken out: nothing is rendered,
+/// because there is no client to render for yet.
+fn collect_payloads(
+    payloads: &[String],
+    adapter: &Arc<dyn ProviderAdapter>,
+    acc: &mut StreamAccumulator,
+    events: &mut Vec<StreamEvent>,
+) {
+    for payload in payloads {
+        match adapter.parse_event(payload, acc) {
+            Ok(parsed) => {
+                for e in &parsed {
+                    acc.observe(e);
+                }
+                events.extend(parsed);
+            }
+            Err(e) => tracing::debug!(error = %e, "skipping unparseable stream frame"),
+        }
+    }
+}
+
 /// Read a non-streaming response and fold it into an accumulator.
 ///
 /// The accumulator must end up in the *same state* a streamed response would
@@ -441,38 +566,153 @@ fn fold_payloads(
 pub async fn collect(
     response: reqwest::Response,
     dialect: Dialect,
-) -> std::result::Result<(bytes::Bytes, StreamAccumulator), Error> {
+) -> std::result::Result<(bytes::Bytes, Vec<StreamEvent>, StreamAccumulator), Error> {
     let bytes = response
         .bytes()
         .await
         .map_err(|e| Error::Internal(format!("reading upstream response: {e}")))?;
 
-    let mut acc = StreamAccumulator::new();
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        tracing::warn!("a successful upstream response was not JSON");
-        acc.mark_unparsed();
-        return Ok((bytes, acc));
-    };
+    // A 200 whose body is not JSON is not an answer in any dialect. This used
+    // to be waved through as "unparsed" and handed to the client verbatim —
+    // which for a translated pair meant bytes in the wrong shape, and for a
+    // same-dialect pair meant whatever the provider's front door emitted. An
+    // error switches credentials, and says what happened.
+    let v = serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|e| {
+        Error::Internal(format!("a successful upstream response was not JSON: {e}"))
+    })?;
 
     let events = match dialect {
         Dialect::AnthropicMessages => oag_proto::anthropic::parse_response(&v),
         Dialect::OpenAIChatCompletions => oag_proto::openai::parse_response(&v),
         Dialect::GeminiGenerateContent => oag_proto::gemini::parse_response(&v),
-        // No provider declares Responses as its native dialect, so nothing
-        // reaches this today — but `Dialect` is non-exhaustive, and the next one
-        // added must not be silently judged by a reader it does not have.
+        Dialect::OpenAIResponses => oag_proto::responses::parse_response(&v),
+        // `Dialect` is non-exhaustive. A dialect with no reader cannot be
+        // rendered for the client either, so this is an error rather than an
+        // unjudged pass: the comment that used to sit here — "no provider
+        // declares Responses as its native dialect, so nothing reaches this"
+        // — was false the day the Codex adapter existed, and the silent arm
+        // beneath it is how a Codex seat's answers reached clients as raw
+        // SSE under application/json.
         other => {
-            tracing::warn!(dialect = ?other, "no non-streaming reader for this dialect");
-            acc.mark_unparsed();
-            return Ok((bytes, acc));
+            return Err(Error::Internal(format!(
+                "no non-streaming reader for the {other:?} dialect"
+            )));
         }
     };
 
+    let mut acc = StreamAccumulator::new();
     for e in &events {
         acc.observe(e);
     }
 
-    Ok((bytes, acc))
+    Ok((bytes, events, acc))
+}
+
+/// Read a streamed upstream response to completion and fold it into events.
+///
+/// For an adapter that streams regardless of what the client asked for (see
+/// `ProviderAdapter::always_streams`): the client wants one body, the upstream
+/// only sends a stream, and the body has to be rendered from the events. This
+/// is `pump` without a client to write to — the same framing, the same parser,
+/// the same watchdogs — and it returns what `collect` returns for a JSON body,
+/// so the caller need not care which it got.
+///
+/// On failure the accumulator comes back with the error. By the time any
+/// failure here fires the provider may have generated — and invoiced — most
+/// of an answer, and an error that dropped the count of it is how a lost
+/// stream reached the ledger as a free one.
+pub async fn collect_stream(
+    response: reqwest::Response,
+    adapter: Arc<dyn ProviderAdapter>,
+    idle_timeout: Duration,
+    max_duration: Duration,
+) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), (Error, StreamAccumulator)> {
+    let started = Instant::now();
+    let framing = adapter.framing();
+    let mut body = response.bytes_stream();
+    let mut pending = Vec::<u8>::new();
+    let mut acc = StreamAccumulator::new();
+    let mut events = Vec::new();
+
+    loop {
+        if started.elapsed() >= max_duration {
+            return Err((
+                Error::Internal(format!(
+                    "upstream stream exceeded {}s",
+                    max_duration.as_secs()
+                )),
+                acc,
+            ));
+        }
+        let chunk = match tokio::time::timeout(idle_timeout, body.next()).await {
+            Err(_) => {
+                return Err((
+                    Error::Internal(format!("upstream idle for {}s", idle_timeout.as_secs())),
+                    acc,
+                ));
+            }
+            Ok(None) => break,
+            Ok(Some(Err(e))) => {
+                return Err((Error::Internal(format!("upstream read failed: {e}")), acc));
+            }
+            Ok(Some(Ok(bytes))) => bytes,
+        };
+        pending.extend_from_slice(&chunk);
+        let payloads = take_payloads(&mut pending, framing);
+        collect_payloads(&payloads, &adapter, &mut acc, &mut events);
+
+        // The same bound `pump` holds, for the same reason: past this the
+        // tail is not a large frame, it is an upstream that will never send
+        // the delimiter, and this reader was the one path that let it
+        // choose how much memory a replica allocates.
+        if pending.len() > MAX_PENDING {
+            return Err((
+                Error::Internal(format!(
+                    "upstream sent {} bytes without completing an event",
+                    pending.len()
+                )),
+                acc,
+            ));
+        }
+    }
+
+    // Whatever is left is a partial frame; try once more in case it completed
+    // exactly at EOF. As in `pump`, and for the same reason: the terminal
+    // event can be the one that lands with the close.
+    if !pending.is_empty() {
+        let payloads = take_payloads(&mut pending, framing);
+        collect_payloads(&payloads, &adapter, &mut acc, &mut events);
+    }
+
+    // An error the upstream put inside a 200 stream is an error, not an
+    // answer: with no client holding the bytes yet, another credential can
+    // still be tried.
+    if let Some(message) = events.iter().find_map(|e| match e {
+        StreamEvent::Error { message } => Some(message.clone()),
+        _ => None,
+    }) {
+        return Err((
+            Error::Internal(format!("upstream stream error: {message}")),
+            acc,
+        ));
+    }
+
+    // A body that ends before its terminal event is a truncated answer, and
+    // the read loop cannot tell: a connection dropped mid-generation ends the
+    // same way a finished one does. `pump` judges completion from the stop
+    // event for exactly this reason; here the same EOF was returned as `Ok`,
+    // so a Codex seat whose connection dropped mid-answer handed the client
+    // half an answer stamped complete, with the tokens the provider billed
+    // for it recorded as zero. An error is the honest outcome, and a cheap
+    // one: nothing has reached the client, so this is a clean failover.
+    if acc.stop_reason().is_none() {
+        return Err((
+            Error::Internal("upstream closed before the response was complete".to_owned()),
+            acc,
+        ));
+    }
+
+    Ok((events, acc))
 }
 
 #[cfg(test)]
@@ -599,6 +839,105 @@ mod tests {
     // ── how a stream ends ────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn a_quiet_upstream_gets_keepalives_downstream_until_the_watchdog_fires() {
+        // The upstream sends one frame and then nothing. The client must see
+        // comment frames at the keepalive interval — the thing every deploy
+        // artefact promised and nothing emitted — and the idle watchdog must
+        // still fire on the UPSTREAM's silence, undisturbed by our own.
+        let (tx, mut rx) = mpsc::channel(64);
+        let outcome = pump(
+            stalling(vec![sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+            )]),
+            anthropic(),
+            tx,
+            Deadlines {
+                idle: Duration::from_millis(250),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_millis(40),
+            },
+            Egress::Passthrough {
+                dialect: Dialect::AnthropicMessages,
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(
+            outcome.error.is_some(),
+            "the idle watchdog fired on the upstream"
+        );
+        let sent = drain(&mut rx).await;
+        let keepalives = sent.matches(": keepalive\n\n").count();
+        assert!(
+            keepalives >= 3,
+            "expected several keepalives across 250ms of silence at 40ms; got {keepalives}: {sent:?}"
+        );
+        assert!(sent.contains("hi"), "the real frame went out too");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_does_not_park_the_pump() {
+        // A receiver that is alive but never polls. With a channel of one and
+        // several chunks to send, the second send would have blocked for as
+        // long as the client kept the connection open — past every watchdog,
+        // holding the lease, the socket and the shutdown guard. Now it waits
+        // the write deadline, gives the client up, and drains the upstream
+        // so the usage still reaches the ledger.
+        let (tx, _rx_never_read) = mpsc::channel(1);
+        let frames = vec![
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"one "}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"two "}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"three"}}"#,
+            ),
+            sse(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}"#,
+            ),
+        ];
+        let started = std::time::Instant::now();
+        let outcome = pump(
+            streamed(frames),
+            anthropic(),
+            tx,
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_millis(50),
+                keepalive: Duration::from_secs(10),
+            },
+            Egress::AnthropicMessages {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(outcome.client_gone, "a reader that never reads is gone");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "returned in {:?}: bounded by the write deadline, not the client",
+            started.elapsed()
+        );
+        assert_eq!(
+            outcome.accumulator.usage().output_tokens,
+            3,
+            "the upstream was drained to the end for accounting"
+        );
+        assert!(
+            outcome.error.is_none(),
+            "the upstream itself was fine: {:?}",
+            outcome.error
+        );
+    }
+
+    #[tokio::test]
     async fn idle_timeout_emits_dialect_error_not_done() {
         // The bug: an abnormal exit was a bare `break`, so it fell through to
         // the unconditional `[DONE]`. A stream that died mid-answer told the
@@ -611,8 +950,12 @@ mod tests {
             )]),
             anthropic(),
             tx,
-            Duration::from_millis(50),
-            Duration::from_secs(30),
+            Deadlines {
+                idle: Duration::from_millis(50),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -651,8 +994,12 @@ mod tests {
             )]),
             anthropic(),
             tx,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -687,8 +1034,12 @@ mod tests {
             )]),
             anthropic(),
             tx,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::AnthropicMessages {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -718,8 +1069,12 @@ mod tests {
             )]),
             anthropic(),
             tx,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -753,8 +1108,12 @@ mod tests {
             )]),
             anthropic(),
             tx,
-            Duration::from_secs(5),
-            Duration::from_secs(30),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -777,8 +1136,12 @@ mod tests {
             stalling(vec![sse(r#"{"type":"ping"}"#)]),
             anthropic(),
             tx,
-            Duration::from_millis(50),
-            Duration::from_secs(30),
+            Deadlines {
+                idle: Duration::from_millis(50),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::Passthrough {
                 dialect: Dialect::AnthropicMessages,
                 request_id: "r1".to_owned(),
@@ -810,8 +1173,12 @@ mod tests {
             tx,
             // Long enough that neither watchdog can be what stops this: the cap
             // trips within milliseconds of the bytes arriving.
-            Duration::from_secs(5),
-            Duration::from_secs(5),
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(5),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
                 model: "m".to_owned(),
@@ -940,7 +1307,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_parses_openai_usage_and_text() {
-        let (_, acc) = collect(
+        let (_, _, acc) = collect(
             body(
                 r#"{
                     "choices": [{
@@ -974,7 +1341,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_parses_gemini_usage_and_text() {
-        let (_, acc) = collect(
+        let (_, _, acc) = collect(
             body(
                 r#"{
                     "candidates": [{
@@ -1001,7 +1368,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_still_parses_anthropic_usage_and_text() {
-        let (_, acc) = collect(
+        let (_, _, acc) = collect(
             body(
                 r#"{
                     "content": [{ "type": "text", "text": "the answer is 4" }],
@@ -1031,7 +1398,7 @@ mod tests {
         // The agentic case: no text at all, and arguments that arrive whole
         // rather than in fragments. Read as Anthropic this was an empty
         // response; read as fragments it would look like a truncated tool call.
-        let (_, acc) = collect(
+        let (_, _, acc) = collect(
             body(
                 r#"{
                     "choices": [{
@@ -1063,20 +1430,178 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_body_with_no_reader_is_not_judged_as_an_empty_answer() {
-        // Nothing serves Responses as an upstream today, so this stands in for
-        // whichever dialect is added next. Gating on it would escalate every
-        // request through it while recording zero tokens for either attempt —
-        // blaming the model for a gap that is ours.
-        let (bytes, acc) = collect(
-            body(r#"{"output":[{"type":"message"}],"usage":{"input_tokens":10}}"#),
+    async fn a_responses_body_is_read_like_every_other() {
+        // This test used to assert the opposite: that a Responses body had no
+        // reader and was passed on unjudged, on the grounds that "nothing
+        // serves Responses as an upstream today". The Codex adapter does, and
+        // an unjudged pass is exactly how its answers reached clients as raw
+        // bytes with zero tokens in the ledger.
+        let (_, events, acc) = collect(
+            body(
+                r#"{
+                    "status": "completed",
+                    "output": [{
+                        "type": "message", "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "the answer is 4" }]
+                    }],
+                    "usage": { "input_tokens": 1200, "output_tokens": 142,
+                               "input_tokens_details": { "cached_tokens": 200 } }
+                }"#,
+            ),
             Dialect::OpenAIResponses,
         )
         .await
         .expect("collects");
 
-        assert_eq!(acc.quality_gate(), None, "unreadable is not unusable");
-        assert!(!bytes.is_empty(), "the client still gets the body");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta { text } if text == "the answer is 4"))
+        );
+        assert_eq!(acc.usage().input_tokens, 1_000);
+        assert_eq!(acc.usage().cache_read_tokens, 200);
+        assert_eq!(acc.usage().output_tokens, 142);
+        assert_eq!(acc.quality_gate(), None);
+    }
+
+    #[tokio::test]
+    async fn a_successful_response_that_is_not_json_is_an_error_not_an_answer() {
+        let err = collect(
+            body("<html>rate limited</html>"),
+            Dialect::AnthropicMessages,
+        )
+        .await
+        .expect_err("not an answer");
+        assert!(err.to_string().contains("not JSON"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_always_streaming_adapter_is_read_to_completion_into_events() {
+        // THE CODEX CASE. The client asked for one body; the adapter forced a
+        // stream. Reading that stream as a JSON body found nothing and handed
+        // the raw `data:` lines back under application/json, with zero tokens
+        // metered. Read as the stream it is, the events carry the text, the
+        // whole tool call, and the usage the seat will be charged for.
+        let frames = [
+            r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":19200,"input_tokens_details":{"cached_tokens":18000}}}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant"}}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"Let me "}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"check."}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":"{\"path\""}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"delta":": \"a.rs\"}"}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"read_file"}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":19200,"input_tokens_details":{"cached_tokens":18000},"output_tokens":142}}}"#,
+        ];
+        let sse = frames.iter().fold(String::new(), |mut out, f| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "data: {f}\n\n");
+            out
+        });
+        let codex: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::codex::CodexAdapter::new());
+        assert!(codex.always_streams());
+
+        let (events, acc) = collect_stream(
+            body(&sse),
+            codex,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("collects the stream");
+
+        let text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "Let me check.");
+        assert_eq!(acc.usage().input_tokens, 1_200);
+        assert_eq!(acc.usage().cache_read_tokens, 18_000);
+        assert_eq!(
+            acc.usage().output_tokens,
+            142,
+            "the seat is charged for these"
+        );
+        assert_eq!(acc.quality_gate(), None, "the tool call reassembled");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_closes_before_its_terminal_event_is_an_error_not_an_answer() {
+        // The Codex seat's connection drops mid-generation. The body simply
+        // ends, exactly as it does on success, and this used to return `Ok`:
+        // half an answer stamped complete, with zero output tokens recorded
+        // for the ones the provider billed. `pump` judges completion from
+        // the terminal event; so must this, and with nothing sent to the
+        // client yet the error is a clean failover.
+        let frames = [
+            r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":100}}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"id":"msg_0","type":"message","role":"assistant"}}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"Let me "}"#,
+        ];
+        let sse = frames.iter().fold(String::new(), |mut out, f| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "data: {f}\n\n");
+            out
+        });
+        let codex: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::codex::CodexAdapter::new());
+
+        let err = collect_stream(
+            body(&sse),
+            codex,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a truncated stream is not an answer");
+        assert!(
+            err.0
+                .to_string()
+                .contains("before the response was complete"),
+            "{}",
+            err.0
+        );
+        // And what it cost is still known: the input side was read from the
+        // first frame, and it is what the ledger will be charged for.
+        assert_eq!(err.1.usage().input_tokens, 100);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_event_that_lands_exactly_at_eof_still_counts() {
+        // The frame carrying `response.completed` can be the one the close
+        // lands on, held in `pending` when the read loop exits. Judging
+        // completion before folding that tail would fail a whole answer.
+        let frames = [
+            r#"{"type":"response.created","response":{"id":"resp_1","model":"gpt-5","usage":{"input_tokens":100}}}"#,
+            r#"{"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"hi"}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":100,"output_tokens":1}}}"#,
+        ];
+        let sse = frames.iter().fold(String::new(), |mut out, f| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "data: {f}\n\n");
+            out
+        });
+        // Split so the last frame's delimiter arrives in its own read.
+        let cut = sse.len() - 1;
+        let chunks = vec![
+            bytes::Bytes::from(sse[..cut].to_owned()),
+            bytes::Bytes::from(sse[cut..].to_owned()),
+        ];
+        let codex: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::codex::CodexAdapter::new());
+
+        let (_, acc) = collect_stream(
+            into_response(futures_util::stream::iter(
+                chunks.into_iter().map(Ok::<_, std::io::Error>),
+            )),
+            codex,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("the answer is whole");
+        assert_eq!(acc.usage().output_tokens, 1);
     }
 
     /// Build one AWS event-stream message carrying `inner`.

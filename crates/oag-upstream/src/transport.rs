@@ -37,16 +37,26 @@ pub trait Transport: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Clone)]
 pub struct HttpTransport {
     client: reqwest::Client,
+    /// How long to wait for the response headers. See `execute`.
+    response_timeout: Duration,
 }
 
 impl HttpTransport {
-    pub fn new(proxy: Option<&str>, connect_timeout: Duration) -> Result<Self> {
+    pub fn new(
+        proxy: Option<&str>,
+        connect_timeout: Duration,
+        response_timeout: Duration,
+    ) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             .connect_timeout(connect_timeout)
-            // No total-response timeout. A streamed completion legitimately
-            // runs for many minutes; any deadline on the whole response will
-            // sever it mid-answer. Stalls are caught by the idle watchdog in
-            // the server, which can tell "slow" from "dead".
+            // No total-response timeout on the client. A streamed completion
+            // legitimately runs for many minutes, and a deadline on the whole
+            // response would sever it mid-answer. What IS bounded is the wait
+            // for the response headers, in `execute` — the client's own
+            // `.timeout()` cannot express "headers only", so it is done there.
+            // Once a response exists, the server's idle watchdog takes over
+            // and can tell "slow" from "dead"; before one does, nothing else
+            // could.
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(32)
             .http2_adaptive_window(true)
@@ -62,17 +72,31 @@ impl HttpTransport {
         let client = builder
             .build()
             .map_err(|e| oag_core::Error::Internal(format!("building http client: {e}")))?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            response_timeout,
+        })
     }
 }
 
 #[async_trait]
 impl Transport for HttpTransport {
     async fn execute(&self, req: reqwest::Request) -> Result<reqwest::Response> {
-        self.client
-            .execute(req)
-            .await
-            .map_err(|e| oag_core::Error::Internal(format!("upstream request: {e}")))
+        // `client.execute` resolves when the response HEADERS arrive; the body
+        // streams after. So a deadline here bounds exactly the silent gap — a
+        // provider that accepted the connection and then sent nothing — and
+        // ends the moment the answer begins, however long that answer then
+        // takes. Before this, that gap had no bound at all: the request, its
+        // credential slot and its in-flight guard sat until the provider felt
+        // like it, and the breaker never heard, because nothing had failed.
+        match tokio::time::timeout(self.response_timeout, self.client.execute(req)).await {
+            Ok(result) => {
+                result.map_err(|e| oag_core::Error::Internal(format!("upstream request: {e}")))
+            }
+            Err(_) => Err(oag_core::Error::UpstreamTimeout {
+                after: self.response_timeout,
+            }),
+        }
     }
 }
 
@@ -87,17 +111,24 @@ impl Transport for HttpTransport {
 pub struct TransportPool {
     inner: moka::future::Cache<TransportKey, Arc<HttpTransport>>,
     connect_timeout: Duration,
+    response_timeout: Duration,
 }
 
 impl TransportPool {
     #[must_use]
-    pub fn new(max_entries: u64, idle_ttl: Duration, connect_timeout: Duration) -> Self {
+    pub fn new(
+        max_entries: u64,
+        idle_ttl: Duration,
+        connect_timeout: Duration,
+        response_timeout: Duration,
+    ) -> Self {
         Self {
             inner: moka::future::Cache::builder()
                 .max_capacity(max_entries)
                 .time_to_idle(idle_ttl)
                 .build(),
             connect_timeout,
+            response_timeout,
         }
     }
 
@@ -108,6 +139,7 @@ impl TransportPool {
         let transport = Arc::new(HttpTransport::new(
             key.proxy.as_deref(),
             self.connect_timeout,
+            self.response_timeout,
         )?);
         self.inner.insert(key.clone(), Arc::clone(&transport)).await;
         Ok(transport)
@@ -129,8 +161,64 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn a_provider_that_accepts_and_never_answers_is_a_bounded_error() {
+        // The gap nothing bounded. A listener that completes the TCP accept
+        // and then holds the socket open forever: the connect timeout is
+        // satisfied, no response ever begins for the idle watchdog to
+        // measure. Before, `execute` awaited this for as long as the peer
+        // cared to keep the socket open.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let hold = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            loop {
+                if let Ok((sock, _)) = listener.accept().await {
+                    kept.push(sock);
+                }
+            }
+        });
+
+        let transport =
+            HttpTransport::new(None, Duration::from_secs(5), Duration::from_millis(300))
+                .expect("transport");
+        let req = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .body("{}")
+            .build()
+            .expect("request");
+
+        let started = std::time::Instant::now();
+        let err = transport.execute(req).await.expect_err("must not hang");
+        hold.abort();
+
+        assert!(
+            matches!(err, oag_core::Error::UpstreamTimeout { after } if after == Duration::from_millis(300)),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "returned in {:?}, which is not bounded by the deadline",
+            started.elapsed()
+        );
+        assert!(
+            matches!(
+                err.disposition(),
+                oag_core::Disposition::FailoverAccount { .. }
+            ),
+            "a silent provider is failed over, like a 5xx"
+        );
+    }
+
+    #[tokio::test]
     async fn transports_are_reused_per_credential() {
-        let pool = TransportPool::new(16, Duration::from_mins(1), Duration::from_secs(5));
+        let pool = TransportPool::new(
+            16,
+            Duration::from_mins(1),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        );
         let key = TransportKey {
             account: AccountId::new(),
             proxy: None,
@@ -144,7 +232,12 @@ mod tests {
     async fn different_credentials_do_not_share_connections() {
         // Sharing would mean sharing whatever per-connection state the provider
         // keeps, so a rate limit on one takes the other down with it.
-        let pool = TransportPool::new(16, Duration::from_mins(1), Duration::from_secs(5));
+        let pool = TransportPool::new(
+            16,
+            Duration::from_mins(1),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        );
         let a = pool
             .get(&TransportKey {
                 account: AccountId::new(),
@@ -164,7 +257,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_same_credential_through_different_proxies_is_separate() {
-        let pool = TransportPool::new(16, Duration::from_mins(1), Duration::from_secs(5));
+        let pool = TransportPool::new(
+            16,
+            Duration::from_mins(1),
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        );
         let account = AccountId::new();
         let direct = pool
             .get(&TransportKey {

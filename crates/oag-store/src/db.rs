@@ -8,6 +8,9 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct Db {
     pool: PgPool,
+    /// What `after_connect` set on every connection, so `migrate` can put it
+    /// back after lifting it for its own session.
+    statement_timeout_ms: i64,
 }
 
 /// Serialises concurrent migration runs across replicas.
@@ -17,9 +20,35 @@ pub struct Db {
 /// versions of the binary migrate simultaneously.
 const MIGRATION_LOCK_ID: i64 = 0x0A6_1247_0001;
 
+/// How long one statement may run before Postgres cancels it, when the caller
+/// does not say. Generous for a request-path query, which is a primary-key
+/// probe or an indexed range; a statement still running at ten seconds is not
+/// slow, it is a connection that would otherwise never come back.
+pub const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl Db {
-    /// Configure the pool. Does not dial — connections open on first use.
+    /// Configure the pool with the default statement timeout. Does not dial —
+    /// connections open on first use.
     pub fn connect(url: &str, max_connections: u32) -> Result<Self> {
+        Self::connect_with(url, max_connections, DEFAULT_STATEMENT_TIMEOUT)
+    }
+
+    /// Configure the pool. Does not dial — connections open on first use.
+    ///
+    /// `statement_timeout` is set on every connection as it opens. Without one,
+    /// a primary that stops answering — a black-holed failover, a network
+    /// partition — does not fail a query, it holds it: the connection sits in
+    /// the query for as long as the kernel keeps the socket, and the pool's
+    /// `acquire_timeout` then refuses every *new* request while the old ones
+    /// keep the slots. Sixteen such queries and the replica is deaf until
+    /// somebody restarts it. A statement timeout makes that a 10-second error
+    /// the pool recovers from on its own.
+    pub fn connect_with(
+        url: &str,
+        max_connections: u32,
+        statement_timeout: Duration,
+    ) -> Result<Self> {
+        let timeout_ms = i64::try_from(statement_timeout.as_millis()).unwrap_or(i64::MAX);
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .acquire_timeout(Duration::from_secs(10))
@@ -27,13 +56,30 @@ impl Db {
             // proxy or failover-capable Postgres accumulates connections
             // pointing at a former primary.
             .max_lifetime(Duration::from_mins(30))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    // `set_config` rather than `SET`, because `SET` cannot
+                    // take a bind parameter and the value must not be spliced
+                    // into SQL text. `false` is "not local": session-level,
+                    // so it survives the pool handing the connection to a
+                    // different task, which `SET LOCAL` would not.
+                    sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                        .bind(format!("{timeout_ms}ms"))
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
+            })
             // Lazy, for the same reason as Redis: a replica that cannot boot
             // until Postgres answers will crash-loop through a failover or a
             // restart, when the correct behaviour is to come up, report
             // `ready: false`, and be routed around until it recovers.
             .connect_lazy(url)
             .map_err(|e| Error::Internal(format!("configuring postgres pool: {e}")))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            statement_timeout_ms: timeout_ms,
+        })
     }
 
     #[must_use]
@@ -53,6 +99,15 @@ impl Db {
             .acquire()
             .await
             .map_err(|e| Error::Internal(format!("acquiring migration connection: {e}")))?;
+
+        // This is a pooled connection, and `after_connect` gave it the
+        // request path's statement timeout. A backfill over the ledger, an
+        // index build on a large table, or simply waiting on the advisory
+        // lock behind another replica's migration all legitimately outlast
+        // ten seconds — and cancelled at that point they leave the deploy red
+        // with the schema half moved. Lifted for this session, put back below
+        // before the connection returns to the pool.
+        Self::lift_statement_timeout(&mut conn).await?;
 
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(MIGRATION_LOCK_ID)
@@ -91,7 +146,36 @@ impl Db {
             .execute(&mut *conn)
             .await;
 
+        // Back to the request path's value: the pool will hand this
+        // connection to a query that expects the bound.
+        self.restore_statement_timeout(&mut conn).await;
+
         result
+    }
+
+    /// Remove the session's statement timeout, for the migration.
+    ///
+    /// Its own function so the test can see the lifted value: from outside
+    /// `migrate` only the restored one is observable, and a test of that
+    /// alone passes with the lift deleted.
+    async fn lift_statement_timeout(conn: &mut sqlx::PgConnection) -> Result<()> {
+        sqlx::query("SELECT set_config('statement_timeout', '0', false)")
+            .execute(conn)
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Internal(format!("lifting statement timeout: {e}")))
+    }
+
+    /// Put the request path's statement timeout back on the session.
+    ///
+    /// Best-effort: the connection is about to return to a pool whose
+    /// `after_connect` cannot run again for it, and there is nothing better
+    /// to do with a failure here than let the next query find out.
+    async fn restore_statement_timeout(&self, conn: &mut sqlx::PgConnection) {
+        let _ = sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+            .bind(format!("{}ms", self.statement_timeout_ms))
+            .execute(conn)
+            .await;
     }
 
     /// Whether the database is actually reachable.
@@ -103,6 +187,54 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::Db;
+
+    /// Migrations run without the pool's statement timeout, and hand the
+    /// connection back with it restored.
+    ///
+    /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it. A pool of
+    /// one, so the connection `migrate` used is the one handed out after.
+    #[tokio::test]
+    async fn migrate_lifts_the_statement_timeout_for_itself_and_puts_it_back() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect_with(&url, 1, std::time::Duration::from_millis(1234)).expect("pool");
+
+        let before: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(db.pool())
+            .await
+            .expect("show");
+        assert_eq!(before, "1234ms", "after_connect set it");
+
+        // Already applied, so this is the lock, the version scan and the
+        // unlock — and it must not run under 1234ms either: an advisory lock
+        // held by another replica's migration is waited on for as long as
+        // that migration takes.
+        db.migrate().await.expect("migrate");
+
+        let after: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(db.pool())
+            .await
+            .expect("show");
+        assert_eq!(after, "1234ms", "restored before the connection went back");
+
+        // The half a restore-only test cannot see: what the migration itself
+        // ran under. The two halves, on the pool's one connection.
+        let mut conn = db.pool().acquire().await.expect("the one connection");
+        Db::lift_statement_timeout(&mut conn).await.expect("lift");
+        let lifted: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("show");
+        assert_eq!(lifted, "0", "no bound while the migration runs");
+        db.restore_statement_timeout(&mut conn).await;
+        let restored: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("show");
+        assert_eq!(restored, "1234ms");
+    }
 
     /// The rollback case, reproduced directly.
     ///

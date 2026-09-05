@@ -156,6 +156,19 @@
     }
   },
   {
+    "type": "overloaded",
+    "status": 503,
+    "variant": "Overloaded",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "overloaded",
+        "message": "this replica is at capacity; retry"
+      }
+    },
+    "retry_after_header": "1"
+  },
+  {
     "type": "quota_reserve_held",
     "status": 503,
     "variant": "ReserveHeld",
@@ -217,6 +230,18 @@
         "upstream": {
           "detail": "the model is not supported for this account"
         }
+      }
+    }
+  },
+  {
+    "type": "upstream_timeout",
+    "status": 504,
+    "variant": "UpstreamTimeout",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "upstream_timeout",
+        "message": "upstream sent no response within 90s"
       }
     }
   }

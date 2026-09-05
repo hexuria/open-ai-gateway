@@ -30,7 +30,7 @@ oag-server = { path = "crates/oag-server" }
 # ── async runtime and HTTP server ──────────────────────────────────────────────
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 axum = { version = "0.8", features = ["macros"] }
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5", features = ["util", "limit", "load-shed"] }
 tower-http = { version = "0.6", features = ["catch-panic", "trace", "limit", "request-id", "timeout"] }
 http = "1"
 http-body-util = "0.1"

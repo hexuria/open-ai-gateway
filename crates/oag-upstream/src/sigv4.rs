@@ -15,6 +15,8 @@
 //! - The date in the credential scope is `YYYYMMDD`; the one in the header is
 //!   the full basic-format timestamp. Mixing them fails with a signature error
 //!   that names neither.
+//! - The canonical URI is the path **URI-encoded exactly once**, which is not
+//!   the same string as the path on the wire. See [`uri_encode_path`].
 
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
@@ -98,8 +100,10 @@ pub fn sign(
         .collect::<Vec<_>>()
         .join(";");
 
-    let canonical_request =
-        format!("{method}\n{path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+    let canonical_uri = uri_encode_path(path);
+    let canonical_request = format!(
+        "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
 
     let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
     let string_to_sign = format!(
@@ -127,6 +131,51 @@ pub fn sign(
         content_sha256: payload_hash,
         session_token: creds.session_token.clone(),
     }
+}
+
+/// The canonical URI: the wire path with every byte URI-encoded once.
+///
+/// SigV4 (for every service except S3) canonicalises the path by URI-encoding
+/// it, leaving only the unreserved set `A-Za-z0-9-._~` and the `/` separators
+/// literal. AWS re-derives this from the bytes it received — no decoding first —
+/// and signs *that*. The authority is AWS's own test suite: its `get-utf8` case
+/// puts the raw bytes `/ሴ` on the request line and expects the canonical URI
+/// `/%E1%88%B4`, encoded exactly once from what arrived. A signer applying zero
+/// passes therefore produces a signature AWS cannot reproduce.
+///
+/// This matters here because of one character. Every Bedrock model id contains
+/// a colon — `anthropic.claude-sonnet-4-v1:0` — which encodes to `%3A`. Without
+/// this the whole adapter signs a canonical request AWS never computes, and the
+/// resulting 403 maps to `Disposition::FailoverAccount`: the failure presents as
+/// a credential going chronically unhealthy rather than as a signing bug, which
+/// is exactly the wrong place to look.
+///
+/// **The invariant is one pass ahead of the wire.** `path` must be the bytes
+/// the HTTP client will actually send, and this function encodes them once on
+/// top. Either composition satisfies AWS: a literal `:` on the wire signed as
+/// `%3A` (this signer, curl's `--aws-sigv4`), or `%3A` on the wire signed as
+/// `%253A` (the AWS SDKs' double encoding). What fails is any *mismatch* in the
+/// number of passes — the raw path signed raw, as before, or a path the caller
+/// pre-encoded and then handed here to be encoded again. `bedrock.rs` keeps the
+/// two in step by signing `url.path()`, the parsed wire path itself, and pins
+/// that with `the_signature_is_computed_over_the_exact_wire_path`.
+fn uri_encode_path(path: &str) -> String {
+    // Unreserved per RFC 3986, which is the set AWS leaves alone. `/` is the
+    // segment separator and stays literal; everything else becomes uppercase
+    // percent-hex, byte by byte, so multi-byte UTF-8 encodes per byte.
+    let mut out = String::with_capacity(path.len());
+    for byte in path.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(*byte as char);
+            }
+            other => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
 }
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -297,6 +346,109 @@ mod tests {
             s.authorization
                 .contains("Credential=AKIDEXAMPLE/20150830/eu-west-1/bedrock/aws4_request"),
             "{}",
+            s.authorization
+        );
+    }
+
+    #[test]
+    fn a_model_ids_colon_is_percent_encoded_in_the_canonical_uri() {
+        // The character this whole function exists for. Every Anthropic-on-
+        // Bedrock model id carries it, so a signer that leaves it literal signs
+        // a canonical request AWS never computes — for every Bedrock request
+        // there has ever been.
+        assert_eq!(
+            uri_encode_path("/model/anthropic.claude-sonnet-4-v1:0/invoke"),
+            "/model/anthropic.claude-sonnet-4-v1%3A0/invoke"
+        );
+    }
+
+    #[test]
+    fn the_unreserved_set_survives_and_separators_stay_literal() {
+        // Encoding these would break the signature just as surely as failing to
+        // encode the colon: the canonical URI is one exact string, not a
+        // conservative over-encoding of it.
+        let unreserved = "/aZ09-._~/x";
+        assert_eq!(uri_encode_path(unreserved), unreserved);
+        assert_eq!(uri_encode_path("/"), "/");
+        // Uppercase hex, and multi-byte UTF-8 encoded per byte.
+        assert_eq!(uri_encode_path("/a b"), "/a%20b");
+        assert_eq!(uri_encode_path("/é"), "/%C3%A9");
+    }
+
+    #[test]
+    fn raw_bytes_on_the_wire_are_encoded_once_per_aws_test_suite() {
+        // AWS's published vector `get-utf8` (botocore: tests/unit/auth/
+        // aws4_testsuite/get-utf8): the request line carries the raw bytes
+        // `/ሴ` and the expected canonical request carries `/%E1%88%B4`. That
+        // is the external proof of this signer's composition — literal bytes
+        // on the wire, one encoding pass in the canonical URI, no decoding in
+        // between. The full signature cannot be reproduced through `sign`,
+        // which always signs `x-amz-content-sha256` where the vector does not,
+        // so the canonical-URI half is pinned to the vector directly.
+        assert_eq!(uri_encode_path("/ሴ"), "/%E1%88%B4");
+    }
+
+    #[test]
+    fn the_canonical_uri_is_encoded_exactly_once() {
+        // The encoder is not idempotent, and that is load-bearing. Two passes
+        // give `%253A`, not `%3A`, so a caller that pre-encodes the path and
+        // hands it here is one pass ahead of the wire *twice* — and the
+        // signature it gets differs from the one the raw path yields. This is
+        // what makes "sign the exact wire bytes" the only safe contract for
+        // `SigningRequest.path`; the adapter side of that contract is pinned
+        // in bedrock.rs by `the_signature_is_computed_over_the_exact_wire_path`.
+        let once = uri_encode_path("/model/m:0/invoke");
+        let twice = uri_encode_path(&once);
+        assert_eq!(once, "/model/m%3A0/invoke");
+        assert_eq!(twice, "/model/m%253A0/invoke");
+        assert_ne!(once, twice, "double encoding must not be a no-op");
+
+        assert_ne!(
+            signed(&creds(), "us-east-1", "/model/m:0/invoke", b"", AT).authorization,
+            signed(&creds(), "us-east-1", &once, b"", AT).authorization
+        );
+    }
+
+    #[test]
+    fn the_signature_matches_the_canonical_request_aws_will_rebuild() {
+        // The assertion the change-detection tests above cannot make. They pin
+        // that the path is signed; none of them pins *what string* is signed,
+        // which is the whole defect. So spell out the canonical request per the
+        // SigV4 spec — note the `%3A` — derive the signature by the documented
+        // steps, and require `sign` to agree.
+        let path = "/model/anthropic.claude-sonnet-4-v1:0/invoke";
+        let body = b"{}";
+        let host = "bedrock-runtime.us-east-1.amazonaws.com";
+        let payload_hash = hex::encode(Sha256::digest(body));
+
+        let canonical_request = format!(
+            "POST\n\
+             /model/anthropic.claude-sonnet-4-v1%3A0/invoke\n\
+             \n\
+             host:{host}\n\
+             x-amz-content-sha256:{payload_hash}\n\
+             x-amz-date:20150830T123600Z\n\
+             \n\
+             host;x-amz-content-sha256;x-amz-date\n\
+             {payload_hash}"
+        );
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n20150830T123600Z\n20150830/us-east-1/bedrock/aws4_request\n{}",
+            hex::encode(Sha256::digest(canonical_request.as_bytes()))
+        );
+        let k_date = hmac(
+            format!("AWS4{}", creds().secret_access_key).as_bytes(),
+            b"20150830",
+        );
+        let k_region = hmac(&k_date, b"us-east-1");
+        let k_service = hmac(&k_region, b"bedrock");
+        let k_signing = hmac(&k_service, b"aws4_request");
+        let expected = hex::encode(hmac(&k_signing, string_to_sign.as_bytes()));
+
+        let s = signed(&creds(), "us-east-1", path, body, AT);
+        assert!(
+            s.authorization.ends_with(&format!("Signature={expected}")),
+            "canonical request mismatch\n  got: {}\n  want signature: {expected}",
             s.authorization
         );
     }
