@@ -22,6 +22,18 @@ use std::fmt;
 #[serde(transparent)]
 pub struct ModelId(pub String);
 
+/// Lets a `HashMap<ModelId, _>` be probed with a `&str`.
+///
+/// The map's lookups are on the request path and `ModelId::new(name)` allocated
+/// a `String` for each of them, only to drop it immediately. `Borrow` requires
+/// that the borrowed form hash identically to the owned one, which holds here
+/// because `ModelId` is a newtype over `String` and derives both.
+impl std::borrow::Borrow<str> for ModelId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 impl ModelId {
     #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
@@ -291,7 +303,10 @@ impl Catalog {
     /// `gpt-5` would route spend somewhere the operator did not choose.
     #[must_use]
     pub fn resolve(&self, name: &str) -> Option<&ModelSpec> {
-        if let Some(spec) = self.models.get(&ModelId::new(name)) {
+        // `Borrow<str>` on the key rather than `ModelId::new(name)`, which
+        // allocated and dropped a `String` on every lookup — once per request,
+        // and twice for a name that falls through to the upstream index below.
+        if let Some(spec) = self.models.get(name) {
             return Some(spec);
         }
         // Exactly one catalogue id spells this upstream name, or nothing:

@@ -90,9 +90,16 @@ impl SessionKey {
 
     /// Resolve the best available key, in descending order of precision.
     ///
-    /// `principal_id` scopes every form: a pin belongs to one tenant's
-    /// conversation, and neither a session id nor a prompt prefix is unique
-    /// across tenants.
+    /// `principal_id` scopes the first two forms: a pin belongs to one tenant's
+    /// conversation, and neither a client session id nor a prompt prefix is
+    /// unique across tenants.
+    ///
+    /// The fallback form does not take it, and does not need to. It hashes
+    /// `api_key_id`, which belongs to exactly one principal — so the scoping is
+    /// there by transitivity rather than by inclusion. Saying "every form" was
+    /// a claim about this function that reading it disproves, which is worse
+    /// than saying nothing: the next person to add a form will look here for
+    /// the rule and find one that is not enforced.
     #[must_use]
     pub fn resolve(
         principal_id: &str,

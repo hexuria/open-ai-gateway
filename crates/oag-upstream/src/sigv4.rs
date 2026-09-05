@@ -40,7 +40,7 @@ pub struct Credentials {
 /// two fields are a long-lived AWS credential.
 ///
 /// The access key id survives: it is an identifier rather than a secret, it
-/// appears in CloudTrail, and it is the one thing that makes a signing problem
+/// appears in `CloudTrail`, and it is the one thing that makes a signing problem
 /// diagnosable at all.
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -70,7 +70,18 @@ impl BudgetState {
         if limit <= Decimal::ZERO {
             return BudgetPressure::Exhausted;
         }
-        if self.spent_usd >= limit * self.hard_stop_multiple {
+        // Clamped at 1. The multiple exists to let spend run PAST the limit
+        // before refusing — degrade first, deny later — so a value below 1
+        // inverts the design: the hard stop arrives before the warning does,
+        // and a principal is cut off having never been degraded. `0.5` reads
+        // like "stricter" and means "refuse at half the budget with no warning
+        // at all", which is the opposite of what this setting is for.
+        //
+        // Clamped rather than refused because it arrives per-principal from the
+        // database, not from a config file: refusing would fail a request over
+        // a row an operator can only fix by finding it first.
+        let multiple = self.hard_stop_multiple.max(Decimal::ONE);
+        if self.spent_usd >= limit * multiple {
             return BudgetPressure::Exhausted;
         }
         // The last fifth of the budget buys cheap models only.
@@ -1139,6 +1150,50 @@ mod tests {
     /// back to the caller as a 503 while a rung naming a different provider sat
     /// there able to serve. This pins the classification the gateway now acts
     /// on; `escalate` accepting the gate is what makes acting on it possible.
+    /// R10. A hard-stop multiple below 1 would invert degrade-before-deny.
+    ///
+    /// The multiple exists to let spend run PAST the limit before refusing:
+    /// degrade first, deny later. Below 1 the hard stop arrives before the
+    /// warning does, so a principal is cut off having never been degraded —
+    /// and `0.5` reads like "stricter" while meaning "refuse at half the budget
+    /// with no warning at all", which is the opposite of what it is for.
+    ///
+    /// Clamped rather than refused because it arrives per-principal from the
+    /// database rather than from a config file: refusing would fail a request
+    /// over a row an operator can only fix by finding it first.
+    #[test]
+    fn a_hard_stop_multiple_below_one_cannot_deny_before_it_degrades() {
+        let at = |spent: i64, multiple| {
+            BudgetState {
+                spent_usd: Decimal::from(spent),
+                limit_usd: Some(Decimal::from(100)),
+                hard_stop_multiple: multiple,
+            }
+            .pressure()
+        };
+
+        // The design, at the shipped multiple of 1.
+        assert_eq!(at(50, Decimal::ONE), BudgetPressure::Normal);
+        assert_eq!(at(85, Decimal::ONE), BudgetPressure::Constrained);
+        assert_eq!(at(100, Decimal::ONE), BudgetPressure::Exhausted);
+
+        // At a half, the old arithmetic denied at 50 — before the warning band
+        // at 80 could ever be entered. Clamped, the behaviour is the same as 1.
+        let half = Decimal::new(5, 1);
+        assert_eq!(
+            at(50, half),
+            BudgetPressure::Normal,
+            "denying here would be a hard stop that fires before any degrade"
+        );
+        assert_eq!(at(85, half), BudgetPressure::Constrained);
+        assert_eq!(at(100, half), BudgetPressure::Exhausted);
+
+        // Above 1 still means what it says: spend past the limit, then deny.
+        let double = Decimal::from(2);
+        assert_eq!(at(150, double), BudgetPressure::Constrained);
+        assert_eq!(at(200, double), BudgetPressure::Exhausted);
+    }
+
     #[test]
     fn a_rung_with_no_usable_credential_escalates_rather_than_failing() {
         use oag_core::{Disposition, Error, Provider};

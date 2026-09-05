@@ -576,6 +576,23 @@ impl Config {
         // single-credential dispatch instead, voiding `max_account_switches`
         // with nothing said. There is no way to spell "unbounded" for this one,
         // and inventing one would make a stuck failover loop unbounded too.
+        // Zero disables the usage poller, and the poller is what keeps
+        // `usage_remaining_pct` current — the number every seat's reserve is
+        // evaluated against. With it stale at whatever the last poll saw, or
+        // never set at all on a fresh replica, `usage_reserve_pct` holds nothing
+        // back and a seat runs to the provider's own refusal. So "disabled"
+        // here silently disables a different feature the operator did not
+        // mention, which is why it is now said rather than assumed: `oag serve`
+        // still honours zero, and this makes choosing it deliberate.
+        if self.gateway.usage_poll_interval.is_zero() {
+            return Err(crate::Error::Config(
+                "gateway.usage_poll_interval of 0 disables the usage poller, and with it \
+                 every seat's reserve — usage_reserve_pct is evaluated against a figure \
+                 only the poller refreshes. Set an interval, or unset every \
+                 usage_reserve_pct first."
+                    .to_owned(),
+            ));
+        }
         if self.gateway.failover_budget.is_zero() {
             return Err(crate::Error::Config(
                 "gateway.failover_budget must be positive; zero would try exactly one \
@@ -612,7 +629,9 @@ impl Config {
 }
 
 /// Serialise `Duration` as whole seconds. Keeps the config file readable
-/// without pulling in a date-parsing dependency for four fields.
+/// without pulling in a date-parsing dependency for the dozen-odd duration
+/// fields in this file — it was four when this was written, and the number is
+/// not the argument anyway.
 mod humantime_secs {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
@@ -1014,5 +1033,26 @@ security:
 
         let one = format!("{MINIMAL}\ngateway:\n  failover_budget: 1\n");
         Config::from_yaml(&one).expect("a short budget is a budget");
+    }
+    /// R12. Zero disables the usage poller, and with it every seat reserve.
+    ///
+    /// `usage_reserve_pct` is evaluated against `usage_remaining_pct`, and only
+    /// the poller refreshes that. With the poller off it is stale at whatever
+    /// the last poll saw — or never set at all on a fresh replica — so every
+    /// reserve holds nothing back and a seat runs to the provider's own
+    /// refusal. "Disabled" silently disabled a different feature the operator
+    /// had not mentioned.
+    #[test]
+    fn a_usage_poll_interval_of_zero_is_refused_because_reserves_depend_on_it() {
+        let zero = format!("{MINIMAL}\ngateway:\n  usage_poll_interval: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("refused");
+        assert!(err.to_string().contains("usage_poll_interval"), "{err}");
+        assert!(
+            err.to_string().contains("reserve"),
+            "the message has to name what else stops working: {err}"
+        );
+
+        let set = format!("{MINIMAL}\ngateway:\n  usage_poll_interval: 60\n");
+        Config::from_yaml(&set).expect("an interval is an interval");
     }
 }
