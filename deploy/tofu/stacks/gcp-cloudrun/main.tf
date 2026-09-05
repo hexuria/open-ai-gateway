@@ -128,18 +128,14 @@ module "gateway" {
   service_account_email = google_service_account.gateway.email
   run_migrations        = var.run_migrations
 
-  # Both are load-bearing for migration ordering; neither is redundant. The
-  # module only ever depended on the secret *containers* via `.secret_id`, never
-  # on their versions — and the job's `secret_key_ref { version = "latest" }`
-  # resolves to nothing when no version exists yet.
-  depends_on = [
-    google_secret_manager_secret_version.this,
-    time_sleep.iam_propagation,
-  ]
+  # The secret versions are already an ordering: `secret_env` names each one
+  # by number, so the module cannot be built before they exist. IAM
+  # propagation is not visible to the graph at all, hence the sleep.
+  depends_on = [time_sleep.iam_propagation]
 }
 
 # The invoker grant that used to be a manual console step. See
-# `invoker_members` for what it means and when to narrow it.
+# `invoker_members` for what it publishes and why it is empty by default.
 resource "google_cloud_run_v2_service_iam_member" "invoker" {
   for_each = toset(var.invoker_members)
   project  = var.project_id
