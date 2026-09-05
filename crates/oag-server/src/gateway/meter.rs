@@ -58,9 +58,40 @@ enum Fate {
 /// Runs after the response has been fully streamed, in the pump's task rather
 /// than the request's — so a client that hung up early still gets billed for
 /// what the provider generated.
-pub async fn record(state: &AppState, ctx: &Context, outcome: &StreamOutcome) {
-    let gate = outcome.accumulator.quality_gate();
+/// `triggering_gate` is the gate that caused an escalation before this attempt,
+/// where there was one. It wins over the accumulator's, for the reason
+/// `run_with_escalation` gives: the accumulator holds the gate this *final*
+/// attempt tripped, which is `None` exactly when the escalation succeeded — so
+/// taking it alone left the reason blank on the rows that have one.
+pub async fn record(
+    state: &AppState,
+    ctx: &Context,
+    outcome: &StreamOutcome,
+    triggering_gate: Option<oag_router::QualityGate>,
+) {
+    let gate = recorded_gate(triggering_gate, &outcome.accumulator);
     record_with_gate(state, ctx, outcome, gate, true, Fate::Served).await;
+}
+
+/// Which gate the ledger row names.
+///
+/// A tiny rule with two customers — the streamed path here and the collected
+/// one in `run_with_escalation` — which is exactly why it is written down once
+/// rather than inlined twice. Inlined twice is how the streamed path came to
+/// use only half of it.
+///
+/// The gate that *caused* an escalation outranks the one this attempt tripped,
+/// because the attempt that finally worked trips nothing: taking the
+/// accumulator's alone left the reason blank on precisely the rows that have
+/// one, and left "which rung is mis-set for this workload" answerable only from
+/// non-streamed traffic. With no escalation, the attempt's own gate is the
+/// answer — a request that came back unusable with no rung left to try is the
+/// whole record of a missed escalation opportunity.
+fn recorded_gate(
+    triggering_gate: Option<oag_router::QualityGate>,
+    accumulator: &oag_proto::StreamAccumulator,
+) -> Option<oag_router::QualityGate> {
+    triggering_gate.or_else(|| accumulator.quality_gate())
 }
 
 async fn record_with_gate(
@@ -650,4 +681,86 @@ mod tests {
             "and the two rows together net out to a saving, not an invented one"
         );
     }
+    /// G3. A streamed request that climbed a rung records why it climbed.
+    ///
+    /// The gate reaches the ledger from two different places depending on
+    /// whether the request streamed, and only one of them was right. The
+    /// collected path passes `triggering_gate.or(gate)`; the streamed path took
+    /// the accumulator's gate alone — the gate the *final* attempt tripped,
+    /// which is `None` exactly when the escalation did its job. So a streamed
+    /// request that escalated recorded no reason for escalating, and "which
+    /// rung is mis-set for this workload" could only be answered from
+    /// non-streamed traffic.
+    #[test]
+    fn a_streamed_escalation_records_the_gate_that_caused_it() {
+        let mut ctx = context(1);
+        ctx.attempt = 1;
+        ctx.decision.reason = SelectionReason::Escalated {
+            from: TierName::new("cheap"),
+            gate: QualityGate::Refusal,
+        };
+
+        // The retry succeeded, so its own accumulator trips nothing. That is
+        // the whole difficulty: the successful attempt cannot say why there
+        // was a retry.
+        let good = outcome(300);
+        assert_eq!(good.accumulator.quality_gate(), None);
+
+        let gate = recorded_gate(Some(QualityGate::Refusal), &good.accumulator);
+        assert_eq!(
+            gate,
+            Some(QualityGate::Refusal),
+            "the cause outranks the successful attempt's silence"
+        );
+        let row = usage_write(&ctx, &good, gate, true, Fate::Served);
+        assert_eq!(
+            row.escalation_gate.as_deref(),
+            Some("Refusal"),
+            "the row names the gate that caused the climb, not the one the \
+             successful attempt failed to trip"
+        );
+        assert_eq!(
+            row.escalated_from_tier.as_deref(),
+            Some("cheap"),
+            "and the two stay separable: this one is set only when we climbed"
+        );
+    }
+
+    /// And with nothing having caused a climb, the attempt's own gate stands.
+    ///
+    /// The other direction of the same rule. A streamed answer that came back
+    /// unusable with no rung left to try still has to record what was wrong
+    /// with it — that row is the whole record of a missed escalation
+    /// opportunity, and it is the one `escalated_from_tier` is empty on.
+    #[test]
+    fn a_streamed_answer_that_tripped_a_gate_still_records_it() {
+        let ctx = context(0);
+        let refused = StreamOutcome {
+            accumulator: {
+                let mut acc = oag_proto::StreamAccumulator::new();
+                acc.observe(&oag_proto::StreamEvent::TextDelta {
+                    text: "I can't help with that.".to_owned(),
+                });
+                acc.observe(&oag_proto::StreamEvent::Stop {
+                    reason: oag_proto::StopReason::Refusal,
+                    usage: oag_router::Usage::default(),
+                });
+                acc
+            },
+            ..outcome(20)
+        };
+        let gate = recorded_gate(None, &refused.accumulator);
+        assert_eq!(
+            gate,
+            Some(QualityGate::Refusal),
+            "nothing caused a climb, so the attempt's own gate is the answer"
+        );
+        let row = usage_write(&ctx, &refused, gate, true, Fate::Served);
+        assert_eq!(row.escalation_gate.as_deref(), Some("Refusal"));
+        assert_eq!(
+            row.escalated_from_tier, None,
+            "nothing climbed, so nothing to say it climbed from"
+        );
+    }
+
 }
