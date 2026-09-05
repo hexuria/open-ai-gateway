@@ -134,7 +134,14 @@ impl AuthCache {
                 Ok(found.map(Arc::new))
             })
             .await
-            .map_err(|e| oag_core::Error::Internal(format!("auth lookup: {e}")))
+            // The shed has to come back out as itself. Folding every load
+            // error into `Internal` turned a refused permit into a 500 with no
+            // `Retry-After` and an ERROR log per shed — a non-retryable answer
+            // to the one condition that exists to be retried elsewhere.
+            .map_err(|e| match &*e {
+                oag_core::Error::Overloaded => oag_core::Error::Overloaded,
+                other => oag_core::Error::Internal(format!("auth lookup: {other}")),
+            })
     }
 
     /// Drop a key from every tier on this replica, and from Redis.
@@ -167,5 +174,42 @@ impl AuthCache {
     #[must_use]
     pub fn l1_len(&self) -> u64 {
         self.l1.entry_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cache over backends nothing listens on: Redis misses fast, and the
+    /// Postgres lookup behind the permit is never reached.
+    fn dead_backends(lookup_permits: usize) -> AuthCache {
+        let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag", 1).expect("lazy pool");
+        let cache = Cache::connect("redis://127.0.0.1:1").expect("lazy client");
+        AuthCache::new(
+            db,
+            cache,
+            16,
+            "a-signing-secret-long-enough-for-the-mac",
+            lookup_permits,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_shed_lookup_is_overloaded_not_internal() {
+        // Every error out of the single-flight load used to be rewritten as
+        // `Internal`, the refused permit included. That answered a shed with
+        // a 500 and no `Retry-After`, logged it as an error, and counted it
+        // as one — a non-retryable answer to the one condition whose whole
+        // point is to be retried on a replica with room.
+        let auth = dead_backends(1);
+        let held = auth.lookups.try_acquire().expect("the only permit");
+
+        let err = auth
+            .authenticate("oag_sk_deadbeefdeadbeefdeadbeefdeadbeef")
+            .await
+            .expect_err("no permit, no lookup");
+        assert!(matches!(err, oag_core::Error::Overloaded), "{err:?}");
+        drop(held);
     }
 }
