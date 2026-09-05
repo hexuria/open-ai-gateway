@@ -888,14 +888,23 @@ type AccountListRow = (
     i16,
     Option<rust_decimal::Decimal>,
     Option<i16>,
+    Option<String>,
 );
 
 async fn list_accounts(db: &Db) -> Result<()> {
     let rows: Vec<AccountListRow> = sqlx::query_as(
         r"
-        SELECT name, provider, kind, schedulable, cooldown_until, rate_limited_until, priority,
-               usage_remaining_pct, usage_reserve_pct
-        FROM account ORDER BY provider, name
+        -- `owner_principal_id` joined to an email, because a credential bound
+        -- to a principal serves that principal and nobody else — the scheduler
+        -- filters on it — and no CLI output mentioned the binding at all. A
+        -- bound seat listed as `ready` is true and misleading in the same
+        -- breath: ready for one person.
+        SELECT a.name, a.provider, a.kind, a.schedulable, a.cooldown_until,
+               a.rate_limited_until, a.priority,
+               a.usage_remaining_pct, a.usage_reserve_pct, p.email
+        FROM account a
+        LEFT JOIN principal p ON p.id = a.owner_principal_id
+        ORDER BY a.provider, a.name
         ",
     )
     .fetch_all(db.pool())
@@ -906,10 +915,22 @@ async fn list_accounts(db: &Db) -> Result<()> {
         println!("no credentials; add one with `oag admin account add`");
         return Ok(());
     }
-    println!("NAME                 PROVIDER     KIND       STATE          PRIORITY  RESERVE");
+    println!(
+        "NAME                 PROVIDER     KIND       STATE          PRIORITY  RESERVE  OWNER"
+    );
     let now = time::OffsetDateTime::now_utc();
-    for (name, provider, kind, schedulable, cooldown, rate_limited, priority, remaining, reserve) in
-        rows
+    for (
+        name,
+        provider,
+        kind,
+        schedulable,
+        cooldown,
+        rate_limited,
+        priority,
+        remaining,
+        reserve,
+        owner,
+    ) in rows
     {
         // "held back" outranks "ready" and nothing else: a reserved-out seat is
         // as unschedulable as a rate limited one, and a listing that called it
@@ -928,7 +949,12 @@ async fn list_accounts(db: &Db) -> Result<()> {
         // A dash rather than a blank where no reserve is set: a column that
         // simply stops has already been read as "the listing is truncated".
         let reserve = reserve.map_or_else(|| "-".to_owned(), |p| format!("{p}%"));
-        println!("{name:<20} {provider:<12} {kind:<10} {state:<14} {priority:<9} {reserve}");
+        // A bound credential reads `ready` and is ready for exactly one person.
+        // The scheduler has always filtered on this; no CLI output said so.
+        let owner = owner.unwrap_or_else(|| "-".to_owned());
+        println!(
+            "{name:<20} {provider:<12} {kind:<10} {state:<14} {priority:<9} {reserve:<8} {owner}"
+        );
     }
     Ok(())
 }

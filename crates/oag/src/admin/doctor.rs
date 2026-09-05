@@ -123,6 +123,15 @@ struct Seat {
     /// held back right now, which is a live reason a request would fail.
     usage_remaining_pct: Option<rust_decimal::Decimal>,
     usage_reserve_pct: Option<i16>,
+    /// The principal this credential is bound to, if it is bound to one.
+    ///
+    /// The scheduler filters on it: a credential with an owner serves that
+    /// principal's requests and nobody else's. Doctor never selected it, so a
+    /// personally bound seat counted as a live credential for its rung and the
+    /// route reported `ok` — for every principal, including the ones that
+    /// cannot reach it. The first symptom is `no_viable_model` on a route the
+    /// CLI has just called healthy.
+    owner_principal_id: Option<uuid::Uuid>,
 }
 
 impl Seat {
@@ -131,6 +140,16 @@ impl Seat {
             && self.cooldown_until.is_none_or(|t| t <= now)
             && self.rate_limited_until.is_none_or(|t| t <= now)
             && !self.reserved_out()
+    }
+
+    /// Whether this credential can serve an arbitrary caller on the route.
+    ///
+    /// A rung is only covered if something on it will answer *anyone* who is
+    /// entitled to the route. An owner-bound credential answers exactly one
+    /// principal, so counting it as coverage told every other principal their
+    /// route was healthy right up until `no_viable_model`.
+    const fn shared(&self) -> bool {
+        self.owner_principal_id.is_none()
     }
 
     /// Whether the reserve is holding this seat out of the pool right now.
@@ -173,12 +192,13 @@ async fn load_accounts(db: &Db, route: &str) -> Result<Vec<Seat>> {
             Option<rust_decimal::Decimal>,
             Option<rust_decimal::Decimal>,
             Option<i16>,
+            Option<uuid::Uuid>,
         ),
     >(
         r"
         SELECT a.name, a.provider, a.kind, a.schedulable, a.cooldown_until,
                a.rate_limited_until, a.monthly_cost_usd,
-               a.usage_remaining_pct, a.usage_reserve_pct
+               a.usage_remaining_pct, a.usage_reserve_pct, a.owner_principal_id
         FROM account a
         JOIN account_route ar ON ar.account_id = a.id
         JOIN route r ON r.id = ar.route_id
@@ -203,6 +223,7 @@ async fn load_accounts(db: &Db, route: &str) -> Result<Vec<Seat>> {
                     monthly_cost_usd,
                     usage_remaining_pct,
                     usage_reserve_pct,
+                    owner_principal_id,
                 )| Seat {
                     name,
                     provider,
@@ -213,6 +234,7 @@ async fn load_accounts(db: &Db, route: &str) -> Result<Vec<Seat>> {
                     monthly_cost_usd,
                     usage_remaining_pct,
                     usage_reserve_pct,
+                    owner_principal_id,
                 },
             )
             .collect()
@@ -255,7 +277,11 @@ fn check_ladder(rungs: &[oag_router::ladder::Rung], accounts: &[Seat], route: &s
         let missing: Vec<&str> = providers
             .iter()
             .copied()
-            .filter(|p| !accounts.iter().any(|a| a.provider == *p && a.live(now)))
+            .filter(|p| {
+                !accounts
+                    .iter()
+                    .any(|a| a.provider == *p && a.live(now) && a.shared())
+            })
             .collect();
         if missing.is_empty() {
             println!(
@@ -270,6 +296,26 @@ fn check_ladder(rungs: &[oag_router::ladder::Rung], accounts: &[Seat], route: &s
                 r.name,
                 missing.join("/")
             );
+            // The one failure whose cause is invisible in the listing above.
+            // A credential that is live in every other respect but bound to a
+            // principal serves that principal and nobody else, so a rung whose
+            // only candidate is bound reads as "no credential" here while
+            // `account list` shows it ready — and the operator goes looking for
+            // an outage that is not there.
+            for p in &missing {
+                let bound: Vec<&str> = accounts
+                    .iter()
+                    .filter(|a| a.provider == **p && a.live(now) && !a.shared())
+                    .map(|a| a.name.as_str())
+                    .collect();
+                if !bound.is_empty() {
+                    println!(
+                        "     note: {} is live but bound to one principal, so it cannot \
+                         serve this rung for anyone else",
+                        bound.join(", ")
+                    );
+                }
+            }
             println!(
                 "     fix: oag admin account add --name {p}-1 --provider {p} --secret <key> --route {route}",
                 p = missing[0]
@@ -419,7 +465,16 @@ mod tests {
             monthly_cost_usd: cost.map(rust_decimal::Decimal::from),
             usage_remaining_pct: None,
             usage_reserve_pct: None,
+            owner_principal_id: None,
         }
+    }
+
+    /// The same seat, bound to one principal — the shape the scheduler will
+    /// only ever hand to that principal's requests.
+    fn owner_bound(name: &str) -> Seat {
+        let mut s = seat(name, "oauth", Some(300));
+        s.owner_principal_id = Some(uuid::Uuid::new_v4());
+        s
     }
 
     /// A seat with a reading and a floor under it, both in whole percent.
@@ -510,6 +565,47 @@ mod tests {
         );
         assert_eq!(
             check_ladder(&rungs, &[reserved("grok", 80, 10)], "default"),
+            0
+        );
+    }
+    /// C10. An owner-bound seat does not cover a rung for everyone else.
+    ///
+    /// The scheduler filters candidates on `owner_principal_id`: a credential
+    /// with an owner serves that principal's requests and nobody else's. Doctor
+    /// never selected the column, so a personally bound seat answered "is there
+    /// a live credential for this rung" on behalf of every principal on the
+    /// route. The route reported `ok`, and the first contradiction anyone saw
+    /// was `no_viable_model` on a route the CLI had just called healthy.
+    #[test]
+    fn an_owner_bound_seat_does_not_cover_a_rung() {
+        let rungs = vec![oag_router::ladder::Rung {
+            name: oag_core::TierName::new("cheap"),
+            models: vec![oag_router::ModelId::new("xai/grok-4.6")],
+        }];
+
+        // Live by every other measure — schedulable, no cooldown, no rate
+        // limit, no reserve — and reachable by exactly one principal.
+        let bound = owner_bound("grok-personal");
+        assert!(
+            bound.live(time::OffsetDateTime::now_utc()),
+            "the fixture has to be live, or this would pass for the wrong reason"
+        );
+        assert_eq!(
+            check_ladder(&rungs, &[bound], "default"),
+            1,
+            "a rung whose only credential answers one principal is not covered"
+        );
+
+        // A shared credential beside it covers the rung for everyone.
+        assert_eq!(
+            check_ladder(
+                &rungs,
+                &[
+                    owner_bound("grok-personal"),
+                    seat("grok-team", "oauth", Some(300))
+                ],
+                "default"
+            ),
             0
         );
     }
