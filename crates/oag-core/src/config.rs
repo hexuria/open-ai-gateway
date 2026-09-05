@@ -541,6 +541,37 @@ impl Config {
                 "gateway.client_write_timeout must be positive".to_owned(),
             ));
         }
+        // And below the stream ceiling, or it can never fire.
+        //
+        // The ceiling is checked at the top of the pump's loop, and the loop is
+        // where the send happens — so a send parked on a client that has
+        // stopped reading is not interrupted by the ceiling, only by this
+        // deadline. Set longer than the ceiling it becomes unreachable: the
+        // parked send holds the credential's concurrency slot, the socket and
+        // the shutdown guard for its full length, and a drain waits for a
+        // client that is never coming back.
+        if self.gateway.client_write_timeout >= self.gateway.max_stream_duration {
+            return Err(crate::Error::Config(
+                "gateway.client_write_timeout must be shorter than \
+                 gateway.max_stream_duration, or a parked send outlives the ceiling \
+                 meant to bound it"
+                    .to_owned(),
+            ));
+        }
+        // Zero here means "try exactly one credential", which is not what zero
+        // means anywhere else in this section: for every neighbouring duration
+        // it means "no deadline". So an operator disabling a budget got silent
+        // single-credential dispatch instead, voiding `max_account_switches`
+        // with nothing said. There is no way to spell "unbounded" for this one,
+        // and inventing one would make a stuck failover loop unbounded too.
+        if self.gateway.failover_budget.is_zero() {
+            return Err(crate::Error::Config(
+                "gateway.failover_budget must be positive; zero would try exactly one \
+                 credential rather than removing the deadline, which is what zero means \
+                 for every other duration here"
+                    .to_owned(),
+            ));
+        }
         // The period of a live interval. Zero is clamped in the pump so it
         // cannot panic, but a one-millisecond keepalive is a stream of
         // comments nobody meant; and one at or past the idle watchdog keeps
@@ -917,5 +948,59 @@ security:
             "not-base64-at-all!!!",
         );
         assert!(Config::from_yaml(&src).is_err());
+    }
+    /// R3. A write deadline above the stream ceiling can never fire.
+    ///
+    /// The ceiling is checked at the top of the pump's loop, and the send
+    /// happens inside it — so a send parked on a client that has stopped
+    /// reading is bounded by this deadline and by nothing else. Longer than the
+    /// ceiling it is unreachable, and the parked send holds the credential's
+    /// concurrency slot, the socket and the shutdown guard for its full length
+    /// while a drain waits for a client that is never coming back.
+    ///
+    /// The default already satisfies this, which is why nothing noticed: only a
+    /// config that changes one of the two can reach it.
+    #[test]
+    fn a_write_deadline_at_or_above_the_stream_ceiling_is_refused() {
+        // `stream_idle_timeout` comes down with the ceiling, or an earlier
+        // constraint fires first and this proves nothing.
+        let cfg = |write: u32| {
+            format!(
+                "{MINIMAL}\ngateway:\n  stream_idle_timeout: 30\n  \
+                 max_stream_duration: 60\n  client_write_timeout: {write}\n"
+            )
+        };
+        let over = cfg(120);
+        let err = Config::from_yaml(&over).expect_err("refused");
+        assert!(err.to_string().contains("client_write_timeout"), "{err}");
+
+        // Equal is refused too: a deadline that fires at the same instant as
+        // the ceiling has the same problem with an extra race in it.
+        assert!(
+            Config::from_yaml(&cfg(60)).is_err(),
+            "equal has the same problem with a race added"
+        );
+
+        Config::from_yaml(&cfg(30)).expect("shorter is the only sane ordering");
+    }
+
+    /// R4. Zero means "no deadline" everywhere here except one place.
+    ///
+    /// For every neighbouring duration zero means unbounded. For
+    /// `failover_budget` it meant "try exactly one credential", so an operator
+    /// disabling the budget got silent single-credential dispatch instead —
+    /// `max_account_switches` voided, with nothing said.
+    #[test]
+    fn a_failover_budget_of_zero_is_refused_rather_than_disabling_failover() {
+        let zero = format!("{MINIMAL}\ngateway:\n  failover_budget: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("refused");
+        assert!(err.to_string().contains("failover_budget"), "{err}");
+        assert!(
+            err.to_string().contains("one credential"),
+            "the message has to say what zero would actually have done: {err}"
+        );
+
+        let one = format!("{MINIMAL}\ngateway:\n  failover_budget: 1\n");
+        Config::from_yaml(&one).expect("a short budget is a budget");
     }
 }
