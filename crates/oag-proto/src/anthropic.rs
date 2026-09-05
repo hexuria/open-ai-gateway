@@ -40,7 +40,17 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     if let Some(t) = req.temperature {
         body["temperature"] = json!(t);
     }
-    if let Some(budget) = req.thinking_budget {
+    // A level from a client that speaks levels becomes a budget here, the
+    // mirror of the OpenAI renderer turning a budget into the nearest level.
+    // `openai::parse_request` deliberately leaves `thinking_budget` empty, so
+    // gating on the budget alone meant a Chat Completions client's
+    // `reasoning_effort: "high"` had nowhere to land: the request reached a
+    // thinking model with thinking switched off, at frontier prices, and
+    // nothing in the answer said the field had been dropped.
+    if let Some(budget) = req
+        .thinking_budget
+        .or_else(|| req.thinking_effort.map(Effort::as_budget))
+    {
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
     }
 
@@ -366,8 +376,14 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
             }
         }
 
+        // Every block ends with this event, whatever kind it was, and the
+        // event does not say which. `current_tool_id` answered "the last call
+        // opened", so a text block closing after a tool call had already
+        // finished emitted a second end for that call — and a renderer that
+        // acts on the end (Gemini emits the call there, Anthropic closes its
+        // block) acted on it twice.
         "content_block_stop" => acc
-            .current_tool_id()
+            .open_tool_id()
             .map(|id| vec![StreamEvent::ToolUseEnd { id }])
             .unwrap_or_default(),
 
@@ -626,7 +642,25 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
                 &json!({
                     "type": "message_delta",
                     "delta": { "stop_reason": stop_reason_str(*reason), "stop_sequence": Value::Null },
-                    "usage": { "output_tokens": st.usage.output_tokens }
+                    // The full merged usage, not `output_tokens` alone.
+                    //
+                    // A native Anthropic upstream reports input and cache
+                    // counts in `message_start`, so repeating only the output
+                    // count on the terminal frame is what the dialect itself
+                    // does. But `message_start` is rendered before any upstream
+                    // has reported usage, and a Chat Completions upstream
+                    // reports all of it at the end — so an Anthropic client
+                    // reading a non-Anthropic model was told, permanently, that
+                    // its prompt cost zero tokens. The other three renderers
+                    // put the whole merged figure on their terminal frame.
+                    // Repeating counts a native upstream already sent is
+                    // harmless: a client merges these, as this gateway does.
+                    "usage": {
+                        "input_tokens": st.usage.input_tokens,
+                        "output_tokens": st.usage.output_tokens,
+                        "cache_read_input_tokens": st.usage.cache_read_tokens,
+                        "cache_creation_input_tokens": st.usage.cache_write_tokens,
+                    }
                 }),
             ));
             out.push_str(&RenderState::frame(
@@ -876,6 +910,130 @@ fn parse_stop_reason(raw: &str) -> StopReason {
 mod tests {
     use super::*;
     use crate::canonical::extract_cache_blocks;
+
+    /// H3. A client that asks for reasoning in levels still gets reasoning.
+    #[test]
+    fn a_reasoning_effort_becomes_a_thinking_budget() {
+        // `openai::parse_request` deliberately leaves `thinking_budget` empty,
+        // so gating on the budget alone meant a Chat Completions client's
+        // `reasoning_effort: "high"` had nowhere to land: the request reached a
+        // thinking model with thinking off, at frontier prices, and nothing in
+        // the answer said the field had been dropped.
+        let mut req = CanonicalRequest {
+            model: "m".to_owned(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            stream: false,
+            temperature: None,
+            thinking_budget: None,
+            thinking_effort: Some(Effort::High),
+            client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
+        };
+        let body = render_request(&req, "claude-opus-5").expect("renders");
+        assert_eq!(body["thinking"]["type"], json!("enabled"));
+        assert_eq!(
+            body["thinking"]["budget_tokens"],
+            json!(Effort::High.as_budget())
+        );
+
+        // An explicit budget still wins: it is the more precise of the two.
+        req.thinking_budget = Some(2048);
+        let body = render_request(&req, "claude-opus-5").expect("renders");
+        assert_eq!(body["thinking"]["budget_tokens"], json!(2048));
+    }
+
+    /// P5. The terminal frame carries the whole bill, not just the output half.
+    #[test]
+    fn the_terminal_frame_reports_the_prompt_count_too() {
+        // A native Anthropic upstream reports input and cache counts in
+        // `message_start`, which this renderer emits before any upstream has
+        // said anything. Over a Chat Completions upstream, which reports all of
+        // it at the end, an Anthropic client was told permanently that its
+        // prompt cost nothing.
+        let mut st = RenderState::default();
+
+        // The order a Chat Completions upstream produces: the stream opens
+        // before anything is known about the bill, and every count arrives at
+        // the end. `message_start` is therefore rendered with zeroes.
+        let start = render_event(
+            &StreamEvent::Start {
+                model: "claude-opus-5".to_owned(),
+                usage: Usage::default(),
+            },
+            &mut st,
+        )
+        .expect("a message_start");
+        assert!(
+            start.contains(r#""input_tokens":0"#),
+            "message_start goes out before the upstream has said anything: {start}"
+        );
+
+        let usage = Usage {
+            input_tokens: 1200,
+            output_tokens: 142,
+            cache_read_tokens: 18000,
+            cache_write_tokens: 300,
+        };
+        let _ = render_event(&StreamEvent::UsageUpdate { usage }, &mut st);
+        let out = render_event(
+            &StreamEvent::Stop {
+                reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+            &mut st,
+        )
+        .expect("a terminal frame");
+
+        // The `message_delta` frame specifically, not the whole string: the
+        // rest of `out` carries other frames, and asserting over all of it is
+        // how this test first passed with the fix reverted.
+        let delta = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .map(|l| serde_json::from_str::<Value>(l).expect("a frame"))
+            .find(|f| f["type"] == "message_delta")
+            .expect("a message_delta frame");
+        assert_eq!(delta["usage"]["input_tokens"], json!(1200), "{delta}");
+        assert_eq!(delta["usage"]["output_tokens"], json!(142), "{delta}");
+        assert_eq!(
+            delta["usage"]["cache_read_input_tokens"],
+            json!(18000),
+            "{delta}"
+        );
+        assert_eq!(
+            delta["usage"]["cache_creation_input_tokens"],
+            json!(300),
+            "{delta}"
+        );
+    }
+
+    /// P13. Only a tool block's close ends a tool call.
+    #[test]
+    fn a_text_block_closing_after_a_tool_call_does_not_end_it_again() {
+        // Every block ends with the same `content_block_stop`, and the event
+        // does not say which kind it closed. Reading "the last call opened"
+        // emitted a second end for a call that had already finished, and a
+        // renderer that acts on the end acted on it twice.
+        let (events, _) = drive(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"done"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+        ]);
+        let ends = events
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::ToolUseEnd { .. }))
+            .count();
+        assert_eq!(ends, 1, "one call opened, so one end: {events:?}");
+    }
 
     /// A realistic streamed response: cached prefix, some text, a tool call
     /// assembled from fragments, then a stop with output counts.

@@ -343,7 +343,13 @@ impl CanonicalRequest {
             tool_count: self.tools.len(),
             turn_count: self.messages.len(),
             has_images: self.has_images(),
-            thinking_requested: self.thinking_budget.is_some_and(|b| b > 0),
+            // Either spelling. A client that asks in levels is asking for
+            // reasoning just as plainly as one that asks in tokens, and reading
+            // only the budget left `reasoning_effort: "high"` classified as an
+            // ordinary request — routed to the cheap rung, which then also
+            // received it with thinking switched off. Compounds H3.
+            thinking_requested: self.thinking_budget.is_some_and(|b| b > 0)
+                || self.thinking_effort.is_some_and(|e| e.as_budget() > 0),
             has_code: self.has_code(),
             explicit_tier: None,
         }
@@ -538,6 +544,40 @@ pub fn extract_cache_blocks(req: &CanonicalRequest) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P4. A level is a request for reasoning just as plainly as a budget is.
+    #[test]
+    fn an_effort_alone_marks_a_request_as_wanting_to_think() {
+        // Reading only `thinking_budget` left a Chat Completions client's
+        // `reasoning_effort: "high"` classified as an ordinary request, so the
+        // classifier sent it to the cheap rung — which then also received it
+        // with thinking switched off (H3). Two halves of one dropped field.
+        let mut req = CanonicalRequest {
+            model: "m".to_owned(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            stream: false,
+            temperature: None,
+            thinking_budget: None,
+            thinking_effort: None,
+            client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
+        };
+        assert!(!req.signal().thinking_requested, "nothing was asked for");
+
+        req.thinking_effort = Some(Effort::High);
+        assert!(req.signal().thinking_requested, "a level is an ask");
+
+        // `Off` is the one level that is not an ask, exactly as a zero budget
+        // is not.
+        req.thinking_effort = Some(Effort::Off);
+        assert!(!req.signal().thinking_requested, "off means off");
+    }
 
     fn text(s: &str) -> ContentBlock {
         ContentBlock::Text {

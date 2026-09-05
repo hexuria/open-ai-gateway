@@ -27,6 +27,7 @@ use oag_core::provider::Dialect;
 use oag_core::{Error, Result};
 use oag_router::Usage;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 
 const DIALECT: Dialect = Dialect::GeminiGenerateContent;
 
@@ -35,7 +36,28 @@ const DIALECT: Dialect = Dialect::GeminiGenerateContent;
 /// The model name is not in the body here: it is in the URL path, which is why
 /// this takes no model argument.
 pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
-    let contents: Vec<Value> = req.messages.iter().map(render_message).collect();
+    // What each tool call was called, keyed by the id its result will quote.
+    //
+    // This dialect addresses a result by the *function's name*; there is no
+    // call id. When the conversation began in another dialect the id is
+    // something like `call_abc123`, and sending that as the name told the model
+    // about a function it has never heard of — so it re-issued the original
+    // call and the agent loop never terminated. The name is right here, on the
+    // `ToolUse` block in the assistant turn the result answers.
+    let tool_names: HashMap<&str, &str> = req
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
+    let contents: Vec<Value> = req
+        .messages
+        .iter()
+        .map(|m| render_message(m, &tool_names))
+        .collect();
 
     let mut body = json!({
         "contents": contents,
@@ -69,7 +91,17 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
     if let Some(t) = req.temperature {
         body["generationConfig"]["temperature"] = json!(t);
     }
-    if let Some(budget) = req.thinking_budget {
+    // A level from a client that speaks levels becomes a budget here, the
+    // mirror of the OpenAI renderer turning a budget into the nearest level.
+    // `openai::parse_request` deliberately leaves `thinking_budget` empty, so
+    // gating on the budget alone meant a Chat Completions client's
+    // `reasoning_effort: "high"` had nowhere to land: the request reached a
+    // thinking model with thinking switched off, at frontier prices, and
+    // nothing in the answer said the field had been dropped.
+    if let Some(budget) = req
+        .thinking_budget
+        .or_else(|| req.thinking_effort.map(Effort::as_budget))
+    {
         body["generationConfig"]["thinkingConfig"] = json!({ "thinkingBudget": budget });
     }
 
@@ -116,7 +148,7 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
     Ok(body)
 }
 
-fn render_message(m: &Message) -> Value {
+fn render_message(m: &Message, tool_names: &HashMap<&str, &str>) -> Value {
     let parts: Vec<Value> = m
         .content
         .iter()
@@ -133,11 +165,15 @@ fn render_message(m: &Message) -> Value {
                 content,
                 ..
             } => Some(json!({
-                // Addressed by name in this dialect; the id is the closest
-                // thing we have when the original name is not carried, once
-                // the ordinal `parse_chunk` may have added is taken off.
+                // Addressed by name in this dialect. The map is the answer
+                // whenever the call came through this gateway; failing that,
+                // the id with any ordinal `parse_chunk` added taken off, which
+                // is right when the call originated here in Gemini's own form.
                 "functionResponse": {
-                    "name": function_name(tool_use_id),
+                    "name": tool_names
+                        .get(tool_use_id.as_str())
+                        .copied()
+                        .unwrap_or_else(|| function_name(tool_use_id)),
                     "response": { "result": content.as_text() },
                 }
             })),
@@ -303,7 +339,18 @@ fn parse_content(v: &Value) -> Option<Message> {
             if let Some(resp) = p.get("functionResponse") {
                 return Some(ContentBlock::ToolResult {
                     tool_use_id: resp["name"].as_str().unwrap_or_default().to_owned(),
-                    content: ToolResultContent::Text(resp["response"].to_string()),
+                    // Unwrap the envelope `render_message` puts on. It writes
+                    // `{"result": <the result>}`, and reading the whole object
+                    // back made the result of one turn the *JSON of* the result
+                    // on the next — a wrapper deeper every round trip, so a
+                    // long tool-using conversation fed the model its own
+                    // punctuation. A `response` this gateway did not render has
+                    // no `result` key and is taken whole, as before.
+                    content: ToolResultContent::Text(match &resp["response"]["result"] {
+                        Value::Null => resp["response"].to_string(),
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    }),
                     is_error: false,
                 });
             }
@@ -592,6 +639,15 @@ pub fn render_message_response(anthropic: &Value) -> Value {
     for block in anthropic["content"].as_array().unwrap_or(&Vec::new()) {
         match block["type"].as_str().unwrap_or_default() {
             "text" => parts.push(json!({ "text": block["text"] })),
+            // Reasoning is collected too. This converter matched `text` and
+            // `tool_use` only, so a non-streamed request lost the thinking that
+            // the identical streamed one delivers, and the tokens were billed
+            // either way. A thought is an ordinary text part flagged `thought`,
+            // which is exactly what `render_event` emits and what this
+            // dialect's own reader looks for.
+            "thinking" => parts.push(json!({
+                "text": block["thinking"], "thought": true
+            })),
             "tool_use" => parts.push(json!({
                 "functionCall": { "name": block["name"], "args": block["input"] }
             })),
@@ -602,6 +658,7 @@ pub fn render_message_response(anthropic: &Value) -> Value {
     let u = &anthropic["usage"];
     let input = u["input_tokens"].as_u64().unwrap_or(0);
     let cached = u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    let written = u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
     let output = u["output_tokens"].as_u64().unwrap_or(0);
 
     json!({
@@ -615,18 +672,24 @@ pub fn render_message_response(anthropic: &Value) -> Value {
             "index": 0,
         }],
         "usageMetadata": {
-            // Folded back together: this dialect reports the total prompt.
-            "promptTokenCount": input + cached,
+            // Folded back together: this dialect reports the total prompt,
+            // cache writes included, so that prompt + candidates == total.
+            "promptTokenCount": input + cached + written,
             "cachedContentTokenCount": cached,
             "candidatesTokenCount": output,
-            "totalTokenCount": input + cached + output,
+            "totalTokenCount": input + cached + written + output,
         }
     })
 }
 
 fn usage_json(u: &Usage) -> Value {
     json!({
-        "promptTokenCount": u.input_tokens + u.cache_read_tokens,
+        // Cache writes belong in the prompt count, because `total()` counts
+        // them and a client that checks prompt + candidates == total is
+        // entitled to find it true. It was not, for any request that wrote to
+        // the cache. The other dialects' renderers fold writes into the prompt
+        // side for the same reason.
+        "promptTokenCount": u.input_tokens + u.cache_read_tokens + u.cache_write_tokens,
         "cachedContentTokenCount": u.cache_read_tokens,
         "candidatesTokenCount": u.output_tokens,
         "totalTokenCount": u.total(),
@@ -651,6 +714,154 @@ fn parse_usage(v: &Value) -> Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(f: impl FnOnce(&mut CanonicalRequest)) -> CanonicalRequest {
+        let mut req = CanonicalRequest {
+            model: "m".to_owned(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            stream: false,
+            temperature: None,
+            thinking_budget: None,
+            thinking_effort: None,
+            client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
+        };
+        f(&mut req);
+        req
+    }
+
+    /// H3. A client that asks for reasoning in levels still gets reasoning.
+    #[test]
+    fn a_reasoning_effort_becomes_a_thinking_budget() {
+        // `openai::parse_request` leaves `thinking_budget` empty on purpose, so
+        // gating on the budget alone dropped `reasoning_effort: "high"` on the
+        // floor: a thinking model asked to think, at frontier prices, with
+        // thinking switched off and nothing saying so.
+        let req = request(|r| r.thinking_effort = Some(Effort::High));
+        let body = render_request(&req).expect("renders");
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            json!(Effort::High.as_budget())
+        );
+
+        // An explicit budget still wins: it is the more precise of the two.
+        let req = request(|r| {
+            r.thinking_effort = Some(Effort::High);
+            r.thinking_budget = Some(2048);
+        });
+        let body = render_request(&req).expect("renders");
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            json!(2048)
+        );
+    }
+
+    /// P10. A tool result is addressed by the function's name, not by an id.
+    #[test]
+    fn a_tool_result_is_named_after_the_function_that_was_called() {
+        // There are no call ids in this dialect. When the conversation began
+        // elsewhere the id is something like `call_abc123`, and sending that as
+        // the name told the model about a function it has never heard of — so
+        // it re-issued the call it had just been answered, and the agent loop
+        // never terminated. The name is on the `ToolUse` block the result
+        // answers.
+        let req = request(|r| {
+            r.messages = vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::ToolUse {
+                        id: "call_abc123".to_owned(),
+                        name: "read_file".to_owned(),
+                        input: json!({"path": "a.rs"}),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: "call_abc123".to_owned(),
+                        content: ToolResultContent::Text("fn main() {}".to_owned()),
+                        is_error: false,
+                    }],
+                },
+            ];
+        });
+        let body = render_request(&req).expect("renders");
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionResponse"]["name"],
+            json!("read_file"),
+            "not the opaque id the other dialect gave it"
+        );
+    }
+
+    /// P12. A tool result does not gain a wrapper on every round trip.
+    #[test]
+    fn a_tool_result_survives_the_round_trip_unwrapped() {
+        // `render_message` writes `{"result": <the result>}`. Reading the whole
+        // object back made one turn's result the *JSON of* the result on the
+        // next, a wrapper deeper each time, until the model was being fed its
+        // own punctuation.
+        let req = request(|r| {
+            r.messages = vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "read_file".to_owned(),
+                    content: ToolResultContent::Text("fn main() {}".to_owned()),
+                    is_error: false,
+                }],
+            }];
+        });
+        let wire = render_request(&req).expect("renders");
+        let back = parse_content(&wire["contents"][0]).expect("parses");
+        match &back.content[0] {
+            ContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content.as_text(), "fn main() {}");
+            }
+            other => panic!("expected a tool result, got {other:?}"),
+        }
+    }
+
+    /// P9. Prompt plus candidates equals total, cache writes included.
+    #[test]
+    fn the_reported_token_counts_add_up() {
+        // Clients in this dialect check that sum. It did not hold for any
+        // request that wrote to the cache: the writes were in `total` and not
+        // in the prompt count.
+        let u = Usage {
+            input_tokens: 1200,
+            output_tokens: 142,
+            cache_read_tokens: 18000,
+            cache_write_tokens: 300,
+        };
+        let out = usage_json(&u);
+        let prompt = out["promptTokenCount"].as_u64().expect("a number");
+        let candidates = out["candidatesTokenCount"].as_u64().expect("a number");
+        let total = out["totalTokenCount"].as_u64().expect("a number");
+        assert_eq!(prompt + candidates, total, "{out}");
+        assert_eq!(prompt, 1200 + 18000 + 300);
+    }
+
+    /// P6. A collected answer keeps the reasoning a streamed one delivers.
+    #[test]
+    fn reasoning_survives_the_non_streamed_conversion() {
+        let out = render_message_response(&json!({
+            "model": "claude-sonnet-4.5",
+            "content": [
+                {"type": "thinking", "thinking": "counting users"},
+                {"type": "text", "text": "SELECT count(*) FROM users;"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        }));
+        let parts = &out["candidates"][0]["content"]["parts"];
+        assert_eq!(parts[0], json!({"text": "counting users", "thought": true}));
+        assert_eq!(parts[1]["text"], json!("SELECT count(*) FROM users;"));
+    }
 
     /// A realistic streamed response, including a whole-arrival tool call and
     /// the usage metadata that lands with the final chunk.
