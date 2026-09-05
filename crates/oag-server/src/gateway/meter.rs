@@ -203,11 +203,12 @@ pub async fn record_collected(
 /// An attempt the quality gate condemned, captured at the moment we gave up on
 /// it and held until the request it belongs to is finished.
 ///
-/// Captured rather than written there and then because of when it has to reach
-/// the ledger, not what it contains. Until the primary key is contracted onto
-/// `(request_id, attempt)`, only the first row for a request survives — and the
-/// row that has to survive is the one the client was served. Captured here, its
-/// latency and usage are still its own rather than the retry's.
+/// Captured rather than written there and then because of where it has to be
+/// written, not what it contains. The row belongs on the detached task that
+/// writes the served row, so that a client hanging up mid-write cannot cancel
+/// it; writing it at the point of abandonment would put it back on the request
+/// future. Captured here, its latency and usage are still its own rather than
+/// the retry's.
 #[derive(Debug, Clone)]
 pub struct Abandoned {
     ctx: Context,
@@ -234,9 +235,9 @@ pub fn abandon(
 ///
 /// The row carries the client's request id, so it stays attributable to the one
 /// request that was made, and `attempt` plus a `selection_reason` of
-/// `abandoned` separate it from the answer that was actually served. Until the
-/// ledger's key contracts, this write loses to the served row it follows and is
-/// dropped; the served row is the one that must not be.
+/// `abandoned` separate it from the answer that was actually served. Since 0014
+/// contracted the ledger's key onto `(request_id, attempt)` it lands beside that
+/// served row rather than losing to it.
 pub async fn record_abandoned(state: &AppState, abandoned: &Abandoned) {
     record_with_gate(
         state,
@@ -249,24 +250,42 @@ pub async fn record_abandoned(state: &AppState, abandoned: &Abandoned) {
     .await;
 }
 
+/// An answer the provider generated and the stream then lost, captured while
+/// the lease that identifies it is still in hand.
+///
+/// Held for the same reason [`Abandoned`] is. Written where it used to be — in
+/// the failover loop, inline — it sat on the request future, so a client that
+/// hung up during the retry cancelled the one write that says the first
+/// generation was paid for. It is also written *after* the served row now,
+/// which is what makes the ordering deliberate rather than incidental.
+#[derive(Debug, Clone)]
+pub struct Lost {
+    ctx: Context,
+    outcome: StreamOutcome,
+}
+
+/// Take note of an answer the stream lost.
+pub fn lose(
+    ctx: Context,
+    accumulator: &oag_proto::StreamAccumulator,
+    error: &oag_core::Error,
+) -> Lost {
+    let outcome = StreamOutcome {
+        error: Some(error.to_string()),
+        ..collected(&ctx, accumulator)
+    };
+    Lost { ctx, outcome }
+}
+
 /// Record an attempt the provider generated and the stream then lost.
 ///
 /// A collected stream that fails after its first frames — a Codex seat's
 /// connection dropping mid-generation — still cost what it generated, and
 /// the retry on another credential is a second generation, not a free
-/// replacement. This row is the first one. Status 502, because that is what
-/// the attempt was; the served row that follows says what the client got.
-pub async fn record_lost(
-    state: &AppState,
-    ctx: &Context,
-    accumulator: &oag_proto::StreamAccumulator,
-    error: &oag_core::Error,
-) {
-    let outcome = StreamOutcome {
-        error: Some(error.to_string()),
-        ..collected(ctx, accumulator)
-    };
-    record_with_gate(state, ctx, &outcome, None, false, Fate::Lost).await;
+/// replacement. Status 502, because that is what the attempt was; the served
+/// row it sits beside says what the client got.
+pub async fn record_lost(state: &AppState, lost: &Lost) {
+    record_with_gate(state, &lost.ctx, &lost.outcome, None, false, Fate::Lost).await;
 }
 
 /// The outcome of a response that arrived in one piece.
