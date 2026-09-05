@@ -206,6 +206,15 @@ impl StreamAccumulator {
         self.tool_calls > 0
     }
 
+    /// How many tool calls have opened in this response so far.
+    ///
+    /// For a dialect with no wire id for a call: the ordinal is what makes
+    /// the synthesised id unique across the chunks of one stream.
+    #[must_use]
+    pub const fn tool_call_count(&self) -> usize {
+        self.tool_calls
+    }
+
     #[must_use]
     pub const fn usage(&self) -> &Usage {
         &self.usage

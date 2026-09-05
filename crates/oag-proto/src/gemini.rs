@@ -11,7 +11,9 @@
 //! - A tool *call* is a `functionCall` part; a tool *result* is a
 //!   `functionResponse` part, addressed by function **name** rather than by a
 //!   call id — so a conversation with two concurrent calls to the same function
-//!   cannot be represented faithfully. We key on name and accept the limit.
+//!   cannot be represented faithfully on the wire. Canonical ids are the name
+//!   plus an ordinal for repeats (`call_id`), so the canonical side at least
+//!   keeps the calls apart; the result still goes back by name.
 //! - Generation settings live under `generationConfig`, not at the top level.
 //! - Usage is `usageMetadata`, and its prompt count *includes* the cached
 //!   prefix, like Chat Completions and unlike Anthropic.
@@ -132,9 +134,10 @@ fn render_message(m: &Message) -> Value {
                 ..
             } => Some(json!({
                 // Addressed by name in this dialect; the id is the closest
-                // thing we have when the original name is not carried.
+                // thing we have when the original name is not carried, once
+                // the ordinal `parse_chunk` may have added is taken off.
                 "functionResponse": {
-                    "name": tool_use_id,
+                    "name": function_name(tool_use_id),
                     "response": { "result": content.as_text() },
                 }
             })),
@@ -321,8 +324,9 @@ fn parse_content(v: &Value) -> Option<Message> {
 pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
     let v: Value = serde_json::from_str(payload)?;
     // A stream delivers the call and the finish in separate chunks, so this
-    // chunk alone cannot know a tool was called; the accumulator can.
-    Ok(parse_chunk(&v, acc.saw_tool_call()))
+    // chunk alone cannot know a tool was called, or how many were; the
+    // accumulator can.
+    Ok(parse_chunk(&v, acc.tool_call_count()))
 }
 
 /// A complete non-streamed `generateContent` body → canonical events.
@@ -332,21 +336,46 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
 /// rather than a different envelope.
 #[must_use]
 pub fn parse_response(v: &Value) -> Vec<StreamEvent> {
-    parse_chunk(v, false)
+    parse_chunk(v, 0)
+}
+
+/// The canonical id for the `ordinal`-th call of a response, to `name`.
+///
+/// This dialect has no wire id: a call is its function's name, and a result
+/// is addressed back by that name. The first call keeps the bare name, so the
+/// common single-call turn round-trips unchanged; every later one carries its
+/// ordinal, because two parallel calls to the same function under one id had
+/// the accumulator fold both argument payloads into one buffer and the hub
+/// emit two `tool_use` blocks a client could not tell apart. `#` because a
+/// function name cannot contain it, which is what lets [`function_name`] take
+/// the suffix back off.
+fn call_id(name: &str, ordinal: usize) -> String {
+    if ordinal == 0 {
+        name.to_owned()
+    } else {
+        format!("{name}#{ordinal}")
+    }
+}
+
+/// The function a canonical tool id names: the inverse of [`call_id`].
+fn function_name(tool_use_id: &str) -> &str {
+    tool_use_id
+        .split_once('#')
+        .map_or(tool_use_id, |(name, _)| name)
 }
 
 /// One chunk, or one whole body, → canonical events.
 ///
-/// `called_a_tool_before` is what an earlier chunk of the same stream
-/// established. This dialect finishes a tool-calling turn with the same
-/// `STOP` as a plain one, and reports the call in whichever chunk carried the
-/// `functionCall` part — so the stop reason has to be computed from both, or
-/// a streamed call reaches an Anthropic client as `end_turn` and a Chat
-/// Completions client as `stop`, and an agent loop dispatching on either
-/// never runs the tool.
-fn parse_chunk(v: &Value, called_a_tool_before: bool) -> Vec<StreamEvent> {
+/// `prior_calls` is how many tool calls earlier chunks of the same stream
+/// carried. It settles two things this chunk cannot alone. The stop reason:
+/// this dialect finishes a tool-calling turn with the same `STOP` as a plain
+/// one and reports the call in whichever chunk carried the `functionCall`
+/// part, and a streamed call read from the finish chunk alone reached an
+/// Anthropic client as `end_turn` and a Chat Completions client as `stop`.
+/// And the call ids, which are ordinals (see [`call_id`]).
+fn parse_chunk(v: &Value, prior_calls: usize) -> Vec<StreamEvent> {
     let mut events = Vec::new();
-    let mut called_a_tool = called_a_tool_before;
+    let mut calls = prior_calls;
 
     if let Some(usage) = v.get("usageMetadata") {
         events.push(StreamEvent::UsageUpdate {
@@ -376,18 +405,19 @@ fn parse_chunk(v: &Value, called_a_tool_before: bool) -> Vec<StreamEvent> {
             }
         }
         if let Some(call) = part.get("functionCall") {
-            called_a_tool = true;
             let name = call["name"].as_str().unwrap_or_default().to_owned();
+            let id = call_id(&name, calls);
+            calls += 1;
             // Arrives whole, not streamed in fragments.
             events.push(StreamEvent::ToolUseStart {
-                id: name.clone(),
-                name: name.clone(),
+                id: id.clone(),
+                name,
             });
             events.push(StreamEvent::ToolUseDelta {
-                id: name.clone(),
+                id: id.clone(),
                 partial_json: call["args"].to_string(),
             });
-            events.push(StreamEvent::ToolUseEnd { id: name });
+            events.push(StreamEvent::ToolUseEnd { id });
         }
     }
 
@@ -396,7 +426,7 @@ fn parse_chunk(v: &Value, called_a_tool_before: bool) -> Vec<StreamEvent> {
             reason: match reason {
                 "MAX_TOKENS" => StopReason::MaxTokens,
                 "SAFETY" | "PROHIBITED_CONTENT" | "BLOCKLIST" => StopReason::Refusal,
-                _ if called_a_tool => StopReason::ToolUse,
+                _ if calls > 0 => StopReason::ToolUse,
                 _ => StopReason::EndTurn,
             },
             usage: v.get("usageMetadata").map(parse_usage).unwrap_or_default(),
@@ -702,6 +732,36 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parallel_calls_to_one_function_get_distinct_ids() {
+        // Two `functionCall` parts naming the same function, one chunk each.
+        // Under one id the accumulator folded both argument payloads into
+        // one buffer — invalid JSON, so the quality gate escalated a good
+        // answer — and the hub emitted two `tool_use` blocks a client could
+        // not address a result to.
+        let (events, acc) = drive(&[
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"a.rs"}}}]}}]}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"path":"b.rs"}}}]}}]}"#,
+            r#"{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}]}"#,
+        ]);
+        let starts: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolUseStart { id, name } => Some((id.as_str(), name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            [("read_file", "read_file"), ("read_file#1", "read_file")]
+        );
+        assert_eq!(acc.quality_gate(), None, "each call's arguments are whole");
+
+        // And the ordinal comes back off on the way to the upstream.
+        assert_eq!(function_name("read_file#1"), "read_file");
+        assert_eq!(function_name("read_file"), "read_file");
     }
 
     #[test]
