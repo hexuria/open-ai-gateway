@@ -14,6 +14,7 @@ data:
   OAG_GATEWAY__SAME_ACCOUNT_RETRIES: {{ .Values.gateway.sameAccountRetries | quote }}
   OAG_GATEWAY__MAX_ACCOUNT_SWITCHES: {{ .Values.gateway.maxAccountSwitches | quote }}
   OAG_GATEWAY__CATALOG_REFRESH_INTERVAL: {{ .Values.gateway.catalogRefreshIntervalSeconds | quote }}
+  OAG_GATEWAY__SPEND_RECONCILE_INTERVAL: {{ .Values.gateway.spendReconcileIntervalSeconds | quote }}
   OAG_GATEWAY__BEDROCK_REGION: {{ .Values.gateway.bedrockRegion | quote }}
   OAG_TELEMETRY__LOG_FILTER: {{ .Values.telemetry.logFilter | quote }}
   OAG_TELEMETRY__LOG_JSON: {{ .Values.telemetry.logJson | quote }}

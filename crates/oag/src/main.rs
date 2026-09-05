@@ -78,6 +78,22 @@ async fn run() -> Result<()> {
             )?;
             db.migrate().await?;
             tracing::info!("migrations applied");
+            // The same pass the gateway runs on its interval, once, here: a
+            // deploy is exactly when the previous release has just spent a
+            // window writing ledger rows without the counters. A failure is
+            // not a failed deploy — the schema is in place, and the gateway's
+            // own pass will catch up within an interval.
+            match oag_store::repo::reconcile_monthly_spend(&db).await {
+                Ok(done) => tracing::info!(
+                    principals = done.principals,
+                    routes = done.routes,
+                    "monthly spend reconciled with the ledger"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "monthly spend could not be reconciled; the gateway retries on its interval"
+                ),
+            }
             Ok(())
         }
         Command::Admin(cmd) => {

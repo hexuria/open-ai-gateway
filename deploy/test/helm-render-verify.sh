@@ -64,13 +64,15 @@ out="$(helm template t "$CHART" -s templates/configmap.yaml \
   --set server.maxInFlight=128 \
   --set database.statementTimeoutSeconds=45 \
   --set gateway.upstreamResponseTimeoutSeconds=120 \
-  --set gateway.clientWriteTimeoutSeconds=90)"
+  --set gateway.clientWriteTimeoutSeconds=90 \
+  --set gateway.spendReconcileIntervalSeconds=300)"
 for pair in 'OAG_SERVER__MAX_IN_FLIGHT: "128"' \
             'OAG_DATABASE__STATEMENT_TIMEOUT: "45"' \
             'OAG_GATEWAY__UPSTREAM_RESPONSE_TIMEOUT: "120"' \
-            'OAG_GATEWAY__CLIENT_WRITE_TIMEOUT: "90"'; do
+            'OAG_GATEWAY__CLIENT_WRITE_TIMEOUT: "90"' \
+            'OAG_GATEWAY__SPEND_RECONCILE_INTERVAL: "300"'; do
   grep -qF "$pair" <<<"$out" || fail "configmap did not render $pair"
 done
-pass "max_in_flight, statement_timeout, upstream_response_timeout, client_write_timeout"
+pass "max_in_flight, statement_timeout, upstream_response_timeout, client_write_timeout, spend_reconcile_interval"
 
 printf '\n\033[32mPASS: the chart renders in all three data modes\033[0m\n'

@@ -79,6 +79,9 @@ gateway:
   sameAccountRetries: 2
   maxAccountSwitches: 3
   catalogRefreshIntervalSeconds: 60
+  # How often the monthly spend counters are checked against the ledger. A
+  # backstop for the rolling-deploy window, off the request path; 0 disables.
+  spendReconcileIntervalSeconds: 600
   bedrockRegion: us-east-1
   # provider -> base URL. Leave empty to use each provider's public API.
   providerBaseUrls: {}

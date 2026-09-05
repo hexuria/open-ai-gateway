@@ -297,6 +297,18 @@ pub struct GatewayConfig {
     /// invites its own rate limit.
     #[serde(with = "humantime_secs")]
     pub usage_poll_interval: Duration,
+    /// How often to bring the monthly spend counters back into agreement with
+    /// the ledger. Zero disables it.
+    ///
+    /// The counters are maintained by the ledger write itself, so this is a
+    /// backstop, not the mechanism. What it backstops is the rolling-deploy
+    /// window: the previous release's replicas write ledger rows without the
+    /// counters for as long as they serve, and without this pass that spend
+    /// stayed invisible to every monthly cap for the rest of the month. One
+    /// indexed sum per budgeted principal and route per tick, off the request
+    /// path; `oag migrate` runs the same pass once at every deploy.
+    #[serde(with = "humantime_secs")]
+    pub spend_reconcile_interval: Duration,
     /// AWS region for Bedrock. Also part of the SigV4 signing scope, so it has
     /// to be right even when `provider_base_urls` points somewhere else.
     #[serde(default = "default_bedrock_region")]
@@ -370,6 +382,7 @@ impl Default for GatewayConfig {
             failover_budget: Duration::from_mins(2),
             catalog_refresh_interval: Duration::from_mins(1),
             usage_poll_interval: Duration::from_mins(5),
+            spend_reconcile_interval: Duration::from_mins(10),
             bedrock_region: default_bedrock_region(),
             provider_base_urls: std::collections::BTreeMap::new(),
             codex: CodexConfig::default(),
