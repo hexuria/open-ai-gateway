@@ -37,7 +37,19 @@ const LOSER_WAIT: Duration = Duration::from_secs(5);
 
 /// Return usable credential material, refreshing first if it is close to expiry.
 pub async fn ensure_fresh(state: &AppState, row: &AccountRow) -> Result<SecretMaterial> {
-    let material: SecretMaterial = state.kek.open_json(&row.sealed())?;
+    // Trimmed on the way out of the seal, not at each adapter's header call.
+    //
+    // A credential arrives from a shell, a `--secret` flag, a pasted
+    // `auth.json` or an environment variable, and every one of those can carry
+    // a trailing newline. Sent verbatim it becomes `Authorization: Bearer
+    // sk-abc\n`, which providers answer with 401 — so a perfectly valid
+    // credential reads as revoked, the breaker cools it down, and the operator
+    // goes looking for a billing problem. Trimming here covers credentials
+    // already stored as well as new ones.
+    let material: SecretMaterial = state
+        .kek
+        .open_json::<SecretMaterial>(&row.sealed())?
+        .trimmed();
     let account = row.account_id();
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
@@ -96,7 +108,10 @@ async fn refresh_locked(
     let row = oag_store::repo::account_by_id(&state.db, account)
         .await?
         .ok_or_else(|| Error::Internal("credential vanished during refresh".to_owned()))?;
-    let current: SecretMaterial = state.kek.open_json(&row.sealed())?;
+    let current: SecretMaterial = state
+        .kek
+        .open_json::<SecretMaterial>(&row.sealed())?
+        .trimmed();
 
     if !current.expires_within(now, REFRESH_SKEW) {
         return Ok(current);
@@ -158,5 +173,10 @@ async fn reread(state: &AppState, account: AccountId) -> Result<Option<SecretMat
     let Some(row) = oag_store::repo::account_by_id(&state.db, account).await? else {
         return Ok(None);
     };
-    Ok(Some(state.kek.open_json(&row.sealed())?))
+    Ok(Some(
+        state
+            .kek
+            .open_json::<SecretMaterial>(&row.sealed())?
+            .trimmed(),
+    ))
 }

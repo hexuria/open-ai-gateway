@@ -1967,11 +1967,22 @@ async fn seed_catalog(db: &Db, from: Option<&str>) -> Result<()> {
 async fn sync_prices(db: &Db, kek: &Kek, provider: &str, account: Option<&str>) -> Result<()> {
     let known: oag_core::Provider = provider.parse()?;
     let row = price_account(db, known, account).await?;
-    let material: SecretMaterial = kek.open_json(&row.sealed())?;
+    let material: SecretMaterial = kek.open_json::<SecretMaterial>(&row.sealed())?.trimmed();
 
-    let Some(prices) = oag_upstream::pricing::fetch(known, &material).await? else {
+    // The kind as well as the provider: a subscription seat's token is not a
+    // management-API key, and presenting it to a price endpoint gets a 401 that
+    // reads as an auth failure against a credential working perfectly well for
+    // inference.
+    let Some(kind) = oag_core::credential::CredentialKind::from_column(&row.kind) else {
+        return Err(oag_core::Error::Internal(format!(
+            "credential '{}' has an unknown kind '{}'",
+            row.name, row.kind
+        )));
+    };
+    let Some(prices) = oag_upstream::pricing::fetch(known, kind, &material).await? else {
         return Err(oag_core::Error::Config(format!(
-            "{known} publishes no price API; seed it from LiteLLM instead"
+            "{known} publishes no price API for a {kind:?} credential; seed it from \
+             LiteLLM instead, or name an API-key credential with --account"
         )));
     };
 

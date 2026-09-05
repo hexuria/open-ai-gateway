@@ -130,6 +130,8 @@ impl fmt::Display for CredentialKind {
 /// one would print the secret into any `tracing` field that captured it.
 #[derive(Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct SecretMaterial {
+    /// The bearer token or API key itself, already trimmed — see
+    /// [`SecretMaterial::trimmed`].
     pub access_token: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub refresh_token: Option<String>,
@@ -172,6 +174,32 @@ impl fmt::Debug for SecretMaterial {
 }
 
 impl SecretMaterial {
+    /// The same material with surrounding whitespace taken off its secrets.
+    ///
+    /// A credential arrives from an operator's shell, a `--secret` flag, a
+    /// pasted `auth.json`, or an environment variable, and every one of those
+    /// can carry a trailing newline. Sent verbatim it becomes
+    /// `Authorization: Bearer sk-abc\n`, which providers reject with a 401 —
+    /// so a credential that is perfectly valid reads as revoked, the breaker
+    /// cools it down, and the operator goes looking for a billing problem.
+    ///
+    /// Done once, here, rather than at each of the adapters' header calls: they
+    /// number a dozen and a new one is written every time a provider is added.
+    #[must_use]
+    pub fn trimmed(mut self) -> Self {
+        // In place, not by `map`: this type zeroizes on drop, so its fields
+        // cannot be moved out of it — which is the point of the zeroizing and
+        // worth the slightly longer spelling.
+        self.access_token = self.access_token.trim().to_owned();
+        if let Some(token) = &mut self.refresh_token {
+            *token = token.trim().to_owned();
+        }
+        if let Some(id) = &mut self.client_id {
+            *id = id.trim().to_owned();
+        }
+        self
+    }
+
     /// Whether the token is expired, or close enough that we should refresh
     /// before spending a request on it.
     #[must_use]
@@ -226,5 +254,32 @@ mod tests {
         for bogus in ["bogus", "subscription", "apikey", "oauth", ""] {
             assert_eq!(CredentialKind::from_qualifier(bogus), None, "{bogus}");
         }
+    }
+    /// U4. A credential is trimmed once, where it leaves the seal.
+    ///
+    /// It arrives from a shell, a `--secret` flag, a pasted `auth.json` or an
+    /// environment variable, and every one of those can carry a trailing
+    /// newline. Sent verbatim it becomes `Authorization: Bearer sk-abc\n`,
+    /// which providers answer with 401 — so a perfectly valid credential reads
+    /// as revoked, the breaker cools it down, and the operator goes looking for
+    /// a billing problem.
+    #[test]
+    fn trimming_covers_every_secret_a_credential_carries() {
+        let material = SecretMaterial {
+            access_token: "  sk-abc\n".to_owned(),
+            refresh_token: Some("\trt-def \n".to_owned()),
+            expires_at: Some(1),
+            version: 3,
+            client_id: Some(" client-1\n".to_owned()),
+            account_id: None,
+        }
+        .trimmed();
+
+        assert_eq!(material.access_token, "sk-abc");
+        assert_eq!(material.refresh_token.as_deref(), Some("rt-def"));
+        assert_eq!(material.client_id.as_deref(), Some("client-1"));
+        // Untouched: these are not secrets and not strings.
+        assert_eq!(material.expires_at, Some(1));
+        assert_eq!(material.version, 3);
     }
 }

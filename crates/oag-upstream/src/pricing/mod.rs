@@ -10,6 +10,7 @@
 pub mod xai;
 
 use oag_core::Provider;
+use oag_core::credential::CredentialKind;
 use oag_core::credential::SecretMaterial;
 use rust_decimal::Decimal;
 
@@ -33,14 +34,78 @@ pub struct ModelPrice {
 
 /// Fetch the provider's price list, or `None` for a provider with no price API
 /// wired up (in which case the caller should stay on the LiteLLM table).
+///
+/// Dispatched on the credential's kind as well as its provider. xAI's price
+/// endpoint is part of its management API and takes an API key; a subscription
+/// seat's OAuth token is not one, and presenting it there gets a 401 that the
+/// caller reads as "prices unavailable" — or, worse, logs as an auth failure
+/// against a credential that is working perfectly for inference. A seat has no
+/// price list to give and asking it is the error.
 pub async fn fetch(
     provider: Provider,
+    kind: CredentialKind,
     credential: &SecretMaterial,
 ) -> oag_core::Result<Option<Vec<ModelPrice>>> {
-    match provider {
-        Provider::XAI => xai::fetch(&credential.access_token).await.map(Some),
+    match (provider, kind) {
+        (Provider::XAI, CredentialKind::ApiKey) => {
+            xai::fetch(&credential.access_token).await.map(Some)
+        }
         // Anthropic, OpenAI and Gemini publish prices on a web page, not an
         // API; there is nothing to call, so LiteLLM stays the source for them.
+        // And a seat token cannot ask, whoever its provider is.
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CredentialKind, Provider, fetch};
+    use oag_core::credential::SecretMaterial;
+
+    fn material() -> SecretMaterial {
+        SecretMaterial {
+            access_token: "not-a-real-token".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        }
+    }
+
+    /// U3. A seat token is never presented to a management API.
+    ///
+    /// xAI's price endpoint is part of its management API and takes an API key.
+    /// A subscription seat's OAuth token is not one, and dispatching on the
+    /// provider alone sent it there — producing a 401 the caller reads as
+    /// "prices unavailable", or logs as an auth failure against a credential
+    /// that is working perfectly for inference.
+    ///
+    /// Asserted without a network call: `Ok(None)` is returned before any
+    /// request is built, which is the whole of the fix.
+    #[tokio::test]
+    async fn a_seat_credential_is_not_asked_for_a_price_list() {
+        for kind in [
+            CredentialKind::OAuth,
+            CredentialKind::Bedrock,
+            CredentialKind::Vertex,
+            CredentialKind::ServiceAccount,
+        ] {
+            let answered = fetch(Provider::XAI, kind, &material())
+                .await
+                .expect("no request is made, so nothing can fail");
+            assert!(
+                answered.is_none(),
+                "{kind:?} has no price list to give, and asking is the error"
+            );
+        }
+
+        // And a provider with no price API is still `None` whatever it holds.
+        assert!(
+            fetch(Provider::Anthropic, CredentialKind::ApiKey, &material())
+                .await
+                .expect("no request")
+                .is_none()
+        );
     }
 }

@@ -200,7 +200,18 @@ impl ProviderAdapter for CodexAdapter {
         // Same auth and same account scoping as `build`: the answer is
         // per-seat, so asking without `chatgpt-account-id` would be asking a
         // different question from the one inference will ask.
-        let mut builder = reqwest::Client::new()
+        // A deadline, because this runs on the catalogue poller rather than on
+        // a request. `Client::new()` has no timeout at all, so a provider that
+        // accepts the connection and never answers holds this future forever —
+        // and the poller awaits it in sequence, so one unresponsive seat stops
+        // every other seat's models from ever being refreshed. Ten seconds is
+        // long for a list of model names and short against "never".
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| {
+                oag_core::Error::Internal(format!("building the served-models client: {e}"))
+            })?
             .get(format!("{}/models", self.base_url))
             // Required, and the backend says so rather than guessing for us:
             // without it the answer is a 400 naming `('query', 'client_version')`
