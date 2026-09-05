@@ -987,7 +987,7 @@ mod tests {
             quota_usd: Some(quota),
             principal_budget_usd: None,
             principal_hard_stop_multiple: rust_decimal::Decimal::ONE,
-            key_hash: String::new(),
+            expires_at: None,
         }
     }
 

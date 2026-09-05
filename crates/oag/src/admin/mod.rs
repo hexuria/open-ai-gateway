@@ -2450,7 +2450,7 @@ mod tests {
             quota_usd: None,
             principal_budget_usd: Some(Decimal::from(100)),
             principal_hard_stop_multiple: Decimal::from(2),
-            key_hash: hash.clone(),
+            expires_at: None,
         };
         cache
             .auth_set(&hash, &ctx, std::time::Duration::from_mins(5), &mac)

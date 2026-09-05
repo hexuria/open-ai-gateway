@@ -2762,7 +2762,7 @@ security:
             quota_usd: None,
             principal_budget_usd: None,
             principal_hard_stop_multiple: rust_decimal::Decimal::ONE,
-            key_hash: String::new(),
+            expires_at: None,
         }
     }
 

@@ -465,7 +465,7 @@ mod tests {
                 quota_usd: None,
                 principal_budget_usd: None,
                 principal_hard_stop_multiple: Decimal::ONE,
-                key_hash: String::new(),
+                expires_at: None,
             },
             decision: RoutingDecision {
                 model: ModelSpec {

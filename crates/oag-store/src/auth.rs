@@ -47,6 +47,32 @@ const L1_TTL: Duration = Duration::from_secs(15);
 /// waiting for expiry.
 const L2_TTL: Duration = Duration::from_mins(5);
 
+/// How long this identity may be cached, or `None` if it must not be.
+///
+/// `authenticate` filters expired keys at read time, so a key that has already
+/// expired never reaches here. But an entry cached a minute before expiry kept
+/// authenticating for the TTL's full five minutes afterwards — on every
+/// replica, with the row in the database already saying no. A key with an
+/// expiry is one somebody chose to time-box, and five minutes past the deadline
+/// is a promise quietly broken.
+///
+/// Capped rather than refused, so a short-lived key still gets whatever caching
+/// its remaining life allows. `None` only for a key whose expiry has already
+/// passed between the query and here, which is a race the caller should not
+/// paper over by caching the answer.
+fn cacheable_for(ctx: &crate::rows::AuthContext, ttl: Duration) -> Option<Duration> {
+    let Some(expires_at) = ctx.expires_at else {
+        return Some(ttl);
+    };
+    let now = time::OffsetDateTime::now_utc();
+    if expires_at <= now {
+        return None;
+    }
+    let remaining = expires_at - now;
+    let remaining = remaining.try_into().unwrap_or(ttl);
+    Some(ttl.min(remaining))
+}
+
 /// The three-tier lookup.
 #[derive(Clone)]
 pub struct AuthCache {
@@ -128,8 +154,10 @@ impl AuthCache {
                     return Err(oag_core::Error::Overloaded);
                 };
                 let found = repo::authenticate(&db, raw_key).await?;
-                if let Some(ctx) = &found {
-                    cache.auth_set(&key, ctx, L2_TTL, &mac).await;
+                if let Some(ctx) = &found
+                    && let Some(ttl) = cacheable_for(ctx, L2_TTL)
+                {
+                    cache.auth_set(&key, ctx, ttl, &mac).await;
                 }
                 Ok(found.map(Arc::new))
             })
@@ -218,5 +246,53 @@ mod tests {
             .expect_err("no permit, no lookup");
         assert!(matches!(err, oag_core::Error::Overloaded), "{err:?}");
         drop(held);
+    }
+    /// S7. A cached identity cannot outlive the key it belongs to.
+    ///
+    /// `authenticate` filters expired keys at read time, so an expired key
+    /// never reaches the cache. But one cached a minute before expiry kept
+    /// authenticating for the L2 TTL's full five minutes afterwards — on every
+    /// replica, with the row in the database already saying no. A key with an
+    /// expiry is one somebody chose to time-box.
+    #[test]
+    fn a_cached_identity_expires_no_later_than_its_key() {
+        let ttl = Duration::from_mins(5);
+        let now = time::OffsetDateTime::now_utc();
+        let ctx = |expires_at| crate::rows::AuthContext {
+            api_key_id: uuid::Uuid::nil(),
+            principal_id: uuid::Uuid::nil(),
+            route_id: uuid::Uuid::nil(),
+            key_floor_tier: None,
+            admin: false,
+            quota_usd: None,
+            principal_budget_usd: None,
+            principal_hard_stop_multiple: rust_decimal::Decimal::ONE,
+            expires_at,
+        };
+
+        // No expiry: the full TTL, exactly as before.
+        assert_eq!(cacheable_for(&ctx(None), ttl), Some(ttl));
+
+        // Expiring inside the window: capped to what is left, so the entry and
+        // the key stop working at the same moment.
+        let soon = cacheable_for(&ctx(Some(now + time::Duration::minutes(1))), ttl)
+            .expect("a live key is cacheable");
+        assert!(
+            soon <= Duration::from_mins(1) && soon > Duration::from_secs(50),
+            "about a minute, not five: {soon:?}"
+        );
+
+        // Expiring well beyond it: the TTL still bounds the cache.
+        assert_eq!(
+            cacheable_for(&ctx(Some(now + time::Duration::hours(2))), ttl),
+            Some(ttl)
+        );
+
+        // Already gone — a race between the query and here. Not cached at all,
+        // rather than cached for a negative duration or clamped to zero.
+        assert_eq!(
+            cacheable_for(&ctx(Some(now - time::Duration::seconds(1))), ttl),
+            None
+        );
     }
 }

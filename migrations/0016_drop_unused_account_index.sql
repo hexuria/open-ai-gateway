@@ -1,0 +1,41 @@
+-- `account_schedulable_idx` serves no query, and never has.
+--
+-- Both 0001 and 0013 introduce it as "the scheduler's candidate query: by
+-- provider, eligible only". No such query exists. What the scheduler actually
+-- runs is `repo::candidates`:
+--
+--     FROM account a
+--     JOIN account_route ar ON ar.account_id = a.id
+--     WHERE ar.route_id = $1
+--       AND a.provider = $2
+--       AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $3)
+--
+-- Three things about that make the index unusable for it. The driving filter is
+-- `ar.route_id`, which `account_route_by_route_idx` already serves; the join
+-- into `account` is by primary key, which is the cheapest access there is; and
+-- the query has no `schedulable` predicate at all — eligibility is decided in
+-- memory over the loaded candidates, deliberately, because the scheduler needs
+-- the ineligible rows to explain why a request could not be served. A partial
+-- index whose predicate the query does not state cannot be chosen for it.
+--
+-- The one query that does filter `schedulable` is the seat poller's
+-- `WHERE kind = 'oauth' AND schedulable`, which this index cannot serve either:
+-- it leads with `provider`, and the poller does not filter on that.
+--
+-- So it has only ever cost. 0013 removed `last_used_at` from it precisely
+-- because index maintenance on this table is write cost for no reader — every
+-- insert and every update to `provider`, `priority` or `schedulable` maintains
+-- it, on a small, hot table where a sequential scan of a few hundred rows is
+-- cheaper than the index would be even if a query named it. That argument does
+-- not stop at one column.
+--
+-- Dropping it rather than retargeting it, for the same reason: there is no
+-- query to retarget it at. If one appears — a deployment with enough
+-- credentials that `candidates` needs help — the index that would serve it is
+-- on `account_route (route_id, account_id)` or on `account (provider)`, and it
+-- should be added then, against a plan, rather than guessed at now.
+--
+-- `account_owner_idx` stays. It is partial on `owner_principal_id IS NOT NULL`,
+-- which is a genuinely selective predicate on a column `candidates` does filter.
+
+DROP INDEX IF EXISTS account_schedulable_idx;
