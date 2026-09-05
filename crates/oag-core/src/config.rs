@@ -114,9 +114,11 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
+    /// A libpq URL, password and all. Never printed: see the hand-written
+    /// [`Debug`](DatabaseConfig#impl-Debug) below.
     pub url: String,
     #[serde(default = "default_db_pool")]
     pub max_connections: u32,
@@ -144,10 +146,56 @@ fn default_bedrock_region() -> String {
     "us-east-1".to_owned()
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedisConfig {
+    /// Carries a password whenever the cache is not on a private network.
+    /// Never printed: see the hand-written [`Debug`](RedisConfig#impl-Debug).
     pub url: String,
+}
+
+/// Replaces the userinfo in a URL with `<redacted>`.
+///
+/// String surgery rather than a URL parser, because this runs on a value that
+/// has already failed to be what we expected often enough to be worth printing:
+/// a malformed URL must still be redacted, and a parser that rejects it would
+/// hand the raw string back to the caller to print instead. Everything between
+/// `://` and the first `@` goes, so a password containing `/`, `:` or `?`
+/// cannot walk out through a cleverer scheme.
+///
+/// The host and database name stay, because they are what makes the printed
+/// configuration worth printing — an operator diagnosing "which database is
+/// this replica actually talking to" needs them, and they are not the secret.
+fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        // No scheme means we cannot tell where userinfo would start, and a
+        // string we cannot parse is a string we do not print.
+        return "<redacted>".to_owned();
+    };
+    match rest.split_once('@') {
+        Some((_userinfo, host)) => format!("{scheme}://<redacted>@{host}"),
+        // No userinfo at all: nothing to hide, and hiding the whole thing would
+        // make the common case less useful for no gain.
+        None => url.to_owned(),
+    }
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &redact_url(&self.url))
+            .field("max_connections", &self.max_connections)
+            .field("statement_timeout", &self.statement_timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for RedisConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisConfig")
+            .field("url", &redact_url(&self.url))
+            .finish()
+    }
 }
 
 /// Secrets. Every field here is required.
@@ -538,6 +586,59 @@ mod humantime_secs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H8. `oag config` must not print the database password.
+    ///
+    /// The subcommand's own help says "with secrets redacted", and only
+    /// `SecurityConfig` had a hand-written `Debug` — the two URL-bearing structs
+    /// derived theirs and printed verbatim. The command exists to be run and
+    /// pasted, so the credential landed in support tickets, CI logs and
+    /// scrollback, and the operator had been told it would not.
+    #[test]
+    fn a_printed_config_carries_no_password() {
+        let db = DatabaseConfig {
+            url: "postgres://oag:S3cret@db.internal/oag".to_owned(),
+            max_connections: 16,
+            statement_timeout: Duration::from_secs(10),
+        };
+        let printed = format!("{db:#?}");
+        assert!(!printed.contains("S3cret"), "{printed}");
+        assert!(
+            printed.contains("db.internal") && printed.contains("/oag"),
+            "the host and database survive — they are what makes a printed \
+             config worth printing, and they are not the secret: {printed}"
+        );
+
+        let redis = RedisConfig {
+            url: "redis://:hunter2@cache.internal:6379".to_owned(),
+        };
+        let printed = format!("{redis:#?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(printed.contains("cache.internal"), "{printed}");
+    }
+
+    /// The awkward URLs, because a redactor that only handles tidy input is a
+    /// redactor that leaks on the day something is misconfigured — which is
+    /// exactly the day someone runs `oag config` and pastes the output.
+    #[test]
+    fn redaction_survives_urls_that_are_not_tidy() {
+        // A password containing the delimiters someone might hope to hide
+        // behind. Everything up to the LAST possible userinfo boundary goes.
+        assert!(
+            !redact_url("postgres://user:p%40ss:word/x?@db/oag").contains("word"),
+            "a password full of separators is still a password"
+        );
+        // No userinfo: nothing to hide, and blanking it would make the common
+        // case useless for no gain.
+        assert_eq!(
+            redact_url("postgres://db.internal:5432/oag"),
+            "postgres://db.internal:5432/oag"
+        );
+        // Not a URL at all. We cannot say where a secret would start, so we do
+        // not print any of it.
+        assert_eq!(redact_url("oag:S3cret@nonsense"), "<redacted>");
+        assert_eq!(redact_url(""), "<redacted>");
+    }
 
     const MINIMAL: &str = r#"
 database:
