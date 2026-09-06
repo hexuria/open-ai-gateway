@@ -267,7 +267,7 @@ prometheusRule:
 # for.
 #
 # The gateway reads its whole configuration from `OAG_*` environment variables,
-# and the chart names fourteen of them. The rest — the `gateway.codex` block,
+# and the chart names nineteen of them. The rest — the `gateway.codex` block,
 # `claude_code_model_aliases`, anything added after this chart was last touched
 # — had no route in at all, which made a runbook step that says "raise
 # server.max_body_bytes" impossible to follow.

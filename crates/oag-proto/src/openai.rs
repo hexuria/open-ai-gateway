@@ -343,8 +343,8 @@ fn parse_one_message(m: &Value, system: &mut Vec<ContentBlock>, messages: &mut V
             // used to fall through to `return` — silently, so a client that sent
             // its instructions as parts got an upstream asked the bare question
             // with no system prompt at all and no field saying one was dropped.
-            // The user branch below and the `tool` branch above have always read
-            // arrays; this arm was the gap.
+            // The user and `tool` branches below have always read arrays; this
+            // arm was the gap.
             match &m["content"] {
                 Value::String(text) => system.push(ContentBlock::Text {
                     text: text.clone(),

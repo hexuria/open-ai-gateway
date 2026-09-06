@@ -2201,7 +2201,7 @@ mod tests {
         );
     }
 
-    /// C11. The same message found in two files is still one API call.    /// C11. The same message found in two files is still one API call.
+    /// C11. The same message found in two files is still one API call.
     ///
     /// A transcript line carries the provider's own message id, which is
     /// globally unique. The session is the file it happened to be found in —

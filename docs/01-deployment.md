@@ -236,6 +236,32 @@ actor, the action and the subject. `warn` rather than `info` because the log
 filter is a free-form string and an operator quietening a noisy deployment to
 `warn` would otherwise erase the audit trail without noticing.
 
+## The Azure cache, public or private
+
+`redis_private` on the `azure-containerapps` stack, and it defaults to `false`.
+
+False is not a recommendation, it is the shape existing deployments already
+have: turning it on forces the Premium SKU, which is a real and permanent cost
+increase, so an upgrade must not make that choice on an operator's behalf.
+
+Set it true when the cache is worth the money — it holds the auth cache and the
+session pins, which together describe who is talking to what. It then sets
+`public_network_access_enabled = false`, attaches a private endpoint in the
+`infra` subnet, and registers the endpoint in a
+`privatelink.redis.cache.windows.net` zone linked to the VNet.
+
+That last part is not optional and is easy to leave out. A private endpoint
+gives the cache a private IP; it does not change what its hostname resolves to.
+Without the zone, `<name>.redis.cache.windows.net` still answers with the public
+address that `public_network_access_enabled = false` has just blocked, and every
+replica loses its cache on an apply that reports success. The stack creates the
+zone and the module refuses `redis_private` without it, so the failure is a plan
+error rather than a dead dependency — but if you lift this module into another
+stack, that zone is the piece to bring with it.
+
+Postgres has been private since it was written, so this flag concerns the cache
+alone.
+
 ## Migrations
 
 `oag migrate` runs them under a Postgres advisory lock; `oag serve` does not run

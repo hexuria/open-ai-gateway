@@ -2585,7 +2585,7 @@ mod tests {
     /// Fixture: a budgeted principal and route with one debit already counted,
     /// plus a builder for further debits of ten cents.
     ///
-    /// Its own function because the race test below is long enough without it,
+    /// Its own function because the race test above is long enough without it,
     /// and because the pieces only mean something together: reconcile touches
     /// budgeted rows only, and the pre-existing row is what proves a pass
     /// rewrites rather than merely adds.

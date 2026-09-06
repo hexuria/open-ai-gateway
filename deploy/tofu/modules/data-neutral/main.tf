@@ -41,7 +41,7 @@ resource "terraform_data" "preflight" {
     }
     precondition {
       condition     = !local.redis_insecure
-      error_message = "This looks like an Upstash URL without TLS. Use rediss:// rather than redis://."
+      error_message = "The Redis URL is not rediss://, so the connection is plaintext. The auth cache and session pins travelling over it describe who is talking to what. Use rediss://, whoever hosts it — the hostname check this replaced let a self-hosted cache through in the clear."
     }
   }
 }

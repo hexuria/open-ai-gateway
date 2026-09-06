@@ -678,7 +678,7 @@ async fn run_with_escalation(
 /// inline `.await` on the request's own future goes with it when it does.
 ///
 /// Takes its own in-flight guard rather than the request's: a shutdown drain
-/// must still wait for these writes, and one caller has already handed the
+/// must still wait for these writes, and one caller will hand the
 /// request's guard to the streaming path. Nothing to write takes no guard.
 fn spawn_unserved(
     state: &Arc<AppState>,
@@ -2233,7 +2233,7 @@ mod tests {
         );
     }
 
-    /// R1, the wiring. The selection error path consults `disposition`.    /// R1, the wiring. The selection error path consults `disposition`.
+    /// R1, the wiring. The selection error path consults `disposition`.
     ///
     /// Reads this file's own source, because reaching that branch needs a
     /// gateway with a real route, a real ladder, and a credential pool that is
@@ -2301,7 +2301,7 @@ mod tests {
         );
     }
 
-    /// G4. Budget pressure is the only thing that suppression counts.    /// G4. Budget pressure is the only thing that suppression counts.
+    /// G4. Budget pressure is the only thing that suppression counts.
     ///
     /// `oag_escalations_suppressed_total` answers one question: how much answer
     /// quality is my budget costing me. It was incremented whenever a gate

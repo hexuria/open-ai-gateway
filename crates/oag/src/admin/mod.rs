@@ -1184,27 +1184,6 @@ async fn init(
     Ok(())
 }
 
-/// Create a principal, or update the budget of one that exists.
-///
-/// **The role is written on insert and never on conflict.** `init` asks for
-/// `admin`, which is right for the principal it is creating — promoting the
-/// first admin is what the command is for — and wrong for one that already
-/// exists. `ON CONFLICT ... SET role = EXCLUDED.role` meant that adding a
-/// second route with
-/// `oag admin init --email someone@corp.com --route staging` silently granted
-/// admin to whoever that email named and then minted them an admin key. Nothing
-/// in the output said a role had changed, because from the command's point of
-/// view nothing had: it had asked for an admin and been given one.
-///
-/// The store's own `upsert_principal` has always omitted `role` here and says
-/// why at length — an idempotent bind must not be able to change authority. The
-/// same argument applies in this direction; only the sign is different. Granting
-/// a role is now `oag admin principal promote`, where it is the whole of the
-/// caller's stated intent rather than a side effect of adding a route.
-///
-/// The budget is still `COALESCE`d rather than overwritten, so an `init` that
-/// omits `--budget-usd` cannot erase one an operator set.
-/// The role this principal holds, or `None` if there is no such principal.
 /// Refuse to mint an admin key for a principal who is not an admin.
 ///
 /// The gate is an AND of two facts and a key can only carry one of them. A key
@@ -1226,6 +1205,7 @@ async fn require_admin_principal(db: &Db, email: &str) -> Result<()> {
     }
 }
 
+/// The role this principal holds, or `None` if there is no such principal.
 async fn principal_role(db: &Db, email: &str) -> Result<Option<String>> {
     sqlx::query_scalar::<_, String>("SELECT role FROM principal WHERE email = $1")
         .bind(email)
@@ -1322,6 +1302,26 @@ async fn evict_principal_keys(db: &Db, redis_url: &str, principal: Uuid, email: 
     }
 }
 
+/// Create a principal, or update the budget of one that exists.
+///
+/// **The role is written on insert and never on conflict.** `init` asks for
+/// `admin`, which is right for the principal it is creating — promoting the
+/// first admin is what the command is for — and wrong for one that already
+/// exists. `ON CONFLICT ... SET role = EXCLUDED.role` meant that adding a
+/// second route with
+/// `oag admin init --email someone@corp.com --route staging` silently granted
+/// admin to whoever that email named and then minted them an admin key. Nothing
+/// in the output said a role had changed, because from the command's point of
+/// view nothing had: it had asked for an admin and been given one.
+///
+/// The store's own `upsert_principal` has always omitted `role` here and says
+/// why at length — an idempotent bind must not be able to change authority. The
+/// same argument applies in this direction; only the sign is different. Granting
+/// a role is now `oag admin principal promote`, where it is the whole of the
+/// caller's stated intent rather than a side effect of adding a route.
+///
+/// The budget is still `COALESCE`d rather than overwritten, so an `init` that
+/// omits `--budget-usd` cannot erase one an operator set.
 async fn upsert_principal(
     db: &Db,
     email: &str,
@@ -2252,7 +2252,7 @@ mod tests {
         );
     }
 
-    /// C14. A duplicate credential name is refused, and renaming is the way out.    /// C14. A duplicate credential name is refused, and renaming is the way out.
+    /// C14. A duplicate credential name is refused, and renaming is the way out.
     ///
     /// `account.name` carries no unique constraint, and every command that
     /// addresses a credential does so by name — `disable`, `enable`,
@@ -2331,7 +2331,7 @@ mod tests {
         );
     }
 
-    /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.    /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.
+    /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.
     ///
     /// clap treats an env-supplied value as explicitly present when it
     /// evaluates conflicts. With `env` on `--secret` and a `conflicts_with_all`

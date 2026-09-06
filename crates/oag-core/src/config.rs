@@ -624,29 +624,31 @@ impl Config {
                     .to_owned(),
             ));
         }
-        // Zero here means "try exactly one credential", which is not what zero
-        // means anywhere else in this section: for every neighbouring duration
-        // it means "no deadline". So an operator disabling a budget got silent
-        // single-credential dispatch instead, voiding `max_account_switches`
-        // with nothing said. There is no way to spell "unbounded" for this one,
-        // and inventing one would make a stuck failover loop unbounded too.
         // Zero disables the usage poller, and the poller is what keeps
         // `usage_remaining_pct` current — the number every seat's reserve is
         // evaluated against. With it stale at whatever the last poll saw, or
         // never set at all on a fresh replica, `usage_reserve_pct` holds nothing
         // back and a seat runs to the provider's own refusal. So "disabled"
         // here silently disables a different feature the operator did not
-        // mention, which is why it is now said rather than assumed: `oag serve`
-        // still honours zero, and this makes choosing it deliberate.
+        // mention, which is why it is refused rather than assumed.
+        //
+        // Refused unconditionally, and the refusal cannot be narrowed to
+        // deployments that use reserves: `usage_reserve_pct` lives in the
+        // database, and this runs before anything has read a row.
         if self.gateway.usage_poll_interval.is_zero() {
             return Err(crate::Error::Config(
                 "gateway.usage_poll_interval of 0 disables the usage poller, and with it \
                  every seat's reserve — usage_reserve_pct is evaluated against a figure \
-                 only the poller refreshes. Set an interval, or unset every \
-                 usage_reserve_pct first."
+                 only the poller refreshes. Set a positive interval."
                     .to_owned(),
             ));
         }
+        // Zero here means "try exactly one credential", which is not what zero
+        // means anywhere else in this section: for every neighbouring duration
+        // it means "no deadline". So an operator disabling a budget got silent
+        // single-credential dispatch instead, voiding `max_account_switches`
+        // with nothing said. There is no way to spell "unbounded" for this one,
+        // and inventing one would make a stuck failover loop unbounded too.
         if self.gateway.failover_budget.is_zero() {
             return Err(crate::Error::Config(
                 "gateway.failover_budget must be positive; zero would try exactly one \

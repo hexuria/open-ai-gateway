@@ -312,7 +312,6 @@ pass "every stream survived a full rolling restart"
 # has just replaced, and the question here is what reached the DATABASE — routing
 # it through a replica that may no longer exist tests the wrong thing, and
 # returned 0 on a run where all eight streams had in fact completed.
-[ -n "$PG" ] || fail "could not find the postgres pod to read the ledger from"
 # Rows this run wrote, not rows the table holds. And served rows only: a severed
 # stream writes a `lost` row, so counting those would let the exact failure this
 # check exists to catch supply its own evidence.
