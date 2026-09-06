@@ -1,25 +1,45 @@
 {{- if eq .Values.data.mode "inCluster" }}
 {{- /*
 The in-cluster data tier: Postgres and Redis, for a demo or a single-node
-install. Neither is a hook, and that is the fix rather than an omission.
+install.
 
-All four resources here carried `helm.sh/hook: pre-install,pre-upgrade`. Helm's
+These are hooks, at weight -10, and the weight is load-bearing. `migrate-job`
+is itself a `pre-install,pre-upgrade` hook at weight -5, and its init container
+waits for Postgres to accept connections. Helm runs the whole pre-install hook
+phase before it applies any ordinary manifest, so an unannotated Postgres here
+is a Postgres that cannot be created until the migrate hook exits — and the
+migrate hook will not exit, because it is waiting for that Postgres. The install
+deadlocks and `helm install --wait` fails on its timeout, twenty minutes later,
+with `Init:0/1` and no explanation attached to it.
+
+That is not hypothetical: dropping the hooks is what the review's D8 asked for,
+it was done, and `kind-verify.sh` in CI failed exactly this way. The finding's
+premise is right and its remedy is not available on its own.
+
+Because the premise IS right, it is written down here rather than lost. Helm's
 default hook deletion policy is `before-hook-creation`, so every `helm upgrade`
-DELETED and recreated both StatefulSets — and their Services — before the new
-gateway pods existed. The fleet lost its database and its cache for the twenty
-to forty seconds that took, failing in-flight ledger writes, on an upgrade that
-reported success and left nothing behind to explain the gap.
+deletes and recreates both StatefulSets and their Services before the new
+gateway pods exist. The fleet loses its database and its cache for the twenty to
+forty seconds that takes, failing in-flight ledger writes, on an upgrade that
+reports success.
 
-A StatefulSet holding a database is not a hook. It is ordinary state to be
-applied and then updated in place, which is what Helm does with an unannotated
-resource. The ordering the hook weight was buying is already handled by the
-gateway's init container, which waits for Postgres to accept connections before
-the gateway starts.
+Three things follow, and the third is the one that matters.
 
-`helm.sh/resource-policy: keep` in their place, so `helm uninstall` does not
-take the data with it. That is a deliberate second decision: an uninstall that
-silently destroys a database is the other half of this failure, and a kept
-PersistentVolumeClaim is recoverable where a deleted one is not.
+`helm.sh/resource-policy: keep` is not the escape. Helm documents it as skipping
+a deletion that `uninstall`, `upgrade` or `rollback` would perform — which is
+the same deletion `before-hook-creation` depends on to recreate the hook, so the
+next upgrade would fail with AlreadyExists instead. Untested against a cluster,
+it would be trading a known cost for an unknown one.
+
+Making `migrate-job` an ordinary manifest, or a post-install hook, would free
+this tier to be ordinary too. Both change when migrations run relative to the
+pods that need them, which is the one ordering in this chart that must not be
+guessed at; it wants its own change, with a cluster to test it on.
+
+Until then: `data.mode: inCluster` is for a demo or a single-node install, and
+this comment is the reason that is not false modesty. A deployment whose
+database matters should use `data.mode: external`, where the database is not
+Helm's to delete on any policy.
 */ -}}
 apiVersion: v1
 kind: Service
@@ -27,8 +47,9 @@ metadata:
   name: {{ include "oag.fullname" . }}-postgres
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
-    # No `helm.sh/hook`. See the note at the top of this file.
-    "helm.sh/resource-policy": keep
+    # Weight -10, ahead of migrate-job's -5. See the note at the top of this file.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
 spec:
   clusterIP: None
   selector:
@@ -42,8 +63,9 @@ metadata:
   name: {{ include "oag.fullname" . }}-postgres
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
-    # No `helm.sh/hook`. See the note at the top of this file.
-    "helm.sh/resource-policy": keep
+    # Weight -10, ahead of migrate-job's -5. See the note at the top of this file.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
 spec:
   serviceName: {{ include "oag.fullname" . }}-postgres
   replicas: 1
@@ -101,8 +123,9 @@ metadata:
   name: {{ include "oag.fullname" . }}-redis
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
-    # No `helm.sh/hook`. See the note at the top of this file.
-    "helm.sh/resource-policy": keep
+    # Weight -10, ahead of migrate-job's -5. See the note at the top of this file.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
 spec:
   clusterIP: None
   selector:
@@ -116,8 +139,9 @@ metadata:
   name: {{ include "oag.fullname" . }}-redis
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
-    # No `helm.sh/hook`. See the note at the top of this file.
-    "helm.sh/resource-policy": keep
+    # Weight -10, ahead of migrate-job's -5. See the note at the top of this file.
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
 spec:
   serviceName: {{ include "oag.fullname" . }}-redis
   replicas: 1
