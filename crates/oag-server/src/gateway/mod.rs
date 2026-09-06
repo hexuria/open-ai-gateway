@@ -357,9 +357,14 @@ async fn run_with_escalation(
                 // parked at its reserve returned 503 while a frontier rung
                 // naming a different provider sat there able to serve.
                 //
-                // Only to a rung naming a *different* provider: climbing to
-                // another rung on the same one re-runs the selection that has
-                // just failed for a reason the rung cannot change.
+                // Only to a rung naming a *different* provider: another rung
+                // on the same one re-runs the selection that has just failed
+                // for a reason the rung cannot change. Same-provider rungs are
+                // skipped rather than settled for — looking one rung up left a
+                // `[kimi, kimi-2, anthropic]` ladder returning 503 when kimi's
+                // only seat was at its reserve, because kimi-2 was all it
+                // looked at. Skipping is not escalating: nothing is dispatched
+                // to the rungs passed over, so the climb costs one escalation.
                 //
                 // `climb_allowed` still applies. A caller who named a model
                 // must not be quietly moved onto another provider's, however
@@ -369,15 +374,14 @@ async fn run_with_escalation(
                     && oag_router::climb_allowed(&decision.reason)
                     && escalations < MAX_ESCALATIONS
                     && let Some(from) = decision.tier.as_ref()
-                    && let Some(next) = policy.escalate(
+                    && let Some(next) = policy.escalate_past_provider(
                         from,
-                        oag_router::QualityGate::NoCredential,
+                        decision.model.provider,
                         &signal,
                         &catalog,
                         canonical.max_tokens,
                         &served,
                     )
-                    && next.model.provider != decision.model.provider
                 {
                     tracing::info!(
                         %request_id, from = ?decision.rung_name(), to = ?next.rung_name(),
@@ -2203,9 +2207,12 @@ mod tests {
              not have, which is how it got that way"
         );
         assert!(
-            path.contains("next.model.provider != decision.model.provider"),
-            "climbing to another rung on the same provider re-runs the selection \
-             that has just failed for a reason the rung cannot change"
+            path.contains("policy.escalate_past_provider("),
+            "the climb must skip every rung on the provider that just failed, not \
+             stop at the first one: a `[kimi, kimi-2, anthropic]` ladder returned \
+             503 while the frontier rung could have served. The rule itself lives \
+             in `oag-router` and is tested there against a real ladder; what this \
+             pins is that the error path still calls it"
         );
         assert!(
             path.contains("oag_router::climb_allowed(&decision.reason)"),
