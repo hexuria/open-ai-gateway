@@ -291,6 +291,19 @@ _verify-env:
     @echo 'export OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)"'
     @echo 'export OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)"'
 
+# Idempotent, because the dev database is not reset between runs.
+#
+# `account add` used to accept a second credential called `mock` and silently
+# create it; it now refuses a duplicate name, which is right — names are how
+# every other command addresses a credential — and it turned this recipe into
+# one that worked exactly once per database. CI never saw it, because CI's
+# database is new every time. `local-verify.sh` on a developer's machine saw it
+# on the second run and died before starting the gateway.
+#
+# Checked rather than `|| true`, so a real failure to add the credential still
+# stops the run. The listing is captured whole rather than piped into `grep -q`:
+# `grep -q` closes the pipe on its first match and the CLI then panics writing
+# the rest of the table into it.
 _verify-bootstrap:
     @OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
@@ -301,8 +314,10 @@ _verify-bootstrap:
                cheap=anthropic/claude-haiku-4.5 \
                balanced=anthropic/claude-sonnet-4.5 \
                frontier=anthropic/claude-opus-5 >/dev/null && \
-             cargo run --quiet -p oag -- admin account add --name mock --provider anthropic \
-               --secret FAKE-CREDENTIAL-FOR-TESTS --route default >/dev/null'
+             have="$(cargo run --quiet -p oag -- admin account list | awk "\$1 == \"mock\"")" && \
+             { [ -n "$have" ] || \
+               cargo run --quiet -p oag -- admin account add --name mock --provider anthropic \
+                 --secret FAKE-CREDENTIAL-FOR-TESTS --route default >/dev/null; }'
 
 # The newest served row, pipe-separated, for the assertions in local-verify.sh.
 #
