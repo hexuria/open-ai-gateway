@@ -102,6 +102,14 @@ resource "azurerm_container_app" "this" {
           name  = "OAG_GATEWAY__MAX_STREAM_DURATION"
           value = tostring(var.max_stream_duration_seconds)
         }
+        # Structured logs, as Cloud Run has always set. The environment is bound
+        # to a Log Analytics workspace, which is how these lines are collected —
+        # and without this they arrive as prose, so nothing can be queried by
+        # field and the workspace holds text nobody can ask a question of.
+        env {
+          name  = "OAG_TELEMETRY__LOG_JSON"
+          value = "true"
+        }
 
         dynamic "env" {
           for_each = var.env

@@ -123,7 +123,36 @@ resource "aws_lb_listener" "this" {
 }
 
 locals {
-  container_env = [for k, v in var.env : { name = k, value = v }]
+  # The admin listener has to be reachable from the ALB, because the ALB is what
+  # health-checks it.
+  #
+  # `server.admin_addr` defaults to `127.0.0.1:8081` — deliberately loopback, so
+  # the admin API is not exposed off the host by an oversight. The container's
+  # own health check curls `127.0.0.1:8080` and never noticed. But the target
+  # group checks `/health/ready` on 8081, and that request arrives on the task's
+  # ENI: a loopback bind refuses it, every target goes unhealthy, and the ALB
+  # serves 503 on an apply that reported success.
+  #
+  # Helm sets this on the Deployment and `compose/stack.yml` sets it on `oag-1`;
+  # this module health-checks the port and did not, which is the same shape as
+  # the Envoy defect fixed two commits ago. The module's own requirement wins
+  # over `var.env`, because the health check it configures depends on it.
+  #
+  # Not an exposure: 8081 is reachable only from the load balancer's security
+  # group, which is what the ingress rule beside the health check is for.
+  #
+  # `LOG_JSON` rides along for the reason Cloud Run has always set it: CloudWatch
+  # turns a JSON line into queryable fields and leaves prose as prose. The review
+  # named Azure; the check that enforces this found two platforms shipping
+  # unstructured logs, and fixing one would have left the other doing it under a
+  # check that says otherwise.
+  container_env = [
+    for k, v in merge(var.env, {
+      OAG_SERVER__ADMIN_ADDR  = "0.0.0.0:8081"
+      OAG_TELEMETRY__LOG_JSON = "true"
+    }) :
+    { name = k, value = v }
+  ]
   # Never plain environment: these come from Secrets Manager or SSM, so they are
   # absent from the task definition and from state.
   container_secrets = [for k, v in var.secret_env : { name = k, valueFrom = v }]

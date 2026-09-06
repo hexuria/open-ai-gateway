@@ -106,6 +106,29 @@ resource "azurerm_private_dns_zone_virtual_network_link" "postgres" {
   tags                = var.tags
 }
 
+# The same story for the cache, and it is the half that was missed.
+#
+# A private endpoint gives the cache a private IP; it does not change what its
+# hostname resolves to. Without this zone `<name>.redis.cache.windows.net` still
+# answers with the public address — which `public_network_access_enabled =
+# false` has just blocked — so `redis_private = true` produced a cache no
+# replica could reach, on an apply that reported success. The endpoint was
+# there; the name still pointed at the door that had been locked.
+resource "azurerm_private_dns_zone" "redis" {
+  count               = var.redis_private ? 1 : 0
+  name                = "privatelink.redis.cache.windows.net"
+  resource_group_name = azurerm_resource_group.this.name
+  tags                = var.tags
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "redis" {
+  count               = var.redis_private ? 1 : 0
+  name                = "${var.name}-redis"
+  private_dns_zone_id = azurerm_private_dns_zone.redis[0].id
+  virtual_network_id  = azurerm_virtual_network.this.id
+  tags                = var.tags
+}
+
 resource "azurerm_log_analytics_workspace" "this" {
   name                = "${var.name}-logs"
   location            = azurerm_resource_group.this.location
@@ -131,8 +154,14 @@ module "data_managed" {
   # Flexible Server and cannot hold a private endpoint.
   redis_private              = var.redis_private
   private_endpoint_subnet_id = azurerm_subnet.infra.id
+  # Empty when the cache is public: the module attaches the zone group only
+  # alongside the endpoint, and both are gated on the same flag.
+  redis_private_dns_zone_id = var.redis_private ? azurerm_private_dns_zone.redis[0].id : ""
 
-  depends_on = [azurerm_private_dns_zone_virtual_network_link.postgres]
+  depends_on = [
+    azurerm_private_dns_zone_virtual_network_link.postgres,
+    azurerm_private_dns_zone_virtual_network_link.redis,
+  ]
 }
 
 module "data_neutral" {

@@ -94,6 +94,10 @@ resource "azurerm_private_endpoint" "redis" {
       condition     = var.private_endpoint_subnet_id != ""
       error_message = "redis_private = true needs private_endpoint_subnet_id: a private cache with nowhere to attach is reachable by nothing."
     }
+    precondition {
+      condition     = var.redis_private_dns_zone_id != ""
+      error_message = "redis_private = true needs redis_private_dns_zone_id: without the zone the cache's hostname still resolves to the public address that public_network_access_enabled = false has just blocked, so every replica loses its cache on an apply that reports success."
+    }
   }
 
   name                = "${var.name}-redis-pe"
@@ -106,5 +110,14 @@ resource "azurerm_private_endpoint" "redis" {
     private_connection_resource_id = azurerm_redis_cache.this.id
     subresource_names              = ["redisCache"]
     is_manual_connection           = false
+  }
+
+  # What actually points the hostname at the endpoint. Azure does not infer it:
+  # the endpoint alone leaves the name resolving publicly, which is the state
+  # `public_network_access_enabled = false` makes fatal rather than merely
+  # pointless.
+  private_dns_zone_group {
+    name                 = "${var.name}-redis"
+    private_dns_zone_ids = [var.redis_private_dns_zone_id]
   }
 }
