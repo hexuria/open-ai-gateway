@@ -113,8 +113,15 @@ gateway.internal {
 # exists inside the compose network and nowhere else — the same posture as the
 # Helm ingress, which routes the `public` port and omits the admin one.
 #
-# To reach the dashboard from the host, publish it to loopback on purpose — add
-# `ports: ["127.0.0.1:8443:8443"]` to the caddy service, never `8443:8443`.
+# From the host, the dashboard is already reachable: `oag-1` in that same file
+# publishes the admin listener as `127.0.0.1:8081:8081`, for exactly this
+# reason. This comment used to send you to add `ports:` to the caddy service for
+# something you already had.
+#
+# Publishing Caddy's 8443 as well buys one thing and it is not access: the
+# `hardening` import, so the dashboard arrives with the same headers and TLS as
+# the inference vhost. If you want that, add `ports: ["127.0.0.1:8443:8443"]` to
+# the caddy service — never `8443:8443`, on either port.
 #
 # `/admin/api` authenticates, but `/`, `/metrics` and `/health/ready` do not:
 # the page has to load before an operator can type a key into it, and the

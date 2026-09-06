@@ -239,7 +239,7 @@ filter is a free-form string and an operator quietening a noisy deployment to
 ## Migrations
 
 `oag migrate` runs them under a Postgres advisory lock; `oag serve` does not run
-them at all. There are fourteen files:
+them at all. There are sixteen files:
 
 | File | What it is |
 |---|---|
@@ -257,6 +257,8 @@ them at all. There are fourteen files:
 | `migrations/0012_denormalised_monthly_spend.sql` | Month-to-date spend on the row it caps, so a budget is enforced against a number that cannot be stale. |
 | `migrations/0013_account_index_without_last_used_at.sql` | `account_schedulable_idx` without the column that made every request's write to it a non-HOT update. |
 | `migrations/0014_usage_event_attempt_key.sql` | Ledger contract: the primary key becomes `(request_id, attempt)` by promoting 0003's index. Abandoned and lost attempts stop being dropped by `ON CONFLICT`, so a request that escalated leaves a row per attempt. |
+| `migrations/0015_widen_spend_counters.sql` | The three denormalised spend counters widened to `numeric(16,8)`, the scale `usage_event.cost_usd` already carries — at `(14,6)` every debit was rounded on the way in and the counters drifted from the sums they mirror. |
+| `migrations/0016_drop_unused_account_index.sql` | `account_schedulable_idx` dropped: both 0001 and 0013 describe it as the scheduler's candidate query and no such query exists, so it was write amplification serving nothing. |
 
 sqlx checksums applied migrations. Against a database that ran an earlier
 version of `0001`, `oag migrate` fails closed with *migration 1 was previously
@@ -266,7 +268,10 @@ is a hand-patched `_sqlx_migrations.checksum`, so once this project has a real
 deployment the baseline stops being editable and changes become `0007` and on.
 Take the next unused number from `migrations/`, never from this table — a doc is
 the one place that can be out of date, and a reused number is a checksum failure
-on somebody else's database.
+on somebody else's database. This table has been out of date twice; `ls
+migrations/*.sql | wc -l` against the count above is the check, and
+`EXPECTED_MIGRATIONS` in `crates/oag/src/admin/doctor.rs` is the one the code
+enforces.
 
 ## Verifying it
 
