@@ -185,7 +185,13 @@ impl AppState {
         };
         let codex: Arc<dyn ProviderAdapter> = Arc::new(
             oag_upstream::CodexAdapter::new()
-                .with_base_url(cx.base_url.clone())
+                // Normalised like every other adapter's. This one was passed
+                // through raw, so a configured `https://host/` produced
+                // `https://host//responses` and a base URL carrying a query was
+                // accepted here and refused everywhere else — the inconsistency
+                // being worse than either behaviour, because it makes the rule
+                // untrue rather than merely strict.
+                .with_base_url(normalise_base_url("codex", &cx.base_url)?)
                 .with_instructions(instructions)
                 .with_beta(cx.beta.clone())
                 .with_originator(cx.originator.clone())
@@ -279,7 +285,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::normalise_base_url;
+    use super::{AppState, normalise_base_url};
 
     /// U5. A configured base URL is normalised once, or refused.
     ///
@@ -328,5 +334,55 @@ mod tests {
         // upstream that never received the request.
         assert!(normalise_base_url("openai", "api.openai.com").is_err());
         assert!(normalise_base_url("openai", "   ").is_err());
+    }
+
+    /// C3: every adapter goes through the normaliser, including this one.
+    ///
+    /// Codex was constructed with `cx.base_url` passed straight through, so a
+    /// configured `https://host/` produced `https://host//responses` and a base
+    /// URL carrying a query was accepted here while being refused for every
+    /// other provider. The inconsistency is worse than either behaviour on its
+    /// own: it makes the rule untrue rather than merely strict.
+    ///
+    /// Asserted through `AppState::new` rather than by calling the normaliser
+    /// again — the helper was never the thing in doubt, the wiring was, and a
+    /// second test of the helper would have passed with Codex still bypassing
+    /// it.
+    // `#[tokio::test]`: `Db::connect` builds a lazy sqlx pool, which needs a
+    // runtime in scope even though it dials nothing.
+    #[tokio::test]
+    async fn a_codex_base_url_is_normalised_like_every_other() {
+        let config = |base: &str| {
+            oag_core::config::Config::from_yaml(&format!(
+                r#"
+database:
+  url: "postgres://oag:oag@127.0.0.1:1/oag"
+redis:
+  url: "redis://127.0.0.1:1"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+gateway:
+  codex:
+    base_url: "{base}"
+"#
+            ))
+            .expect("test config")
+        };
+        let build = |base: &str| {
+            let config = config(base);
+            let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+            let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+            AppState::new(config, db, cache)
+        };
+
+        build("https://chatgpt.com/backend-api/codex/")
+            .expect("a trailing slash is normalised away, not rejected");
+
+        // The refusal is the proof: it can only come from the normaliser, and
+        // the normaliser can only be reached if this adapter goes through it.
+        let err = build("https://chatgpt.com/backend-api/codex?token=secret")
+            .expect_err("a query in a base URL is refused for codex too");
+        assert!(err.to_string().contains("codex"), "{err}");
     }
 }
