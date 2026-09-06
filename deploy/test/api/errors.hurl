@@ -45,7 +45,14 @@ Content-Type: application/json
 { "model": "nope/not-a-model", "max_tokens": 8, "messages": [{ "role": "user", "content": "hi" }] }
 HTTP 400
 [Asserts]
-jsonpath "$.error.type" exists
+# The kind, not merely that a kind is present. `exists` passed for any error
+# this request could possibly have produced — including an auth failure or a
+# malformed body — so the one thing the case is named for went unasserted.
+jsonpath "$.error.type" == "no_viable_model"
+# And the message has to name the route and the command that fixes it. That is
+# the whole reason this is a 400 rather than a bare 404: the caller can act on
+# the first and cannot on the second.
+jsonpath "$.error.message" contains "route"
 
 # ── a model the CREDENTIAL refuses ──
 # Different failure, same status. The model is real, catalogued and priced; this
