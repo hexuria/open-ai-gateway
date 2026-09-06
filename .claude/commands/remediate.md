@@ -60,7 +60,7 @@ is right; a lying comment fixed alongside its code shares the commit.
 | R2 | baseline is the dearer of `dearest_served` and the ladder ceiling (`policy.rs:354`, `:474`), so a partial served set cannot price below what served |
 | S1 | move the widest window bound into the `ON` clause of both ledger joins (`repo.rs:1080`, `:689`); pin with `EXPLAIN` in a gated test |
 | S3 | `set_config('TimeZone','UTC',false)` in `after_connect` (`db.rs:59`), so SQL and Rust agree on the month |
-| S2 | `revoke_key_by_prefix` returns every row; the CLI evicts and names all of them |
+| S2, C17 | `revoke_key_by_prefix` returns every row; the CLI evicts and names all of them — which is also the whole of C17, a finding no group table had claimed |
 | S4 | widen the three spend counters to `numeric(16,8)` — migration `0015` |
 | G2 | `pump` extracts an in-band `Error` event as `collect_stream` does, and stops emitting a second contradicting frame |
 | G3, G4 | thread `triggering_gate` into `stream_response`; increment the suppression counter only when budget pressure was the sole blocker |

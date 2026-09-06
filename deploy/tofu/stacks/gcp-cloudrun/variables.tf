@@ -171,3 +171,18 @@ variable "cloudflare_rate_limit_requests_per_minute" {
     proxied; an unproxied record never sees the traffic.
   EOT
 }
+
+variable "deletion_protection" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Refuse to delete the Cloud Run service.
+
+    `false`, matching the migrate job beside it: the service holds no state and
+    is reproducible from this configuration, and the provider's own default of
+    `true` makes `terraform destroy` fail at exactly the moment someone is
+    tearing down an environment they meant to tear down.
+
+    Set it true for a service you would rather not lose to a misapplied plan.
+  EOT
+}

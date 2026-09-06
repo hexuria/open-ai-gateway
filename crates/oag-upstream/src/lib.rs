@@ -92,7 +92,7 @@ pub(crate) fn builder_client() -> oag_core::Result<reqwest::Client> {
 /// # Errors
 ///
 /// If the proxy URL is unusable or the client cannot be built.
-pub fn side_channel_client(
+pub(crate) fn side_channel_client(
     proxy: Option<&str>,
     timeout: std::time::Duration,
 ) -> oag_core::Result<reqwest::Client> {

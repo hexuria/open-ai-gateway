@@ -184,6 +184,7 @@ column means the defect also depends on documented third-party behaviour.
 | C14 | confirmed | `admin/mod.rs:1452` | no unique name; no rename or remove command |
 | C15 | confirmed | `usage_import.rs:829` | last-write-wins on ambiguous names |
 | C16 | confirmed | `doctor.rs:48` | counts rows, ignores versions and `success` |
+| C17 | confirmed, closed by S2 | `admin/mod.rs:1658` | revoking a shared prefix evicted one of the keys it deactivated. Never assigned to a group — S2 gave `revoke_key_by_prefix` every row and the CLI now loops them, evicting and naming each, which is the whole of C17. Verified 2026-09-06 |
 | D16 | confirmed | `data-neutral/main.tf:25` | TLS check gated on `upstash.io` |
 | D17 | confirmed | `compute-fargate/main.tf:217` | invented 120s cap |
 | D18 | confirmed | `aws-fargate/variables.tf:24`, `module:34` | `public_subnet_ids` always used |
