@@ -15,10 +15,24 @@ Behaviour is set by environment:
   MOCK_CHUNKS          how many content deltas to spread across it (default 20)
   MOCK_FAIL_STATUS     if set, every POST returns this status instead
   MOCK_FAIL_FIRST      fail only the first N POSTs, then serve normally
+  MOCK_FAIL_FOR_KEY    `credential=status` pairs, comma separated: only these
+                       upstream credentials fail, each with its own status, and
+                       every other credential is served
+  MOCK_FAIL_FIRST_CREDENTIAL
+                       fail every POST from whichever credential POSTed first
+                       since the last `/_credentials?reset=1`, with this status.
+                       For failover: which of two equal accounts the scheduler
+                       picks is its own business, so naming one in advance makes
+                       the test depend on that choice
 
 GET /_seen returns the POST count as plain text, without incrementing it.
+GET /_credentials returns one short hash per distinct credential seen — never
+the value — so a script can assert that two accounts were both used without a
+secret reaching CI output. `?reset=1` clears the list after reading it, which is
+how a script scopes the question to one request rather than to the whole run.
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -30,22 +44,69 @@ STREAM_SECONDS = float(os.environ.get("MOCK_STREAM_SECONDS", "20"))
 CHUNKS = int(os.environ.get("MOCK_CHUNKS", "20"))
 FAIL_STATUS = os.environ.get("MOCK_FAIL_STATUS")
 FAIL_FIRST = int(os.environ.get("MOCK_FAIL_FIRST", "0"))
+# Per-credential failure, because `MOCK_FAIL_STATUS` fails everyone and a
+# gateway that never failed over then looks exactly like one that failed over to
+# a second dead credential. It is a map rather than a single name because the
+# two behaviours worth telling apart need different statuses: 408 is retried on
+# the same account, 5xx moves to another one.
+FAIL_FOR_KEY = {}
+for _pair in filter(None, os.environ.get("MOCK_FAIL_FOR_KEY", "").split(",")):
+    _cred, _, _status = _pair.partition("=")
+    FAIL_FOR_KEY[_cred] = int(_status or FAIL_STATUS or 408)
+FAIL_FIRST_CREDENTIAL = os.environ.get("MOCK_FAIL_FIRST_CREDENTIAL")
 
 _lock = threading.Lock()
 _seen = 0
+_credentials = []
 
 
-def _record_and_status():
+def _credential(headers):
+    """The upstream credential a POST arrived with, recording a hash of it.
+
+    The value never reaches the log or `/_credentials`. A short digest answers
+    the only question a script asks — were these two requests made with
+    different credentials — and a mock that printed the real thing would put a
+    secret in CI output on every run.
+    """
+    raw = headers.get("x-api-key") or headers.get("authorization") or ""
+    if raw:
+        digest = _digest(raw)
+        with _lock:
+            if digest not in _credentials:
+                _credentials.append(digest)
+    return raw
+
+
+def _digest(raw):
+    return hashlib.sha256(raw.encode()).hexdigest()[:8]
+
+
+def _record_and_status(credential=""):
     """Count this POST, then decide whether it fails.
 
     Every POST increments, including health probes that POST an empty body.
-    MOCK_FAIL_STATUS fails every request; MOCK_FAIL_FIRST fails only the first
-    N. Counted under a lock so N is total rather than N per thread.
+    MOCK_FAIL_FOR_KEY fails only the credentials it names; MOCK_FAIL_STATUS
+    fails every request; MOCK_FAIL_FIRST fails only the first N. Counted under a
+    lock so N is total rather than N per thread.
     """
     global _seen
     with _lock:
         _seen += 1
         n = _seen
+    if credential in FAIL_FOR_KEY:
+        return FAIL_FOR_KEY[credential]
+    if FAIL_FIRST_CREDENTIAL:
+        # Whichever credential went first. Two accounts on a rung are equal as
+        # far as this mock is concerned, and which one the scheduler reaches for
+        # is not a property worth pinning — that the request survives the one it
+        # picked failing is.
+        with _lock:
+            first = _credentials[0] if _credentials else None
+        if first is not None and first == _digest(credential):
+            return int(FAIL_FIRST_CREDENTIAL)
+        return None
+    if FAIL_FOR_KEY:
+        return None
     if FAIL_STATUS:
         return int(FAIL_STATUS)
     if n <= FAIL_FIRST:
@@ -61,10 +122,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         # The breaker harness needs the POST count without adding to it.
-        if self.path.split("?", 1)[0].rstrip("/") == "/_seen":
+        route, _, query = self.path.partition("?")
+        route = route.rstrip("/")
+        if route in ("/_seen", "/_credentials"):
             with _lock:
-                n = _seen
-            payload = str(n).encode()
+                if route == "/_seen":
+                    payload = str(_seen).encode()
+                else:
+                    payload = "\n".join(_credentials).encode()
+                    # Scoped to one request when asked. Without this the list is
+                    # cumulative over the run, and "more credentials than
+                    # before" is then true whenever a later stage uses a
+                    # different account — which is not failover.
+                    if "reset=1" in query:
+                        _credentials.clear()
             self.send_response(200)
             self.send_header("content-type", "text/plain")
             self.send_header("content-length", str(len(payload)))
@@ -87,7 +158,7 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("mock-request: " + json.dumps(request, separators=(",", ":")) + "\n")
         sys.stderr.flush()
 
-        status = _record_and_status()
+        status = _record_and_status(_credential(self.headers))
         if status:
             payload = json.dumps(
                 {"type": "error", "error": {"type": "overloaded_error", "message": "mock failure"}}

@@ -36,7 +36,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say "1/5  infrastructure"
+say "1/6  infrastructure"
 if [ -z "${OAG_DATABASE__URL:-}" ]; then
   just dev-up >/dev/null
 fi
@@ -44,7 +44,7 @@ eval "$(just _verify-env)"
 just migrate >/dev/null
 pass "postgres, redis, schema"
 
-say "2/5  Anthropic mock"
+say "2/6  Anthropic mock"
 MOCK_STREAM_SECONDS="$STREAM_SECONDS" MOCK_CHUNKS="$CHUNKS" PORT="$MOCK_PORT" \
   python3 deploy/test/mock-upstream.py >"$WORK/mock.log" 2>&1 &
 MOCK_PID=$!
@@ -55,7 +55,7 @@ done
 [ "$(seen)" = "0" ] || fail "mock never became ready; see $WORK/mock.log"
 pass "mock on :$MOCK_PORT"
 
-say "3/5  gateway, one anthropic account on an isolated route"
+say "3/6  gateway, one anthropic account on an isolated route"
 KEY="$(
   cargo run --quiet -p oag -- admin init --email translate@localhost --route "$ROUTE" 2>/dev/null \
     | grep -oE 'oag_live_[0-9a-f]+' | head -1
@@ -127,7 +127,7 @@ print(f"  ok  {model} on '{tier}': in={inp} out={out}, ${cost} vs ${counterfactu
 PY
 }
 
-say "4/5  Chat Completions client, Anthropic upstream"
+say "4/6  Chat Completions client, Anthropic upstream"
 since="$(mark)"
 curl -sS --max-time 30 -o "$WORK/openai.json" -w "%{http_code}" \
   -X POST "http://$PUBLIC/v1/chat/completions" \
@@ -197,11 +197,60 @@ PY
 assert_ledger $((CHUNKS * 3)) "$since"
 pass "stream translated + [DONE] + ledger"
 
+# The third client dialect. Chat Completions above and Anthropic passthrough
+# are both exercised end to end; `/v1/responses` was not exercised by any
+# script, so a quarter of the hub's client surface rested on unit tests while
+# the other three had a live request behind them. Its converter is also the one
+# that differs most from canonical — `input` rather than `messages`, named
+# stream events, and `output_text` where every other dialect says `text`.
+say "5/6  Responses client, Anthropic upstream"
+since="$(mark)"
+curl -sS --max-time 30 -o "$WORK/responses.json" -w "%{http_code}" \
+  -X POST "http://$PUBLIC/v1/responses" \
+  -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"model":"oag/auto","input":"hello","stream":false}' \
+  >"$WORK/responses.status"
+[ "$(cat "$WORK/responses.status")" = "200" ] \
+  || fail "responses: HTTP $(cat "$WORK/responses.status") $(cat "$WORK/responses.json")"
+python3 - "$WORK/responses.json" <<'PY' || fail "body was not a Responses response"
+import json, sys
+body = json.load(open(sys.argv[1]))
+if body.get("type") == "message":
+    sys.exit("got an Anthropic Messages body — translation did not run")
+if body.get("object") != "response":
+    sys.exit(f"object={body.get('object')!r}, expected response")
+if body.get("status") != "completed":
+    sys.exit(f"status={body.get('status')!r}, expected completed")
+text = []
+for item in body.get("output") or []:
+    if item.get("type") != "message":
+        continue
+    for part in item.get("content") or []:
+        # `output_text` on the way out, `input_text` on the way in: a round trip
+        # has to flip them, and a converter that does not looks correct here
+        # until a reply is fed back as context.
+        if part.get("type") != "output_text":
+            sys.exit(f"content part type={part.get('type')!r}, expected output_text")
+        text.append(part.get("text") or "")
+joined = "".join(text)
+if joined != "mock response":
+    sys.exit(f"output text={joined!r}, expected 'mock response'")
+usage = body.get("usage") or {}
+if usage.get("input_tokens") != 100 or usage.get("output_tokens") != 12:
+    sys.exit(f"usage={usage}")
+if usage.get("total_tokens") != 112:
+    sys.exit(f"total_tokens={usage.get('total_tokens')!r}, expected 112")
+PY
+grep -q 'POST /v1/messages' "$WORK/mock.log" \
+  || fail "mock never saw /v1/messages — the adapter did not fire"
+assert_ledger 12 "$since"
+pass "responses translated + ledger"
+
 # Two fields that are invisible in the reply: the gateway either renders them on
 # the way out or it does not, and the client is told nothing either way. Both
 # were dropped in silence until 2026-09-05 — a system message written as parts,
 # and a reasoning level from a client whose dialect has no budget field.
-say "5/5  fields the reply cannot show you"
+say "6/6  fields the reply cannot show you"
 before="$(wc -l <"$WORK/mock.log")"
 curl -sS --max-time 30 -o "$WORK/fields.json" -w "%{http_code}" \
   -X POST "http://$PUBLIC/v1/chat/completions" \
