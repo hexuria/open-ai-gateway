@@ -2189,6 +2189,77 @@ mod tests {
         );
     }
 
+    /// H4: the three unserved writes must not ride on the request future.
+    ///
+    /// They were inline `.await`s on the same future hyper drops when a client
+    /// hangs up, so a provider that had already generated — and would already
+    /// invoice — those tokens left no ledger row at all. For the abandoned rows
+    /// this is the last chance they get.
+    ///
+    /// The guard is taken synchronously, before the spawn, which is what makes
+    /// this deterministic rather than a race: the moment `spawn_unserved`
+    /// returns, the work is counted as in flight, so a drain waits for it and
+    /// dropping the caller cannot take it away.
+    #[tokio::test]
+    async fn unserved_rows_are_spawned_off_the_request_future() {
+        let state = state();
+        let ctx = meter::Context {
+            request_id: RequestId::new(),
+            auth: auth_context(),
+            decision: decision_for(oag_core::Provider::Anthropic),
+            account: oag_core::AccountId::new(),
+            started: std::time::Instant::now(),
+            attempt: 0,
+            flat_rate: false,
+        };
+        let accumulator = oag_proto::StreamAccumulator::new();
+        let abandoned = meter::abandon(
+            ctx.clone(),
+            &accumulator,
+            oag_router::QualityGate::EmptyResponse,
+        );
+        let lost = meter::lose(
+            ctx,
+            &accumulator,
+            &oag_core::Error::Internal("stream lost".to_owned()),
+        );
+
+        let before = state.lifecycle.in_flight();
+
+        // Called from inside a future that is then dropped without ever being
+        // polled to completion — the shape of a client hang-up.
+        let caller = {
+            let state = Arc::clone(&state);
+            async move {
+                spawn_unserved(&state, Some(abandoned), vec![lost]);
+                std::future::pending::<()>().await;
+            }
+        };
+        let mut caller = Box::pin(caller);
+        // One poll: enough to reach `spawn_unserved` and park on `pending`.
+        std::future::poll_fn(|cx| {
+            let _ = caller.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        let tracked = state.lifecycle.in_flight();
+        assert!(
+            tracked > before,
+            "the unserved writes are not tracked as in-flight work, so a drain \
+             will not wait for them and an inline await would be cancelled with \
+             the request: {before} -> {tracked}"
+        );
+
+        drop(caller);
+        assert!(
+            state.lifecycle.in_flight() > before,
+            "the writes went with the request future when it was dropped — \
+             which is H4 exactly: the provider invoices the tokens and the \
+             ledger has no row"
+        );
+    }
+
     fn decision_for(provider: oag_core::Provider) -> RoutingDecision {
         use oag_router::{Capabilities, ModelId, ModelSpec, Pricing};
         RoutingDecision {
