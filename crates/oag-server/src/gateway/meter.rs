@@ -139,6 +139,31 @@ fn usage_write(
         Fate::Abandoned | Fate::Lost => (Decimal::ZERO, None),
     };
 
+    // The API-equivalent price, which is what a seat's savings are measured
+    // against. An attempt nobody was served displaced no bill, so it must not
+    // claim to have displaced one — the same argument the paragraph above makes
+    // for the frontier baseline, applied to the column beside it, which was
+    // left saying the opposite.
+    //
+    // `cost`, not zero, and that distinction is the whole fix:
+    //
+    // - On a **metered** credential `cost` already *is* the API price, so this
+    //   changes nothing and the row still records what those tokens cost us.
+    //   Zeroing it here would make `api - cost` negative and understate the
+    //   very savings figure the column feeds.
+    // - On a **flat-rate seat** `cost` is zero, which is the point. The row
+    //   stops matching `cost_usd = 0 AND counterfactual_api_usd > 0` — the
+    //   predicate `seat_summaries` uses to recognise a seat row at all — so a
+    //   generation the client never received no longer appears in that seat's
+    //   displaced-spend total, or in the ordering that ranks seats by it.
+    //
+    // Since 0014 these rows land for the first time, so this was latent until
+    // the migration that made abandoned and lost attempts real.
+    let counterfactual_api = match fate {
+        Fate::Served => api_equivalent,
+        Fate::Abandoned | Fate::Lost => cost,
+    };
+
     // `escalated_from_tier` is set only when we actually climbed a rung;
     // `escalation_gate` is set whenever a gate tripped. Keeping them separate
     // is what lets you count missed escalation opportunities — the streamed
@@ -177,7 +202,7 @@ fn usage_write(
         cost_usd: cost,
         counterfactual_usd: counterfactual,
         counterfactual_model_id: counterfactual_model,
-        counterfactual_api_usd: api_equivalent,
+        counterfactual_api_usd: counterfactual_api,
         status: if outcome.error.is_some() { 502 } else { 200 },
         latency_ms: i32::try_from(outcome.total.as_millis()).ok(),
         ttft_ms: outcome.ttft.and_then(|d| i32::try_from(d.as_millis()).ok()),
@@ -577,6 +602,51 @@ mod tests {
         // The frontier baseline is still recorded; it is a different question
         // (what the top rung would have cost) and stays on its own column.
         assert!(row.counterfactual_usd > Decimal::ZERO);
+    }
+
+    #[test]
+    fn an_unserved_seat_row_displaces_no_api_bill() {
+        // The seat table recognises its rows by `cost_usd = 0 AND
+        // counterfactual_api_usd > 0`, and an abandoned attempt on a seat used
+        // to match it — so a generation the client never received was credited
+        // to that seat as displaced spend, and the seats that wasted the most
+        // ranked highest. Latent until 0014 made these rows land at all.
+        let mut ctx = context(0);
+        ctx.flat_rate = true;
+
+        for fate in [Fate::Abandoned, Fate::Lost] {
+            let row = usage_write(&ctx, &outcome(300), None, false, fate);
+            assert_eq!(row.cost_usd, Decimal::ZERO, "{fate:?}");
+            assert_eq!(
+                row.counterfactual_api_usd,
+                Decimal::ZERO,
+                "{fate:?}: nobody was served, so no pay-per-token bill was displaced"
+            );
+            assert!(
+                !(row.cost_usd == Decimal::ZERO && row.counterfactual_api_usd > Decimal::ZERO),
+                "{fate:?}: the row must not match the seat predicate"
+            );
+        }
+
+        // The served row on the same seat still books what it displaced: this
+        // narrows the claim to unserved attempts, it does not withdraw it.
+        let served = usage_write(&ctx, &outcome(300), None, false, Fate::Served);
+        assert!(served.counterfactual_api_usd > Decimal::ZERO);
+    }
+
+    #[test]
+    fn an_unserved_metered_row_still_records_what_it_cost() {
+        // The other half, and the reason the fix is `cost` rather than zero.
+        // These tokens were bought and the invoice will show them. Zeroing the
+        // API-equivalent price here would make (api - cost) negative on this
+        // row and understate the savings figure it feeds.
+        let ctx = context(0); // flat_rate: false
+        let row = usage_write(&ctx, &outcome(300), None, false, Fate::Abandoned);
+        assert!(row.cost_usd > Decimal::ZERO, "we paid for these tokens");
+        assert_eq!(
+            row.counterfactual_api_usd, row.cost_usd,
+            "a metered row contributes nothing to (api - cost), whatever its fate"
+        );
     }
 
     #[test]
