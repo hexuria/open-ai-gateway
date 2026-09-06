@@ -691,7 +691,7 @@ pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsa
                p.monthly_budget_usd,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
-               ), 0)::numeric(14,6),
+               ), 0)::numeric(16,8),
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
                      AND u.selection_reason NOT IN ('abandoned', 'lost')
@@ -930,8 +930,8 @@ pub async fn key_usage_by_model(
                COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
                COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
                COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens,
-               COALESCE(SUM(cost_usd), 0)::numeric(14,6) AS cost_usd,
-               COALESCE(SUM(counterfactual_api_usd), 0)::numeric(14,6) AS list_usd,
+               COALESCE(SUM(cost_usd), 0)::numeric(16,8) AS cost_usd,
+               COALESCE(SUM(counterfactual_api_usd), 0)::numeric(16,8) AS list_usd,
                CASE WHEN $3::numeric IS NULL THEN NULL
                     ELSE SUM(ROUND(counterfactual_api_usd * 1000000 / $3::numeric))::bigint
                END AS points
@@ -1043,7 +1043,7 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                k.spent_usd,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
-               ), 0)::numeric(14,6) AS month_usd,
+               ), 0)::numeric(16,8) AS month_usd,
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
                      AND u.selection_reason NOT IN ('abandoned', 'lost')
@@ -1051,13 +1051,13 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                date_trunc('month', now()) + interval '1 month' AS month_resets_at,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '5 hours'
-               ), 0)::numeric(14,6) AS five_hour_usd,
+               ), 0)::numeric(16,8) AS five_hour_usd,
                MIN(u.occurred_at) FILTER (
                    WHERE u.occurred_at >= now() - interval '5 hours'
                ) + interval '5 hours' AS five_hour_frees_at,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '7 days'
-               ), 0)::numeric(14,6) AS seven_day_usd,
+               ), 0)::numeric(16,8) AS seven_day_usd,
                MIN(u.occurred_at) FILTER (
                    WHERE u.occurred_at >= now() - interval '7 days'
                ) + interval '7 days' AS seven_day_frees_at,
@@ -1071,16 +1071,16 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                ) AS seven_day_requests,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
-               ), 0)::numeric(14,6) AS month_counterfactual_usd,
+               ), 0)::numeric(16,8) AS month_counterfactual_usd,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '5 hours'
-               ), 0)::numeric(14,6) AS five_hour_counterfactual_usd,
+               ), 0)::numeric(16,8) AS five_hour_counterfactual_usd,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '7 days'
-               ), 0)::numeric(14,6) AS seven_day_counterfactual_usd,
+               ), 0)::numeric(16,8) AS seven_day_counterfactual_usd,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '24 hours'
-               ), 0)::numeric(14,6) AS day_usd,
+               ), 0)::numeric(16,8) AS day_usd,
                MIN(u.occurred_at) FILTER (
                    WHERE u.occurred_at >= now() - interval '24 hours'
                ) + interval '24 hours' AS day_frees_at,
@@ -1090,7 +1090,7 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                ) AS day_requests,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '24 hours'
-               ), 0)::numeric(14,6) AS day_counterfactual_usd,
+               ), 0)::numeric(16,8) AS day_counterfactual_usd,
                CASE WHEN $2::numeric IS NULL THEN NULL ELSE COALESCE(SUM(ROUND(u.counterfactual_api_usd * 1000000 / $2::numeric)) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
                ), 0)::bigint END AS month_points,
@@ -3965,6 +3965,54 @@ mod tests {
             used.is_empty(),
             "a query DOES use account_schedulable_idx, so 0016 dropped an index \
              something needed: {used:?}"
+        );
+    }
+
+    /// C7: 0015 says "nothing rounds on the way out". It has to be true.
+    ///
+    /// The migration widened the three spend counters to `numeric(16,8)`, the
+    /// scale the ledger already carries, so a debit is no longer rounded on the
+    /// way in. Every read path then cast its ledger sums back to
+    /// `numeric(14,6)` — while returning the widened counter beside them
+    /// untouched — so a panel could show a key's `spent_usd` and its own ledger
+    /// sum disagreeing in the last two digits, which is the exact symptom 0015
+    /// claims to have removed.
+    ///
+    /// A single sub-cent debit is enough to see it: at six places
+    /// `0.00000001` reads as `0.00000000`.
+    #[tokio::test]
+    async fn a_sub_cent_debit_survives_the_read_path() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (key, build) = metered_key(&db).await;
+
+        let tiny: Decimal = "0.00000001".parse().expect("decimal");
+        record_usage(&db, &build(Uuid::now_v7(), 0, "classified", "0.00000001"))
+            .await
+            .expect("record");
+
+        let usage = key_usage(&db, key, None)
+            .await
+            .expect("read the panel")
+            .expect("the key exists");
+        assert_eq!(
+            usage.month_to_date_usd, tiny,
+            "the ledger sum was rounded on the way out, so it no longer matches \
+             the counter 0015 widened to hold it"
+        );
+
+        let counter: Decimal = sqlx::query_scalar("SELECT spent_usd FROM api_key WHERE id = $1")
+            .bind(key)
+            .fetch_one(db.pool())
+            .await
+            .expect("read the counter");
+        assert_eq!(
+            usage.month_to_date_usd, counter,
+            "the panel and the counter must agree to the last place: they are \
+             the same money, read two ways"
         );
     }
 
