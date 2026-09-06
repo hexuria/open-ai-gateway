@@ -2439,9 +2439,12 @@ mod tests {
             .execute(db.pool())
             .await
             .expect("route");
+        // An admin, because the eviction is reached through `init` and `init`
+        // mints an admin key — which B5 now refuses for a member. The role is
+        // incidental to what this test is about; the eviction is not.
         let principal: Uuid = sqlx::query_scalar(
             "INSERT INTO principal (id, email, role, monthly_budget_usd)
-             VALUES (gen_random_uuid(), $1, 'member', 100) RETURNING id",
+             VALUES (gen_random_uuid(), $1, 'admin', 100) RETURNING id",
         )
         .bind(&email)
         .fetch_one(db.pool())
@@ -2474,7 +2477,14 @@ mod tests {
             "the fixture has to be cached for the eviction to mean anything"
         );
 
-        evict_principal_keys(&db, &redis_url, principal, &email).await;
+        // Through `init`, which is what C5 changed. Calling
+        // `evict_principal_keys` directly tested the helper: delete the call
+        // from `init` and this stayed green, which is the state the finding
+        // describes — a new cap set at the CLI and not enforced for five
+        // minutes.
+        init(&db, &redis_url, &email, &route, Some(Decimal::from(50)))
+            .await
+            .expect("init lowers the budget");
 
         assert!(
             cache.auth_get(&hash, &mac).await.is_none(),

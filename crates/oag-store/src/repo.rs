@@ -1023,17 +1023,13 @@ struct KeyUsageRow {
     seven_day_points: Option<i64>,
 }
 
-/// One key's cap and spend; `None` for an id that is not a key. Every figure comes from the
-/// ledger, not the counter, for the same reason `principal_usage` reads the ledger: the ledger
-/// is the record. One statement, three windows, the key's own rows only.
-/// `reference` is the points price, read first by the caller; without one the points fields
-/// are `None`, never zero.
-// One statement, four windows, ten figures each: the length is the SELECT list, and splitting
-// it would read the ledger twice.
-#[allow(clippy::too_many_lines)]
-pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<Option<KeyUsage>> {
-    sqlx::query_as::<_, KeyUsageRow>(
-        r"
+/// The key-usage panel, as one statement.
+///
+/// A `const` so the `EXPLAIN` test can plan the statement this function
+/// actually runs. The test used to inline the join "verbatim from its `FROM`
+/// onwards", which meant deleting S1's window bound from the real query left
+/// it green: a copy of a fix cannot fail with it.
+const KEY_USAGE_SQL: &str = r"
         SELECT k.id,
                k.name,
                k.key_prefix,
@@ -1128,44 +1124,54 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                   )
         WHERE k.id = $1
         GROUP BY k.id, k.name, k.key_prefix, p.email, k.active, k.quota_usd, k.spent_usd
-        ",
-    )
-    .bind(id)
-    .bind(reference)
-    .fetch_optional(db.pool())
-    .await
-    .map(|row| {
-        row.map(|row| KeyUsage {
-            key_id: row.id,
-            name: row.name,
-            prefix: row.key_prefix,
-            principal_email: row.email,
-            active: row.active,
-            quota_usd: row.quota_usd,
-            spent_usd: row.spent_usd,
-            month_to_date_usd: row.month_usd,
-            requests: row.month_requests,
-            month_resets_at: row.month_resets_at,
-            five_hour_usd: row.five_hour_usd,
-            five_hour_frees_at: row.five_hour_frees_at,
-            seven_day_usd: row.seven_day_usd,
-            seven_day_frees_at: row.seven_day_frees_at,
-            five_hour_requests: row.five_hour_requests,
-            seven_day_requests: row.seven_day_requests,
-            month_counterfactual_usd: row.month_counterfactual_usd,
-            five_hour_counterfactual_usd: row.five_hour_counterfactual_usd,
-            seven_day_counterfactual_usd: row.seven_day_counterfactual_usd,
-            day_usd: row.day_usd,
-            day_frees_at: row.day_frees_at,
-            day_requests: row.day_requests,
-            day_counterfactual_usd: row.day_counterfactual_usd,
-            month_points: row.month_points,
-            five_hour_points: row.five_hour_points,
-            day_points: row.day_points,
-            seven_day_points: row.seven_day_points,
+";
+
+/// One key's cap and spend; `None` for an id that is not a key. Every figure comes from the
+/// ledger, not the counter, for the same reason `principal_usage` reads the ledger: the ledger
+/// is the record. One statement, three windows, the key's own rows only.
+/// `reference` is the points price, read first by the caller; without one the points fields
+/// are `None`, never zero.
+// One statement, four windows, ten figures each: the length is the SELECT list, and splitting
+// it would read the ledger twice.
+#[allow(clippy::too_many_lines)]
+pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<Option<KeyUsage>> {
+    sqlx::query_as::<_, KeyUsageRow>(KEY_USAGE_SQL)
+        .bind(id)
+        .bind(reference)
+        .fetch_optional(db.pool())
+        .await
+        .map(|row| {
+            row.map(|row| KeyUsage {
+                key_id: row.id,
+                name: row.name,
+                prefix: row.key_prefix,
+                principal_email: row.email,
+                active: row.active,
+                quota_usd: row.quota_usd,
+                spent_usd: row.spent_usd,
+                month_to_date_usd: row.month_usd,
+                requests: row.month_requests,
+                month_resets_at: row.month_resets_at,
+                five_hour_usd: row.five_hour_usd,
+                five_hour_frees_at: row.five_hour_frees_at,
+                seven_day_usd: row.seven_day_usd,
+                seven_day_frees_at: row.seven_day_frees_at,
+                five_hour_requests: row.five_hour_requests,
+                seven_day_requests: row.seven_day_requests,
+                month_counterfactual_usd: row.month_counterfactual_usd,
+                five_hour_counterfactual_usd: row.five_hour_counterfactual_usd,
+                seven_day_counterfactual_usd: row.seven_day_counterfactual_usd,
+                day_usd: row.day_usd,
+                day_frees_at: row.day_frees_at,
+                day_requests: row.day_requests,
+                day_counterfactual_usd: row.day_counterfactual_usd,
+                month_points: row.month_points,
+                five_hour_points: row.five_hour_points,
+                day_points: row.day_points,
+                seven_day_points: row.seven_day_points,
+            })
         })
-    })
-    .map_err(|e| Error::Internal(format!("reading key usage: {e}")))
+        .map_err(|e| Error::Internal(format!("reading key usage: {e}")))
 }
 
 /// The points reference price — one token at this many USD per million is one point — if the
@@ -2514,10 +2520,24 @@ mod tests {
             // transaction waiting for another's row lock waits on that
             // transaction's id, so nothing ungranted is recorded against the
             // table itself.
+            //
+            // Narrowed to the reconcile's own statements, and to somebody else's
+            // backend. "Any backend waiting on a lock in this database" is
+            // satisfied by any sibling test's `db.migrate()`, which takes an
+            // advisory lock — so under parallel load the probe returned true
+            // for a stranger, the debit committed before this pass reached the
+            // row, and the reverted code passed. The test was interleaving
+            // nothing and asserting it had.
+            //
+            // Both statements, because the pass blocks on whichever comes
+            // first: it takes the row lock with `SELECT ... FOR UPDATE` before
+            // it runs the `SET spent_usd` that needs it.
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_stat_activity
                   WHERE datname = current_database()
-                    AND wait_event_type = 'Lock'",
+                    AND pid <> pg_backend_pid()
+                    AND wait_event_type = 'Lock'
+                    AND (query LIKE '%FOR UPDATE%' OR query LIKE '%SET spent_usd%')",
             )
             .fetch_one(db.pool())
             .await
@@ -4036,23 +4056,24 @@ mod tests {
             .await
             .expect("ask for the index plan");
 
-        // The join `key_usage` makes, verbatim from its `FROM` onwards.
-        let plan: String = sqlx::query_scalar(
-            "EXPLAIN SELECT count(*) FROM api_key k
-               JOIN principal p ON p.id = k.principal_id
-               LEFT JOIN usage_event u
-                      ON u.api_key_id = k.id
-                     AND u.occurred_at >= LEAST(
-                             date_trunc('month', now()),
-                             now() - interval '7 days'
-                         )
-              WHERE k.id = $1",
-        )
-        .bind(key)
-        .fetch_all(&mut *tx)
-        .await
-        .map(|rows: Vec<String>| rows.join("\n"))
-        .expect("explain");
+        // The statement `key_usage` runs, not a copy of its join. This test
+        // used to inline the join "verbatim from its `FROM` onwards", so
+        // deleting S1's window bound from the real query left it green — which
+        // is the failure this whole group is about. `EXPLAIN` on the const is
+        // the only form that cannot drift from what runs.
+        // `Box::leak` because sqlx refuses a non-`'static` statement — the same
+        // "static SQL only" rule the rest of this crate follows, enforced by
+        // the driver. One leaked string per test run is the cost of planning
+        // the real query instead of a copy, and it is a cost worth paying
+        // exactly once.
+        let explain: &'static str = Box::leak(format!("EXPLAIN {KEY_USAGE_SQL}").into_boxed_str());
+        let plan: String = sqlx::query_scalar(explain)
+            .bind(key)
+            .bind(Option::<Decimal>::None)
+            .fetch_all(&mut *tx)
+            .await
+            .map(|rows: Vec<String>| rows.join("\n"))
+            .expect("explain");
         tx.rollback().await.expect("rollback");
 
         let ledger_cond = plan
