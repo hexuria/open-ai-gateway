@@ -22,6 +22,81 @@ pub const API_VERSION: &str = "2023-06-01";
 
 const DIALECT: Dialect = Dialect::AnthropicMessages;
 
+/// Anthropic's floor for `budget_tokens`. Smaller values are refused outright,
+/// which is why `Off` renders no thinking block rather than a budget of zero.
+const MIN_THINKING_BUDGET: u32 = 1024;
+
+/// Which of the two thinking controls a model accepts.
+///
+/// This vendor split its API here, and a renderer that speaks one form is wrong
+/// for half the catalogue:
+///
+/// - **4.5 and earlier** take `thinking: {type: "enabled", budget_tokens: N}`
+///   and nothing else; `type: "adaptive"` is a 400 there.
+/// - **4.6** takes both, with `budget_tokens` deprecated.
+/// - **4.7 and later reject `type: "enabled"` with a 400.** That includes
+///   `claude-opus-5`, which this repository's own default ladder puts on the
+///   `frontier` rung — so the un-gated bridge broke the rung a client reaches
+///   by asking for maximum reasoning.
+///
+/// The replacement is `type: "adaptive"` with the depth on
+/// `output_config.effort`, whose levels are the ones [`Effort`] already spells.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ThinkingMode {
+    Budget,
+    Adaptive,
+}
+
+/// The `(major, minor)` generation in a model name, if it carries one.
+///
+/// Reads both orders this vendor has used — `claude-3-5-haiku` puts the version
+/// before the family, `claude-opus-4-5` after it — and Bedrock's
+/// `anthropic.claude-haiku-4-5-v1:0`, which wraps the same name. Segments of
+/// 100 or more are dropped as date stamps: `claude-opus-4-5-20251101` is 4.5
+/// released on a date, not version 4.5.20251101.
+fn generation(upstream_model: &str) -> Option<(u32, u32)> {
+    let mut parts = upstream_model
+        .split(['-', '.', '_', ':'])
+        .filter_map(|segment| segment.parse::<u32>().ok())
+        .filter(|number| *number < 100);
+    let major = parts.next()?;
+    Some((major, parts.next().unwrap_or(0)))
+}
+
+/// `None` for a name whose generation cannot be read — see the call site for
+/// why that renders no thinking at all rather than a default.
+///
+/// Note what this deliberately does not do: it does not gate models older than
+/// the ones that support thinking at all. A 3.x model still receives a budget
+/// and still refuses it. That was true before this function existed, no model
+/// on the default ladder is affected, and widening the fix to cover it belongs
+/// to its own change.
+fn thinking_mode(upstream_model: &str) -> Option<ThinkingMode> {
+    let (major, minor) = generation(upstream_model)?;
+    Some(if (major, minor) >= (4, 6) {
+        ThinkingMode::Adaptive
+    } else {
+        ThinkingMode::Budget
+    })
+}
+
+/// The budget to render for a model that speaks budgets, or `None` for none.
+///
+/// Two constraints, both this vendor's and both hard: at least
+/// [`MIN_THINKING_BUDGET`], and *strictly less than* `max_tokens`, because
+/// thinking tokens count against that same ceiling. A Chat Completions client
+/// leaves `max_tokens` at its 4096 default while `High` asks for 16384, so the
+/// unclamped bridge produced a 400 on the very request the finding describes.
+///
+/// A ceiling too low to hold the floor yields no thinking rather than an
+/// invalid block: the request still gets an answer, which is the outcome the
+/// client was getting before any of this.
+fn anthropic_budget(req: &CanonicalRequest) -> Option<u32> {
+    let (asked, _) = req.thinking_request()?;
+    let budget = asked.min(req.max_tokens.checked_sub(1)?);
+    (budget >= MIN_THINKING_BUDGET).then_some(budget)
+}
+
 /// Canonical → Anthropic wire JSON.
 pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Value> {
     let mut body = json!({
@@ -47,11 +122,28 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     // `reasoning_effort: "high"` had nowhere to land: the request reached a
     // thinking model with thinking switched off, at frontier prices, and
     // nothing in the answer said the field had been dropped.
-    if let Some(budget) = req
-        .thinking_budget
-        .or_else(|| req.thinking_effort.map(Effort::as_budget))
-    {
-        body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+    //
+    // Bridging the field was half the job; the rendered value has to be one the
+    // model will accept, and which form that is depends on the generation.
+    // Sending the wrong one is a 400, which is worse than the silent
+    // non-thinking answer this bridge was written to fix. See `thinking_mode`.
+    match thinking_mode(upstream_model) {
+        Some(ThinkingMode::Budget) => {
+            if let Some(budget) = anthropic_budget(req) {
+                body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+            }
+        }
+        Some(ThinkingMode::Adaptive) => {
+            if let Some((_, effort)) = req.thinking_request() {
+                body["thinking"] = json!({ "type": "adaptive" });
+                body["output_config"] = json!({ "effort": effort.as_str() });
+            }
+        }
+        // A name whose generation this cannot read. Either form would be a
+        // guess, and a wrong guess is a 400 rather than a degraded answer — so
+        // send neither, which is what this renderer did before the bridge
+        // existed. A silent non-thinking answer is the failure we already know.
+        None => {}
     }
 
     // Two fields this dialect simply does not have. Structured output is not
@@ -935,17 +1027,149 @@ mod tests {
             stop: Vec::new(),
             previous_response_id: None,
         };
-        let body = render_request(&req, "claude-opus-5").expect("renders");
+        // A model that speaks budgets, and room for one: `High` asks for 16384,
+        // which is clamped below `max_tokens` rather than sent as-is. Sent
+        // as-is it was a 400, because thinking counts against that ceiling.
+        req.max_tokens = 8192;
+        let body = render_request(&req, "claude-sonnet-4-5").expect("renders");
         assert_eq!(body["thinking"]["type"], json!("enabled"));
-        assert_eq!(
-            body["thinking"]["budget_tokens"],
-            json!(Effort::High.as_budget())
-        );
+        assert_eq!(body["thinking"]["budget_tokens"], json!(8191));
 
         // An explicit budget still wins: it is the more precise of the two.
         req.thinking_budget = Some(2048);
-        let body = render_request(&req, "claude-opus-5").expect("renders");
+        let body = render_request(&req, "claude-sonnet-4-5").expect("renders");
         assert_eq!(body["thinking"]["budget_tokens"], json!(2048));
+    }
+
+    #[test]
+    fn a_ceiling_with_no_room_for_the_floor_renders_no_thinking() {
+        // `budget_tokens` must be at least 1024 and strictly below
+        // `max_tokens`. A 1024-token answer cannot satisfy both, and the
+        // request is worth more than the thinking: render none and let it
+        // through, rather than an invalid block the upstream refuses.
+        let req = CanonicalRequest {
+            model: "m".to_owned(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            stream: false,
+            temperature: None,
+            thinking_budget: None,
+            thinking_effort: Some(Effort::High),
+            client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
+        };
+        let body = render_request(&req, "claude-sonnet-4-5").expect("renders");
+        assert_eq!(body["thinking"], json!(null), "{body}");
+    }
+
+    #[test]
+    fn a_newer_model_gets_adaptive_thinking_and_an_effort_level() {
+        // `type: "enabled"` is a 400 on 4.7 and later, and `claude-opus-5` is
+        // on this repository's own default ladder. The bridge that fixed H3
+        // sent it there unconditionally, so asking for maximum reasoning on the
+        // frontier rung became a hard failure — worse than the silent
+        // non-thinking answer H3 described.
+        let mut req = CanonicalRequest {
+            model: "m".to_owned(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 8192,
+            stream: false,
+            temperature: None,
+            thinking_budget: None,
+            thinking_effort: Some(Effort::High),
+            client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
+        };
+        let body = render_request(&req, "claude-opus-5").expect("renders");
+        assert_eq!(body["thinking"]["type"], json!("adaptive"));
+        assert_eq!(body["output_config"]["effort"], json!("high"));
+        assert_eq!(
+            body["thinking"]["budget_tokens"],
+            json!(null),
+            "a budget on an adaptive model is the 400 this test exists for"
+        );
+
+        // A client that asked in tokens is asking for depth too: it lands on
+        // the nearest level rather than being dropped for want of a field.
+        req.thinking_effort = None;
+        req.thinking_budget = Some(40000);
+        let body = render_request(&req, "claude-opus-5").expect("renders");
+        assert_eq!(body["output_config"]["effort"], json!("xhigh"));
+    }
+
+    #[test]
+    fn thinking_off_renders_no_block_in_either_form() {
+        // `Off` is a request for no thinking, not for zero tokens of it. Zero
+        // is below Anthropic's floor of 1024, and `output_config.effort` has no
+        // such level — so a request that used to work returned a 400 on both
+        // sides of the generation split. `signal()` reads `Off` the same way.
+        let req = CanonicalRequest {
+            model: "m".to_owned(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 8192,
+            stream: false,
+            temperature: None,
+            thinking_budget: None,
+            thinking_effort: Some(Effort::Off),
+            client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
+        };
+        for model in ["claude-sonnet-4-5", "claude-opus-5"] {
+            let body = render_request(&req, model).expect("renders");
+            assert_eq!(body["thinking"], json!(null), "{model}: {body}");
+            assert_eq!(body["output_config"], json!(null), "{model}: {body}");
+        }
+    }
+
+    #[test]
+    fn a_generation_is_read_from_every_name_shape_this_vendor_uses() {
+        // Both orders, a date stamp, and the Bedrock wrapper. A name whose
+        // generation cannot be read renders no thinking at all, because either
+        // form would be a guess and a wrong guess is a 400.
+        assert_eq!(
+            thinking_mode("claude-sonnet-4-5"),
+            Some(ThinkingMode::Budget)
+        );
+        assert_eq!(
+            thinking_mode("claude-opus-4-5-20251101"),
+            Some(ThinkingMode::Budget),
+            "a date stamp is not a minor version"
+        );
+        assert_eq!(
+            thinking_mode("claude-3-5-haiku"),
+            Some(ThinkingMode::Budget)
+        );
+        assert_eq!(
+            thinking_mode("anthropic.claude-haiku-4-5-v1:0"),
+            Some(ThinkingMode::Budget),
+            "Bedrock wraps the same name"
+        );
+        assert_eq!(
+            thinking_mode("claude-sonnet-4-6"),
+            Some(ThinkingMode::Adaptive),
+            "4.6 deprecates budget_tokens; prefer the form that is not going away"
+        );
+        assert_eq!(thinking_mode("claude-opus-5"), Some(ThinkingMode::Adaptive));
+        assert_eq!(
+            thinking_mode("claude-fable-5-1"),
+            Some(ThinkingMode::Adaptive)
+        );
+        assert_eq!(thinking_mode("some-local-model"), None);
     }
 
     /// P5. The terminal frame carries the whole bill, not just the output half.
@@ -1204,10 +1428,20 @@ mod tests {
         );
         assert_eq!(extract_cache_blocks(&canonical), vec!["You are helpful."]);
 
-        let rendered = render_request(&canonical, "claude-opus-5").expect("renders");
+        // Rendered back to a model that speaks budgets. On a 4.6-or-later model
+        // the same request renders `adaptive` instead — see
+        // `a_newer_model_gets_adaptive_thinking_and_an_effort_level`.
+        //
+        // 8000 comes back as 4095, and that is the clamp earning its keep on a
+        // request nobody translated: this fixture asks for 8000 thinking tokens
+        // inside a 4096-token ceiling, which Anthropic refuses outright. The
+        // rule is the same whichever spelling asked — a client's own explicit
+        // budget is no more valid than a bridged one, and a served answer with
+        // slightly less thinking beats a 400.
+        let rendered = render_request(&canonical, "claude-sonnet-4-5").expect("renders");
         assert_eq!(rendered["max_tokens"], 4096);
         assert_eq!(rendered["system"][0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(rendered["thinking"]["budget_tokens"], 8000);
+        assert_eq!(rendered["thinking"]["budget_tokens"], 4095);
     }
 
     #[test]
