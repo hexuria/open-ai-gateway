@@ -95,4 +95,78 @@ if missing:
     sys.exit(1)
 
 print("tofu: every Cloud Run resource states its own deletion_protection")
+
+# A health check aimed at a listener that will refuse it.
+#
+# `oag`'s admin listener defaults to `127.0.0.1:8081` — deliberately loopback,
+# so the admin API is not reachable off the machine by accident. A health check
+# arriving from a load balancer therefore needs the module to bind it wider,
+# and Helm and compose both do. A module that health-checks 8081 and does not
+# is a module where every target is unhealthy on a green apply, which is the
+# same shape as the H10 defect two commits before this one.
+loopback = []
+for f in sorted(glob.glob("deploy/tofu/modules/*/*.tf")):
+    body = open(f).read()
+    checks_admin_port = re.search(r"^\s*port(_value)?\s*=\s*\"?8081\"?", body, re.M)
+    if checks_admin_port and "OAG_SERVER__ADMIN_ADDR" not in body:
+        loopback.append(f"  {f}: health-checks 8081 without setting OAG_SERVER__ADMIN_ADDR")
+
+if loopback:
+    print("\nHealth checks aimed at a listener bound to loopback:\n")
+    print("\n".join(loopback))
+    print(
+        "\n`server.admin_addr` defaults to 127.0.0.1:8081. A check from a load\n"
+        "balancer is refused, every target goes unhealthy, and the apply is green."
+    )
+    sys.exit(1)
+
+print("tofu: every module health-checking 8081 binds the admin listener for it")
+
+# A private endpoint with no private DNS zone resolves to the public address it
+# was created to stop using. Azure does not link the two for you: without a
+# `private_dns_zone_group` the hostname still answers with the public IP, which
+# `public_network_access_enabled = false` has just blocked. Green apply, dead
+# dependency.
+undns = []
+for f in sorted(glob.glob("deploy/tofu/modules/*/*.tf")):
+    body = open(f).read()
+    for block in re.finditer(
+        r'resource\s+"azurerm_private_endpoint"\s+"([^"]+)"\s*\{(.*?)\n\}',
+        body,
+        re.S,
+    ):
+        name, inner = block.groups()
+        if "private_dns_zone_group" not in inner:
+            undns.append(f"  {f}: azurerm_private_endpoint.{name} has no private_dns_zone_group")
+
+if undns:
+    print("\nPrivate endpoints whose hostname still resolves publicly:\n")
+    print("\n".join(undns))
+    print("\nWithout the zone group the name resolves to the IP the endpoint replaced.")
+    sys.exit(1)
+
+print("tofu: every private endpoint carries a DNS zone group")
+
+# Structured logs, on every platform that ships them somewhere structured.
+#
+# `OAG_TELEMETRY__LOG_JSON` is what makes a log line queryable in Log Analytics
+# or Cloud Logging. Cloud Run set it and Container Apps did not, so one
+# platform's logs arrived as prose — and the review's own note for this, "missing
+# Azure LOG_JSON", was answered against the wrong claim the first time.
+unstructured = [
+    d
+    for d in sorted(glob.glob("deploy/tofu/modules/compute-*/"))
+    if not any(
+        "OAG_TELEMETRY__LOG_JSON" in open(f).read() for f in glob.glob(f"{d}*.tf")
+    )
+]
+
+if unstructured:
+    print("\nCompute modules that never set OAG_TELEMETRY__LOG_JSON:\n")
+    for d in unstructured:
+        print(f"  {d}")
+    print("\nTheir logs arrive as prose, and nothing can query them by field.")
+    sys.exit(1)
+
+print("tofu: every compute module asks for structured logs")
 PY

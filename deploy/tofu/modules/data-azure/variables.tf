@@ -41,6 +41,20 @@ variable "redis_private" {
   EOT
 }
 
+variable "redis_private_dns_zone_id" {
+  type        = string
+  default     = ""
+  description = <<-EOT
+    The privatelink.redis.cache.windows.net zone the endpoint registers in.
+
+    Required whenever `redis_private` is true, and the reason is easy to miss: a
+    private endpoint gives the cache a private IP but does not change what its
+    public hostname resolves to. Without the zone group the name still answers
+    with the public address that `public_network_access_enabled = false` has
+    just blocked, and every replica loses its cache on a green apply.
+  EOT
+}
+
 variable "private_endpoint_subnet_id" {
   type        = string
   default     = ""
