@@ -40,17 +40,40 @@ pub use transport::{HttpTransport, Transport, TransportKey, TransportPool};
 /// And each `Client` allocates a connection pool that this use throws away
 /// immediately — invisible per request, and one allocation and teardown per
 /// request across every adapter.
-pub(crate) fn builder_client() -> reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+pub(crate) fn builder_client() -> oag_core::Result<reqwest::Client> {
+    // Built once, and the outcome — including a failure — is what is cached.
+    //
+    // This used to end in `unwrap_or_default()`, under a comment saying that
+    // was "rather than a panic". It is not: `Client::default()` is
+    // `Client::new()`, which reqwest documents as panicking, so the fallback
+    // was the same panic one call deeper. The comment also promised the failure
+    // would surface "at the transport with an error naming it"; the transport
+    // is never reached, because the panic happens while building the request.
+    //
+    // A `Result` instead. Every caller is inside an adapter's `build`, which
+    // already returns one, so this costs five `?` and turns a panic on the
+    // request path — a 500 for every in-flight stream on that replica, which is
+    // exactly what this crate's lint configuration forbids — into an error the
+    // caller reports.
+    //
+    // The error is cached with the client because a TLS backend that failed to
+    // initialise will fail identically every time, and retrying it per request
+    // would turn one broken deployment into a busy one.
+    static CLIENT: std::sync::OnceLock<std::result::Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            // `unwrap_or_default` rather than a panic: `Client::default()` is
-            // the same construction and the failure is not one we can act on
-            // here. If TLS is genuinely broken, the request fails at the
-            // transport with an error naming it.
-            reqwest::Client::builder().build().unwrap_or_default()
+            reqwest::Client::builder()
+                .build()
+                .map_err(|e| e.to_string())
         })
         .clone()
+        .map_err(|e| {
+            oag_core::Error::Internal(format!(
+                "the HTTP client could not be built, so no upstream can be reached \
+                 from this process: {e}"
+            ))
+        })
 }
 
 /// A client for the calls that are not inference: refresh, quota, prices.
@@ -98,6 +121,28 @@ mod side_channel_tests {
     /// sometimes succeeding and quietly bypassing the control the proxy existed
     /// to enforce. A credential's proxy is a property of the credential, not of
     /// one kind of request made with it.
+    /// C5: `builder_client` reports a failure instead of unwinding.
+    ///
+    /// It ended in `unwrap_or_default()` under a comment calling that an
+    /// alternative to panicking. `Client::default()` is `Client::new()`, which
+    /// reqwest documents as panicking — so the fallback was the same panic one
+    /// call deeper, on a path this crate's lints forbid panicking on because a
+    /// panic there is a 500 for every in-flight stream on the replica. The
+    /// comment also promised the failure would surface "at the transport with
+    /// an error naming it"; the transport is never reached.
+    ///
+    /// This asserts what a test here can: the call yields `Ok` and is reusable.
+    /// The failure itself cannot be provoked in a unit test — it needs a broken
+    /// TLS backend, not an input — and that is precisely why the old claim went
+    /// unexamined. What stops it now is the signature: `?` at all five call
+    /// sites, each already inside a `build` that returns `Result`, so there is
+    /// no longer an expression that *can* unwind.
+    #[test]
+    fn the_shared_client_is_built_fallibly() {
+        super::builder_client().expect("a client is built");
+        super::builder_client().expect("and the cached outcome is reusable");
+    }
+
     #[test]
     fn a_side_channel_client_accepts_a_proxy_and_refuses_a_broken_one() {
         side_channel_client(None, Duration::from_secs(20)).expect("no proxy is fine");

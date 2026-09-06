@@ -161,7 +161,7 @@ impl ProviderAdapter for CodexAdapter {
         }
 
         let cred: &SecretMaterial = req.credential;
-        let mut builder = crate::builder_client()
+        let mut builder = crate::builder_client()?
             .post(format!("{}/responses", self.base_url))
             .header("accept", "text/event-stream")
             .header("authorization", format!("Bearer {}", cred.access_token))
