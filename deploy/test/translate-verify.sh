@@ -218,7 +218,7 @@ tail -n "+$((before + 1))" "$WORK/mock.log" | grep '^mock-request: ' | tail -1 \
 [ -s "$WORK/upstream.json" ] || fail "the mock recorded no request; see $WORK/mock.log"
 
 python3 - "$WORK/upstream.json" <<'FIELDS' || fail "a field was dropped on the way to the upstream"
-import json, sys
+import json, re, sys
 req = json.load(open(sys.argv[1]))
 
 # H1. The array form is legal here and used to be discarded, so the model was
@@ -234,10 +234,35 @@ if "Never write prose." not in text:
 
 # H3. This dialect speaks budgets, the client spoke levels, and the bridge only
 # ever ran in the other direction.
+#
+# Which form is correct depends on the model that served, and asserting one
+# unconditionally is how this check came to pass while the frontier rung
+# returned 400s: `type: "enabled"` is rejected on 4.7 and later, and
+# `reasoning_effort: "high"` is exactly what routes a request up to them.
 thinking = req.get("thinking") or {}
-if thinking.get("type") != "enabled" or not thinking.get("budget_tokens"):
-    sys.exit(f"reasoning_effort did not become a thinking budget: thinking={thinking!r}")
-print(f"  ok  system rendered, thinking budget {thinking['budget_tokens']}")
+model = req.get("model", "")
+parts = [int(p) for p in re.split(r"[-._:]", model) if p.isdigit() and int(p) < 100]
+generation = (parts + [0, 0])[:2]
+
+if generation >= [4, 6]:
+    if thinking.get("type") != "adaptive":
+        sys.exit(f"{model} takes adaptive thinking; got thinking={thinking!r}")
+    if thinking.get("budget_tokens") is not None:
+        sys.exit(f"{model} rejects budget_tokens; got thinking={thinking!r}")
+    effort = (req.get("output_config") or {}).get("effort")
+    if effort != "high":
+        sys.exit(f"reasoning_effort did not become an effort level: {effort!r}")
+    print(f"  ok  system rendered, {model} got adaptive thinking at effort {effort}")
+else:
+    if thinking.get("type") != "enabled":
+        sys.exit(f"{model} takes a thinking budget; got thinking={thinking!r}")
+    budget = thinking.get("budget_tokens")
+    ceiling = req.get("max_tokens", 4096)
+    # The upstream refuses a budget outside these bounds, so a check that only
+    # asked whether the field was present would pass on a request that 400s.
+    if not isinstance(budget, int) or budget < 1024 or budget >= ceiling:
+        sys.exit(f"budget {budget!r} is not >= 1024 and < max_tokens {ceiling!r}")
+    print(f"  ok  system rendered, {model} got thinking budget {budget} under {ceiling}")
 FIELDS
 pass "system-as-parts and reasoning_effort both reached the upstream"
 
