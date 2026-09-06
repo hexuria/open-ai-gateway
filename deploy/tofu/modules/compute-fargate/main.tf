@@ -60,9 +60,23 @@ resource "aws_lb_target_group" "this" {
   deregistration_delay = var.deregistration_delay_seconds
 
   health_check {
-    # Liveness on the public port. Readiness lives on 8081 and the ALB does not
-    # route there, so the deep check belongs to the container's own probe.
-    path                = "/health/live"
+    # Readiness, on the admin port. The ALB routes traffic to 8080 and health-
+    # checks 8081, which is what `port` below is for.
+    #
+    # These two probes were the wrong way round, and the consequence is not
+    # symmetric. A failing CONTAINER health check makes ECS kill and replace the
+    # task; a failing ALB check only stops routing to it. With the deep check on
+    # the container, an RDS failover made every task's `/health/ready` fail at
+    # once and ECS recycled the entire fleet — while the ALB, checking only
+    # `/health/live`, kept routing to tasks that could not serve.
+    #
+    # So: the load balancer takes the deep check, because "stop sending this
+    # replica work" is the proportionate response to a dependency being down,
+    # and the container takes liveness, because "replace this task" is only ever
+    # right for a process that is actually dead. Every other platform in this
+    # repository is arranged that way.
+    port                = "8081"
+    path                = "/health/ready"
     interval            = 15
     timeout             = 5
     healthy_threshold   = 2
@@ -162,7 +176,11 @@ locals {
       secrets     = local.container_secrets
 
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/health/ready || exit 1"]
+        # Liveness, not readiness — see the target group's health check above.
+        # ECS replaces a task whose check fails, and a task whose database is
+        # unreachable is not a task worth replacing: every replacement finds the
+        # same database.
+        command     = ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health/live || exit 1"]
         interval    = 15
         timeout     = 5
         retries     = 3

@@ -57,6 +57,20 @@ resource "aws_vpc_security_group_egress_rule" "lb_to_tasks" {
   ip_protocol                  = "tcp"
 }
 
+# The admin port, for the target group's health check only.
+#
+# The ALB health-checks `/health/ready`, which is registered on 8081, and
+# without this rule every check times out and every target is unhealthy. It is
+# still only the load balancer's security group that can reach it — nothing
+# routes client traffic there, and the admin API keeps its own key.
+resource "aws_vpc_security_group_egress_rule" "lb_to_tasks_health" {
+  security_group_id            = aws_security_group.lb.id
+  referenced_security_group_id = aws_security_group.task.id
+  from_port                    = 8081
+  to_port                      = 8081
+  ip_protocol                  = "tcp"
+}
+
 resource "aws_security_group" "task" {
   name        = "${var.name}-task"
   description = "The ${var.name} tasks"
@@ -68,6 +82,15 @@ resource "aws_vpc_security_group_ingress_rule" "task_from_lb" {
   referenced_security_group_id = aws_security_group.lb.id
   from_port                    = 8080
   to_port                      = 8080
+  ip_protocol                  = "tcp"
+}
+
+# The other half of the health-check path. See `lb_to_tasks_health`.
+resource "aws_vpc_security_group_ingress_rule" "task_from_lb_health" {
+  security_group_id            = aws_security_group.task.id
+  referenced_security_group_id = aws_security_group.lb.id
+  from_port                    = 8081
+  to_port                      = 8081
   ip_protocol                  = "tcp"
 }
 

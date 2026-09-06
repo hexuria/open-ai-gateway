@@ -78,6 +78,18 @@ resource "google_secret_manager_secret_version" "this" {
   }
   secret      = google_secret_manager_secret.this[each.key].id
   secret_data = each.value
+
+  # `DISABLE`, not the default `DELETE`.
+  #
+  # The Cloud Run module pins each secret by version number so that a rotation
+  # produces a new revision — which is right, and it means the *previous*
+  # revision still references the previous version. Destroying that version on
+  # rotation makes rolling back fail with "secret version was destroyed": the
+  # rollback is attempted precisely when something has gone wrong, and it is the
+  # one moment the old version is needed.
+  #
+  # Disabled versions are recoverable and cost nothing. A destroyed one is gone.
+  deletion_policy = "DISABLE"
 }
 
 resource "google_service_account" "gateway" {

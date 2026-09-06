@@ -53,10 +53,22 @@ render is the cheapest possible place to catch them.
     {{- fail (printf "data.mode must be 'external' or 'inCluster', not %q" .Values.data.mode) -}}
   {{- end -}}
 
-  {{- if and .Values.podDisruptionBudget.enabled (ge (int .Values.podDisruptionBudget.minAvailable) (int .Values.replicaCount)) -}}
-    {{- if not .Values.autoscaling.enabled -}}
-      {{- fail (printf "podDisruptionBudget.minAvailable (%v) is not below replicaCount (%v); no pod could ever be evicted, so node drains would hang."
-          .Values.podDisruptionBudget.minAvailable .Values.replicaCount) -}}
+  {{- /*
+  The floor a PDB is compared against is the smallest the fleet can be, and with
+  autoscaling on that is `autoscaling.minReplicas`, not `replicaCount`.
+
+  This guard was nested inside `if not autoscaling.enabled`, and autoscaling
+  defaults to TRUE — so in the shipped configuration it could not fire at all.
+  A `minAvailable` at or above the floor means no pod can ever be evicted and a
+  node drain hangs forever: one of the five guarantees the docs say this chart
+  gives, unenforced in the only configuration most people run.
+  */ -}}
+  {{- if .Values.podDisruptionBudget.enabled -}}
+    {{- $floor := .Values.autoscaling.enabled | ternary (int .Values.autoscaling.minReplicas) (int .Values.replicaCount) -}}
+    {{- $what := .Values.autoscaling.enabled | ternary "autoscaling.minReplicas" "replicaCount" -}}
+    {{- if ge (int .Values.podDisruptionBudget.minAvailable) $floor -}}
+      {{- fail (printf "podDisruptionBudget.minAvailable (%v) is not below %s (%v); no pod could ever be evicted, so node drains would hang."
+          .Values.podDisruptionBudget.minAvailable $what $floor) -}}
     {{- end -}}
   {{- end -}}
 {{- end -}}

@@ -1,12 +1,34 @@
 {{- if eq .Values.data.mode "inCluster" }}
+{{- /*
+The in-cluster data tier: Postgres and Redis, for a demo or a single-node
+install. Neither is a hook, and that is the fix rather than an omission.
+
+All four resources here carried `helm.sh/hook: pre-install,pre-upgrade`. Helm's
+default hook deletion policy is `before-hook-creation`, so every `helm upgrade`
+DELETED and recreated both StatefulSets — and their Services — before the new
+gateway pods existed. The fleet lost its database and its cache for the twenty
+to forty seconds that took, failing in-flight ledger writes, on an upgrade that
+reported success and left nothing behind to explain the gap.
+
+A StatefulSet holding a database is not a hook. It is ordinary state to be
+applied and then updated in place, which is what Helm does with an unannotated
+resource. The ordering the hook weight was buying is already handled by the
+gateway's init container, which waits for Postgres to accept connections before
+the gateway starts.
+
+`helm.sh/resource-policy: keep` in their place, so `helm uninstall` does not
+take the data with it. That is a deliberate second decision: an uninstall that
+silently destroys a database is the other half of this failure, and a kept
+PersistentVolumeClaim is recoverable where a deleted one is not.
+*/ -}}
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "oag.fullname" . }}-postgres
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-10"
+    # No `helm.sh/hook`. See the note at the top of this file.
+    "helm.sh/resource-policy": keep
 spec:
   clusterIP: None
   selector:
@@ -20,8 +42,8 @@ metadata:
   name: {{ include "oag.fullname" . }}-postgres
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-10"
+    # No `helm.sh/hook`. See the note at the top of this file.
+    "helm.sh/resource-policy": keep
 spec:
   serviceName: {{ include "oag.fullname" . }}-postgres
   replicas: 1
@@ -79,8 +101,8 @@ metadata:
   name: {{ include "oag.fullname" . }}-redis
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-10"
+    # No `helm.sh/hook`. See the note at the top of this file.
+    "helm.sh/resource-policy": keep
 spec:
   clusterIP: None
   selector:
@@ -94,8 +116,8 @@ metadata:
   name: {{ include "oag.fullname" . }}-redis
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-10"
+    # No `helm.sh/hook`. See the note at the top of this file.
+    "helm.sh/resource-policy": keep
 spec:
   serviceName: {{ include "oag.fullname" . }}-redis
   replicas: 1
