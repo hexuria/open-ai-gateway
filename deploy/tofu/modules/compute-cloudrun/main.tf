@@ -24,6 +24,14 @@ resource "google_cloud_run_v2_service" "this" {
   location = var.region
   ingress  = var.ingress
 
+  # The provider defaults this to `true` for a service, which makes
+  # `terraform destroy` fail — the migrate job beside it sets `false` and says
+  # why, and the service was simply missed. The same reasoning applies: the
+  # service holds no state, it is reproducible from this configuration, and a
+  # failed create can then self-heal on the next apply instead of needing a
+  # console visit.
+  deletion_protection = var.deletion_protection
+
   # No revision, and therefore no traffic, until the migration has finished.
   # `depends_on` orders updates as well as creates, so this holds on every
   # upgrade rather than only on the first apply.

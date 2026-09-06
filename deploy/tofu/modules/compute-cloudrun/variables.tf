@@ -92,3 +92,18 @@ variable "run_migrations" {
     happily against a schema a newer release already applied.
   EOT
 }
+
+variable "deletion_protection" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Refuse to delete the Cloud Run service.
+
+    `false`, matching the migrate job, because the service holds no state and is
+    reproducible from this configuration — and because the provider's default of
+    `true` makes `terraform destroy` fail, which is a surprise at exactly the
+    moment someone is tearing down an environment they meant to tear down.
+
+    Set it true for a service you would rather not lose to a misapplied plan.
+  EOT
+}

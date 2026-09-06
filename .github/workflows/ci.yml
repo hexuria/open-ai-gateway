@@ -78,6 +78,12 @@ jobs:
             terraform -chdir="$dir" validate
           done
 
+      # `validate` accepts a resource that can never render — a count gated on
+      # a variable whose default is falsy and which no stack passes. That is
+      # how the Cloudflare rate limit sat in the tree unreachable.
+      - name: tofu reachability
+        run: ./deploy/test/tofu-verify.sh
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:

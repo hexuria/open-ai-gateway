@@ -205,6 +205,11 @@ module "edge" {
   # the guarded number and the deployed number have to be one number.
   proxied = var.cloudflare_proxied
 
+  # Passed through, because the module's ruleset is gated on it being non-zero
+  # and no stack was passing it — so the rate limit could not be turned on from
+  # anywhere. A variable no caller can set is not a default, it is dead code.
+  rate_limit_requests_per_minute = var.cloudflare_rate_limit_requests_per_minute
+
   # Cloud Run routes by `Host`, and a proxied Cloudflare record sends the
   # custom hostname rather than the `run.app` one — so without a domain mapping
   # every request to the custom hostname 404s while the `run.app` URL works.

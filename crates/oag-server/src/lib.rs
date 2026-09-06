@@ -485,6 +485,102 @@ mod background_task_tests {
     }
 }
 
+/// The Caddy allow-list and `public_router` are one list in two files.
+///
+/// `deploy/caddy/Caddyfile` says so itself — its `@inference` matcher "mirrors
+/// `public_router`" — and nothing checked it, so the two drifted: the
+/// allow-list carried `/embeddings*` for a route that has never existed, which
+/// tells a reader the gateway serves embeddings. Drift the other way is worse
+/// in a quieter way: a route added here and not there is a 404 at the edge
+/// while every test in this file passes.
+#[cfg(test)]
+mod caddy_allow_list_tests {
+    /// The paths in the `@inference` matcher, in the order Caddy reads them.
+    fn allow_list() -> Vec<String> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/caddy/Caddyfile");
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!(
+                "{path}: {e}. The allow-list this test checks lives there; if the \
+                 Caddyfile moved, repoint this test rather than deleting it — the \
+                 mirror it enforces is the reason the file says it is a mirror"
+            )
+        });
+        let line = src
+            .lines()
+            .find(|l| l.trim_start().starts_with("@inference path "))
+            .expect("the Caddyfile still declares an @inference path matcher");
+        line.trim()
+            .trim_start_matches("@inference path ")
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Every path `public_router` serves, read from the source above.
+    ///
+    /// The router is built from a `state` this module has no cheap way to
+    /// construct, and the routes are literals either way, so reading them is
+    /// both simpler and stricter: a route added anywhere in these two functions
+    /// is seen here whether or not a test exercises it.
+    fn public_paths() -> Vec<String> {
+        let src = include_str!("lib.rs");
+        let mut paths = Vec::new();
+        for start in ["fn inference_routes(", "pub fn public_router("] {
+            let at = src.find(start).expect("declared in this file");
+            let rest = &src[at..];
+            let end = rest.find("\n}\n").expect("has a closing brace");
+            for hit in rest[..end].match_indices(".route(") {
+                let after = &rest[hit.0 + ".route(".len()..];
+                let quoted = after
+                    .find('"')
+                    .and_then(|q| after[q + 1..].find('"').map(|e| &after[q + 1..q + 1 + e]));
+                if let Some(path) = quoted {
+                    paths.push(path.to_owned());
+                }
+            }
+        }
+        assert!(!paths.is_empty(), "no routes were found to check");
+        paths
+    }
+
+    /// Caddy's `path` matcher: a trailing `*` is a prefix, anything else exact.
+    fn matches(pattern: &str, path: &str) -> bool {
+        match pattern.strip_suffix('*') {
+            Some(prefix) => path.starts_with(prefix),
+            None => pattern == path,
+        }
+    }
+
+    #[test]
+    fn every_allowed_path_reaches_a_route_that_exists() {
+        let paths = public_paths();
+        for pattern in allow_list() {
+            assert!(
+                paths.iter().any(|p| matches(&pattern, p)),
+                "the Caddy allow-list admits `{pattern}`, which matches no route in \
+                 `public_router`: {paths:?}. An allow-list entry for a route that does \
+                 not exist advertises a capability the gateway does not have"
+            );
+        }
+    }
+
+    #[test]
+    fn every_public_route_is_admitted_by_the_allow_list() {
+        let allowed = allow_list();
+        for path in public_paths() {
+            // A wildcard segment is axum's, not a literal; take the prefix
+            // before it, which is what a request's path actually starts with.
+            let concrete = path.split_once('{').map_or(path.as_str(), |(head, _)| head);
+            assert!(
+                allowed.iter().any(|a| matches(a, concrete)),
+                "`{path}` is served by `public_router` and no entry in the Caddy \
+                 allow-list admits it: {allowed:?}. Behind Caddy that route is a 404, \
+                 and every test in this file still passes"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod router_tests {
     use super::*;

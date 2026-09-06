@@ -66,7 +66,11 @@ gateway.internal {
 	# An allow-list, and it has to stay one: it mirrors `public_router` in
 	# crates/oag-server/src/lib.rs. A route added there and not here is a 404 at
 	# the edge, which is the safe direction to be wrong in.
-	@inference path /v1/* /v1beta/* /chat/* /responses* /embeddings* /models /health/live
+	# `/embeddings*` is gone: no such route exists in `public_router`, and an
+	# allow-list entry for a route that does not exist is not harmless — it says
+	# the gateway serves embeddings, which is the first thing someone reads when
+	# asking whether it does.
+	@inference path /v1/* /v1beta/* /chat/* /responses* /models /health/live
 	handle @inference {
 		reverse_proxy envoy:10000 {
 			# Caddy detects text/event-stream and flushes immediately, so

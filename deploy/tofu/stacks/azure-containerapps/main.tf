@@ -209,4 +209,9 @@ module "edge" {
   hostname                   = var.hostname
   origin                     = module.gateway.fqdn
   keepalive_interval_seconds = var.stream_keepalive_interval_seconds
+
+  # Passed through, because the module's ruleset is gated on it being non-zero
+  # and no stack was passing it — so the rate limit could not be turned on from
+  # anywhere. A variable no caller can set is not a default, it is dead code.
+  rate_limit_requests_per_minute = var.cloudflare_rate_limit_requests_per_minute
 }

@@ -155,3 +155,19 @@ variable "domain_mapping_verified" {
     404 for every request while reporting success.
   EOT
 }
+
+variable "cloudflare_rate_limit_requests_per_minute" {
+  type        = number
+  default     = 0
+  description = <<-EOT
+    Per-IP requests per minute blocked at the Cloudflare edge, or 0 for no limit.
+
+    0 by default because the right ceiling depends on the traffic, and a limit
+    guessed here would cut off long-lived streams — which is why the module
+    calls its own limit "deliberately generous". Ahead of the gateway's own
+    per-key limits, this stops obvious abuse before it reaches the database.
+
+    Only takes effect when `cloudflare_zone_id` is set and the record is
+    proxied; an unproxied record never sees the traffic.
+  EOT
+}
