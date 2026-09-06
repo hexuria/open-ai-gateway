@@ -355,6 +355,28 @@ impl CanonicalRequest {
         }
     }
 
+    /// What this request asked for by way of thinking, as both a token budget
+    /// and a level, or `None` when it asked for none.
+    ///
+    /// The two spellings are one request. A client that names a level is asking
+    /// for reasoning as plainly as one that names a number, and every dialect
+    /// that speaks either can be served from this pair — so the conversion
+    /// lives here rather than being re-derived, differently, in each renderer.
+    ///
+    /// `Off` and a zero budget both answer `None`. Off is a request for *no*
+    /// thinking, not a request for zero tokens of it, and the difference
+    /// matters on the wire: Anthropic's floor is 1024, so a renderer that
+    /// passed the zero through was refused. `signal()` above reads it the same
+    /// way, and the two must not disagree about what "off" means.
+    #[must_use]
+    pub fn thinking_request(&self) -> Option<(u32, Effort)> {
+        if let Some(budget) = self.thinking_budget.filter(|b| *b > 0) {
+            return Some((budget, Effort::from_budget(budget)));
+        }
+        let effort = self.thinking_effort.filter(|e| !matches!(e, Effort::Off))?;
+        Some((effort.as_budget(), effort))
+    }
+
     /// Rough prompt size.
     ///
     /// Four bytes per token is the usual English approximation. Deliberately an

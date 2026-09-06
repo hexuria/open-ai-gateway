@@ -16,6 +16,11 @@ Behaviour is set by environment:
   MOCK_FAIL_STATUS     if set, every POST returns this status instead
   MOCK_FAIL_FIRST      fail only the first N POSTs, then serve normally
 
+A request whose `thinking` block the real API would refuse is refused here too
+(400): `type: "enabled"` requires `budget_tokens` of at least 1024 and strictly
+below `max_tokens`. Without that, a gateway rendering an impossible budget
+passes every check in this repository and fails in production.
+
 GET /_seen returns the POST count as plain text, without incrementing it.
 """
 
@@ -73,6 +78,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_error(404)
 
+    def _refuse(self, status, kind, message):
+        """An error in the shape this API actually returns them."""
+        payload = json.dumps(
+            {"type": "error", "error": {"type": kind, "message": message}}
+        ).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("content-length", 0) or 0))
         try:
@@ -98,6 +114,29 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
+
+        # The two constraints the real Messages API puts on thinking, because a
+        # mock that accepts anything cannot see the class of bug this exists to
+        # catch. `translate-verify.sh` sends `reasoning_effort: "high"`, and the
+        # gateway's first attempt at bridging that rendered a budget of 16384
+        # inside a 4096-token ceiling — a 400 in production and a pass here.
+        #
+        #   budget_tokens >= 1024, and strictly < max_tokens
+        #
+        # `type: "adaptive"` carries no budget and is not checked: its depth
+        # rides on `output_config.effort`, which has no numeric constraint.
+        thinking = request.get("thinking") or {}
+        if thinking.get("type") == "enabled":
+            budget = thinking.get("budget_tokens")
+            ceiling = request.get("max_tokens", 4096)
+            if not isinstance(budget, int) or budget < 1024 or budget >= ceiling:
+                self._refuse(
+                    400,
+                    "invalid_request_error",
+                    f"thinking.budget_tokens must be >= 1024 and < max_tokens "
+                    f"(got {budget!r} against max_tokens {ceiling!r})",
+                )
+                return
 
         if request.get("stream"):
             self._stream(request)
