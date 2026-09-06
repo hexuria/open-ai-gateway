@@ -826,15 +826,34 @@ mod tests {
         // score and include the one after it, or the two disagree about a
         // member on the line and a credential reads one slot fuller than
         // the acquire will find it.
+        //
+        // The two sides of that boundary are not equally safe to pin, and
+        // treating them as if they were is what made this test flaky. `now` is
+        // read once, here; the window's edge keeps moving while the test runs.
+        // A member planted at exactly `now - ttl` only gets *older* relative to
+        // that edge, so it stays excluded however slow the run — the exclusive
+        // side can be pinned to the second. A member planted just inside falls
+        // out of the window as soon as the run takes longer than its margin,
+        // and at one second of margin, ordinary parallel load was enough: the
+        // count came back 1 and the failure read as a regression in the Lua.
+        //
+        // Five seconds, which is far outside any scheduling delay this test can
+        // suffer and far inside a one-minute TTL — it is still 55 seconds from
+        // `now`, so it cannot pass by the count simply admitting recent members.
+        let inside_margin_secs: i64 = 5;
         let ttl_secs = i64::try_from(ttl.as_secs()).expect("fits");
         let _: () = conn
             .zadd(slot_key(account), "on-the-line", now - ttl_secs)
             .await
             .expect("plant a member at exactly now - ttl");
         let _: () = conn
-            .zadd(slot_key(account), "just-inside", now - ttl_secs + 1)
+            .zadd(
+                slot_key(account),
+                "just-inside",
+                now - ttl_secs + inside_margin_secs,
+            )
             .await
-            .expect("plant a member one second inside");
+            .expect("plant a member inside the window");
 
         assert_eq!(
             cache.slots_in_use(account, ttl).await.expect("count"),
