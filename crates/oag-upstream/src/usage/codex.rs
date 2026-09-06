@@ -53,11 +53,16 @@ const WEEKLY_WINDOW_SECS: f64 = 604_800.0;
 /// The thirty-day pool a free plan is metered on. Observed live.
 const MONTHLY_WINDOW_SECS: f64 = 2_592_000.0;
 
-pub async fn fetch(credential: &SecretMaterial) -> Result<Option<UsageSnapshot>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::Internal(format!("building usage client: {e}")))?;
+pub async fn fetch(
+    credential: &SecretMaterial,
+    proxy: Option<&str>,
+) -> Result<Option<UsageSnapshot>> {
+    // Through the credential's proxy, like every other call this gateway makes
+    // on its behalf. U12 routed inference, refresh and price lookups through it
+    // and left the quota poll building its own client — so a deployment with a
+    // mandated egress proxy still reached this provider directly, every poll
+    // interval, from every replica.
+    let client = crate::side_channel_client(proxy, std::time::Duration::from_secs(10))?;
 
     let mut request = client
         .get(USAGE_URL)

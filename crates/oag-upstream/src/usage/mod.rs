@@ -69,10 +69,11 @@ pub async fn fetch(
     provider: Provider,
     kind: CredentialKind,
     credential: &SecretMaterial,
+    proxy: Option<&str>,
 ) -> oag_core::Result<Option<UsageSnapshot>> {
     match endpoint_for(provider, kind) {
-        Some(Endpoint::GrokBilling) => grok::fetch(&credential.access_token).await,
-        Some(Endpoint::CodexWham) => codex::fetch(credential).await,
+        Some(Endpoint::GrokBilling) => grok::fetch(&credential.access_token, proxy).await,
+        Some(Endpoint::CodexWham) => codex::fetch(credential, proxy).await,
         None => Ok(None),
     }
 }
@@ -101,6 +102,57 @@ mod tests {
         assert_eq!(
             endpoint_for(Provider::XAI, CredentialKind::OAuth),
             Some(Endpoint::GrokBilling)
+        );
+    }
+
+    /// C2: the quota poll was the one side-channel call U12 did not reach.
+    ///
+    /// Refresh and price lookups were routed through the credential's proxy;
+    /// these two built their own client, so a deployment whose egress must go
+    /// through a proxy reached the provider directly on every poll interval,
+    /// from every replica — succeeding, and quietly bypassing the control the
+    /// proxy exists to enforce.
+    ///
+    /// An unusable proxy is the assertion, because it can only be reported by
+    /// code that actually looked at it. A `Client::builder()` that ignores the
+    /// argument cannot produce this error; it would attempt a real request
+    /// instead, which is both the bug and untestable here.
+    #[tokio::test]
+    async fn a_quota_poll_goes_through_the_credentials_proxy() {
+        let material = SecretMaterial {
+            access_token: "fixture-not-a-credential".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        };
+
+        for (provider, kind) in [
+            (Provider::XAI, CredentialKind::OAuth),
+            (Provider::OpenAI, CredentialKind::OAuth),
+        ] {
+            let err = fetch(provider, kind, &material, Some("not a url"))
+                .await
+                .expect_err("an unusable proxy is a config error, not silent direct egress");
+            assert!(
+                err.to_string().contains("proxy_url"),
+                "{provider:?}/{kind:?}: {err}"
+            );
+        }
+
+        // A provider with nothing to poll never builds a client at all, so the
+        // broken proxy is not its problem and it still answers `None`.
+        assert!(
+            fetch(
+                Provider::Anthropic,
+                CredentialKind::ApiKey,
+                &material,
+                Some("not a url"),
+            )
+            .await
+            .expect("nothing to poll")
+            .is_none()
         );
     }
 

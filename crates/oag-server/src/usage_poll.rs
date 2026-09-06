@@ -64,7 +64,8 @@ async fn poll_once(state: &Arc<AppState>) {
             }
         };
 
-        match oag_upstream::usage::fetch(provider, kind, &material).await {
+        match oag_upstream::usage::fetch(provider, kind, &material, row.proxy_url.as_deref()).await
+        {
             Ok(Some(snap)) => {
                 let resets = snap
                     .resets_at
