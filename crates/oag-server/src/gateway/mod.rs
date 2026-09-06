@@ -2241,6 +2241,37 @@ mod tests {
     /// less reliable than the thing it would prove. `oag-router` pins the
     /// classification and the escalation this depends on; what is left is that
     /// anything asks, and this is that.
+    /// G3's wiring: the streamed path hands the ledger the gate that caused
+    /// the climb.
+    ///
+    /// The rule itself — triggering gate outranks the accumulator's — is tested
+    /// behaviourally in `meter`, through the row it produces. What no test
+    /// reached was whether `stream_response` passes the gate at all, and that
+    /// is the half G3 changed: the collected path had threaded it for a while
+    /// and this one had not, so every streamed request that climbed a rung
+    /// recorded no reason for having climbed.
+    ///
+    /// A source scan, and it is a source scan for the same reason R1's is:
+    /// `stream_response` takes a live `reqwest::Response`, a lease and a
+    /// state, none of which a unit test can produce. Deleting the argument is
+    /// what this catches; the rule is covered where it can be run.
+    #[test]
+    fn the_streamed_path_hands_the_ledger_its_triggering_gate() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split_once("fn stream_response(")
+            .expect("declared in this file")
+            .1;
+        let path = &body[..body.find("\n}\n").unwrap_or(body.len())];
+
+        assert!(
+            path.contains("meter::record(&state2, &ctx, &outcome, triggering_gate)"),
+            "the streamed path must pass the gate that caused the escalation, \
+             not leave the ledger to read it from an accumulator that is silent \
+             exactly when the climb worked"
+        );
+    }
+
     #[test]
     fn the_selection_error_path_asks_the_disposition() {
         let src = include_str!("mod.rs");
