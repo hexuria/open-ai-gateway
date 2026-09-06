@@ -25,6 +25,31 @@ spec:
       annotations:
         # Roll the pods when configuration changes, not only when the image does.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- /*
+        And when a SECRET changes, which is the one that matters most.
+
+        Without this, `helm upgrade` with a new `credentialKek` updated the
+        Secret and left the pod template byte-identical — a successful upgrade
+        with nothing to roll. The rotation then landed pod by pod at arbitrary
+        times, through HPA scale-ups and node drains, giving a fleet where some
+        pods could decrypt sealed credentials and some could not, with no deploy
+        to correlate against.
+
+        Skipped when this chart renders no Secret at all: with both
+        `existingSecret` values set the file is empty, its checksum is a
+        constant, and an annotation that never changes is noise on every pod —
+        worse, it would imply a guarantee the chart cannot make, since the
+        Secret it would need to hash belongs to someone else.
+
+        A template comment rather than a YAML one: a `#` comment in a template
+        is rendered into the manifest that gets applied, and this reasoning
+        belongs to whoever reads the chart, not to everyone running
+        `kubectl get deploy -o yaml`.
+        */ -}}
+        {{- if or (not .Values.security.existingSecret) (eq .Values.data.mode "inCluster") (not .Values.data.external.existingSecret) }}
+        # Roll the pods when a secret changes, too.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}

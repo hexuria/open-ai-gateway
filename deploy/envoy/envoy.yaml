@@ -90,10 +90,30 @@ static_resources:
       load_assignment:
         cluster_name: oag_gateway
         endpoints:
+          # `health_check_config.port_value: 8081` on every endpoint. Traffic
+          # goes to 8080; the health check goes to 8081.
+          #
+          # `/health/ready` is registered on the ADMIN listener only, and 8080
+          # carries inference plus `/health/live`. So the check below was GETting
+          # a path that does not exist on the port it was checking: 404 against
+          # an `expected_statuses` default of 200, every host permanently
+          # unhealthy.
+          #
+          # The stack appears to work because Envoy's 50% panic threshold then
+          # balances across all hosts regardless of health — which is exactly
+          # the state in which both advertised properties are dead. A replica
+          # with a dead pool is never ejected, and a draining replica is never
+          # removed during `just stack-roll`.
           - lb_endpoints:
-              - endpoint: { address: { socket_address: { address: oag-1, port_value: 8080 } } }
-              - endpoint: { address: { socket_address: { address: oag-2, port_value: 8080 } } }
-              - endpoint: { address: { socket_address: { address: oag-3, port_value: 8080 } } }
+              - endpoint:
+                  address: { socket_address: { address: oag-1, port_value: 8080 } }
+                  health_check_config: { port_value: 8081 }
+              - endpoint:
+                  address: { socket_address: { address: oag-2, port_value: 8080 } }
+                  health_check_config: { port_value: 8081 }
+              - endpoint:
+                  address: { socket_address: { address: oag-3, port_value: 8080 } }
+                  health_check_config: { port_value: 8081 }
       health_checks:
         - timeout: 3s
           interval: 5s
@@ -104,6 +124,10 @@ static_resources:
             # and Redis are actually reachable. A replica whose database
             # connection died still answers /health/live perfectly well, and
             # balancing onto it just spreads the failure around.
+            #
+            # Reachable only because of the `health_check_config` above: this
+            # path lives on the admin listener, and without that the check went
+            # to 8080 and 404ed.
             path: "/health/ready"
       outlier_detection:
         # Eject a replica that starts returning 5xx even while its health check

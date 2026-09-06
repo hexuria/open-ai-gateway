@@ -184,11 +184,27 @@ module "gateway" {
   execution_role_arn     = aws_iam_role.execution.arn
   task_role_arn          = aws_iam_role.task.arn
 
+  # `arn:::version_id`, not the bare ARN.
+  #
+  # ECS resolves a bare ARN to AWSCURRENT at task start, so rotating a secret
+  # left this task definition byte-identical: no new revision, no deployment,
+  # and every running task keeping the old value. `terraform apply
+  # -var credential_kek=<new>` reported one changed secret version and no ECS
+  # change at all.
+  #
+  # The failure arrives weeks later. An unrelated image bump finally rolls the
+  # tasks, the new ones cannot decrypt credentials sealed under the old KEK, and
+  # every upstream call fails — with nothing in the change log between then and
+  # now that touched credentials.
+  #
+  # The `:::` is the ARN's own separator syntax for "no label, this version id".
+  # The Cloud Run module pins by version number for exactly this reason and says
+  # so in `compute-cloudrun/main.tf`.
   secret_env = {
-    OAG_DATABASE__URL            = aws_secretsmanager_secret.this["database-url"].arn
-    OAG_REDIS__URL               = aws_secretsmanager_secret.this["redis-url"].arn
-    OAG_SECURITY__SIGNING_SECRET = aws_secretsmanager_secret.this["signing-secret"].arn
-    OAG_SECURITY__CREDENTIAL_KEK = aws_secretsmanager_secret.this["credential-kek"].arn
+    OAG_DATABASE__URL            = "${aws_secretsmanager_secret.this["database-url"].arn}:::${aws_secretsmanager_secret_version.this["database-url"].version_id}"
+    OAG_REDIS__URL               = "${aws_secretsmanager_secret.this["redis-url"].arn}:::${aws_secretsmanager_secret_version.this["redis-url"].version_id}"
+    OAG_SECURITY__SIGNING_SECRET = "${aws_secretsmanager_secret.this["signing-secret"].arn}:::${aws_secretsmanager_secret_version.this["signing-secret"].version_id}"
+    OAG_SECURITY__CREDENTIAL_KEK = "${aws_secretsmanager_secret.this["credential-kek"].arn}:::${aws_secretsmanager_secret_version.this["credential-kek"].version_id}"
   }
 
   env = var.gateway_env
