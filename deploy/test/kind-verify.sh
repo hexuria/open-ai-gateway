@@ -72,17 +72,17 @@ EOF
 }
 trap cleanup EXIT
 
-say "1/7  cluster"
+say "1/8  cluster"
 kind get clusters 2>/dev/null | grep -qx "$CLUSTER" || kind create cluster --name "$CLUSTER" --wait 120s
 kubectl --context "kind-$CLUSTER" create namespace "$NS" --dry-run=client -o yaml | kubectl --context "kind-$CLUSTER" apply -f - >/dev/null
 KC="kubectl --context kind-$CLUSTER -n $NS"
 
-say "2/7  image"
+say "2/8  image"
 # Built here rather than pulled: the point is to test THIS working tree.
 docker build -q -f "$REPO_ROOT/deploy/Dockerfile" -t oag:verify "$REPO_ROOT" >/dev/null
 kind load docker-image oag:verify --name "$CLUSTER" >/dev/null
 
-say "3/7  mock upstream"
+say "3/8  mock upstream"
 $KC create configmap mock-upstream \
   --from-file=mock-upstream.py="$REPO_ROOT/deploy/test/mock-upstream.py" \
   --dry-run=client -o yaml | $KC apply -f - >/dev/null
@@ -120,7 +120,7 @@ YAML
 $KC apply -f "$WORK/mock.yaml" >/dev/null
 $KC rollout status deployment/mock-upstream --timeout=180s >/dev/null
 
-say "4/7  install the chart"
+say "4/8  install the chart"
 helm --kube-context "kind-$CLUSTER" upgrade --install oag "$REPO_ROOT/deploy/helm/open-ai-gateway" \
   -n "$NS" --wait --timeout "${HELM_TIMEOUT:-20m}" \
   --set image.repository=oag --set image.tag=verify --set image.pullPolicy=Never \
@@ -165,7 +165,49 @@ DEPLOY="$($KC get deploy -l app.kubernetes.io/name=open-ai-gateway -o jsonpath='
 [ -n "$DEPLOY" ] || fail "could not find the gateway deployment"
 echo "  service=$SVC deployment=$DEPLOY"
 
-say "5/7  bootstrap a key and a credential"
+say "5/8  an upgrade leaves the data tier alone"
+# D8, and the check that was missing when the hooks were first changed.
+#
+# The in-cluster Postgres and Redis are `pre-install` hooks. They used to be
+# `pre-install,pre-upgrade`, and Helm's default hook deletion policy is
+# `before-hook-creation` — so every `helm upgrade` deleted and recreated both
+# StatefulSets before the new pods existed, taking the database away from the
+# fleet for as long as that took. Dropping `pre-upgrade` is what fixes it, and
+# nothing here could see either the bug or the fix: this script only ever
+# installed.
+#
+# The pod's UID is the assertion. A recreated StatefulSet gets a new pod with a
+# new UID; a StatefulSet Helm never touched keeps the one it had. Names are not
+# enough — a recreated `oag-postgres-0` has the same name.
+PG_POD="$($KC get pod -l app.kubernetes.io/name=open-ai-gateway-postgres \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+[ -n "$PG_POD" ] || PG_POD="$($KC get pod -o name | grep postgres | head -1 | cut -d/ -f2)"
+[ -n "$PG_POD" ] || fail "could not find the postgres pod to watch across the upgrade"
+PG_UID_BEFORE="$($KC get pod "$PG_POD" -o jsonpath='{.metadata.uid}')"
+
+# A real upgrade with one harmless change, so Helm has something to roll and the
+# run is not a no-op it could skip.
+helm --kube-context "kind-$CLUSTER" upgrade oag "$REPO_ROOT/deploy/helm/open-ai-gateway" \
+  -n "$NS" --wait --timeout "${HELM_TIMEOUT:-20m}" \
+  --set image.repository=oag --set image.tag=verify --set image.pullPolicy=Never \
+  --set replicaCount=3 \
+  --set data.mode=inCluster \
+  --set security.signingSecret="verify-only-signing-secret-0123456789abcdef" \
+  --set security.credentialKek="dmVyaWZ5LW9ubHkta2VrLTMyLWJ5dGVzLTAxMjM0NTY=" \
+  --set gateway.providerBaseUrls.anthropic="http://mock-upstream:8088" \
+  --set-string podAnnotations."oag\.dev/upgrade-probe"=1 >/dev/null || {
+    $KC get pods -o wide || true
+    fail "helm upgrade failed"
+  }
+
+PG_UID_AFTER="$($KC get pod "$PG_POD" -o jsonpath='{.metadata.uid}' 2>/dev/null || echo gone)"
+[ "$PG_UID_AFTER" = "$PG_UID_BEFORE" ] \
+  || fail "the upgrade replaced the Postgres pod ($PG_UID_BEFORE -> $PG_UID_AFTER).
+  With \`pre-upgrade\` on the data hooks, Helm deletes and recreates the StatefulSet
+  before the new gateway pods exist, and the fleet loses its database mid-upgrade."
+pass "postgres survived the upgrade untouched (same pod uid)"
+
+say "6/8  bootstrap a key and a credential"
 POD="$($KC get pod -l app.kubernetes.io/name=open-ai-gateway -o jsonpath='{.items[0].metadata.name}')"
 KEY="$($KC exec "$POD" -- oag admin init --email verify@localhost --route default 2>/dev/null \
         | grep -oE 'oag_live_[0-9a-f]+' | head -1)"
@@ -175,7 +217,7 @@ $KC exec "$POD" -- oag admin account add --name mock --provider anthropic \
   --secret FAKE-CREDENTIAL-FOR-TESTS --route default >/dev/null
 pass "bootstrapped"
 
-say "6/7  open $STREAMS streams, then restart every replica mid-flight"
+say "7/8  open $STREAMS streams, then restart every replica mid-flight"
 # Note what this does and does not prove: `port-forward` to a Service binds to
 # ONE pod and stays there, so all the streams below land on a single replica
 # rather than spreading across three. That is still the property under test —
@@ -240,7 +282,7 @@ echo "  restart issued with streams in flight; waiting for them to finish"
 # waiting on the wrong thing is what was unbounded.
 for pid in "${STREAM_PIDS[@]}"; do wait "$pid" || true; done
 
-say "7/7  results"
+say "8/8  results"
 survived=0
 for i in $(seq 1 "$STREAMS"); do
   # message_stop is the only proof of a COMPLETE stream. A severed one still
