@@ -9,7 +9,17 @@ variable "name" {
 }
 variable "image" {
   type        = string
-  description = "e.g. ghcr.io/hexuria/open-ai-gateway:0.1.0"
+  description = <<-EOT
+    The gateway image to run, including a tag.
+
+    `ghcr.io/hexuria/open-ai-gateway:main` is published on every push to the
+    default branch, and `:sha-<full sha>` on the same pushes — either is a real
+    tag today. A semver tag such as `:0.1.0` exists only once a `v0.1.0` git tag
+    has been pushed; the release workflow publishes semver on `v*` and nothing
+    else does, so naming one before it is cut lands on ImagePullBackOff.
+
+    Pin a sha for anything you intend to keep: `:main` moves under you.
+  EOT
 }
 
 variable "data_mode" {

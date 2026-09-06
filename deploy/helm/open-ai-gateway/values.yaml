@@ -5,7 +5,12 @@
 
 image:
   repository: ghcr.io/hexuria/open-ai-gateway
-  tag: ""            # defaults to .Chart.AppVersion
+  # Defaults to .Chart.AppVersion, which is "0.1.0" — and a `0.1.0` image
+  # exists only once a `v0.1.0` git tag has been pushed, because the release
+  # workflow publishes semver on `v*` and nothing else does. Until then the
+  # documented install lands on ImagePullBackOff. Set this to `main`, or to a
+  # `sha-<full sha>` tag for anything you intend to keep.
+  tag: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 
