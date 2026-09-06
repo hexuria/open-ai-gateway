@@ -502,9 +502,11 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
     // A streamed refusal arrives on its own channel, in fragments, exactly as
     // content does. See the note in `parse_response`: unread it reads as an
     // empty answer and buys a second refusal a rung up.
-    let mut refused = false;
     if let Some(text) = delta["refusal"].as_str().filter(|t| !t.is_empty()) {
-        refused = true;
+        // Recorded on the accumulator, not in a local. The finish arrives in a
+        // later chunk with an empty delta, so a local is false by the time the
+        // stop reason is decided — see the note there.
+        acc.note_refusal();
         events.push(StreamEvent::TextDelta {
             text: text.to_owned(),
         });
@@ -580,15 +582,24 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
             // ones announced in this one. See `parse_response` for why the
             // wire word alone is not enough.
             //
-            // `refused` only covers a refusal arriving in this same chunk,
-            // which is the common case — a refusal is short. One split across
-            // chunks still stops as `end_turn`, because nothing between here
-            // and the accumulator distinguishes a refusal delta from a text
-            // one. That is the pre-existing behaviour and it is not the part
-            // of H2 that cost money: the refusal text now reaches the client
-            // either way, so `quality_gate` no longer reads the answer as
-            // empty and buys a second refusal a rung up.
-            reason: finish_reason(reason, acc.saw_tool_call() || !opened.is_empty(), refused),
+            // The refusal is read from the accumulator, not from this chunk.
+            //
+            // It used to be a local, with a comment calling a same-chunk
+            // refusal "the common case". It is the rare one: this dialect sends
+            // `finish_reason` in its own chunk with an empty delta, so the
+            // refusal text has already gone by and the local is false. Every
+            // streamed refusal stopped as `end_turn` — an answer that ended
+            // normally and happens to decline — and an Anthropic client was
+            // told exactly that.
+            //
+            // The money half of H2 was fixed: the text reaches the client, so
+            // `quality_gate` no longer reads the answer as empty and buys a
+            // second refusal a rung up. This is the other half.
+            reason: finish_reason(
+                reason,
+                acc.saw_tool_call() || !opened.is_empty(),
+                acc.saw_refusal(),
+            ),
             usage: Usage::default(),
         });
     }
@@ -1085,6 +1096,19 @@ mod tests {
             acc.quality_gate(),
             Some(oag_router::QualityGate::EmptyResponse),
             "a refusal is not an empty response"
+        );
+
+        // And it stops as a refusal, which is the half this test used to avoid.
+        //
+        // The chunks above are the shape this dialect actually sends: the
+        // refusal in one, `finish_reason` alone in the next. Reading `refusal`
+        // only within the finishing chunk therefore fired almost never, and an
+        // Anthropic client saw `end_turn` — an answer that ended normally and
+        // happens to decline. Asserting `!= EmptyResponse` passed throughout.
+        assert_eq!(
+            acc.stop_reason(),
+            Some(StopReason::Refusal),
+            "a refusal split from its finish_reason still stops as one: {events:?}"
         );
     }
 
