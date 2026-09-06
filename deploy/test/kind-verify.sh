@@ -204,6 +204,19 @@ done
 [ "${models:-0}" -gt 0 ] || fail "the catalog never reached this replica; every request would fail to route"
 pass "catalog visible ($models concrete models)"
 
+# A mark, taken from Postgres, just before the streams open.
+#
+# The count at the end used to be over the whole table, and the cluster and its
+# PVC are reused when you re-run after a failure — so by the second run the
+# ledger already held more rows than the threshold and the check could not fail
+# whatever the gateway did. That is the shape of a green light that means
+# nothing. Read from Postgres rather than `date`, because the comparison is
+# against `occurred_at`, and the runner's clock is not the database's.
+PG="$($KC get pod -o name | grep postgres | head -1 | cut -d/ -f2)"
+[ -n "$PG" ] || fail "could not find the postgres pod to take a ledger mark from"
+SINCE="$($KC exec "$PG" -- psql -U oag -d oag -At -c 'SELECT now()' 2>/dev/null | tr -d '\r')"
+[ -n "$SINCE" ] || fail "could not read a timestamp from the ledger database"
+
 # Collect the stream PIDs. A bare `wait` would also wait on the port-forward,
 # which never exits — that hung a CI run until the 45-minute job timeout while
 # the streams themselves had long since finished.
@@ -257,12 +270,15 @@ pass "every stream survived a full rolling restart"
 # has just replaced, and the question here is what reached the DATABASE — routing
 # it through a replica that may no longer exist tests the wrong thing, and
 # returned 0 on a run where all eight streams had in fact completed.
-PG="$($KC get pod -o name | grep postgres | head -1 | cut -d/ -f2)"
 [ -n "$PG" ] || fail "could not find the postgres pod to read the ledger from"
+# Rows this run wrote, not rows the table holds. And served rows only: a severed
+# stream writes a `lost` row, so counting those would let the exact failure this
+# check exists to catch supply its own evidence.
 requests="$($KC exec "$PG" -- psql -U oag -d oag -At -c \
-  'SELECT count(*) FROM usage_event' 2>/dev/null | tr -d '[:space:]')"
+  "SELECT count(*) FROM usage_event WHERE occurred_at > '$SINCE' \
+     AND selection_reason NOT IN ('abandoned', 'lost')" 2>/dev/null | tr -d '[:space:]')"
 requests="${requests:-0}"
-echo "  ledger rows: $requests (expected >= $STREAMS)"
+echo "  ledger rows written by this run: $requests (expected >= $STREAMS)"
 [ "$requests" -ge "$STREAMS" ] \
   || fail "only $requests of $STREAMS completed streams reached the ledger — metering
   was cut off with the pod, so spend on a drained stream is invisible"

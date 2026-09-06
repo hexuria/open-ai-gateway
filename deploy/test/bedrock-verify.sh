@@ -148,8 +148,29 @@ curl -sN --max-time 30 -X POST "http://$PUBLIC/v1/messages" \
   >"$WORK/stream.txt"
 grep -q 'event: content_block_delta' "$WORK/stream.txt" \
   || fail "stream had no content deltas: $(head -c 500 "$WORK/stream.txt")"
-grep -q 'bedrock' "$WORK/stream.txt" \
-  || fail "stream had no overlay text: $(head -c 500 "$WORK/stream.txt")"
+# Reassembled, not grepped. `grep -q 'bedrock'` matched
+# `"model":"bedrock-mock"` inside `message_start` — a frame the decoder emits
+# before it has decoded anything — so the whole check passed with zero delivered
+# text, which is exactly the failure the Bedrock decoder can have.
+python3 - "$WORK/stream.txt" <<'PY' || fail "bedrock stream text did not reassemble"
+import json, sys
+text = []
+for line in open(sys.argv[1]):
+    if not line.startswith("data: "):
+        continue
+    payload = line[6:].strip()
+    if payload in ("", "[DONE]"):
+        continue
+    body = json.loads(payload)
+    if body.get("type") != "content_block_delta":
+        continue
+    delta = body.get("delta", {})
+    if isinstance(delta.get("text"), str):
+        text.append(delta["text"])
+joined = "".join(text)
+if "bedrock mock" not in joined:
+    sys.exit(f"reassembled {joined!r}, which does not contain 'bedrock mock'")
+PY
 grep -q 'event: message_delta\|event: message_stop' "$WORK/stream.txt" \
   || fail "stream never completed: $(tail -c 400 "$WORK/stream.txt")"
 assert_ledger "$since"
