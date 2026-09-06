@@ -278,6 +278,59 @@ async fn handle(
 /// changes the model. A named passthrough request must not walk onto the
 /// next ladder provider; hitting the caller's own `max_tokens` is not a
 /// weaker-model failure; budget pressure must not undo a downgrade.
+/// Whether the budget, and nothing else, is what stopped this climb.
+///
+/// G4. `oag_escalations_suppressed_total` answers one question — how much
+/// answer quality is my budget costing me — and it was incremented whenever a
+/// gate tripped and the principal happened to be near their cap, regardless of
+/// whether the budget had anything to do with it. Four other things stop a
+/// climb, and on a constrained principal every one of them was counted as the
+/// budget's doing, so the number an operator would act on was inflated by
+/// exactly the cases where raising the cap would change nothing.
+///
+/// The question is counterfactual and has to be: would this have climbed if the
+/// principal had headroom? Everything but the pressure is re-asked with
+/// `Normal` substituted — including `policy.escalate`, because a gate with no
+/// rung above it is not a suppression whatever the budget says.
+///
+/// A named predicate rather than a condition inline at the counter, because
+/// the counter sits inside `run_with_escalation` and cannot be reached without
+/// a credential, a database and a live request. The rule is the part worth
+/// testing and this is the shape that lets it be tested.
+#[allow(clippy::too_many_arguments)]
+fn budget_alone_prevented_the_climb(
+    gate: Option<oag_router::QualityGate>,
+    pressure: oag_router::BudgetPressure,
+    decision: &RoutingDecision,
+    escalations: u8,
+    max_tokens: u32,
+    policy: &RoutingPolicy,
+    signal: &oag_router::RequestSignal,
+    catalog: &oag_router::Catalog,
+    served: &std::collections::HashSet<String>,
+) -> bool {
+    let Some(gate) = gate else { return false };
+    if pressure == oag_router::BudgetPressure::Normal {
+        return false;
+    }
+    if !should_climb(
+        &decision.reason,
+        gate,
+        oag_router::BudgetPressure::Normal,
+        escalations,
+        max_tokens,
+        decision.model.max_output_tokens,
+    ) {
+        return false;
+    }
+    let Some(from) = decision.tier.as_ref() else {
+        return false;
+    };
+    policy
+        .escalate(from, gate, signal, catalog, max_tokens, served)
+        .is_some()
+}
+
 fn should_climb(
     reason: &oag_router::SelectionReason,
     gate: oag_router::QualityGate,
@@ -528,21 +581,17 @@ async fn run_with_escalation(
         // with `Normal` substituted, including `policy.escalate`, because a
         // gate with no rung above it is not a suppression whatever the budget
         // says.
-        if let Some(gate) = gate
-            && pressure != oag_router::BudgetPressure::Normal
-            && should_climb(
-                &decision.reason,
-                gate,
-                oag_router::BudgetPressure::Normal,
-                escalations,
-                canonical.max_tokens,
-                decision.model.max_output_tokens,
-            )
-            && let Some(from) = decision.tier.as_ref()
-            && policy
-                .escalate(from, gate, &signal, &catalog, canonical.max_tokens, &served)
-                .is_some()
-        {
+        if budget_alone_prevented_the_climb(
+            gate,
+            pressure,
+            &decision,
+            escalations,
+            canonical.max_tokens,
+            &policy,
+            &signal,
+            &catalog,
+            &served,
+        ) {
             tracing::info!(
                 %request_id, ?gate,
                 "not escalating: this principal is near their budget, so a worse \
@@ -2237,82 +2286,103 @@ mod tests {
     /// the ones where it does not.
     #[test]
     fn only_a_climb_that_budget_alone_prevented_is_a_suppression() {
-        use oag_router::{BudgetPressure, QualityGate, SelectionReason};
+        use oag_router::{BudgetPressure, QualityGate};
 
-        let classified = SelectionReason::Classified;
-        let gate = QualityGate::Refusal;
-        // Room under the caller's own cap, so `truncated_by_client_cap` is not
-        // what is doing the work in any of these.
-        let (asked, model_max) = (1024, 8192);
+        // Through the predicate the counter actually consults, not through
+        // `should_climb` alone. `should_climb` is not what G4 changed: the fix
+        // was asking it a second time with `Normal` substituted, and asking
+        // `escalate` as well, and a test that calls `should_climb` directly
+        // passes with both of those deleted.
+        //
+        // A ladder with somewhere to go, so the escalate half is satisfied and
+        // the pressure is genuinely the only thing in the way.
+        let policy = suppression_policy();
+        let catalog = suppression_catalog();
+        let served = std::collections::HashSet::new();
+        let signal = oag_router::RequestSignal::default();
+        let cheap = decision_on_rung("cheap", 0);
 
-        // The suppression the counter is for: everything would have allowed the
-        // climb, and only the pressure stopped it.
         assert!(
-            !should_climb(
-                &classified,
-                gate,
+            budget_alone_prevented_the_climb(
+                Some(QualityGate::Refusal),
                 BudgetPressure::Constrained,
+                &cheap,
                 0,
-                asked,
-                model_max
+                1024,
+                &policy,
+                &signal,
+                &catalog,
+                &served,
             ),
-            "a constrained principal does not climb"
-        );
-        assert!(
-            should_climb(
-                &classified,
-                gate,
-                BudgetPressure::Normal,
-                0,
-                asked,
-                model_max
-            ),
-            "and with headroom it would have — so the budget is what cost the \
-             caller the better answer, and that is the one to count"
+            "everything else allows the climb and only the pressure stops it: \
+             that is the one case the counter is for"
         );
 
-        // Not a suppression: the escalation ceiling is reached, so this request
-        // was never going to climb again whatever the budget said. Counted
-        // before, because the pressure was non-Normal and a gate had tripped.
+        // Not a suppression: no pressure at all.
+        assert!(!budget_alone_prevented_the_climb(
+            Some(QualityGate::Refusal),
+            BudgetPressure::Normal,
+            &cheap,
+            0,
+            1024,
+            &policy,
+            &signal,
+            &catalog,
+            &served,
+        ));
+
+        // Not a suppression: the climb budget is already spent, so headroom
+        // would have changed nothing. This is one of the four other blockers
+        // that used to be counted as the budget's doing.
         assert!(
-            !should_climb(
-                &classified,
-                gate,
-                BudgetPressure::Normal,
+            !budget_alone_prevented_the_climb(
+                Some(QualityGate::Refusal),
+                BudgetPressure::Constrained,
+                &cheap,
                 MAX_ESCALATIONS,
-                asked,
-                model_max
+                1024,
+                &policy,
+                &signal,
+                &catalog,
+                &served,
             ),
-            "the ceiling stops it with headroom too, so the budget is not the cause"
+            "an exhausted escalation budget stops this climb whatever the cap is"
         );
 
-        // Not a suppression: a passthrough request must not be migrated onto a
-        // model the caller did not name. Nothing to do with money.
+        // Not a suppression: at the ceiling there is no rung above, and a gate
+        // with nowhere to go is not the budget's fault either.
         assert!(
-            !should_climb(
-                &SelectionReason::Passthrough,
-                gate,
-                BudgetPressure::Normal,
+            !budget_alone_prevented_the_climb(
+                Some(QualityGate::Refusal),
+                BudgetPressure::Constrained,
+                &decision_on_rung("frontier", 2),
                 0,
-                asked,
-                model_max
+                1024,
+                &policy,
+                &signal,
+                &catalog,
+                &served,
             ),
-            "a named model is honoured whatever the budget is"
+            "a gate with no rung above it is not a suppression whatever the budget says"
         );
 
-        // Not a suppression: the answer hit the caller's own `max_tokens`,
-        // which a dearer model would hit in exactly the same place.
-        assert!(
-            !should_climb(
-                &classified,
-                QualityGate::Truncated,
-                BudgetPressure::Normal,
-                0,
-                100,
-                8192
-            ),
-            "the caller's own cap truncated it, and a rung up cannot help"
-        );
+        // Not a suppression: no gate tripped, so nothing was prevented.
+        assert!(!budget_alone_prevented_the_climb(
+            None,
+            BudgetPressure::Constrained,
+            &cheap,
+            0,
+            1024,
+            &policy,
+            &signal,
+            &catalog,
+            &served,
+        ));
+
+        // `should_climb` itself is not re-tested here. It is not what G4
+        // changed — the fix was asking it again with `Normal` substituted, and
+        // asking `escalate` too — and it has its own coverage where the climb
+        // decision is made.
     }
 
     #[test]
@@ -2587,6 +2657,71 @@ mod tests {
              which is H4 exactly: the provider invoices the tokens and the \
              ledger has no row"
         );
+    }
+
+    /// A three-rung ladder with somewhere to climb to, for the suppression
+    /// predicate: the question it asks is counterfactual, so the fixture has to
+    /// make the *other* blockers absent rather than merely unlikely.
+    fn suppression_catalog() -> oag_router::Catalog {
+        use oag_router::{Capabilities, ModelId, ModelSpec, Pricing};
+        let model = |id: &str, input: rust_decimal::Decimal| ModelSpec {
+            id: ModelId::new(id),
+            provider: oag_core::Provider::Anthropic,
+            upstream_name: id.split('/').next_back().unwrap_or(id).to_owned(),
+            pricing: Pricing {
+                input_per_mtok: input,
+                output_per_mtok: input,
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
+            },
+            context_window: 200_000,
+            max_output_tokens: 8192,
+            capabilities: Capabilities {
+                vision: true,
+                tools: true,
+                reasoning: true,
+                prompt_cache: true,
+            },
+            display_label: None,
+        };
+        oag_router::Catalog::from_entries([
+            model("anthropic/haiku", rust_decimal::Decimal::ONE),
+            model("anthropic/sonnet", rust_decimal::Decimal::from(3)),
+            model("anthropic/opus", rust_decimal::Decimal::from(15)),
+        ])
+    }
+
+    fn suppression_policy() -> RoutingPolicy {
+        use oag_core::TierName;
+        use oag_router::{ModelId, ladder::Rung};
+        let ladder = TierLadder::new(vec![
+            Rung {
+                name: TierName::new("cheap"),
+                models: vec![ModelId::new("anthropic/haiku")],
+            },
+            Rung {
+                name: TierName::new("balanced"),
+                models: vec![ModelId::new("anthropic/sonnet")],
+            },
+            Rung {
+                name: TierName::new("frontier"),
+                models: vec![ModelId::new("anthropic/opus")],
+            },
+        ])
+        .expect("non-empty");
+        RoutingPolicy::new(ladder, Box::new(oag_router::HeuristicClassifier::default()))
+    }
+
+    fn decision_on_rung(rung: &str, index: u8) -> RoutingDecision {
+        let mut d = decision_for(oag_core::Provider::Anthropic);
+        d.model.id = oag_router::ModelId::new(match rung {
+            "cheap" => "anthropic/haiku",
+            "balanced" => "anthropic/sonnet",
+            _ => "anthropic/opus",
+        });
+        d.model.max_output_tokens = 8192;
+        d.tier = Some(oag_core::Tier::new(rung, index));
+        d
     }
 
     fn decision_for(provider: oag_core::Provider) -> RoutingDecision {

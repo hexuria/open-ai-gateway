@@ -238,16 +238,7 @@ impl Cache {
             }
         };
 
-        // `try_from_secs_f64`, not `from_secs_f64`, which panics on a
-        // non-finite or out-of-range value. This number comes back from a Lua
-        // script in Redis, so it is data from another process — and a panic
-        // here is a 500 on a request the rate limiter was only meant to delay.
-        // A value we cannot make a duration of means "no wait", which is the
-        // same answer this already gives for an unparseable one.
-        let wait: f64 = wait.parse().unwrap_or(0.0);
-        Ok((wait > 0.0)
-            .then(|| Duration::try_from_secs_f64(wait).ok())
-            .flatten())
+        Ok(wait_from_redis(&wait))
     }
 
     /// Give a slot back.
@@ -606,6 +597,25 @@ fn slot_key(account: AccountId) -> String {
 /// as permission to make 60 requests, and a caller who makes them in the first
 /// second has not broken the promise — they have simply spent it. What the
 /// bucket prevents is spending it twice inside one minute.
+/// The wait a rate-limit script asked for, or `None` for no wait.
+///
+/// `try_from_secs_f64`, not `from_secs_f64`, which panics on a non-finite or
+/// out-of-range value. This number comes back from a Lua script in Redis, so it
+/// is data from another process — and a panic here is a 500 on a request the
+/// rate limiter was only meant to delay. A value we cannot make a duration of
+/// means "no wait", the same answer an unparseable one already gets.
+///
+/// A named function rather than three lines at the call site, because the call
+/// site needs a live Redis and a script that returns the value in question.
+/// The test used to reimplement these lines, so deleting `try_from_secs_f64`
+/// from the real code left it green — a copy of the fix cannot fail with it.
+fn wait_from_redis(raw: &str) -> Option<Duration> {
+    let wait: f64 = raw.parse().unwrap_or(0.0);
+    (wait > 0.0)
+        .then(|| Duration::try_from_secs_f64(wait).ok())
+        .flatten()
+}
+
 fn rate_and_burst(rpm: u32) -> (f64, f64) {
     let burst = f64::from(rpm.max(1));
     (burst / 60.0, burst)
@@ -962,14 +972,11 @@ mod tests {
     /// the limiter turning a slowdown into an outage.
     #[test]
     fn a_nonsense_wait_from_redis_is_no_wait_rather_than_a_panic() {
-        // The conversion, exercised over the values a `parse::<f64>()` of
-        // arbitrary bytes can actually produce.
-        let wait = |raw: &str| -> Option<Duration> {
-            let wait: f64 = raw.parse().unwrap_or(0.0);
-            (wait > 0.0)
-                .then(|| Duration::try_from_secs_f64(wait).ok())
-                .flatten()
-        };
+        // The real conversion, over the values a `parse::<f64>()` of arbitrary
+        // bytes can actually produce. This used to be a copy of those three
+        // lines, which meant the test passed with `try_from_secs_f64` deleted
+        // from the code it was written to protect.
+        let wait = super::wait_from_redis;
 
         assert_eq!(wait("1.5"), Some(Duration::from_millis(1500)));
         assert_eq!(wait("0"), None);
