@@ -3896,6 +3896,78 @@ mod tests {
     /// rather than of how much data happens to be in the table — so the test
     /// says nothing about which plan the planner prefers today, and turning
     /// sequential scans off is how it asks the question it actually means.
+    /// C4: the reason 0016 gives for dropping `account_schedulable_idx`.
+    ///
+    /// Its first draft said the seat poller was the only query filtering
+    /// `schedulable`. `route_channels` does too, and the claim was
+    /// load-bearing — had a `schedulable` query led with `provider`, dropping
+    /// the index would have been a regression rather than a saving.
+    ///
+    /// So this asks the planner rather than arguing. The index is recreated
+    /// exactly as 0013 defined it, both queries are explained, and neither may
+    /// choose it. Recreated and dropped inside the test because 0016 has
+    /// already removed it: asserting that a plan does not use an index that
+    /// does not exist would pass for the wrong reason, which is the shape of
+    /// check this whole review was about.
+    #[tokio::test]
+    async fn an_index_on_provider_cannot_serve_a_query_without_one() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS account_schedulable_idx \
+             ON account (provider, priority) WHERE schedulable",
+        )
+        .execute(db.pool())
+        .await
+        .expect("recreate the index 0013 defined");
+
+        let route = Uuid::now_v7();
+        let principal = Uuid::now_v7();
+        let plans = [
+            // `route_channels`: filters `schedulable`, does not bound `provider`.
+            sqlx::query_scalar::<_, String>(
+                "EXPLAIN SELECT DISTINCT a.provider, a.kind, a.served_models \
+                 FROM account a JOIN account_route ar ON ar.account_id = a.id \
+                 WHERE ar.route_id = $1 AND a.schedulable \
+                   AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $2)",
+            )
+            .bind(route)
+            .bind(principal)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain route_channels"),
+            // The seat poller: same predicate, same absence of a provider bound.
+            sqlx::query_scalar::<_, String>(
+                "EXPLAIN SELECT id FROM account WHERE kind = 'oauth' AND schedulable",
+            )
+            .fetch_all(db.pool())
+            .await
+            .expect("explain the poller"),
+        ];
+
+        let used: Vec<String> = plans
+            .iter()
+            .flatten()
+            .filter(|line| line.contains("account_schedulable_idx"))
+            .cloned()
+            .collect();
+
+        sqlx::query("DROP INDEX IF EXISTS account_schedulable_idx")
+            .execute(db.pool())
+            .await
+            .expect("leave the schema as 0016 left it");
+
+        assert!(
+            used.is_empty(),
+            "a query DOES use account_schedulable_idx, so 0016 dropped an index \
+             something needed: {used:?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_usage_panels_bound_the_ledger_side_of_their_joins() {
         let Some(db) = test_db() else {

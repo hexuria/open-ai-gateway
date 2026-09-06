@@ -18,9 +18,21 @@
 -- the ineligible rows to explain why a request could not be served. A partial
 -- index whose predicate the query does not state cannot be chosen for it.
 --
--- The one query that does filter `schedulable` is the seat poller's
--- `WHERE kind = 'oauth' AND schedulable`, which this index cannot serve either:
--- it leads with `provider`, and the poller does not filter on that.
+-- Two queries do filter `schedulable`, and this index can serve neither.
+--
+-- The seat poller runs `WHERE kind = 'oauth' AND schedulable`, and
+-- `repo::route_channels` — which answers "what can this route offer" — runs
+-- `WHERE ar.route_id = $1 AND a.schedulable AND (...)`. Both match the
+-- index's predicate and neither constrains `provider`, which is the index's
+-- leading column. A B-tree cannot be range-scanned on its second column
+-- without a bound on its first, so both fall back to the same access they
+-- already use.
+--
+-- (An earlier draft of this comment claimed the poller was the only such
+-- query. It was not, and the claim was load-bearing: if a `schedulable` query
+-- DID lead with `provider`, dropping this index would be a regression rather
+-- than a saving. `an_index_on_provider_cannot_serve_a_query_without_one` in
+-- `repo.rs` now settles that by asking the planner instead of by argument.)
 --
 -- So it has only ever cost. 0013 removed `last_used_at` from it precisely
 -- because index maintenance on this table is write cost for no reader — every
