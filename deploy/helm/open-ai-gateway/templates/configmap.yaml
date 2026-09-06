@@ -18,6 +18,29 @@ data:
   OAG_GATEWAY__BEDROCK_REGION: {{ .Values.gateway.bedrockRegion | quote }}
   OAG_TELEMETRY__LOG_FILTER: {{ .Values.telemetry.logFilter | quote }}
   OAG_TELEMETRY__LOG_JSON: {{ .Values.telemetry.logJson | quote }}
+  # `int64` before `quote`: YAML parses a value this large as a float and it
+  # renders as "3.3554432e+07", which the gateway's config parser rejects.
+  OAG_SERVER__MAX_BODY_BYTES: {{ .Values.server.maxBodyBytes | int64 | quote }}
+  OAG_GATEWAY__FAILOVER_BUDGET: {{ .Values.gateway.failoverBudgetSeconds | quote }}
+  OAG_GATEWAY__USAGE_POLL_INTERVAL: {{ .Values.gateway.usagePollIntervalSeconds | quote }}
   {{- range $provider, $url := .Values.gateway.providerBaseUrls }}
   OAG_GATEWAY__PROVIDER_BASE_URLS__{{ $provider | upper }}: {{ $url | quote }}
+  {{- end }}
+  {{- /*
+  The escape hatch, and the reason there is one.
+
+  Fourteen settings had keys here and the rest of the configuration file did
+  not — including `server.max_body_bytes`, which `values.yaml` and the
+  `OagReplicaShedding` runbook both tell operators to change. A knob a runbook
+  points at and the chart cannot set is a runbook step that cannot be done, and
+  the answer to that cannot be "add another key each time", because the settings
+  outnumber the ones anyone anticipated.
+
+  `extraEnv` takes any `OAG_*` variable, so a setting this chart has never heard
+  of is still reachable. Rendered last, so it also overrides the keys above —
+  deliberate: an operator who needs a value the chart spells differently should
+  not have to wait for a chart release.
+  */ -}}
+  {{- range $key, $value := .Values.extraEnv }}
+  {{ $key }}: {{ $value | quote }}
   {{- end }}

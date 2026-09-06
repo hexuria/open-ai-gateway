@@ -230,7 +230,23 @@ module "gateway" {
     OAG_SECURITY__CREDENTIAL_KEK = "${aws_secretsmanager_secret.this["credential-kek"].arn}:::${aws_secretsmanager_secret_version.this["credential-kek"].version_id}"
   }
 
-  env = var.gateway_env
+  # The guarded number and the deployed number, merged into one.
+  #
+  # `stream_keepalive_interval_seconds` was passed to the Cloudflare module,
+  # which preconditions on it staying under Cloudflare's ~100s Proxy Read
+  # Timeout — and to nothing else. The gateway read its own
+  # `OAG_GATEWAY__STREAM_KEEPALIVE_INTERVAL` from `gateway_env` or from its
+  # default, so the two were independent: an operator who raised the real one
+  # got the 524s the guard promised to prevent, with the guard still green.
+  #
+  # Merged rather than appended, so an explicit `gateway_env` entry still wins —
+  # someone setting it by hand has said something more specific than the
+  # variable's default, and the precondition still sees the variable, which is
+  # the honest limit of what this can promise.
+  env = merge(
+    { OAG_GATEWAY__STREAM_KEEPALIVE_INTERVAL = tostring(var.stream_keepalive_interval_seconds) },
+    var.gateway_env,
+  )
 
   max_stream_duration_seconds = var.max_stream_duration_seconds
   desired_count               = var.desired_count

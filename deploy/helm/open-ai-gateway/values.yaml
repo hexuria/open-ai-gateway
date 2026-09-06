@@ -87,6 +87,14 @@ gateway:
   # How often the monthly spend counters are checked against the ledger. A
   # backstop for the rolling-deploy window, off the request path; 0 disables.
   spendReconcileIntervalSeconds: 600
+
+  # How long failover may keep trying credentials for one request. Zero is
+  # refused by the gateway rather than meaning "no deadline"; see its config.
+  failoverBudgetSeconds: 120
+
+  # How often seat quotas are polled. The reserve every seat is held back by is
+  # evaluated against the figure this refreshes, so zero is refused too.
+  usagePollIntervalSeconds: 300
   bedrockRegion: us-east-1
   # provider -> base URL. Leave empty to use each provider's public API.
   providerBaseUrls: {}
@@ -145,6 +153,14 @@ server:
   # raise this — which is only possible if the chart can set it. Sized with
   # `resources.limits.memory`: see the note there.
   maxInFlight: 64
+
+  # The largest request body accepted, in bytes. `OagReplicaShedding` names this
+  # too: a fleet shedding on memory rather than on concurrency is usually taking
+  # bodies larger than it was sized for.
+  #
+  # 32 MiB, which is the gateway's own default — a chart key that quietly
+  # changed a default would be worse than no key at all.
+  maxBodyBytes: 33554432
 
 database:
   # Ceiling on any one statement. A held query on a stalled primary is turned
@@ -229,3 +245,21 @@ serviceMonitor:
   enabled: false
   interval: 15s
   labels: {}
+
+# Any other configuration key, for the settings this chart has no key of its own
+# for.
+#
+# The gateway reads its whole configuration from `OAG_*` environment variables,
+# and the chart names fourteen of them. The rest — the `gateway.codex` block,
+# `claude_code_model_aliases`, anything added after this chart was last touched
+# — had no route in at all, which made a runbook step that says "raise
+# server.max_body_bytes" impossible to follow.
+#
+# Rendered after the named keys, so it can override them as well as add to them.
+# An operator who needs a value the chart spells differently should not have to
+# wait for a chart release.
+#
+#   extraEnv:
+#     OAG_GATEWAY__CODEX__USER_AGENT: "my-org/1.0"
+#     OAG_SERVER__MAX_BODY_BYTES: "67108864"
+extraEnv: {}
