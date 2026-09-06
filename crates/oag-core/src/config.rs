@@ -160,8 +160,10 @@ pub struct RedisConfig {
 /// has already failed to be what we expected often enough to be worth printing:
 /// a malformed URL must still be redacted, and a parser that rejects it would
 /// hand the raw string back to the caller to print instead. Everything between
-/// `://` and the first `@` goes, so a password containing `/`, `:` or `?`
-/// cannot walk out through a cleverer scheme.
+/// `://` and the **last** `@` of the authority goes, so a password containing
+/// `/`, `:`, `?` or `@` cannot walk out through a cleverer scheme — and the
+/// `password` and `sslpassword` query parameters go too, because libpq accepts
+/// a password there and this used to print that form verbatim.
 ///
 /// The host and database name stay, because they are what makes the printed
 /// configuration worth printing — an operator diagnosing "which database is
@@ -172,13 +174,65 @@ fn redact_url(url: &str) -> String {
         // string we cannot parse is a string we do not print.
         return "<redacted>".to_owned();
     };
-    match rest.split_once('@') {
-        Some((_userinfo, host)) => format!("{scheme}://<redacted>@{host}"),
-        // No userinfo at all: nothing to hide, and hiding the whole thing would
+
+    // The authority ends at the first `/` or `?`. Splitting there before
+    // looking for userinfo is what makes the `rsplit_once` below safe: an `@`
+    // inside a query value is not a userinfo boundary, and treating it as one
+    // would redact the wrong half of the string.
+    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+
+    // The LAST `@`, not the first. A password may legally contain one, and
+    // splitting at the first left the remainder of it in the output — for
+    // `u:p@ss@host` this printed `<redacted>@ss@host`, handing over most of the
+    // password under a function whose whole purpose is to withhold it.
+    let authority = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("<redacted>@{host}"),
+        // No userinfo at all: nothing to hide there, and hiding the host would
         // make the common case less useful for no gain.
-        None => url.to_owned(),
+        None => authority.to_owned(),
+    };
+
+    // An `@` past the authority means this is not a shape we can reason about:
+    // a well-formed DSN does not carry one there, so the string has already
+    // failed to be what we expected and we cannot say which part of it is the
+    // secret. Withhold all of it. This is deliberately blunt — a query value
+    // that legitimately contains `@`, such as Azure's `user=name@server`, is
+    // redacted whole rather than parsed — because the alternative is guessing
+    // about a malformed URL, and guessing wrong prints a password.
+    if tail.contains('@') {
+        return "<redacted>".to_owned();
     }
+
+    // libpq takes the same credentials as query parameters, and this printed
+    // them verbatim: `postgres://host/db?password=…` walked out whole under a
+    // subcommand whose help says secrets are redacted. Values only — the keys
+    // stay, so the reader can see that a password was set without seeing it.
+    let tail = match tail.split_once('?') {
+        Some((path, query)) => {
+            let query: Vec<String> = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((key, _)) if SECRET_QUERY_KEYS.contains(&key) => {
+                        format!("{key}=<redacted>")
+                    }
+                    _ => pair.to_owned(),
+                })
+                .collect();
+            format!("{path}?{}", query.join("&"))
+        }
+        None => tail.to_owned(),
+    };
+
+    format!("{scheme}://{authority}{tail}")
 }
+
+/// Query parameters libpq accepts a secret in.
+///
+/// Not an exhaustive list of everything sensitive a DSN can carry — `sslkey`
+/// names a file rather than holding a secret — but the two that are a password
+/// by another spelling.
+const SECRET_QUERY_KEYS: [&str; 2] = ["password", "sslpassword"];
 
 impl std::fmt::Debug for DatabaseConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -615,6 +669,59 @@ mod tests {
         let printed = format!("{redis:#?}");
         assert!(!printed.contains("hunter2"), "{printed}");
         assert!(printed.contains("cache.internal"), "{printed}");
+    }
+
+    /// The two DSN shapes that walked a password straight out of this function
+    /// while it reported having redacted one.
+    #[test]
+    fn a_password_in_the_query_string_is_redacted_too() {
+        // libpq accepts the credentials as query parameters, and a deployment
+        // that hands its DSN over that way — several managed providers emit
+        // exactly this shape — printed the password in full.
+        let db = DatabaseConfig {
+            url: "postgres://db.internal:5432/oag?user=oag&password=hunter2&sslmode=require"
+                .to_owned(),
+            max_connections: 16,
+            statement_timeout: Duration::from_secs(10),
+        };
+        let printed = format!("{db:#?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(
+            printed.contains("password=<redacted>"),
+            "the key stays so a reader can see a password was set: {printed}"
+        );
+        assert!(
+            printed.contains("sslmode=require") && printed.contains("user=oag"),
+            "the parameters that are not secrets survive: {printed}"
+        );
+
+        let ssl = DatabaseConfig {
+            url: "postgres://db.internal/oag?sslpassword=topsecret".to_owned(),
+            max_connections: 16,
+            statement_timeout: Duration::from_secs(10),
+        };
+        let printed = format!("{ssl:#?}");
+        assert!(!printed.contains("topsecret"), "{printed}");
+    }
+
+    #[test]
+    fn a_password_containing_an_at_sign_does_not_leak_its_tail() {
+        // `@` is legal in a password, and splitting the authority at the FIRST
+        // one printed everything after it: `u:p@ss@host` became
+        // `<redacted>@ss@host`, which hands over most of the secret while
+        // reporting a redaction. The last `@` is the userinfo boundary.
+        let db = DatabaseConfig {
+            url: "postgres://oag:p@ssw0rd@db.internal/oag".to_owned(),
+            max_connections: 16,
+            statement_timeout: Duration::from_secs(10),
+        };
+        let printed = format!("{db:#?}");
+        assert!(!printed.contains("ssw0rd"), "{printed}");
+        assert!(!printed.contains("p@ss"), "{printed}");
+        assert!(
+            printed.contains("db.internal") && printed.contains("/oag"),
+            "{printed}"
+        );
     }
 
     /// The awkward URLs, because a redactor that only handles tidy input is a
