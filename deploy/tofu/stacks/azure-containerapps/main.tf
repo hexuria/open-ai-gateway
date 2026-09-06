@@ -1,7 +1,9 @@
 # Azure: Container Apps, with the data tier selectable.
 #
-#   managed  — Postgres Flexible Server + Azure Cache for Redis, both reached
-#              privately over the VNet.
+#   managed  — Postgres Flexible Server, always private over the VNet, plus
+#              Azure Cache for Redis, which is public by default and private
+#              when `redis_private = true` (see that variable: it forces the
+#              Premium family, so it is a cost decision).
 #   neutral  — Neon + Upstash, supplied as URLs, so compute can move clouds
 #              without the data moving with it.
 #
@@ -123,6 +125,12 @@ module "data_managed" {
   delegated_subnet_id = azurerm_subnet.postgres[0].id
   private_dns_zone_id = azurerm_private_dns_zone.postgres[0].id
   highly_available    = var.highly_available
+
+  # The cache's reachability, and where its private endpoint attaches when it
+  # has one. `infra` rather than `postgres`: that subnet is delegated to
+  # Flexible Server and cannot hold a private endpoint.
+  redis_private              = var.redis_private
+  private_endpoint_subnet_id = azurerm_subnet.infra.id
 
   depends_on = [azurerm_private_dns_zone_virtual_network_link.postgres]
 }

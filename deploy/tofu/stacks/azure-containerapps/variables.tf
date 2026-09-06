@@ -127,3 +127,23 @@ variable "run_migrations" {
     happily against a schema a newer release already applied.
   EOT
 }
+
+variable "redis_private" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Reach Azure Cache for Redis over a private endpoint instead of the internet.
+
+    `false` is the shape every existing deployment has, so an upgrade changes
+    nothing — and it means anyone holding the access key reads the auth cache
+    from anywhere. The session pins and cached identities in there describe who
+    is talking to what.
+
+    `true` turns public access off, creates a private endpoint in the
+    infrastructure subnet, and forces the Premium family, because Basic and
+    Standard have no VNet integration. That is a cost decision, which is why
+    this is a variable rather than simply the right answer.
+
+    Postgres is private either way.
+  EOT
+}
