@@ -38,6 +38,56 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # Two gates this repository documents as existing and which ran nowhere.
+  #
+  # A malformed `.tf` merged green until someone tried to apply it, and a new
+  # advisory landed in silence — including one against a dependency the ignore
+  # list in `.cargo/audit.toml` says must be "re-checked when the dependency it
+  # names moves", which nothing was in a position to notice.
+  #
+  # Its own job because it shares nothing with the Rust build: no toolchain
+  # cache to warm, no services, and it should report separately, since
+  # "Terraform is malformed" and "a test failed" are different problems for
+  # different people.
+  deploy-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # Formatting first, as in the Rust job: the cheapest failure should not
+      # wait on provider downloads.
+      - name: terraform fmt
+        run: terraform fmt -check -recursive deploy/tofu
+
+      # `-backend=false`, so no credentials and no state are needed — this
+      # validates the configuration, not a deployment. Every stack and every
+      # module, because a module is where a broken reference usually is and a
+      # stack that does not use it would not surface one.
+      - name: terraform validate
+        run: |
+          set -euo pipefail
+          for dir in deploy/tofu/stacks/*/ deploy/tofu/modules/*/; do
+            echo "== $dir"
+            terraform -chdir="$dir" init -backend=false -input=false > /dev/null
+            terraform -chdir="$dir" validate
+          done
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Reads `.cargo/audit.toml`, where every ignore has to say why the
+      # advisory does not apply. An ignore that can never be re-checked is an
+      # ignore that becomes permanent by accident.
+      - name: cargo audit
+        run: cargo audit
+
   # Everything above is pure and needs no services, which is the payoff for
   # keeping oag-router, oag-pool, and oag-proto free of I/O. Only the store and
   # server tiers need real infrastructure.
