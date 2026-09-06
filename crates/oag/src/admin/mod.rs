@@ -771,12 +771,10 @@ async fn key_cmd(db: &Db, redis_url: &str, cli: KeyCli) -> Result<()> {
         }) => {
             // The admin gate wants BOTH the key's flag and the principal's
             // role, so an admin key on a member principal is refused by every
-            // admin endpoint it is presented to. Nothing checked, nothing
-            // warned, and the troubleshooting doc sent the operator back to the
-            // command that had just produced the unusable key.
-            if admin {
-                require_admin_principal(db, &email).await?;
-            }
+            // admin endpoint it is presented to. It is enforced inside
+            // `mint_key`, which is the only place all three callers pass
+            // through — this arm and the one below used to check for
+            // themselves, and `init` did not check at all.
             let key = mint_key(db, &email, &route, &name, floor_tier.as_deref(), admin).await?;
             print_key(&key);
             Ok(())
@@ -790,9 +788,6 @@ async fn key_cmd(db: &Db, redis_url: &str, cli: KeyCli) -> Result<()> {
                         .to_owned(),
                 ));
             };
-            if cli.admin {
-                require_admin_principal(db, &email).await?;
-            }
             let key = mint_key(
                 db,
                 &email,
@@ -1392,6 +1387,23 @@ async fn mint_key(
     admin: bool,
 ) -> Result<String> {
     use std::fmt::Write as _;
+
+    // The admin gate lives here, not at the call sites.
+    //
+    // C7 put it on the two `key create` arms and missed the third caller.
+    // `init` mints with `admin = true` unconditionally and then prints "This is
+    // an ADMIN key" — and once C6 stopped `init` promoting an existing
+    // principal, that became exactly the key C7 refuses one command over: it
+    // authenticates, and every admin endpoint then refuses it. The operator is
+    // told they hold admin authority they do not have.
+    //
+    // This function already takes `admin` and already resolves the principal,
+    // so it is the one place a fourth caller cannot forget. `require_admin_
+    // principal` passes when there is no principal at all, leaving the missing
+    // -row diagnosis below to name both lookups it could have been.
+    if admin {
+        require_admin_principal(db, email).await?;
+    }
 
     // 32 bytes of entropy. The prefix is there so a leaked key is recognisable
     // in a log and can be grepped for during an incident.
@@ -2629,7 +2641,13 @@ mod tests {
         .await
         .expect("seed a member");
 
-        let err = require_admin_principal(&db, &email)
+        let route = format!("c7-{}", Uuid::new_v4());
+        upsert_route(&db, &route).await.expect("route");
+
+        // Through `mint_key`, not `require_admin_principal`. Calling the helper
+        // proved only that the helper works: it passed with both call-site
+        // checks deleted, which is precisely the state `init` was already in.
+        let err = mint_key(&db, &email, &route, "k", None, true)
             .await
             .expect_err("a member cannot hold an admin key");
         let message = err.to_string();
@@ -2638,12 +2656,84 @@ mod tests {
             "the operator needs the command that fixes it, not just the refusal: {message}"
         );
 
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM api_key k JOIN principal p ON p.id = k.principal_id \
+             WHERE p.email = $1",
+        )
+        .bind(&email)
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(
+            keys, 0,
+            "the refusal must happen before anything is written"
+        );
+
         // An inference key for the same principal is unaffected: only the
         // combination is refused.
+        mint_key(&db, &email, &route, "inference", None, false)
+            .await
+            .expect("a member may hold an inference key");
+
         promote_principal(&db, &email).await.expect("promote");
-        require_admin_principal(&db, &email)
+        mint_key(&db, &email, &route, "admin", None, true)
             .await
             .expect("an admin may hold an admin key");
+    }
+
+    /// C7's failure, reached through the door C7 did not close.
+    #[tokio::test]
+    async fn init_refuses_an_admin_key_for_an_existing_member() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("b5-{}@example.invalid", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')",
+        )
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("seed a member");
+
+        // `init` mints with `admin = true` unconditionally and prints "This is
+        // an ADMIN key". Once C6 stopped it promoting an existing principal,
+        // that key authenticated and was then refused by every admin endpoint —
+        // the exact scenario C7 refuses one command over, with nothing checked
+        // and nothing warned. The redis URL is unused because no budget is
+        // passed, so no eviction runs.
+        let route = format!("b5-{}", Uuid::new_v4());
+        let err = init(&db, "redis://127.0.0.1:1", &email, &route, None)
+            .await
+            .expect_err("init must not mint an admin key for a member");
+        assert!(
+            err.to_string().contains("oag admin principal promote"),
+            "the refusal names the command that fixes it: {err}"
+        );
+
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM api_key k JOIN principal p ON p.id = k.principal_id \
+             WHERE p.email = $1",
+        )
+        .bind(&email)
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(
+            keys, 0,
+            "a key the operator was told is an admin key must not exist"
+        );
+
+        // Promoted, `init` completes: the refusal is about the role, not about
+        // `init` itself, and the documented first-run path still works.
+        promote_principal(&db, &email).await.expect("promote");
+        init(&db, "redis://127.0.0.1:1", &email, &route, None)
+            .await
+            .expect("init succeeds for an admin principal");
     }
 
     /// H9. A key that was not stored is not printed.
