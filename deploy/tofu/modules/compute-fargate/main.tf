@@ -10,7 +10,7 @@
 
 terraform {
   required_providers {
-    aws = { source = "hashicorp/aws", version = ">= 5.0" }
+    aws = { source = "hashicorp/aws", version = "~> 6.0" }
   }
 }
 
@@ -31,8 +31,15 @@ resource "aws_lb" "this" {
   name               = var.name
   load_balancer_type = "application"
   internal           = var.internal
-  subnets            = var.public_subnet_ids
-  security_groups    = [var.lb_security_group_id]
+  # An internal load balancer belongs in the private subnets.
+  #
+  # This always used `public_subnet_ids`, so `internal = true` produced a
+  # load balancer with no public IPs sitting in subnets that route to an
+  # internet gateway — which applies cleanly and defeats the point of asking for
+  # an internal one. The variable's own description said it was ignored when
+  # internal; nothing ignored it.
+  subnets         = var.internal ? var.private_subnet_ids : var.public_subnet_ids
+  security_groups = [var.lb_security_group_id]
 
   # Inactivity, not total duration. Must exceed the gateway's keepalive
   # interval by a wide margin; it comfortably does at the default of 10s.
@@ -233,8 +240,13 @@ resource "aws_ecs_service" "this" {
   deployment_maximum_percent         = 200
 
   # Long enough that a task finishes draining before ECS kills it.
-  # ECS caps this at 120s for Fargate, so the gateway's drain budget should be
-  # set to match rather than the other way round on this platform.
+  #
+  # There is no 120s cap. This comment used to assert one, and told the reader
+  # to size the gateway's drain budget around it — advice derived from a limit
+  # that does not exist. ECS accepts a grace period up to 2,147,483,647 seconds;
+  # what actually bounds a drain here is the target group's
+  # `deregistration_delay`, which this module sets from
+  # `deregistration_delay_seconds` and which AWS does cap, at 3,600.
   health_check_grace_period_seconds = var.health_check_grace_period_seconds
 
   # Without this the apply returns the moment ECS accepts the deployment, which

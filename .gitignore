@@ -9,7 +9,12 @@
 
 # OpenTofu / Terraform local state and provider downloads
 .terraform/
-.terraform.lock.hcl
+# `.terraform.lock.hcl` is NOT ignored — it is committed, deliberately.
+#
+# Provider constraints here are `~> N`, which floats within a major. Without the
+# lock file a fresh clone resolves whichever minor is newest that day, so two
+# operators on the same commit get different plans and one of them is surprised.
+# The lock is what makes a commit mean one thing.
 *.tfstate
 *.tfstate.*
 

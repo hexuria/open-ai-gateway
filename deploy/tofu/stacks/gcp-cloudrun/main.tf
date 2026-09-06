@@ -15,7 +15,7 @@
 terraform {
   required_version = ">= 1.5"
   required_providers {
-    google = { source = "hashicorp/google", version = ">= 5.0" }
+    google = { source = "hashicorp/google", version = "~> 7.0" }
     # Pinned to v4: v5 turned `rules` from a block into an attribute, so the
     # ruleset resources below do not parse against it.
     cloudflare = { source = "cloudflare/cloudflare", version = "~> 4.0" }
@@ -199,4 +199,32 @@ module "edge" {
   hostname                   = var.hostname
   origin                     = replace(module.gateway.url, "https://", "")
   keepalive_interval_seconds = var.stream_keepalive_interval_seconds
+
+  # Passed, not defaulted. The precondition below guards `cloudflare_proxied`,
+  # and a guard on a value the record does not use is the same defect as D11 —
+  # the guarded number and the deployed number have to be one number.
+  proxied = var.cloudflare_proxied
+
+  # Cloud Run routes by `Host`, and a proxied Cloudflare record sends the
+  # custom hostname rather than the `run.app` one — so without a domain mapping
+  # every request to the custom hostname 404s while the `run.app` URL works.
+  # The apply succeeds and the output prints the hostname, which is what makes
+  # this expensive to diagnose: everything says it worked.
+  #
+  # A precondition rather than a `google_cloud_run_domain_mapping`, because a
+  # mapping requires the domain to be verified in Search Console first — a
+  # manual step this stack cannot perform and should not appear to. Refusing
+  # with an explanation beats applying something that cannot serve.
+  depends_on = [terraform_data.proxied_hostname_needs_a_mapping]
+}
+
+resource "terraform_data" "proxied_hostname_needs_a_mapping" {
+  count = var.cloudflare_zone_id == "" ? 0 : 1
+
+  lifecycle {
+    precondition {
+      condition     = !var.cloudflare_proxied || var.domain_mapping_verified
+      error_message = "A proxied Cloudflare record sends `hostname` as the Host header, and Cloud Run routes by Host — so it answers 404 for a hostname it has no domain mapping for, while the run.app URL keeps working. Create the mapping (the domain must be verified in Search Console first) and set domain_mapping_verified = true, or set cloudflare_proxied = false and let the record resolve straight through."
+    }
+  }
 }

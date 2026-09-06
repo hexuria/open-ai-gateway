@@ -14,7 +14,7 @@
 terraform {
   required_version = ">= 1.5"
   required_providers {
-    aws = { source = "hashicorp/aws", version = ">= 5.0" }
+    aws = { source = "hashicorp/aws", version = "~> 6.0" }
     # Pinned to v4: v5 turned `rules` from a block into an attribute, so the
     # ruleset resources in the edge module do not parse against it.
     cloudflare = { source = "cloudflare/cloudflare", version = "~> 4.0" }

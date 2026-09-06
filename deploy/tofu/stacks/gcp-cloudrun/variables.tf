@@ -128,3 +128,30 @@ variable "run_migrations" {
     happily against a schema a newer release already applied.
   EOT
 }
+
+variable "cloudflare_proxied" {
+  type        = bool
+  default     = true
+  description = <<-EOT
+    Whether the Cloudflare record proxies (orange cloud) or resolves through.
+
+    Proxied sends `hostname` as the Host header. Cloud Run routes by Host, so a
+    proxied record needs a domain mapping or every request to the custom
+    hostname 404s while the run.app URL keeps working — see
+    `domain_mapping_verified`.
+  EOT
+}
+
+variable "domain_mapping_verified" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Set once a Cloud Run domain mapping exists for `hostname`.
+
+    Creating one requires the domain to be verified in Google Search Console
+    first, which is a manual step this stack cannot perform and should not
+    appear to. So it asks instead: with `cloudflare_proxied = true` and this
+    false, the apply is refused rather than producing a hostname that answers
+    404 for every request while reporting success.
+  EOT
+}

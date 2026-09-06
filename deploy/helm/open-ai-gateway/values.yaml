@@ -246,6 +246,23 @@ serviceMonitor:
   interval: 15s
   labels: {}
 
+
+# The alert rules, as a PrometheusRule.
+#
+# `deploy/prometheus/alerts.yml` holds the same rules for a standalone
+# Prometheus. On Kubernetes there was no way to get them: the chart shipped a
+# ServiceMonitor, so metrics were scraped and nothing was ever paged on, and an
+# operator following the runbooks found the alerts they name do not exist.
+#
+# Off by default, like the ServiceMonitor beside it: both need the Prometheus
+# Operator's CRDs, and a chart that fails to install on a cluster without them
+# would be worse than one that ships no rules.
+prometheusRule:
+  enabled: false
+  # Whatever label your Prometheus selects rules by — commonly
+  # `release: kube-prometheus-stack`.
+  labels: {}
+
 # Any other configuration key, for the settings this chart has no key of its own
 # for.
 #
