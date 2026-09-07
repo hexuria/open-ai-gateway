@@ -322,27 +322,12 @@ pub struct TierRow {
     pub saved_usd: String,
 }
 
-/// One row per subscription seat, each metered on its own.
+/// The statement [`seat_summaries`] runs.
 ///
-/// Each flat-rate account (`kind='oauth'`) is its own row so three Grok seats
-/// read as three lines, not one blur. A `LEFT JOIN` keeps a seat with no
-/// traffic this window visible at zero rather than vanishing, and the seat-row
-/// predicate on the join (`cost_usd = 0 AND counterfactual_api_usd > 0`) counts
-/// only what the seat actually served. Failures degrade to an empty list — a
-/// missing subscriptions table should not take down the whole summary.
-///
-/// Usage imported with `admin usage import --account <seat>` is written in that
-/// exact shape and counts here, deliberately: it is that subscription's traffic
-/// whether or not this gateway carried it, and the fee it is measured against
-/// was paid either way. The same predicate keeps it out of the headline, so it
-/// is stated once.
-async fn seat_summaries(
-    db: &oag_store::Db,
-    window: &period::Resolved,
-    degraded: &mut Vec<&'static str>,
-) -> Vec<SeatRow> {
-    let seats: Vec<SeatTuple> = sqlx::query_as(
-        r"
+/// A constant for the same reason `ORIGIN_BREAKDOWN_SQL` is one: a test that
+/// retypes a `COUNT ... FILTER` is a copy, and a copy agrees with its original
+/// only until somebody edits one of them.
+const SEAT_SUMMARIES_SQL: &str = r"
             SELECT a.name,
                    COUNT(u.request_id) FILTER (
                        WHERE u.selection_reason NOT IN ('abandoned', 'lost')
@@ -363,21 +348,41 @@ async fn seat_summaries(
             GROUP BY a.id, a.name, a.monthly_cost_usd, a.usage_remaining_pct,
                      a.usage_window_label, a.created_at
             ORDER BY COALESCE(SUM(u.counterfactual_api_usd), 0) DESC, a.name
-            ",
-    )
-    .bind(window.start)
-    .bind(window.end)
-    .fetch_all(db.pool())
-    .await
-    // Degrading to an empty section is this helper's documented contract —
-    // one sub-table must not take down the whole summary — but degrading
-    // SILENTLY was not: an empty list rendered as "no seats", indistinguishable
-    // from a query that failed. Say which it was.
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
-        degraded.push("subscriptions");
-        Vec::new()
-    });
+            ";
+
+/// One row per subscription seat, each metered on its own.
+///
+/// Each flat-rate account (`kind='oauth'`) is its own row so three Grok seats
+/// read as three lines, not one blur. A `LEFT JOIN` keeps a seat with no
+/// traffic this window visible at zero rather than vanishing, and the seat-row
+/// predicate on the join (`cost_usd = 0 AND counterfactual_api_usd > 0`) counts
+/// only what the seat actually served. Failures degrade to an empty list — a
+/// missing subscriptions table should not take down the whole summary.
+///
+/// Usage imported with `admin usage import --account <seat>` is written in that
+/// exact shape and counts here, deliberately: it is that subscription's traffic
+/// whether or not this gateway carried it, and the fee it is measured against
+/// was paid either way. The same predicate keeps it out of the headline, so it
+/// is stated once.
+async fn seat_summaries(
+    db: &oag_store::Db,
+    window: &period::Resolved,
+    degraded: &mut Vec<&'static str>,
+) -> Vec<SeatRow> {
+    let seats: Vec<SeatTuple> = sqlx::query_as(SEAT_SUMMARIES_SQL)
+        .bind(window.start)
+        .bind(window.end)
+        .fetch_all(db.pool())
+        .await
+        // Degrading to an empty section is this helper's documented contract —
+        // one sub-table must not take down the whole summary — but degrading
+        // SILENTLY was not: an empty list rendered as "no seats", indistinguishable
+        // from a query that failed. Say which it was.
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
+            degraded.push("subscriptions");
+            Vec::new()
+        });
 
     seats
         .into_iter()
@@ -415,12 +420,6 @@ async fn seat_summaries(
         .collect()
 }
 
-/// Usage grouped by where the rows came from and whose credential paid.
-///
-/// Unlike the headline, this counts flat-rate seat rows too: the question here
-/// is "what ran, and did this gateway see it", and excluding a subscription's
-/// traffic would answer a different one. The `LEFT JOIN` is what lets a row keep
-/// its seat's name; rows attributed to nothing group together under a null,
 /// The statement [`origin_breakdown`] runs.
 ///
 /// A constant so its shape can be asserted without a database. Two things in it
@@ -461,6 +460,12 @@ const ORIGIN_BREAKDOWN_SQL: &str = r"
             ORDER BY u.origin, COALESCE(SUM(u.counterfactual_api_usd), 0) DESC, a.name
             ";
 
+/// Usage grouped by where the rows came from and whose credential paid.
+///
+/// Unlike the headline, this counts flat-rate seat rows too: the question here
+/// is "what ran, and did this gateway see it", and excluding a subscription's
+/// traffic would answer a different one. The `LEFT JOIN` is what lets a row keep
+/// its seat's name; rows attributed to nothing group together under a null,
 /// which is the honest rendering of an import nobody said the owner of.
 ///
 /// Returns nothing while every row came from the gateway, so a deployment that
@@ -1014,7 +1019,7 @@ pub async fn usage(State(state): State<Arc<AppState>>, Query(page): Query<Page>)
 
 #[cfg(test)]
 mod tests {
-    use super::{ORIGIN_BREAKDOWN_SQL, Summary};
+    use super::{ORIGIN_BREAKDOWN_SQL, OriginTuple, SEAT_SUMMARIES_SQL, SeatTuple, Summary};
 
     /// A3, end to end: a section whose query fails names itself.
     ///
@@ -1057,6 +1062,107 @@ mod tests {
         let origins = super::origin_breakdown(&db, &window, &mut degraded).await;
         assert!(origins.is_empty());
         assert_eq!(degraded, vec!["subscriptions", "origins"]);
+    }
+
+    /// The `64fc95b` filter, on the admin surface: attempts are not requests.
+    ///
+    /// Since 0014 contracted the ledger key onto `(request_id, attempt)`, one
+    /// client request leaves a row per attempt — a gate abandoning an answer, a
+    /// stream lost, then the one that served. Every one was generated upstream
+    /// and every one is money; only one of them is a request. Both aggregates
+    /// here carry `COUNT(...) FILTER (WHERE selection_reason NOT IN
+    /// ('abandoned', 'lost'))` and neither had a test, so either could be
+    /// deleted and the panels would quietly report a gateway serving more
+    /// traffic the more often escalation saved a bad answer.
+    ///
+    /// Seeded and read inside one transaction, rolled back: these statements
+    /// aggregate over the whole window with nothing to key on, so counting a
+    /// difference against the pool would move under any other test writing a
+    /// ledger row.
+    #[tokio::test]
+    async fn the_admin_panels_count_requests_and_sum_attempts() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = oag_store::Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let window = super::period::resolve(
+            &super::period::Window::default(),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("window");
+
+        let tag = uuid::Uuid::new_v4();
+        let mut tx = db.pool().begin().await.expect("begin");
+        let seat: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce) \
+             VALUES (gen_random_uuid(), $1, 'anthropic', 'oauth', '\\x00', '\\x00') \
+             RETURNING id",
+        )
+        .bind(format!("seat-{tag}"))
+        .fetch_one(&mut *tx)
+        .await
+        .expect("a seat to attribute the rows to");
+
+        // A seat row is `cost_usd = 0` with a real displaced API bill, which is
+        // what `seat_summaries` joins on.
+        let request_id = uuid::Uuid::new_v4();
+        for (attempt, reason) in [(0i16, "abandoned"), (1, "lost"), (2, "classified")] {
+            sqlx::query(
+                "INSERT INTO usage_event (request_id, attempt, account_id, origin, \
+                 model_id, tier, selection_reason, input_tokens, output_tokens, \
+                 cost_usd, counterfactual_usd, counterfactual_api_usd, status) \
+                 VALUES ($1, $2, $3, 'gateway', 'anthropic/claude-opus-5', 'frontier', \
+                         $4, 100, 20, 0, 3.00, 1.00, 200)",
+            )
+            .bind(request_id)
+            .bind(attempt)
+            .bind(seat)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await
+            .expect("seed");
+        }
+
+        // The statements the handlers run, on this transaction's snapshot.
+        // Not copies of them: both are constants, so what is planned here is
+        // what `seat_summaries` and `origin_breakdown` plan, and a `FILTER`
+        // deleted from either shows up here.
+        let seats: Vec<SeatTuple> = sqlx::query_as(SEAT_SUMMARIES_SQL)
+            .bind(window.start)
+            .bind(window.end)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("the subscriptions panel");
+        let origins: Vec<OriginTuple> = sqlx::query_as(ORIGIN_BREAKDOWN_SQL)
+            .bind(window.start)
+            .bind(window.end)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("the origins panel");
+        tx.rollback().await.expect("rollback");
+
+        let name = format!("seat-{tag}");
+        let seat_row = seats
+            .iter()
+            .find(|r| r.0 == name)
+            .unwrap_or_else(|| panic!("the seat this test made is not in the panel"));
+        assert_eq!(
+            seat_row.1, 1,
+            "three ledger rows for one client request, and the subscriptions \
+             panel has to say one"
+        );
+
+        let origin_row = origins
+            .iter()
+            .find(|r| r.1.as_deref() == Some(name.as_str()))
+            .unwrap_or_else(|| panic!("the seat this test made is not in the origins panel"));
+        assert_eq!(
+            origin_row.4, 1,
+            "and so does the origins panel, which groups the same three rows"
+        );
     }
 
     /// A3. A section that failed is distinguishable from one that is empty.
