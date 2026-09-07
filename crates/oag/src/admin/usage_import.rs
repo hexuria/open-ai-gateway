@@ -1152,6 +1152,11 @@ fn plan(
                     // Nothing is lost by dropping it: `origin` still says which
                     // CLI the rows came from, and that is what `revert` matches
                     // on. It never matched on this shape.
+                    // Changing this shape changes the identity every re-import
+                    // recognises, so a change here needs a migration to carry
+                    // the rows already written across — see
+                    // `migrations/0017_rekey_claude_code_imports.sql`, which
+                    // exists because this one shipped without it.
                     let source_ref = if source.message_ids_are_global() {
                         format!("{origin}:{}", message.external_id)
                     } else {
@@ -2148,6 +2153,130 @@ mod tests {
         assert_eq!(first.rows[0].source_ref, "claude-code:msg_a");
         assert_eq!(first.rows[0].request_id, second.rows[0].request_id);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C11's other half: the rows a previous binary already wrote.
+    ///
+    /// Changing the derived `source_ref` changes the identity every re-import
+    /// recognises — the unique index on `source_ref` and the `uuid_v5` that
+    /// becomes `request_id`. Without 0017 the first import after this upgrade
+    /// matches nothing and books the whole corpus a second time, and reports it
+    /// as a clean first import because every row really was written.
+    ///
+    /// Driven against the database rather than asserted about the format,
+    /// because the fix is a migration and what has to be true is a property of
+    /// the rows: an old-shaped row is re-keyed to exactly what `plan()` now
+    /// derives, and two old rows for one message become one.
+    #[tokio::test]
+    async fn the_backfill_rekeys_old_imports_onto_what_the_importer_now_derives() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        // Two sessions quoting one message, plus a message seen once. The
+        // shape a pre-C11 binary wrote.
+        let tag = Uuid::new_v4().simple().to_string();
+        let shared = format!("msg_shared_{tag}");
+        let only = format!("msg_only_{tag}");
+        let old_rows = [
+            (
+                format!("claude-code:sess_a_{tag}:{shared}"),
+                "2026-09-01T10:00:00Z",
+            ),
+            (
+                format!("claude-code:sess_b_{tag}:{shared}"),
+                "2026-09-02T10:00:00Z",
+            ),
+            (
+                format!("claude-code:sess_a_{tag}:{only}"),
+                "2026-09-01T11:00:00Z",
+            ),
+        ];
+        for (source_ref, at) in &old_rows {
+            sqlx::query(
+                "INSERT INTO usage_event (request_id, attempt, origin, source_ref, model_id, \
+                 tier, selection_reason, input_tokens, output_tokens, cost_usd, \
+                 counterfactual_usd, counterfactual_api_usd, status, occurred_at) \
+                 VALUES ($1, 0, 'claude-code', $2, 'anthropic/claude-opus-5', 'frontier', \
+                         'imported', 100, 20, 0, 0, 1.00, 200, $3::timestamptz)",
+            )
+            .bind(Uuid::new_v5(&IMPORT_NAMESPACE, source_ref.as_bytes()))
+            .bind(source_ref)
+            .bind(at)
+            .execute(db.pool())
+            .await
+            .expect("seed a pre-C11 row");
+        }
+
+        // The migration has already run, so re-key these by hand exactly as it
+        // does — the statement is the same one, against rows seeded after it.
+        // What is asserted is the outcome the migration defines, not the run.
+        rekey_claude_code_imports(&db).await;
+
+        let refs: Vec<String> = sqlx::query_scalar(
+            "SELECT source_ref FROM usage_event WHERE source_ref LIKE $1 ORDER BY source_ref",
+        )
+        .bind(format!("%{tag}%"))
+        .fetch_all(db.pool())
+        .await
+        .expect("read back");
+
+        assert_eq!(
+            refs,
+            vec![
+                format!("claude-code:{only}"),
+                format!("claude-code:{shared}")
+            ],
+            "the session is gone from the key, and the message quoted in two \
+             sessions is one row rather than two"
+        );
+
+        // And the identity a re-import derives finds them. This is the whole
+        // point: `plan()` computes both of these, and both must match.
+        for message in [&shared, &only] {
+            let source_ref = format!("claude-code:{message}");
+            let found: Option<Uuid> =
+                sqlx::query_scalar("SELECT request_id FROM usage_event WHERE source_ref = $1")
+                    .bind(&source_ref)
+                    .fetch_optional(db.pool())
+                    .await
+                    .expect("read back");
+            assert_eq!(
+                found,
+                Some(Uuid::new_v5(&IMPORT_NAMESPACE, source_ref.as_bytes())),
+                "a re-import derives this request_id for {source_ref}; if the row \
+                 carries another one the primary key does not collide and the \
+                 import writes it again"
+            );
+        }
+
+        sqlx::query("DELETE FROM usage_event WHERE source_ref LIKE $1")
+            .bind(format!("%{tag}%"))
+            .execute(db.pool())
+            .await
+            .expect("clean up");
+    }
+
+    /// 0017 itself, run against rows this test seeded.
+    ///
+    /// The migration text, not a copy of it: a migration runs once and long
+    /// before a test can plant a row in the old shape, so the alternative is
+    /// either a test that asserts nothing about those rows or a second copy of
+    /// the statements that agrees with the original only until somebody edits
+    /// one of them. `include_str!` removes the choice.
+    ///
+    /// Safe to run twice: it creates its helper, uses it, drops it, and its
+    /// `WHERE` matches only rows still in the old shape.
+    async fn rekey_claude_code_imports(db: &Db) {
+        const MIGRATION: &str =
+            include_str!("../../../../migrations/0017_rekey_claude_code_imports.sql");
+        sqlx::raw_sql(MIGRATION)
+            .execute(db.pool())
+            .await
+            .expect("0017 runs against the rows seeded above");
     }
 
     /// C15. A spelling two models answer to prices neither.
