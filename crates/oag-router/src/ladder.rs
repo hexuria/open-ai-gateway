@@ -116,11 +116,39 @@ impl TierLadder {
         catalog: &'c Catalog,
         need: &Requirements,
     ) -> Option<&'c ModelSpec> {
+        self.pick_where(tier, catalog, need, |_| true)
+    }
+
+    /// The same choice, skipping one provider's models.
+    ///
+    /// For R1's climb past a provider that cannot be dispatched to. A rung is
+    /// a list, and `pick` takes the first entry that satisfies the request — so
+    /// a rung of `[kimi/k2, anthropic/opus]` answers "kimi", and a caller
+    /// asking "is there anything here that is not kimi" got the whole rung
+    /// skipped on the strength of its first entry. Mixed rungs are the
+    /// documented shape: `docs/02-cost-routing.md` gives one as the example.
+    pub fn pick_without<'c>(
+        &self,
+        tier: &Tier,
+        catalog: &'c Catalog,
+        need: &Requirements,
+        avoid: oag_core::Provider,
+    ) -> Option<&'c ModelSpec> {
+        self.pick_where(tier, catalog, need, |spec| spec.provider != avoid)
+    }
+
+    fn pick_where<'c>(
+        &self,
+        tier: &Tier,
+        catalog: &'c Catalog,
+        need: &Requirements,
+        also: impl Fn(&ModelSpec) -> bool,
+    ) -> Option<&'c ModelSpec> {
         let rung = self.rungs.get(usize::from(tier.rank))?;
         rung.models
             .iter()
             .filter_map(|id| catalog.get(id))
-            .find(|spec| spec.satisfies(need))
+            .find(|spec| spec.satisfies(need) && also(spec))
     }
 }
 
