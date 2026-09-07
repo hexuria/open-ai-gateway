@@ -30,6 +30,52 @@ These are settled. Do not re-open them.
    nothing knowingly broken reaches `main`. Everything else — P1, P2, P3, P4 —
    goes into **one follow-up PR** stacked on `review/group-6-tests-docs`.
 
+### What decision 1 actually resolved to, in session
+
+`budget_tokens` **is** rejected on Claude 4.7 and later, `claude-opus-5`
+included — which is the `frontier` rung of this repository's own default ladder.
+Checked against
+<https://platform.claude.com/docs/en/build-with-claude/extended-thinking> and
+<https://platform.claude.com/docs/en/build-with-claude/effort>, not inferred
+from a 400. The renderer is therefore model-aware, and the shape is:
+
+- **4.5 and earlier**: `thinking: {type: "enabled", budget_tokens: N}`, clamped
+  below `max_tokens`. `type: "adaptive"` is a 400 there.
+- **4.6**: both accepted, `budget_tokens` deprecated.
+- **4.7 and later**: `thinking: {type: "adaptive"}` with the depth on
+  `output_config.effort`, whose levels are the ones `Effort` already spells.
+- **`Off`**: no thinking block at all, on every version. Anthropic's floor for
+  `budget_tokens` is 1024, so a budget of zero is not a way to say "do not
+  think" there.
+
+Gemini is the opposite and deliberately does not share the helper:
+`thinkingBudget: 0` is how *that* dialect says "do not think"
+(<https://ai.google.dev/gemini-api/docs/generate-content/thinking>), so `Off`
+renders a zero rather than omitting the config. Pinned by
+`a_gemini_effort_off_renders_a_zero_budget`. Gemini's Pro-class models reject a
+budget of zero and want -1 or a positive number; gating on that needs a
+per-model capability the catalogue does not carry and was left out of scope.
+
+## Decisions taken by the owner, 2026-09-07
+
+Taken while closing the whole-stack review. Also settled.
+
+1. **Landing.** A ninth branch, `review/group-8-review-fixes-2`, stacked on
+   `review/group-7-review-fixes` and opened as PR #73 against it. #72 is not
+   touched. The chain becomes `#65 → #71 → #66 → #67 → #68 → #69 → #70 → #72 →
+   #73`, and nothing merges.
+2. **R12.** `gateway.usage_poll_interval: 0` is a **startup warning, not a
+   refusal**. Refusing it was scope creep on a comment-correction finding and
+   breaks any deployment that chose zero deliberately. The warning names the
+   consequence: the poller does not run, so no seat's `usage_reserve_pct` is
+   enforced.
+3. **Counterfactual (B7).** Unserved rows get a literal `Decimal::ZERO` for
+   `counterfactual_api_usd`, matching `counterfactual_usd` — which is decision 3
+   above, restated because the code had drifted to writing the cost there. No
+   consumer sums `api − cost`, so that argument was overstated.
+4. **B3's clamp stays.** An Anthropic client's explicit `budget_tokens` above
+   `max_tokens` is clamped rather than passed through to a 400.
+
 ## The shape of it
 
 Seven PRs, 123 findings closed. The reviews found **8 blockers**, **9 partial or

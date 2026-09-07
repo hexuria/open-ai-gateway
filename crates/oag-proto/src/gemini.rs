@@ -98,6 +98,18 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
     // `reasoning_effort: "high"` had nowhere to land: the request reached a
     // thinking model with thinking switched off, at frontier prices, and
     // nothing in the answer said the field had been dropped.
+    //
+    // `Effort::Off` therefore renders `thinkingBudget: 0`, which is this
+    // dialect's own way of switching thinking off — the opposite of Anthropic,
+    // where a budget of zero is invalid and `Off` omits the block entirely. See
+    // <https://ai.google.dev/gemini-api/docs/generate-content/thinking>.
+    // Omitting the config here would leave the model on its default and give a
+    // client that asked for no thinking some, at thinking prices.
+    //
+    // Not gated by model: the Pro-class models reject a budget of zero and
+    // require -1 or a positive number, so `Off` is a 400 there rather than a
+    // silent default. Gating on that needs a per-model capability the catalogue
+    // does not carry, and is out of scope here.
     if let Some(budget) = req
         .thinking_budget
         .or_else(|| req.thinking_effort.map(Effort::as_budget))
@@ -760,6 +772,36 @@ mod tests {
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             json!(2048)
         );
+    }
+
+    /// B4's Gemini half: `Off` renders a zero budget, and that is correct here.
+    ///
+    /// The review paired this with Anthropic's `Off`, where `budget_tokens: 0`
+    /// is invalid and the field is omitted. Gemini is the opposite: zero is how
+    /// this dialect *says* "do not think"
+    /// (<https://ai.google.dev/gemini-api/docs/generate-content/thinking>), so
+    /// omitting the config would leave a thinking model on its default and a
+    /// client that asked for no thinking would get some, at thinking prices.
+    ///
+    /// So the refutation is pinned rather than asserted in a commit body: the
+    /// two dialects render `Off` differently on purpose, and a later change
+    /// making them agree would be the regression.
+    #[test]
+    fn a_gemini_effort_off_renders_a_zero_budget() {
+        let req = request(|r| r.thinking_effort = Some(Effort::Off));
+        let body = render_request(&req).expect("renders");
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            json!(0),
+            "zero is this dialect's way of switching thinking off; leaving the \
+             config out would leave the model on its own default"
+        );
+
+        // And it survives the round trip as the same instruction, rather than
+        // coming back as "the client said nothing about thinking".
+        let back = parse_request(&body).expect("parses");
+        assert_eq!(back.thinking_budget, Some(0));
+        assert_eq!(back.thinking_effort, Some(Effort::Off));
     }
 
     /// P10. A tool result is addressed by the function's name, not by an id.

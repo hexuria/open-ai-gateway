@@ -41,6 +41,13 @@ const MIN_THINKING_BUDGET: u32 = 1024;
 ///
 /// The replacement is `type: "adaptive"` with the depth on
 /// `output_config.effort`, whose levels are the ones [`Effort`] already spells.
+///
+/// Checked against the vendor's own documentation rather than inferred from a
+/// 400, and cited here because the commit that made the change
+/// (`fa58580`) cannot be rewritten to carry them:
+///
+/// - <https://platform.claude.com/docs/en/build-with-claude/extended-thinking>
+/// - <https://platform.claude.com/docs/en/build-with-claude/effort>
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ThinkingMode {
     Budget,

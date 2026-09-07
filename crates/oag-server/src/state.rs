@@ -34,6 +34,14 @@ pub struct AppState {
     /// that started with one catalog finishes with it — a price changing
     /// halfway through a request would make the ledger disagree with itself.
     catalog: Arc<RwLock<Arc<Catalog>>>,
+    /// A8. The readiness answer, memoised for a second by `health::ready`.
+    ///
+    /// A field rather than the process-global `OnceLock` it was: that made the
+    /// memo shared by every `AppState` in the process, so a test priming one
+    /// state's readiness answered for another's, and two gateways in one binary
+    /// would report each other's backends. Nothing else on this struct is
+    /// process-global, and this had no reason to be.
+    pub readiness: Arc<tokio::sync::Mutex<Option<(std::time::Instant, oag_store::Readiness)>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -226,6 +234,7 @@ impl AppState {
             adapters: Arc::new(adapters),
             codex,
             catalog: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
+            readiness: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
