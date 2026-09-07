@@ -1165,6 +1165,91 @@ mod tests {
         );
     }
 
+    /// A4. The principal upsert echoes the budget that is now in force.
+    ///
+    /// The reply used to say nothing about the budget, so a caller could not
+    /// tell an upsert that set one from an upsert that left an existing one
+    /// alone — and the idempotent form (no budget in the body) does leave it
+    /// alone rather than clearing it, which is the guess callers got wrong.
+    /// Driven through the handler with a real `AdminActor` and a real
+    /// database, because the echo is a read-back after the write and a shape
+    /// test on the JSON would not prove the read happens.
+    ///
+    /// Gated on both backends: the upsert evicts the principal's cached keys,
+    /// and against a closed Redis port that eviction waits out the connection
+    /// manager's backoff.
+    #[tokio::test]
+    async fn the_principal_upsert_reports_the_budget_now_in_force() {
+        use axum::body::to_bytes;
+        use axum::extract::{Json, State};
+
+        let (Ok(db_url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            &db_url, &redis_url, "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 2).expect("pool");
+        db.migrate().await.expect("migrate");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("client");
+        let state = std::sync::Arc::new(crate::AppState::new(config, db, cache).expect("state"));
+
+        let actor = || super::AdminActor {
+            principal_id: uuid::Uuid::nil(),
+            email: "a4-admin@example.invalid".to_owned(),
+        };
+        let email = format!("a4-{}@example.invalid", uuid::Uuid::new_v4());
+        let upsert = async |budget: Option<&str>| {
+            let response = super::upsert_principal(
+                State(std::sync::Arc::clone(&state)),
+                actor(),
+                Json(super::write::PrincipalInput {
+                    email: email.clone(),
+                    role: None,
+                    monthly_budget_usd: budget.map(str::to_owned),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 16).await.expect("body");
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json")
+        };
+
+        // As money, not as text: the column is `numeric(14,6)`, so the read-back
+        // carries the stored scale and `12.50` comes back as `12.500000`.
+        let budget = |reply: &serde_json::Value| -> Option<rust_decimal::Decimal> {
+            reply["monthly_budget_usd"]
+                .as_str()
+                .map(|b| b.parse().expect("a decimal"))
+        };
+        let twelve_fifty = Some(rust_decimal::Decimal::new(1250, 2));
+
+        let set = upsert(Some("12.50")).await;
+        assert_eq!(budget(&set), twelve_fifty);
+        assert_eq!(set["budget_unchanged"], serde_json::json!(false));
+
+        // The idempotent re-bind: no budget in the body leaves the existing one
+        // in force, and the reply has to say both that it is in force and that
+        // this call did not set it.
+        let again = upsert(None).await;
+        assert_eq!(
+            budget(&again),
+            twelve_fifty,
+            "the budget that is now in force, read back rather than echoed"
+        );
+        assert_eq!(
+            again["budget_unchanged"],
+            serde_json::json!(true),
+            "and said plainly, because the alternative is every caller \
+             discovering it from a support thread"
+        );
+    }
+
     /// A3. A section that failed is distinguishable from one that is empty.
     ///
     /// The two list sections degrade to empty rather than failing the whole
