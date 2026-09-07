@@ -169,4 +169,113 @@ if unstructured:
     sys.exit(1)
 
 print("tofu: every compute module asks for structured logs")
+
+# D11. The guarded number and the deployed number are the same number.
+#
+# `stream_keepalive_interval_seconds` reaches the Cloudflare module, which
+# preconditions on it staying under Cloudflare's ~100s Proxy Read Timeout. The
+# gateway read its own `OAG_GATEWAY__STREAM_KEEPALIVE_INTERVAL` out of
+# `gateway_env`, so the two were independent: raise the real one and you get the
+# 524s the precondition promised to prevent, with the precondition still green.
+#
+# Every stack has to merge the *same variable* the precondition sees into the
+# compute env. A literal, or a second variable, would apply cleanly and re-open
+# the gap.
+ungated = []
+for f in sorted(glob.glob("deploy/tofu/stacks/*/main.tf")):
+    body = open(f).read()
+    if "keepalive_interval_seconds" not in body:
+        continue  # a stack with no edge in front of it has nothing to reconcile
+    merged = re.search(
+        r"OAG_GATEWAY__STREAM_KEEPALIVE_INTERVAL\s*=\s*tostring\("
+        r"var\.stream_keepalive_interval_seconds\)",
+        body,
+    )
+    guarded = re.search(
+        r"keepalive_interval_seconds\s*=\s*var\.stream_keepalive_interval_seconds", body
+    )
+    if not merged:
+        ungated.append(
+            f"  {f}: the compute env does not carry var.stream_keepalive_interval_seconds"
+        )
+    elif not guarded:
+        ungated.append(f"  {f}: the edge module is not given the variable the env carries")
+
+if ungated:
+    print("\nStacks where the guarded keepalive is not the deployed keepalive:\n")
+    print("\n".join(ungated))
+    print("\nThe precondition then guards a number nothing runs on.")
+    sys.exit(1)
+
+print("tofu: every stack guards the keepalive it actually deploys")
+
+# H11. A secret pinned by ARN alone is not pinned.
+#
+# ECS resolves a bare ARN to AWSCURRENT at task start, so rotating a secret left
+# the task definition byte-identical: no new revision, no deployment, every
+# running task keeping the old value. The break arrives weeks later, when an
+# unrelated image bump finally rolls the tasks onto a KEK that cannot decrypt
+# anything sealed under the old one — with nothing in the change log between
+# then and now that touched credentials.
+#
+# `:::${version_id}` is the ARN's own syntax for "no label, this version".
+bare = []
+for f in sorted(glob.glob("deploy/tofu/stacks/*/main.tf")):
+    body = open(f).read()
+    block = re.search(r"secret_env\s*=\s*\{(.*?)\n  \}", body, re.S)
+    if not block:
+        continue
+    for line in block.group(1).splitlines():
+        if "=" not in line or not line.strip():
+            continue
+        value = line.split("=", 1)[1].strip()
+        # Only Secrets Manager ARNs need this pin; a Cloud Run secret reference
+        # or a Key Vault id is a different shape and pins its own way.
+        if "secretsmanager_secret" in value and ":::" not in value:
+            bare.append(f"  {f}: {line.strip()}")
+
+if bare:
+    print("\nSecrets referenced by a bare ARN, which ECS resolves at task start:\n")
+    print("\n".join(bare))
+    print("\nA rotation then changes nothing in the task definition, and nothing rolls.")
+    sys.exit(1)
+
+print("tofu: every Secrets Manager reference pins a version")
 PY
+
+# H10. Envoy health-checks the port readiness is served on.
+#
+# `/health/ready` lives on 8081 and traffic on 8080. An endpoint without its own
+# `health_check_config` is checked on its traffic port, where that path does not
+# exist — so either every endpoint fails and the cluster has no healthy hosts,
+# or the check passes against the wrong handler and a replica that cannot reach
+# Postgres keeps taking work.
+python3 - <<'ENVOY'
+import re
+import sys
+
+body = open("deploy/envoy/envoy.yaml").read()
+starts = [m.start() for m in re.finditer(r"^\s*- endpoint:", body, re.M)]
+if not starts:
+    print("envoy: no endpoints found, so this assertion checks nothing")
+    sys.exit(1)
+
+missing = []
+for i, start in enumerate(starts):
+    end = starts[i + 1] if i + 1 < len(starts) else len(body)
+    block = body[start:end]
+    if "health_check_config: { port_value: 8081 }" not in block:
+        address = next(
+            (l.strip() for l in block.splitlines() if "socket_address" in l), block.strip()
+        )
+        missing.append(address)
+
+if missing:
+    print("\nEnvoy endpoints health-checked on their traffic port:\n")
+    for m in missing:
+        print(f"  {m}")
+    print("\n/health/ready is on 8081; on 8080 the check tests the wrong handler.")
+    sys.exit(1)
+
+print(f"envoy: all {len(starts)} endpoints health-check port 8081")
+ENVOY
