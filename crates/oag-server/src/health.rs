@@ -97,24 +97,10 @@ mod tests {
     use crate::AppState;
     use std::sync::Arc;
 
+    /// Closed ports: `readiness` answers "not ready" without waiting, which is
+    /// all this test needs — the question is whose memo answered.
     fn state() -> Arc<AppState> {
-        // Closed ports: `readiness` answers "not ready" without waiting, which
-        // is all this test needs — the question is whose memo answered.
-        let config = oag_core::config::Config::from_yaml(
-            r#"
-database:
-  url: "postgres://oag:oag@127.0.0.1:1/oag"
-redis:
-  url: "redis://127.0.0.1:1"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-"#,
-        )
-        .expect("test config");
-        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
-        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
-        Arc::new(AppState::new(config, db, cache).expect("state"))
+        crate::testing::state("")
     }
 
     /// A8. The readiness memo belongs to one gateway, not to the process.

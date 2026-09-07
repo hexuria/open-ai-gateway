@@ -675,19 +675,7 @@ mod tests {
     /// A state whose Redis is a port nothing listens on: every slot question
     /// fails at connect, immediately. `Db::connect` is lazy and never dialled.
     fn dead_redis_state() -> Arc<AppState> {
-        let src = r#"
-database:
-  url: "postgres://oag:oag@127.0.0.1:1/oag"
-redis:
-  url: "redis://127.0.0.1:1"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-"#;
-        let config = oag_core::config::Config::from_yaml(src).expect("test config");
-        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
-        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
-        Arc::new(AppState::new(config, db, cache).expect("state"))
+        crate::testing::state("")
     }
 
     #[tokio::test]
@@ -1044,16 +1032,8 @@ security:
             eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
             return;
         };
-        let config = oag_core::config::Config::from_yaml(&format!(
-            r#"
-database:
-  url: "{db_url}"
-redis:
-  url: "{redis_url}"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-"#
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            &db_url, &redis_url, "",
         ))
         .expect("test config");
         let db = oag_store::Db::connect(&config.database.url, 4).expect("pool");

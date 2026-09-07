@@ -362,25 +362,9 @@ mod tests {
     // runtime in scope even though it dials nothing.
     #[tokio::test]
     async fn a_codex_base_url_is_normalised_like_every_other() {
-        let config = |base: &str| {
-            oag_core::config::Config::from_yaml(&format!(
-                r#"
-database:
-  url: "postgres://oag:oag@127.0.0.1:1/oag"
-redis:
-  url: "redis://127.0.0.1:1"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-gateway:
-  codex:
-    base_url: "{base}"
-"#
-            ))
-            .expect("test config")
-        };
         let build = |base: &str| {
-            let config = config(base);
+            let config =
+                crate::testing::config(&format!("gateway:\n  codex:\n    base_url: \"{base}\"\n"));
             let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
             let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
             AppState::new(config, db, cache)
@@ -413,21 +397,9 @@ gateway:
     #[tokio::test]
     async fn every_configured_base_url_goes_through_the_normaliser() {
         let build = |provider: &str, url: &str| {
-            let config = oag_core::config::Config::from_yaml(&format!(
-                r#"
-database:
-  url: "postgres://oag:oag@127.0.0.1:1/oag"
-redis:
-  url: "redis://127.0.0.1:1"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-gateway:
-  provider_base_urls:
-    {provider}: "{url}"
-"#
-            ))
-            .expect("a base URL override is valid configuration in its own right");
+            let config = crate::testing::config(&format!(
+                "gateway:\n  provider_base_urls:\n    {provider}: \"{url}\"\n"
+            ));
             let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
             let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
             AppState::new(config, db, cache)
@@ -473,20 +445,9 @@ gateway:
     #[tokio::test]
     async fn a_stream_ceiling_that_outlives_a_slot_is_refused_at_startup() {
         let build = |max_stream_duration: u64| {
-            let config = oag_core::config::Config::from_yaml(&format!(
-                r#"
-database:
-  url: "postgres://oag:oag@127.0.0.1:1/oag"
-redis:
-  url: "redis://127.0.0.1:1"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-gateway:
-  max_stream_duration: {max_stream_duration}
-"#
-            ))
-            .expect("the ceiling is valid configuration in its own right");
+            let config = crate::testing::config(&format!(
+                "gateway:\n  max_stream_duration: {max_stream_duration}\n"
+            ));
             let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
             let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
             AppState::new(config, db, cache)

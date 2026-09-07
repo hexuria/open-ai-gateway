@@ -3038,19 +3038,7 @@ mod tests {
     /// `Cache::connect` only opens a redis client, so the adapter lookup these
     /// tests are about runs long before any backend would.
     fn state() -> Arc<AppState> {
-        let src = r#"
-database:
-  url: "postgres://oag:oag@127.0.0.1:1/oag"
-redis:
-  url: "redis://127.0.0.1:1"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-"#;
-        let config = oag_core::config::Config::from_yaml(src).expect("test config");
-        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
-        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
-        Arc::new(AppState::new(config, db, cache).expect("state"))
+        crate::testing::state("")
     }
 
     fn auth_context() -> oag_store::AuthContext {
