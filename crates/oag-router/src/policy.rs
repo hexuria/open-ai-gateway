@@ -349,9 +349,20 @@ impl RoutingPolicy {
     ///
     /// Taking the dearer keeps both properties and adds the one that matters:
     /// a baseline can never be cheaper than a rung this route can reach, so a
-    /// served row can never report a negative saving. Ties go to the served
-    /// model, which is the more truthful of two equals — and deterministically,
-    /// because the ledger records the winner as `counterfactual_model`.
+    /// row served from the ladder can never report a negative saving. Ties go
+    /// to the served model, which is the more truthful of two equals — and
+    /// deterministically, because the ledger records the winner as
+    /// `counterfactual_model`.
+    ///
+    /// "From the ladder" is the limit of the claim, and it is worth stating.
+    /// A passthrough to an off-ladder model takes this same baseline, and that
+    /// model is only in `served` — and so only in `dearest_served` — if a
+    /// credential on the route advertises it. One that does not, or one priced
+    /// at zero (`dearest_served` skips free models, since a seat's zero would
+    /// win nothing), is compared against the ladder's ceiling instead, and a
+    /// dearer named model then reports a negative saving on its own row. The
+    /// headline excludes those rows by the seat predicate; a per-request view
+    /// does not.
     fn baseline(
         &self,
         catalog: &Catalog,

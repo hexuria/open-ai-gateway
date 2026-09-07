@@ -878,8 +878,11 @@ impl Prices {
                 // so the last row in catalogue order won a coin toss the caller
                 // could not see — and a transcript slug that matched it was
                 // priced against the wrong model, silently, on every row of the
-                // import. The tail-of-the-id key is the one that collides in
-                // practice: `openai/gpt-5` and `azure/gpt-5` both end `gpt-5`.
+                // import. The tail-of-the-id key is the one that collides:
+                // `index` filters the catalogue to a single provider two lines
+                // above, so the collision is never between providers — it is
+                // one row's `upstream_name` against another's id-tail *within*
+                // one, which is the pair the test fixtures.
                 //
                 // Marked rather than dropped, because the *unambiguous* keys of
                 // both models still work: only the spelling that cannot

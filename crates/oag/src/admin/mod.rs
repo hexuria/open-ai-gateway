@@ -1868,8 +1868,9 @@ async fn insert_account(
         return Err(oag_core::Error::Config(format!(
             "credential '{name}' was created but there is no route named '{route}', so it is \
              attached to nothing and no request can reach it. Create the route with \
-             `oag admin init --route {route}`, then re-run this command; the credential \
-             already stored is safe to delete or reuse."
+             `oag admin init --route {route}`, then attach this credential to it — \
+             re-running this command is refused, because the name is now taken by the \
+             row it just made. The secret is stored and does not need supplying again."
         )));
     }
 

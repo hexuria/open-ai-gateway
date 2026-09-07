@@ -92,8 +92,11 @@ gateway:
   # refused by the gateway rather than meaning "no deadline"; see its config.
   failoverBudgetSeconds: 120
 
-  # How often seat quotas are polled. The reserve every seat is held back by is
-  # evaluated against the figure this refreshes, so zero is refused too.
+  # How often seat quotas are polled. Zero is accepted and stops the poller —
+  # which also stops every seat's `usageReservePct` being enforced, because the
+  # figure that is evaluated against is only refreshed here. The gateway warns
+  # about that on the way up rather than refusing it: a deployment holding no
+  # seats has no reserve to protect and may want zero on purpose.
   usagePollIntervalSeconds: 300
   bedrockRegion: us-east-1
   # provider -> base URL. Leave empty to use each provider's public API.
@@ -249,8 +252,9 @@ serviceMonitor:
 
 # The alert rules, as a PrometheusRule.
 #
-# `deploy/prometheus/alerts.yml` holds the same rules for a standalone
-# Prometheus. On Kubernetes there was no way to get them: the chart shipped a
+# `deploy/prometheus/alerts.yml` holds the standalone-Prometheus set. Not the
+# same rules: the template lists what differs and why, and a reader comparing
+# the two files needs to be sent there rather than told they match. On Kubernetes there was no way to get them: the chart shipped a
 # ServiceMonitor, so metrics were scraped and nothing was ever paged on, and an
 # operator following the runbooks found the alerts they name do not exist.
 #

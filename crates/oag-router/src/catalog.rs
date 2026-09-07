@@ -22,12 +22,19 @@ use std::fmt;
 #[serde(transparent)]
 pub struct ModelId(pub String);
 
-/// Lets a `HashMap<ModelId, _>` be probed with a `&str`.
+/// Lets the catalogue's `BTreeMap<ModelId, _>` be probed with a `&str`.
 ///
 /// The map's lookups are on the request path and `ModelId::new(name)` allocated
-/// a `String` for each of them, only to drop it immediately. `Borrow` requires
-/// that the borrowed form hash identically to the owned one, which holds here
-/// because `ModelId` is a newtype over `String` and derives both.
+/// a `String` for each of them, only to drop it immediately.
+///
+/// `Borrow` requires the borrowed form to be *consistent* with the owned one
+/// under whichever trait the collection uses. The one that matters here is
+/// `Ord`, because `Catalog.models` is a `BTreeMap`: a probe walks the tree
+/// comparing `&str` against `ModelId`, and it finds the right node only because
+/// `ModelId`'s derived `Ord` is its `String`'s. `Hash` agrees for the same
+/// reason — the type is a newtype over `String` and derives both — so a
+/// `HashMap` keyed by `ModelId` would be probeable too. There is not one in the
+/// workspace today.
 impl std::borrow::Borrow<str> for ModelId {
     fn borrow(&self) -> &str {
         &self.0
