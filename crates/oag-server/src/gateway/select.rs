@@ -1018,20 +1018,10 @@ security:
         assert_eq!(reserve_holding_back(&rows), None);
     }
 
-    #[test]
-    fn a_slot_outlives_the_longest_permitted_request() {
-        // If a slot expired under a live request, the credential would be
-        // oversubscribed rather than merely leaky.
-        //
-        // Against the configured ceiling, not against a copy of its default.
-        // `assert!(SLOT_TTL > Duration::from_mins(30))` compared two constants
-        // and could only fail if someone edited one of them in this file — it
-        // said nothing about the deployment, which is where the ceiling
-        // actually comes from and where it can be raised past the TTL.
-        let default = oag_core::config::Config::default_gateway_max_stream_duration();
-        assert!(
-            SLOT_TTL > default,
-            "the shipped default must leave room: {SLOT_TTL:?} vs {default:?}"
-        );
-    }
+    // The slot-TTL-against-the-ceiling assertion used to live here and compared
+    // `SLOT_TTL` against the shipped default — two constants, agreeing by
+    // construction. It is now
+    // `state::tests::a_stream_ceiling_that_outlives_a_slot_is_refused_at_startup`,
+    // which drives `AppState::new` and so covers a deployment that raises the
+    // ceiling in its own YAML. That is the case the check was written for.
 }

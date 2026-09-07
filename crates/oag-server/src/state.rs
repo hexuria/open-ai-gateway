@@ -385,4 +385,54 @@ gateway:
             .expect_err("a query in a base URL is refused for codex too");
         assert!(err.to_string().contains("codex"), "{err}");
     }
+
+    /// G8. A stream ceiling that outlives a concurrency slot is refused here.
+    ///
+    /// A slot must outlive the longest request it guards. One that expires
+    /// under a live request oversubscribes the credential silently — nothing
+    /// observes a slot vanishing, so the first symptom is the provider's own
+    /// rate limit on a deployment that believes it is inside its limits.
+    ///
+    /// `select.rs` used to assert this by comparing `SLOT_TTL` against the
+    /// shipped default: two constants, which could only disagree if somebody
+    /// edited one of them, and which said nothing about the deployment that
+    /// raises the ceiling in its own YAML. That is precisely the deployment the
+    /// check exists for, so the assertion lives on the call instead — delete the
+    /// refusal in `AppState::new` and this fails, whereas the old one did not.
+    #[tokio::test]
+    async fn a_stream_ceiling_that_outlives_a_slot_is_refused_at_startup() {
+        let build = |max_stream_duration: u64| {
+            let config = oag_core::config::Config::from_yaml(&format!(
+                r#"
+database:
+  url: "postgres://oag:oag@127.0.0.1:1/oag"
+redis:
+  url: "redis://127.0.0.1:1"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+gateway:
+  max_stream_duration: {max_stream_duration}
+"#
+            ))
+            .expect("the ceiling is valid configuration in its own right");
+            let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+            let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+            AppState::new(config, db, cache)
+        };
+
+        let ttl = crate::gateway::select::SLOT_TTL.as_secs();
+        build(oag_core::config::Config::default_gateway_max_stream_duration().as_secs())
+            .expect("the shipped default must leave room, or no deployment starts");
+        build(ttl - 1).expect("a ceiling one second inside the TTL still fits");
+
+        for over in [ttl, ttl + 60] {
+            let err = build(over).expect_err("a ceiling at or past the slot TTL is refused");
+            assert!(
+                err.to_string().contains("max_stream_duration") && err.to_string().contains("slot"),
+                "the refusal names both numbers, because only the operator can \
+                 reconcile them: {err}"
+            );
+        }
+    }
 }

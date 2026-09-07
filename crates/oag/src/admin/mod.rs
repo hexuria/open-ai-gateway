@@ -2412,6 +2412,49 @@ mod tests {
         );
     }
 
+    /// And the exclusion itself, at the place that now owns it.
+    ///
+    /// The two tests above pin clap: it reads no environment variable, and it
+    /// refuses nothing. Neither reaches `add_account_from_args`, which is where
+    /// the refusal moved to — so with that check deleted both still pass, and a
+    /// `--secret` typed beside `--from` would be silently discarded. This one
+    /// parses the same command line and hands the parsed args to the command.
+    ///
+    /// The database is never reached: the check precedes every query, so a pool
+    /// pointed at a closed port is enough, and that it returns at all is part of
+    /// the assertion — a refusal made after the first query would hang here.
+    #[tokio::test]
+    async fn a_typed_secret_beside_an_importer_is_refused_by_the_command() {
+        let cli = AdminCli::try_parse_from([
+            "admin",
+            "account",
+            "add",
+            "--name",
+            "seat",
+            "--from",
+            "codex",
+            "--secret",
+            "typed-on-the-command-line",
+        ])
+        .expect("clap accepts it; the command is what refuses it");
+        let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+            panic!("expected an account add");
+        };
+
+        let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag_g0", 1).expect("lazy pool");
+        let kek = oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=")
+            .expect("kek");
+        let err = add_account_from_args(&db, &kek, args)
+            .await
+            .expect_err("a typed --secret beside --from is refused");
+        assert!(
+            err.to_string()
+                .contains("--secret cannot be combined with --from"),
+            "the error names the exclusion, so the operator knows which flag to \
+             drop and that the environment fallback is not the problem: {err}"
+        );
+    }
+
     /// C5. Changing a budget at the CLI evicts the identities that cache it.
     ///
     /// A budget lives in the cached auth context, not only in the row. The HTTP
