@@ -581,9 +581,10 @@ impl RoutingPolicy {
         max_output_tokens: u32,
         served: &std::collections::HashSet<String>,
     ) -> Option<RoutingDecision> {
+        let origin = from.clone();
         let mut from = from.clone();
         loop {
-            let next = self.escalate(
+            let mut next = self.escalate(
                 &from,
                 QualityGate::NoCredential,
                 signal,
@@ -592,6 +593,19 @@ impl RoutingPolicy {
                 served,
             )?;
             if next.model.provider != avoid {
+                // Relabelled to the rung the request actually left.
+                //
+                // `escalate` builds the reason from whatever `from` it was
+                // handed, and this loop hands it a cursor. So a climb that
+                // skipped `balanced` on its way from `cheap` to `frontier`
+                // recorded `escalated_from = balanced` — a rung nothing was
+                // ever dispatched to. The ledger's whole use for that column
+                // is answering "which rung is mis-set for this workload", and
+                // it was naming a rung the request never touched.
+                next.reason = SelectionReason::Escalated {
+                    from: origin.name.clone(),
+                    gate: QualityGate::NoCredential,
+                };
                 return Some(next);
             }
             // Strictly ascending — `escalate` resolves the rung above `from`,
@@ -870,21 +884,58 @@ mod tests {
              skipped, not settled for"
         );
 
-        // And when every rung above is the same provider, there is genuinely
+        // And the ledger is told the rung the request LEFT, not the cursor the
+        // walk happened to stop on. `escalate` builds the reason from whatever
+        // `from` it is handed, so a climb that skipped `balanced` recorded it
+        // as the origin — a rung nothing was ever dispatched to, in the column
+        // an operator reads to find a mis-set rung.
+        assert_eq!(
+            next.reason,
+            SelectionReason::Escalated {
+                from: TierName::new("cheap"),
+                gate: QualityGate::NoCredential,
+            },
+            "the climb started at cheap; balanced was skipped, never tried"
+        );
+
+        // And when every rung above really is the same provider, there is
         // nowhere to go: the original error is the honest answer, not a climb
         // onto a rung that will fail the same way.
+        //
+        // Its own ladder, because the fixture above cannot express it — its
+        // rungs above `cheap` are Kimi then Anthropic, so avoiding Anthropic
+        // from `cheap` lands on kimi-2 and the assertion passed without ever
+        // reaching the `None` this is about.
+        let all_one = Catalog::from_entries([
+            model("anthropic/haiku", Provider::Anthropic, 200_000, dec!(1)),
+            model("anthropic/sonnet", Provider::Anthropic, 200_000, dec!(3)),
+        ]);
+        let all_one_policy = RoutingPolicy::new(
+            TierLadder::new(vec![
+                Rung {
+                    name: TierName::new("cheap"),
+                    models: vec![ModelId::new("anthropic/haiku")],
+                },
+                Rung {
+                    name: TierName::new("frontier"),
+                    models: vec![ModelId::new("anthropic/sonnet")],
+                },
+            ])
+            .expect("non-empty"),
+            Box::new(HeuristicClassifier::default()),
+        );
         assert!(
-            policy
+            all_one_policy
                 .escalate_past_provider(
                     &Tier::new("cheap", 0),
                     Provider::Anthropic,
                     &RequestSignal::default(),
-                    &catalog,
+                    &all_one,
                     1024,
                     &HashSet::new(),
                 )
-                .is_none_or(|d| d.model.provider != Provider::Anthropic),
-            "a climb must never land on the provider it was climbing away from"
+                .is_none(),
+            "every rung above names the provider being climbed away from"
         );
 
         // The ceiling still terminates the walk rather than looping.
