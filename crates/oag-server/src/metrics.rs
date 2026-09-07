@@ -42,6 +42,10 @@ pub fn describe() {
         "Requests retried one tier up after a quality gate tripped."
     );
     describe_counter!(
+        "oag_channel_unavailable_total",
+        "Requests whose `@api`/`@sub` pin left no credential of that kind on the route."
+    );
+    describe_counter!(
         "oag_failovers_total",
         "Requests moved to a different credential after an upstream failure."
     );
@@ -141,4 +145,100 @@ pub async fn render(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         handle.render(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    /// A6. Every counter this crate emits has a description.
+    ///
+    /// An undescribed series still appears in `/metrics`; what it lacks is the
+    /// `# HELP` line, so the operator reading a dashboard has the name and
+    /// nothing else. The finding named three; two were described and
+    /// `oag_channel_unavailable_total` — added by G5's `@api`/`@sub` pin, after
+    /// the sweep — was not, so the fix was one short of its own scope.
+    ///
+    /// A source scan, and a whole-crate one: the alternative is installing a
+    /// recorder and provoking every counter, which needs the live paths each of
+    /// them sits on. What is checkable without that is the pairing, and a name
+    /// added anywhere in the crate fails this the moment it lands.
+    #[test]
+    fn every_metric_this_crate_emits_is_described() {
+        // Every `.rs` in the crate, so a counter introduced in any module is
+        // covered by where it lives rather than by being remembered here.
+        let sources = [
+            include_str!("metrics.rs"),
+            include_str!("lib.rs"),
+            include_str!("health.rs"),
+            include_str!("state.rs"),
+            include_str!("usage_poll.rs"),
+            include_str!("breakers.rs"),
+            include_str!("shutdown.rs"),
+            include_str!("listen.rs"),
+            include_str!("gateway/mod.rs"),
+            include_str!("gateway/select.rs"),
+            include_str!("gateway/meter.rs"),
+            include_str!("gateway/sse.rs"),
+            include_str!("gateway/refresh.rs"),
+            include_str!("gateway/models.rs"),
+            include_str!("gateway/alias.rs"),
+            include_str!("gateway/authn.rs"),
+            include_str!("gateway/presence.rs"),
+            include_str!("gateway/count_tokens.rs"),
+            include_str!("admin/mod.rs"),
+            include_str!("admin/auth.rs"),
+            include_str!("admin/write.rs"),
+            include_str!("admin/points.rs"),
+            include_str!("admin/services.rs"),
+        ];
+
+        // A name is emitted where it follows `counter!(`, `histogram!(` or
+        // `gauge!(`, and described where it follows `describe_`. This file
+        // holds both, so the two sets are read from what precedes the name
+        // rather than from which file it is in.
+        let names = |kinds: [&str; 3]| {
+            let mut found = std::collections::BTreeSet::new();
+            for src in sources {
+                for kind in kinds {
+                    for (at, _) in src.match_indices(kind) {
+                        let rest = &src[at + kind.len()..];
+                        let Some(open) = rest.find('"') else { continue };
+                        // Only whitespace between the macro and its first
+                        // argument, or this is some other call entirely.
+                        if !rest[..open].trim().is_empty() {
+                            continue;
+                        }
+                        let rest = &rest[open + 1..];
+                        if let Some(close) = rest.find('"')
+                            && rest[..close].starts_with("oag_")
+                        {
+                            found.insert(rest[..close].to_owned());
+                        }
+                    }
+                }
+            }
+            found
+        };
+
+        let described = names([
+            "describe_counter!(",
+            "describe_histogram!(",
+            "describe_gauge!(",
+        ]);
+        let mut emitted = names(["\ncounter!(", " counter!(", "::counter!("]);
+        emitted.extend(names(["\nhistogram!(", " histogram!(", "::histogram!("]));
+        emitted.extend(names(["\ngauge!(", " gauge!(", "::gauge!("]));
+
+        assert!(
+            !emitted.is_empty() && !described.is_empty(),
+            "the scan found nothing, so it is asserting nothing: {} emitted, {} described",
+            emitted.len(),
+            described.len()
+        );
+        let undescribed: Vec<&String> = emitted.difference(&described).collect();
+        assert!(
+            undescribed.is_empty(),
+            "these reach /metrics with no HELP line, so a dashboard shows the \
+             name and nothing else: {undescribed:?}"
+        );
+    }
 }
