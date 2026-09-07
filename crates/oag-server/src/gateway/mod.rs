@@ -1628,11 +1628,22 @@ async fn try_credential(
                 if let Some(d) = transport_failure(&state.breakers, account, retrying) {
                     apply_disposition(state, account, d).await;
                 }
-                if retrying {
-                    tokio::time::sleep(backoff(attempt)).await;
-                } else {
+                if !retrying {
                     return Outcome::Switch(last);
                 }
+                // The same re-check the `Step::Retry` arm makes, for the same
+                // reason and against the same failure it has just recorded.
+                // G7 added it there and not here, so a connect, TLS or DNS
+                // failure that tripped the breaker still received every
+                // remaining same-credential retry — the traffic a breaker
+                // exists to stop, aimed at the credential it has this moment
+                // decided is unhealthy. `transport_failure` above is what
+                // records that failure, so the breaker's answer here is fresh.
+                let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                if !state.breakers.permits(account, now) {
+                    return Outcome::Switch(last);
+                }
+                tokio::time::sleep(backoff(attempt)).await;
             }
         }
     }
@@ -2231,6 +2242,69 @@ mod tests {
         );
     }
 
+    /// G7's other arm: the transport failures retry against the breaker too.
+    ///
+    /// The re-check went onto the `Step::Retry` arm — the one reached from an
+    /// upstream *response* — and not onto the arm below it, which is where a
+    /// connect, TLS or DNS failure lands. Both loop back to the same credential
+    /// and both have just recorded a failure that may have opened its breaker,
+    /// so a credential that tripped on a connect error still received every
+    /// remaining retry: exactly the traffic a breaker exists to stop, aimed at
+    /// the credential it had this moment decided was unhealthy.
+    ///
+    /// A source scan for the same reason its sibling is one: reaching either
+    /// arm needs a live upstream failing in a specific way against a real
+    /// lease. What is checkable is that both arms ask, and that is what this
+    /// asks.
+    #[test]
+    fn both_retry_arms_re_ask_the_breaker() {
+        // The function's own text, cut before this module — a scan whose
+        // haystack includes the test doing the scanning counts its own string
+        // literals, which is how the first version of this passed with the fix
+        // reverted. It found that on its first revert-check.
+        let src = include_str!("mod.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]\n")
+            .map_or(src, |(code, _)| code);
+        let body = code
+            .split_once("async fn try_credential(")
+            .expect("the retry loop is in this file")
+            .1;
+        let loop_body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+
+        // Both arms that loop back to the same credential, and only those.
+        assert_eq!(
+            loop_body
+                .matches("tokio::time::sleep(backoff(attempt)).await")
+                .count(),
+            2,
+            "a third arm sleeping into another attempt is one this does not \
+             know to check: {loop_body}"
+        );
+        assert_eq!(
+            loop_body
+                .matches("state.breakers.permits(account, now)")
+                .count(),
+            2,
+            "one on the response-failure arm and one on the transport arm; \
+             either without the other is a credential retried past its own \
+             breaker on half the ways a request can fail"
+        );
+
+        // And each check must come before the sleep it guards, not after it.
+        for (i, segment) in loop_body
+            .split("tokio::time::sleep(backoff(attempt)).await")
+            .enumerate()
+            .take(2)
+        {
+            assert!(
+                segment.contains("!state.breakers.permits(account, now)"),
+                "the retry at sleep {i} goes out without asking the breaker \
+                 about the failure it has just recorded"
+            );
+        }
+    }
+
     /// G7. Every same-credential retry asks the breaker, not just the first.
     #[test]
     fn a_retry_rechecks_the_breaker_it_may_have_just_tripped() {
@@ -2334,7 +2408,9 @@ mod tests {
         // The module's code, not its tests — this assertion's own string
         // literal is a match otherwise, and a count that includes the thing
         // doing the counting is not a count.
-        let code = src.split_once("\n#[cfg(test)]\n").map_or(src, |(code, _)| code);
+        let code = src
+            .split_once("\n#[cfg(test)]\n")
+            .map_or(src, |(code, _)| code);
         assert_eq!(
             code.matches(guard).count(),
             2,
