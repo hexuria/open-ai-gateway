@@ -153,22 +153,69 @@ print("tofu: every private endpoint carries a DNS zone group")
 # or Cloud Logging. Cloud Run set it and Container Apps did not, so one
 # platform's logs arrived as prose — and the review's own note for this, "missing
 # Azure LOG_JSON", was answered against the wrong claim the first time.
-unstructured = [
-    d
-    for d in sorted(glob.glob("deploy/tofu/modules/compute-*/"))
-    if not any(
-        "OAG_TELEMETRY__LOG_JSON" in open(f).read() for f in glob.glob(f"{d}*.tf")
-    )
-]
+# In the block that SERVES, not merely somewhere in the file. D23 set this on
+# Azure's `init_container` — the one-shot migrate container — and left the
+# gateway container logging prose; the first version of this check grepped the
+# file, found the string, and passed. A guard that cannot tell those two apart
+# is the thing it was written to prevent.
+#
+# Two shapes to satisfy, because the three modules use both. Cloud Run and
+# Container Apps declare env inline per container, so the setting has to appear
+# after the line that marks the serving container — an init container is always
+# declared before the container it precedes. Fargate builds one
+# `local.container_env` and hands it to both containers, so what has to appear
+# after the marker is a reference to a local that sets it.
+SERVES = re.compile(r'args\s*=\s*\["serve"\]|command\s*=\s*\["serve"\]')
+LOG_JSON = "OAG_TELEMETRY__LOG_JSON"
+
+
+def locals_that_set(body, needle):
+    """Names of `locals` entries whose value mentions `needle`."""
+    names = set()
+    for opener in re.finditer(r"^locals\s*\{", body, re.M):
+        rest = body[opener.end():]
+        closer = re.search(r"^\}", rest, re.M)
+        block = rest[: closer.start()] if closer else rest
+        # Top-level entries in a `locals` block are indented two spaces.
+        parts = re.split(r"^  (\w+)\s*=", block, flags=re.M)
+        for k in range(1, len(parts) - 1, 2):
+            if needle in parts[k + 1]:
+                names.add(parts[k])
+    return names
+
+
+unstructured = []
+for d in sorted(glob.glob("deploy/tofu/modules/compute-*/")):
+    files = glob.glob(f"{d}*.tf")
+    if not any(LOG_JSON in open(f).read() for f in files):
+        unstructured.append(f"  {d}: never sets {LOG_JSON}")
+        continue
+
+    served = False
+    for f in files:
+        body = open(f).read()
+        marker = SERVES.search(body)
+        if not marker:
+            continue
+        after = body[marker.start():]
+        via_local = any(f"local.{n}" in after for n in locals_that_set(body, LOG_JSON))
+        if LOG_JSON in after or via_local:
+            served = True
+            break
+
+    if not served:
+        unstructured.append(
+            f"  {d}: sets {LOG_JSON}, but not where the serving container reads it"
+        )
 
 if unstructured:
-    print("\nCompute modules that never set OAG_TELEMETRY__LOG_JSON:\n")
-    for d in unstructured:
-        print(f"  {d}")
-    print("\nTheir logs arrive as prose, and nothing can query them by field.")
+    print("\nCompute modules whose serving container logs prose:\n")
+    print("\n".join(unstructured))
+    print("\nNothing can query those lines by field, and the replica that")
+    print("writes them is the one every request goes through.")
     sys.exit(1)
 
-print("tofu: every compute module asks for structured logs")
+print("tofu: every compute module's SERVING container asks for structured logs")
 
 # D11. The guarded number and the deployed number are the same number.
 #
