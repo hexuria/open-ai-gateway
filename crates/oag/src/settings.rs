@@ -33,20 +33,21 @@ pub fn load(path: Option<&str>) -> Result<Config> {
         .map_err(|e| Error::Config(format!("building config: {e}")))?;
     cfg.validate()?;
 
-    // Said once, at the only point a running gateway loads its configuration.
-    for warning in startup_warnings(&cfg) {
-        tracing::warn!("{warning}");
-    }
-
     Ok(cfg)
 }
 
 /// What a configuration that validates still deserves to be told about.
 ///
-/// Returned rather than logged in place so a test can read it: a `tracing`
-/// line has no seam, and the R12 warning went in with no test at all — delete
-/// it and every test in the workspace stays green, which is the shape of gap
-/// this round exists to close.
+/// Returned rather than logged so a test can read it: a `tracing` line has no
+/// seam, and the R12 warning went in with no test at all — delete it and every
+/// test in the workspace stayed green, which is the shape of gap this round
+/// exists to close.
+///
+/// Public, and emitted by the caller rather than here, for a second reason the
+/// first fix missed: `load` runs before `init_telemetry`, so a `tracing::warn!`
+/// inside it has no subscriber and goes nowhere. The one path a running gateway
+/// takes told the operator nothing at all while a unit test called this
+/// function directly and passed.
 ///
 /// R12. Zero is a legitimate `usage_poll_interval` — a deployment with no
 /// subscription seats has no reserve for the poller to protect — but it also
@@ -54,7 +55,7 @@ pub fn load(path: Option<&str>) -> Result<Config> {
 /// feature from the one the operator turned off. Refusing it was tried and was
 /// wrong: it stopped deployments that had chosen zero on purpose. Naming the
 /// consequence is the part that was actually missing.
-fn startup_warnings(cfg: &Config) -> Vec<String> {
+pub fn startup_warnings(cfg: &Config) -> Vec<String> {
     let mut warnings = Vec::new();
     if cfg.gateway.usage_poll_interval.is_zero() {
         warnings.push(
@@ -179,7 +180,7 @@ gateway:
             .expect("zero and sixty are both valid configuration")
         };
 
-        let warned = super::startup_warnings(&cfg(0));
+        let warned = startup_warnings(&cfg(0));
         assert_eq!(
             warned.len(),
             1,
@@ -192,7 +193,7 @@ gateway:
             warned[0]
         );
         assert!(
-            super::startup_warnings(&cfg(60)).is_empty(),
+            startup_warnings(&cfg(60)).is_empty(),
             "a positive interval has nothing to warn about"
         );
     }

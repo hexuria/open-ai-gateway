@@ -64,6 +64,15 @@ async fn run() -> Result<()> {
     let config = settings::load(cli.config.as_deref())?;
     init_telemetry(&config);
 
+    // After the subscriber, not before it. These were emitted from inside
+    // `settings::load`, which runs first — so every one of them went to a
+    // `tracing` with no subscriber installed and reached nobody, on the one
+    // path a running gateway actually takes. The test called the function
+    // directly and passed throughout.
+    for warning in settings::startup_warnings(&config) {
+        tracing::warn!("{warning}");
+    }
+
     match cli.command {
         Command::Config => {
             // `Config`'s Debug redacts the secret fields by hand.
