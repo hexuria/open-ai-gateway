@@ -84,6 +84,12 @@ jobs:
       - name: tofu reachability
         run: ./deploy/test/tofu-verify.sh
 
+      # The mock upstream is what every request-path check trusts to say which
+      # credential served a request. Nothing else can check it: a mock that read
+      # the header wrongly would agree with itself and the scripts would pass.
+      - name: mock upstream selftest
+        run: MOCK_SELFTEST=1 python3 deploy/test/mock-upstream.py
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:

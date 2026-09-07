@@ -2690,6 +2690,63 @@ mod tests {
         );
     }
 
+    /// H4's other half: the call sites, which the test above cannot see.
+    ///
+    /// `unserved_rows_are_spawned_off_the_request_future` proves
+    /// `spawn_unserved` detaches. It says nothing about whether
+    /// `run_with_escalation` uses it — put an inline `.await` back on any of the
+    /// three exits and that test stays green while the rows go with the dropped
+    /// request future, which is H4 exactly.
+    ///
+    /// A source scan, and it says so: the three exits are a client hang-up, a
+    /// budget refusal and an exhausted ladder, each reached only by driving a
+    /// real request to a real upstream failure. What is checkable without that
+    /// is the shape of the code, so that is what this checks.
+    ///
+    /// The served path's own `record_abandoned` / `record_lost` are inline on
+    /// purpose and are not a violation: they sit inside the `tokio::spawn` that
+    /// already writes the served row, after it, so the answer the client got is
+    /// in the ledger before the attempts that failed to be it. The assertion is
+    /// therefore about position, not about absence.
+    #[test]
+    fn every_unserved_exit_detaches_its_writes() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split_once("async fn run_with_escalation(")
+            .expect("the function is in this file")
+            .1;
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+
+        assert_eq!(
+            body.matches("spawn_unserved(state, abandoned, lost);")
+                .count(),
+            3,
+            "three exits leave without serving — a hang-up, a budget refusal \
+             and an exhausted ladder — and each owes the ledger its attempts"
+        );
+
+        // The served path's spawn. Everything after it is already detached.
+        let detached = body
+            .find("let state2 = Arc::clone(state);")
+            .expect("the served path spawns its writes");
+        for call in ["meter::record_abandoned(", "meter::record_lost("] {
+            let sites: Vec<usize> = body.match_indices(call).map(|(i, _)| i).collect();
+            assert_eq!(
+                sites.len(),
+                1,
+                "{call} appears {} times; every unserved exit should be going \
+                 through `spawn_unserved`",
+                sites.len()
+            );
+            assert!(
+                sites[0] > detached,
+                "{call} is awaited on the request's own future, so a client \
+                 that hangs up takes the row with it and the provider invoices \
+                 tokens the ledger never heard of"
+            );
+        }
+    }
+
     /// A three-rung ladder with somewhere to climb to, for the suppression
     /// predicate: the question it asks is counterfactual, so the fixture has to
     /// make the *other* blockers absent rather than merely unlikely.
