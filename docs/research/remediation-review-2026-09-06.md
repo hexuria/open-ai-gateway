@@ -77,6 +77,17 @@ Taken while closing the whole-stack review. Also settled.
    consumer sums `api − cost`, so that argument was overstated.
 4. **B3's clamp stays.** An Anthropic client's explicit `budget_tokens` above
    `max_tokens` is clamped rather than passed through to a 400.
+5. **Points follow B7.** Decision 3 was taken on the premise that nothing read
+   `counterfactual_api_usd` on its own; `key_usage_by_model` does, and derives
+   the **points** a partner service enforces member limits in from it. With the
+   literal zero, an abandoned or lost attempt on a metered credential costs the
+   gateway (`cost_usd` records it) and costs the member nothing in points;
+   before B7 the member paid for the attempt *and* the served answer. **Kept at
+   zero, knowingly**: a quality gate abandoning an answer is the gateway's own
+   escalation decision and a lost stream is an infrastructure failure, and
+   charging the member for either bills one request twice. Stated where the
+   column is written (`meter.rs`), where points are defined (`points.rs`), and
+   in the statement that sums them (`repo.rs`).
 
 ## The shape of it
 
