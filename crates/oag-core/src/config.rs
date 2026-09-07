@@ -1142,14 +1142,14 @@ security:
         let one = format!("{MINIMAL}\ngateway:\n  failover_budget: 1\n");
         Config::from_yaml(&one).expect("a short budget is a budget");
     }
-    /// R12. Zero disables the usage poller, and with it every seat reserve.
+    /// R12. Zero disables the usage poller, and is accepted.
     ///
-    /// `usage_reserve_pct` is evaluated against `usage_remaining_pct`, and only
-    /// the poller refreshes that. With the poller off it is stale at whatever
-    /// the last poll saw — or never set at all on a fresh replica — so every
-    /// reserve holds nothing back and a seat runs to the provider's own
-    /// refusal. "Disabled" silently disabled a different feature the operator
-    /// had not mentioned.
+    /// It also disables every seat reserve — `usage_reserve_pct` is evaluated
+    /// against `usage_remaining_pct`, and only the poller refreshes that — and
+    /// for a while this crate refused zero on those grounds. That was wrong: it
+    /// stopped deployments that had chosen zero on purpose because they hold no
+    /// seats. The consequence is worth saying, not enforcing; `oag`'s settings
+    /// loader says it, and its test is `a_zero_poll_interval_is_warned_about…`.
     #[test]
     fn a_usage_poll_interval_of_zero_is_accepted_rather_than_refused() {
         // It was refused for one commit, which made a comment correction into a
