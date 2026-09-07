@@ -41,9 +41,11 @@ from a 400. The renderer is therefore model-aware, and the shape is:
 
 - **4.5 and earlier**: `thinking: {type: "enabled", budget_tokens: N}`, clamped
   below `max_tokens`. `type: "adaptive"` is a 400 there.
-- **4.6**: both accepted, `budget_tokens` deprecated.
-- **4.7 and later**: `thinking: {type: "adaptive"}` with the depth on
+- **4.6 and later**: `thinking: {type: "adaptive"}` with the depth on
   `output_config.effort`, whose levels are the ones `Effort` already spells.
+  The vendor still accepts `budget_tokens` on 4.6 (deprecated) and rejects it
+  from 4.7; the renderer switches at 4.6, preferring the form that is not going
+  away, and `thinking_mode`'s test pins `claude-sonnet-4-6` as adaptive.
 - **`Off`**: no thinking block at all, on every version. Anthropic's floor for
   `budget_tokens` is 1024, so a budget of zero is not a way to say "do not
   think" there.
