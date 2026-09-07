@@ -164,10 +164,12 @@ mod tests {
     ///
     /// The holder parks in the Postgres handshake against a listener that
     /// accepts and never speaks, so it keeps its permit for as long as the test
-    /// needs and the second request's answer is deterministic rather than a
-    /// race. It is aborted rather than awaited: waiting out the pool's
-    /// ten-second acquire timeout would put thirty-odd seconds into every run
-    /// of this crate's tests to observe something already observed.
+    /// needs. The listener signals its first accept, and the second request is
+    /// sent only then: the pool dials after the permit is taken, so the accept
+    /// is proof the permit is held, and no sleep has to guess at it. The holder
+    /// is aborted rather than awaited: waiting out the pool's ten-second
+    /// acquire timeout would put thirty-odd seconds into every run of this
+    /// crate's tests to observe something already observed.
     ///
     /// Distinct keys on purpose: `authenticate` single-flights by hash, so two
     /// requests carrying the same key would be one lookup holding one permit.
@@ -181,30 +183,35 @@ mod tests {
 
         // Accepts the connection and never sends a byte, so the Postgres
         // startup message is never answered and the lookup holds its permit.
+        // The first accept is signalled: the pool dials only after the permit
+        // is taken, so a connection arriving here *is* the permit being held,
+        // and the second request can be sent the moment that is true rather
+        // than after a sleep that guesses at it.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let hangs = listener.local_addr().expect("addr");
+        let (dialled, permit_held) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             let mut held = Vec::new();
+            let mut dialled = Some(dialled);
             while let Ok((conn, _)) = listener.accept().await {
                 held.push(conn);
+                if let Some(tx) = dialled.take() {
+                    let _ = tx.send(());
+                }
             }
         });
 
-        let config = oag_core::config::Config::from_yaml(&format!(
-            r#"
-database:
-  url: "postgres://oag:oag@{hangs}/oag"
-  max_connections: 0
-redis:
-  url: "redis://127.0.0.1:1"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-"#
-        ))
-        .expect("test config");
+        let config = crate::testing::config_yaml(
+            &format!("postgres://oag:oag@{hangs}/oag"),
+            "redis://127.0.0.1:1",
+            "",
+        );
+        let mut config = oag_core::config::Config::from_yaml(&config).expect("test config");
+        // One permit. The pool is sized separately below, so the second
+        // request is refused by the permit rather than queued at the pool.
+        config.database.max_connections = 0;
         let db = oag_store::Db::connect(&config.database.url, 4).expect("lazy pool");
         let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
         let state = std::sync::Arc::new(crate::AppState::new(config, db, cache).expect("state"));
@@ -230,7 +237,10 @@ security:
         // timeout, and what it is for is holding the permit while the next
         // request asks for one.
         let holder = tokio::spawn(ask("oag_live_a_aaaaaaaaaaaaaaaaaaaaaaaa"));
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), permit_held)
+            .await
+            .expect("the holder reached the handshake, so it holds the permit")
+            .expect("the listener is alive");
 
         let shed = ask("oag_live_b_bbbbbbbbbbbbbbbbbbbbbbbb").await;
         holder.abort();
