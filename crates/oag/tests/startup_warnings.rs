@@ -10,6 +10,12 @@
 //! the same path a `serve` does — load, then telemetry, then the command — and
 //! needs no database, no Redis and no network.
 
+// `expect` is denied on the request path and permitted in `#[cfg(test)]`
+// modules. An integration test is its own crate and gets neither exemption, so
+// it is stated here: a fixture that cannot set itself up has to stop loudly,
+// and `?` in a test would turn a broken fixture into a silent pass.
+#![allow(clippy::expect_used)]
+
 use std::io::Write as _;
 use std::process::Command;
 
