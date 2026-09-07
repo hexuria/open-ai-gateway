@@ -1066,10 +1066,17 @@ fn render_tool_end(st: &mut RenderState, out: &mut String, id: &str) -> Option<(
 pub fn render_response(anthropic: &Value, request_id: &str) -> Value {
     let mut output = Vec::new();
     let mut text = String::new();
+    let mut thinking = String::new();
 
     for block in anthropic["content"].as_array().unwrap_or(&Vec::new()) {
         match block["type"].as_str().unwrap_or_default() {
             "text" => text.push_str(block["text"].as_str().unwrap_or_default()),
+            // Reasoning is collected too. This converter matched `text` and
+            // `tool_use` only, so a non-streamed request lost the thinking the
+            // identical streamed one delivers, with the tokens billed either
+            // way. A `reasoning` item carrying a summary part is the shape this
+            // dialect streams it in, and the shape its own reader expects.
+            "thinking" => thinking.push_str(block["thinking"].as_str().unwrap_or_default()),
             "tool_use" => output.push(json!({
                 "id": format!("fc_{request_id}_{}", output.len()),
                 "type": "function_call",
@@ -1093,6 +1100,20 @@ pub fn render_response(anthropic: &Value, request_id: &str) -> Value {
                 "status": "completed",
                 "role": "assistant",
                 "content": [{ "type": "output_text", "text": text, "annotations": [] }],
+            }),
+        );
+    }
+
+    // And reasoning before that, which is the order it is generated in and the
+    // order a stream emits it.
+    if !thinking.is_empty() {
+        output.insert(
+            0,
+            json!({
+                "id": format!("rs_{request_id}_0"),
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{ "type": "summary_text", "text": thinking }],
             }),
         );
     }
@@ -1145,6 +1166,31 @@ fn usage_json(u: &Usage) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P6. A collected answer keeps the reasoning a streamed one delivers.
+    #[test]
+    fn reasoning_survives_the_non_streamed_conversion() {
+        // The tokens are billed whether or not the client asked for a stream,
+        // so dropping the block on one path and not the other is a difference
+        // the client pays for and cannot see. A `reasoning` item carrying a
+        // summary part is the shape this dialect streams it in.
+        let out = render_response(
+            &json!({
+                "model": "claude-sonnet-4.5",
+                "content": [
+                    {"type": "thinking", "thinking": "counting users"},
+                    {"type": "text", "text": "SELECT count(*) FROM users;"},
+                ],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+            }),
+            "req-1",
+        );
+        let output = out["output"].as_array().expect("an output list");
+        assert_eq!(output[0]["type"], json!("reasoning"));
+        assert_eq!(output[0]["summary"][0]["text"], json!("counting users"));
+        assert_eq!(output[1]["type"], json!("message"));
+    }
 
     /// A realistic streamed response, with the full item and content-part
     /// lifecycle this dialect requires.

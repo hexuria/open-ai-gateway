@@ -55,7 +55,14 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
         "model": upstream_model,
         "messages": messages,
         "stream": req.stream,
+        // Both spellings. `max_tokens` is deprecated and rejected outright by
+        // the reasoning models — a gpt-5 or o-series request carrying it comes
+        // back 400 — while older models and most OpenAI-compatible upstreams
+        // know only that one. Sending both is what the SDKs settled on: a model
+        // that understands `max_completion_tokens` uses it, the rest read
+        // `max_tokens`, and the two never disagree because they are one value.
         "max_tokens": req.max_tokens,
+        "max_completion_tokens": req.max_tokens,
     });
 
     // The level, where the client gave one. A budget is rendered as the nearest
@@ -331,11 +338,29 @@ fn parse_one_message(m: &Value, system: &mut Vec<ContentBlock>, messages: &mut V
 
         if role == "system" || role == "developer" {
             // A system message becomes the top-level field, not a user turn.
-            if let Some(text) = m["content"].as_str() {
-                system.push(ContentBlock::Text {
-                    text: text.to_owned(),
+            //
+            // Both content forms, because both are legal here and the array one
+            // used to fall through to `return` — silently, so a client that sent
+            // its instructions as parts got an upstream asked the bare question
+            // with no system prompt at all and no field saying one was dropped.
+            // The user branch below and the `tool` branch above have always read
+            // arrays; this arm was the gap.
+            match &m["content"] {
+                Value::String(text) => system.push(ContentBlock::Text {
+                    text: text.clone(),
                     cache_control: None,
-                });
+                }),
+                Value::Array(parts) => {
+                    for p in parts {
+                        if let Some(text) = p["text"].as_str() {
+                            system.push(ContentBlock::Text {
+                                text: text.to_owned(),
+                                cache_control: None,
+                            });
+                        }
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -474,6 +499,17 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
         });
     }
 
+    // A streamed refusal arrives on its own channel, in fragments, exactly as
+    // content does. See the note in `parse_response`: unread it reads as an
+    // empty answer and buys a second refusal a rung up.
+    let mut refused = false;
+    if let Some(text) = delta["refusal"].as_str().filter(|t| !t.is_empty()) {
+        refused = true;
+        events.push(StreamEvent::TextDelta {
+            text: text.to_owned(),
+        });
+    }
+
     // Some OpenAI-compatible providers stream reasoning in a side channel.
     if let Some(text) = delta["reasoning_content"]
         .as_str()
@@ -540,7 +576,19 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
             events.push(StreamEvent::ToolUseEnd { id });
         }
         events.push(StreamEvent::Stop {
-            reason: parse_finish_reason(reason),
+            // `acc` saw the calls open in earlier frames; `opened` holds the
+            // ones announced in this one. See `parse_response` for why the
+            // wire word alone is not enough.
+            //
+            // `refused` only covers a refusal arriving in this same chunk,
+            // which is the common case — a refusal is short. One split across
+            // chunks still stops as `end_turn`, because nothing between here
+            // and the accumulator distinguishes a refusal delta from a text
+            // one. That is the pre-existing behaviour and it is not the part
+            // of H2 that cost money: the refusal text now reaches the client
+            // either way, so `quality_gate` no longer reads the answer as
+            // empty and buys a second refusal a rung up.
+            reason: finish_reason(reason, acc.saw_tool_call() || !opened.is_empty(), refused),
             usage: Usage::default(),
         });
     }
@@ -579,6 +627,22 @@ pub fn parse_response(body: &Value) -> Vec<StreamEvent> {
         });
     }
 
+    // Where this dialect puts a refusal: `content` is null and the words are
+    // here. Unread, the accumulator saw no text and no tool calls, so
+    // `quality_gate` called the answer empty, the gateway escalated a rung and
+    // paid a dearer model to refuse a second time — and the client was handed
+    // `"content": ""` for both. `responses.rs` has always read its own refusal
+    // channel; this was the one cell of the matrix that did not.
+    let refused = message["refusal"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .map(|text| {
+            events.push(StreamEvent::TextDelta {
+                text: text.to_owned(),
+            });
+        })
+        .is_some();
+
     // The same side channel several OpenAI-compatible providers use when
     // streaming reasoning.
     if let Some(text) = message["reasoning_content"]
@@ -613,8 +677,17 @@ pub fn parse_response(body: &Value) -> Vec<StreamEvent> {
     }
 
     if let Some(reason) = choice["finish_reason"].as_str().filter(|r| !r.is_empty()) {
+        // The wire word is not enough on its own. An upstream that finishes a
+        // tool-calling turn with `"stop"` rather than `"tool_calls"` is common,
+        // and taken at face value it tells an Anthropic client `end_turn` — so
+        // an agent loop dispatching on the stop reason treats the turn as final
+        // and never runs the tool it was just handed. `responses.rs` and
+        // `gemini.rs` both look at what actually arrived; this reader did not.
+        let called_a_tool = message["tool_calls"]
+            .as_array()
+            .is_some_and(|calls| !calls.is_empty());
         events.push(StreamEvent::Stop {
-            reason: parse_finish_reason(reason),
+            reason: finish_reason(reason, called_a_tool, refused),
             usage,
         });
     }
@@ -622,11 +695,22 @@ pub fn parse_response(body: &Value) -> Vec<StreamEvent> {
     events
 }
 
-fn parse_finish_reason(raw: &str) -> StopReason {
+/// The stop reason, from the wire word and what actually arrived with it.
+///
+/// The word alone is unreliable in two directions, and both were wrong here.
+/// An upstream may finish a tool-calling turn with `"stop"`, which read as
+/// `end_turn` and stalled every agent loop that dispatches on the stop reason;
+/// and a refusal comes through with `"stop"` too, which read as a normal answer
+/// that happened to be empty.
+fn finish_reason(raw: &str, called_a_tool: bool, refused: bool) -> StopReason {
     match raw {
         "length" => StopReason::MaxTokens,
         "tool_calls" | "function_call" => StopReason::ToolUse,
         "content_filter" => StopReason::Refusal,
+        // Below the named words, because a word that names the reason outright
+        // beats an inference from the payload.
+        _ if refused => StopReason::Refusal,
+        _ if called_a_tool => StopReason::ToolUse,
         _ => StopReason::EndTurn,
     }
 }
@@ -813,11 +897,19 @@ pub fn render_event(event: &StreamEvent, st: &mut RenderState) -> Option<String>
 #[must_use]
 pub fn render_completion(anthropic: &Value, request_id: &str) -> Value {
     let mut text = String::new();
+    let mut thinking = String::new();
     let mut tool_calls = Vec::new();
 
     for block in anthropic["content"].as_array().unwrap_or(&Vec::new()) {
         match block["type"].as_str().unwrap_or_default() {
             "text" => text.push_str(block["text"].as_str().unwrap_or_default()),
+            // Reasoning is collected too. This converter matched `text` and
+            // `tool_use` only, so a `"stream": false` request lost the thinking
+            // block that the identical streamed request delivers — while the
+            // tokens were billed either way. `reasoning_content` is the field
+            // `render_event` streams it on, so a client sees the same shape
+            // whichever way it asked.
+            "thinking" => thinking.push_str(block["thinking"].as_str().unwrap_or_default()),
             "tool_use" => tool_calls.push(json!({
                 "id": block["id"],
                 "type": "function",
@@ -844,6 +936,9 @@ pub fn render_completion(anthropic: &Value, request_id: &str) -> Value {
     let output = u["output_tokens"].as_u64().unwrap_or(0);
 
     let mut message = json!({ "role": "assistant", "content": text });
+    if !thinking.is_empty() {
+        message["reasoning_content"] = json!(thinking);
+    }
     if !tool_calls.is_empty() {
         message["tool_calls"] = Value::Array(tool_calls);
         // This dialect wants a null content when the turn is only tool calls.
@@ -911,6 +1006,153 @@ mod tests {
             out.extend(events);
         }
         (out, acc)
+    }
+
+    /// H1. An array-form system message carries instructions like any other.
+    #[test]
+    fn a_system_message_written_as_parts_still_reaches_the_upstream() {
+        // Both forms are legal in this dialect. The array one used to be
+        // dropped in silence, so the model was asked the user's question with
+        // no instructions at all and nothing said a field had gone missing.
+        let body = json!({"messages": [
+            {"role": "system", "content": [
+                {"type": "text", "text": "You are a SQL generator."},
+                {"type": "text", "text": "Never write prose."},
+            ]},
+            {"role": "user", "content": "count the users"},
+        ]});
+        let req = parse_request(&body).expect("parses");
+        let system: Vec<&str> = req
+            .system
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            system,
+            vec!["You are a SQL generator.", "Never write prose."]
+        );
+    }
+
+    /// H2, whole-body half. A refusal is an answer, not an empty response.
+    #[test]
+    fn a_refusal_is_read_as_text_rather_than_as_nothing() {
+        // `content` is null and the words are in `refusal`. Unread, the
+        // accumulator saw nothing at all, the quality gate called it empty,
+        // and the gateway escalated a rung to buy a second refusal.
+        let body = json!({"choices": [{"message": {
+            "content": Value::Null,
+            "refusal": "I'm sorry, I can't help with that.",
+        }, "finish_reason": "stop"}]});
+        let events = parse_response(&body);
+        let mut acc = StreamAccumulator::new();
+        for e in &events {
+            acc.observe(e);
+        }
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::TextDelta { text } if text.contains("can't help")
+            )),
+            "the refusal text reaches the client: {events:?}"
+        );
+        assert_eq!(acc.stop_reason(), Some(StopReason::Refusal));
+        assert_eq!(
+            acc.quality_gate(),
+            Some(oag_router::QualityGate::Refusal),
+            "a refusal, not an empty response"
+        );
+    }
+
+    /// H2, streamed half.
+    #[test]
+    fn a_streamed_refusal_is_read_as_text_too() {
+        let (events, acc) = drive(&[
+            r#"{"choices":[{"delta":{"role":"assistant","content":null},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"refusal":"I can't help with that."},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::TextDelta { text } if text.contains("can't help")
+            )),
+            "{events:?}"
+        );
+        assert_ne!(
+            acc.quality_gate(),
+            Some(oag_router::QualityGate::EmptyResponse),
+            "a refusal is not an empty response"
+        );
+    }
+
+    /// P7. The wire word is not the whole stop reason.
+    #[test]
+    fn a_tool_call_finished_with_stop_still_stops_as_a_tool_use() {
+        // Plenty of OpenAI-compatible upstreams end a tool-calling turn with
+        // `"stop"`. Taken at face value that reaches an Anthropic client as
+        // `end_turn`, and an agent loop dispatching on the stop reason treats
+        // the turn as final and never runs the tool it was just handed.
+        let body = json!({"choices": [{"message": {
+            "content": Value::Null,
+            "tool_calls": [{"id": "call_1", "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"}}],
+        }, "finish_reason": "stop"}]});
+        let mut acc = StreamAccumulator::new();
+        for e in &parse_response(&body) {
+            acc.observe(e);
+        }
+        assert_eq!(acc.stop_reason(), Some(StopReason::ToolUse));
+
+        // And streamed, where the call opened in an earlier chunk.
+        let (_, acc) = drive(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        assert_eq!(acc.stop_reason(), Some(StopReason::ToolUse));
+    }
+
+    /// P11. The reasoning models reject `max_tokens` outright.
+    #[test]
+    fn the_output_cap_is_sent_under_both_spellings() {
+        // A gpt-5 or o-series request carrying `max_tokens` comes back 400;
+        // older models and most compatible upstreams know only that spelling.
+        // One value, both names, so neither kind of upstream is excluded.
+        let req = parse_request(&json!(
+            {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1024}
+        ))
+        .expect("parses");
+        let body = render_request(&req, "gpt-5").expect("renders");
+        assert_eq!(body["max_tokens"], json!(1024));
+        assert_eq!(body["max_completion_tokens"], json!(1024));
+    }
+
+    /// P6. A collected answer keeps the reasoning a streamed one delivers.
+    #[test]
+    fn reasoning_survives_the_non_streamed_conversion() {
+        // The tokens are billed whether or not the client asked for a stream,
+        // so dropping the block on one path and not the other is a difference
+        // the client pays for and cannot see.
+        let anthropic = json!({
+            "model": "claude-sonnet-4.5",
+            "content": [
+                {"type": "thinking", "thinking": "The user wants a count."},
+                {"type": "text", "text": "SELECT count(*) FROM users;"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        });
+        let out = render_completion(&anthropic, "req-1");
+        assert_eq!(
+            out["choices"][0]["message"]["reasoning_content"],
+            json!("The user wants a count.")
+        );
+        assert_eq!(
+            out["choices"][0]["message"]["content"],
+            json!("SELECT count(*) FROM users;")
+        );
     }
 
     #[test]
