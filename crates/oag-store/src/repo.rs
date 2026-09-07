@@ -4004,17 +4004,28 @@ mod tests {
             lines
         };
 
-        // Did the index supply a bound, or was it merely walked? `Index Cond`
-        // under the scan node is the planner saying the index's own columns
-        // narrowed the search; without one it read every entry and filtered on
-        // the heap, which a partial index on `schedulable` allows whatever it
-        // is keyed on.
+        // Did the index supply a bound anywhere, or was it merely walked?
+        // `Index Cond` under a scan node is the planner saying the index's own
+        // columns narrowed the search; without one it read every entry and
+        // filtered on the heap, which a partial index on `schedulable` allows
+        // whatever it is keyed on.
+        //
+        // *Every* occurrence, not the first. Both plans are searched together
+        // and the index can appear in each, so which one comes first is a
+        // property of the table's statistics rather than of the index: with
+        // `account` nearly empty the planner takes the partial index for
+        // `route_channels` too, as a plain Index Scan with a `Filter` and no
+        // `Index Cond` — and a check that stopped there would conclude the
+        // control could not say yes and fail on a fresh database while passing
+        // on a developer's populated one.
         let bounded = |plan: &[String]| {
-            plan.iter()
-                .skip_while(|l| !l.contains("account_schedulable_idx"))
-                .skip(1)
-                .take_while(|l| !l.contains("->"))
-                .any(|l| l.contains("Index Cond:"))
+            plan.iter().enumerate().any(|(i, line)| {
+                line.contains("account_schedulable_idx")
+                    && plan[i + 1..]
+                        .iter()
+                        .take_while(|l| !l.contains("->"))
+                        .any(|l| l.contains("Index Cond:"))
+            })
         };
 
         // The control. An index whose columns the poller can genuinely use, so
