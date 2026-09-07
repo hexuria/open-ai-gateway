@@ -250,6 +250,20 @@ pub struct Summary {
     /// credential it was booked against. Empty until something has been
     /// imported, so a deployment that only ever proxies sees no extra noise.
     pub by_origin: Vec<OriginRow>,
+    /// Sections that failed to load and are therefore empty for a reason other
+    /// than having nothing in them.
+    ///
+    /// The two lists above degrade to empty rather than failing the whole
+    /// summary — one slow sub-query must not take down the page — but an empty
+    /// Subscriptions section reads exactly like a deployment with no seats, so
+    /// an operator whose seat query timed out concluded the seats had been
+    /// removed. The three sibling queries return 500 for the same failure and
+    /// say in comments why they do; these two cannot, so they say which of them
+    /// is missing instead.
+    ///
+    /// Empty on a healthy response, which is the common case and costs a caller
+    /// nothing to ignore.
+    pub degraded: Vec<&'static str>,
 }
 
 /// One subscription seat's economics over the window.
@@ -322,7 +336,11 @@ pub struct TierRow {
 /// whether or not this gateway carried it, and the fee it is measured against
 /// was paid either way. The same predicate keeps it out of the headline, so it
 /// is stated once.
-async fn seat_summaries(db: &oag_store::Db, window: &period::Resolved) -> Vec<SeatRow> {
+async fn seat_summaries(
+    db: &oag_store::Db,
+    window: &period::Resolved,
+    degraded: &mut Vec<&'static str>,
+) -> Vec<SeatRow> {
     let seats: Vec<SeatTuple> = sqlx::query_as(
         r"
             SELECT a.name,
@@ -357,6 +375,7 @@ async fn seat_summaries(db: &oag_store::Db, window: &period::Resolved) -> Vec<Se
     // from a query that failed. Say which it was.
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
+        degraded.push("subscriptions");
         Vec::new()
     });
 
@@ -450,7 +469,11 @@ const ORIGIN_BREAKDOWN_SQL: &str = r"
             ORDER BY u.origin, COALESCE(SUM(u.counterfactual_api_usd), 0) DESC, a.name
             ";
 
-async fn origin_breakdown(db: &oag_store::Db, window: &period::Resolved) -> Vec<OriginRow> {
+async fn origin_breakdown(
+    db: &oag_store::Db,
+    window: &period::Resolved,
+    degraded: &mut Vec<&'static str>,
+) -> Vec<OriginRow> {
     let rows: Vec<OriginTuple> = sqlx::query_as(ORIGIN_BREAKDOWN_SQL)
         .bind(window.start)
         .bind(window.end)
@@ -462,6 +485,7 @@ async fn origin_breakdown(db: &oag_store::Db, window: &period::Resolved) -> Vec<
         // from a query that failed. Say which it was.
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
+            degraded.push("origins");
             Vec::new()
         });
 
@@ -486,6 +510,22 @@ async fn origin_breakdown(db: &oag_store::Db, window: &period::Resolved) -> Vec<
             },
         )
         .collect()
+}
+
+/// One row of the per-rung breakdown, formatted.
+///
+/// Its own function only because `summary` sits on the hundred-line limit and
+/// this is the part of it that is arithmetic rather than decisions.
+fn tier_row(
+    (tier, requests, spent, cf): (String, i64, rust_decimal::Decimal, rust_decimal::Decimal),
+) -> TierRow {
+    TierRow {
+        tier,
+        requests,
+        spent_usd: format!("{spent:.4}"),
+        counterfactual_usd: format!("{cf:.4}"),
+        saved_usd: format!("{:.4}", cf - spent),
+    }
 }
 
 pub async fn summary(
@@ -578,7 +618,10 @@ pub async fn summary(
         rust_decimal::Decimal::ZERO
     };
 
-    let subscriptions = seat_summaries(&state.db, &window).await;
+    // Named rather than counted: a caller that only knows "something failed"
+    // still cannot tell the reader which number to distrust.
+    let mut degraded: Vec<&'static str> = Vec::new();
+    let subscriptions = seat_summaries(&state.db, &window, &mut degraded).await;
 
     let hit_rate = if prompt > 0 {
         rust_decimal::Decimal::from(cached) / rust_decimal::Decimal::from(prompt)
@@ -586,6 +629,9 @@ pub async fn summary(
     } else {
         rust_decimal::Decimal::ZERO
     };
+
+    // Before the literal, so `degraded` is complete when it is read into it.
+    let by_origin = origin_breakdown(&state.db, &window, &mut degraded).await;
 
     Json(Summary {
         window: window.view(),
@@ -595,18 +641,10 @@ pub async fn summary(
         saved_usd: format!("{saved:.4}"),
         saved_pct: format!("{pct:.1}"),
         cache_hit_rate: format!("{hit_rate:.1}"),
-        by_origin: origin_breakdown(&state.db, &window).await,
+        by_origin,
+        degraded,
         subscriptions,
-        by_tier: by_tier
-            .into_iter()
-            .map(|(tier, requests, spent, cf)| TierRow {
-                tier,
-                requests,
-                spent_usd: format!("{spent:.4}"),
-                counterfactual_usd: format!("{cf:.4}"),
-                saved_usd: format!("{:.4}", cf - spent),
-            })
-            .collect(),
+        by_tier: by_tier.into_iter().map(tier_row).collect(),
     })
     .into_response()
 }
@@ -976,7 +1014,113 @@ pub async fn usage(State(state): State<Arc<AppState>>, Query(page): Query<Page>)
 
 #[cfg(test)]
 mod tests {
-    use super::ORIGIN_BREAKDOWN_SQL;
+    use super::{ORIGIN_BREAKDOWN_SQL, Summary};
+
+    /// A3, end to end: a section whose query fails names itself.
+    ///
+    /// Driven through the real helper against a database that cannot answer,
+    /// because the defect is in the wiring rather than in the shape — asserting
+    /// that `Summary` can carry a `degraded` list says nothing about whether
+    /// anything ever puts a name in it.
+    #[tokio::test]
+    async fn a_section_whose_query_fails_puts_its_name_in_degraded() {
+        // A reachable Postgres and a database that is not there: the connection
+        // is refused when the query asks for it, which is exactly where these
+        // helpers catch a failure — and it fails in milliseconds, where an
+        // unreachable host costs the pool's full ten-second acquire timeout.
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let Some((prefix, _)) = url.rsplit_once('/') else {
+            eprintln!("skipped: no database name in OAG_TEST_DATABASE_URL");
+            return;
+        };
+        let db = oag_store::Db::connect(&format!("{prefix}/oag_no_such_database"), 1)
+            .expect("lazy connect");
+        let window = super::period::resolve(
+            &super::period::Window::default(),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("window");
+
+        let mut degraded = Vec::new();
+        let seats = super::seat_summaries(&db, &window, &mut degraded).await;
+        assert!(seats.is_empty(), "nothing could be read");
+        assert_eq!(
+            degraded,
+            vec!["subscriptions"],
+            "an empty list alone reads as a deployment with no seats, which is \
+             a conclusion an operator acts on and it is wrong"
+        );
+
+        let origins = super::origin_breakdown(&db, &window, &mut degraded).await;
+        assert!(origins.is_empty());
+        assert_eq!(degraded, vec!["subscriptions", "origins"]);
+    }
+
+    /// A3. A section that failed is distinguishable from one that is empty.
+    ///
+    /// The two list sections degrade to empty rather than failing the whole
+    /// summary — one slow sub-query must not take down the page — but an empty
+    /// Subscriptions section reads exactly like a deployment with no seats. An
+    /// operator whose seat query timed out concluded the seats had been
+    /// removed, which is a conclusion worth acting on and wrong.
+    #[test]
+    fn a_degraded_summary_names_the_sections_that_failed() {
+        let json = serde_json::to_value(Summary {
+            window: super::period::resolve(
+                &super::period::Window::default(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("the default window resolves")
+            .view(),
+            requests: 0,
+            spent_usd: "0.0000".to_owned(),
+            counterfactual_usd: "0.0000".to_owned(),
+            saved_usd: "0.0000".to_owned(),
+            saved_pct: "0.0".to_owned(),
+            cache_hit_rate: "0.0".to_owned(),
+            by_tier: Vec::new(),
+            subscriptions: Vec::new(),
+            by_origin: Vec::new(),
+            degraded: vec!["subscriptions"],
+        })
+        .expect("serialises");
+
+        assert_eq!(
+            json["degraded"],
+            serde_json::json!(["subscriptions"]),
+            "an empty list plus a named section is a different answer from an \
+             empty list alone, and it is the true one"
+        );
+        assert_eq!(json["subscriptions"], serde_json::json!([]));
+    }
+
+    /// And a healthy summary says nothing, which costs a caller nothing.
+    #[test]
+    fn a_healthy_summary_reports_no_degraded_sections() {
+        let json = serde_json::to_value(Summary {
+            window: super::period::resolve(
+                &super::period::Window::default(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .expect("the default window resolves")
+            .view(),
+            requests: 1,
+            spent_usd: "1.0000".to_owned(),
+            counterfactual_usd: "9.0000".to_owned(),
+            saved_usd: "8.0000".to_owned(),
+            saved_pct: "88.9".to_owned(),
+            cache_hit_rate: "0.0".to_owned(),
+            by_tier: Vec::new(),
+            subscriptions: Vec::new(),
+            by_origin: Vec::new(),
+            degraded: Vec::new(),
+        })
+        .expect("serialises");
+        assert_eq!(json["degraded"], serde_json::json!([]));
+    }
 
     /// A7. The origin table groups by credential identity and measures one thing.
     ///

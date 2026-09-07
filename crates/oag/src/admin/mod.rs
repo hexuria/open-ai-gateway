@@ -50,6 +50,9 @@ pub enum AdminCommand {
     /// Routing policy for a named route.
     #[command(subcommand)]
     Route(RouteCommand),
+    /// Principals: the identities keys are minted against.
+    #[command(subcommand)]
+    Principal(PrincipalCommand),
     /// Model catalog: seed, overlay prices, list.
     #[command(subcommand)]
     Catalog(CatalogCommand),
@@ -111,6 +114,19 @@ pub enum AdminCommand {
     FlushCache,
 }
 
+/// The one command that changes a principal's authority.
+#[derive(Subcommand, Debug)]
+pub enum PrincipalCommand {
+    /// Grant the admin role.
+    ///
+    /// Deliberately separate from `init`, which used to grant it as a side
+    /// effect of adding a route. There is no `demote`: see `promote_principal`.
+    Promote {
+        #[arg(long)]
+        email: String,
+    },
+}
+
 /// A CLI whose session we can import as an OAuth seat.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum AccountSource {
@@ -122,6 +138,13 @@ pub enum AccountSource {
 
 #[derive(Subcommand, Debug)]
 pub enum AccountCommand {
+    /// Rename a credential. The way out of a duplicate name.
+    Rename {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
     /// Register an upstream credential.
     Add {
         #[command(flatten)]
@@ -181,15 +204,25 @@ pub struct AccountAddArgs {
         conflicts_with_all = ["from", "from_grok", "from_codex"]
     )]
     provider: Option<String>,
-    /// The provider API key. Read from `OAG_ACCOUNT_SECRET` if omitted, so it
-    /// need not appear in shell history or the process table.
-    #[arg(
-        long,
-        env = "OAG_ACCOUNT_SECRET",
-        hide_env_values = true,
-        required_unless_present_any = ["from", "from_grok", "from_codex"],
-        conflicts_with_all = ["from", "from_grok", "from_codex"]
-    )]
+    /// The provider API key.
+    ///
+    /// Falls back to `OAG_ACCOUNT_SECRET`, so it need not appear in shell
+    /// history or the process table. Required with `--provider`, and read in
+    /// `add_account_from_args` rather than declared here with clap's `env`.
+    ///
+    /// That is the whole of finding C8. clap treats an env-supplied value as
+    /// explicitly present when it evaluates conflicts, so with
+    /// `OAG_ACCOUNT_SECRET` exported — the documented way to keep a key out of
+    /// shell history, recommended by this very help text — every `--from`
+    /// import failed with "the argument '--secret' cannot be used with
+    /// '--from'", naming a flag that was not on the command line. Only the
+    /// operator who followed the advice could hit it.
+    ///
+    /// Reading the variable ourselves keeps the two cases distinguishable: a
+    /// `--secret` that was typed conflicts with an importer and is refused
+    /// below, and one inherited from the environment does not, because the
+    /// operator was not asserting anything about this invocation.
+    #[arg(long)]
     secret: Option<String>,
     /// Import a signed-in CLI session as an OAuth credential.
     ///
@@ -469,13 +502,16 @@ pub async fn run(
             email,
             route,
             budget_usd,
-        } => init(db, &email, &route, budget_usd).await,
+        } => init(db, redis_url, &email, &route, budget_usd).await,
         AdminCommand::Status => status(db).await,
         AdminCommand::Doctor { route } => doctor::run(db, config, &route).await,
         AdminCommand::Providers => print_providers(db).await,
         AdminCommand::Account(cmd) => account_cmd(db, kek, cmd).await,
         AdminCommand::Key(cli) => key_cmd(db, redis_url, cli).await,
         AdminCommand::Route(cmd) => route_cmd(db, cmd).await,
+        AdminCommand::Principal(PrincipalCommand::Promote { email }) => {
+            promote_principal(db, &email).await
+        }
         AdminCommand::Catalog(cmd) => catalog_cmd(db, kek, cmd).await,
         AdminCommand::Usage(cmd) => usage_cmd(db, cmd).await,
         AdminCommand::Cache(CacheCommand::Flush) | AdminCommand::FlushCache => {
@@ -522,6 +558,7 @@ async fn account_cmd(db: &Db, kek: &Kek, cmd: AccountCommand) -> Result<()> {
     match cmd {
         AccountCommand::Add { args } => add_account_from_args(db, kek, args).await,
         AccountCommand::List => list_accounts(db).await,
+        AccountCommand::Rename { from, to } => rename_account(db, &from, &to).await,
         AccountCommand::Disable { name } => set_account_schedulable(db, &name, false).await,
         AccountCommand::Enable { name } => set_account_schedulable(db, &name, true).await,
         AccountCommand::SetCost { name, monthly_cost } => {
@@ -648,6 +685,24 @@ async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddArgs) -> Resu
     } else {
         from
     };
+
+    // The exclusion clap used to express, enforced where the distinction is
+    // visible. An imported seat takes its credential from a signed-in CLI's
+    // session file, so a `--secret` typed alongside `--from` would be silently
+    // ignored — worth an error. One sitting in the environment is not: it is
+    // there for every other invocation and says nothing about this one.
+    if source.is_some() && secret.is_some() {
+        return Err(oag_core::Error::Config(
+            "--secret cannot be combined with --from: an imported seat takes its \
+             credential from the CLI session file, so a secret passed here would be \
+             ignored. A secret in OAG_ACCOUNT_SECRET is fine — this is only about the \
+             flag."
+                .to_owned(),
+        ));
+    }
+
+    // Only after the conflict check, so the fallback cannot resurrect it.
+    let secret = secret.or_else(|| std::env::var("OAG_ACCOUNT_SECRET").ok());
     match source {
         Some(AccountSource::Grok) => {
             import_grok(
@@ -682,7 +737,10 @@ async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddArgs) -> Resu
         None => {
             let (Some(provider), Some(secret)) = (provider, secret) else {
                 return Err(oag_core::Error::Config(
-                    "--provider and --secret are required without --from".to_owned(),
+                    "--provider and --secret are required without --from. The secret may \
+                     come from OAG_ACCOUNT_SECRET instead of the flag, which keeps it out \
+                     of shell history."
+                        .to_owned(),
                 ));
             };
             add_account(
@@ -711,6 +769,12 @@ async fn key_cmd(db: &Db, redis_url: &str, cli: KeyCli) -> Result<()> {
             floor_tier,
             admin,
         }) => {
+            // The admin gate wants BOTH the key's flag and the principal's
+            // role, so an admin key on a member principal is refused by every
+            // admin endpoint it is presented to. It is enforced inside
+            // `mint_key`, which is the only place all three callers pass
+            // through — this arm and the one below used to check for
+            // themselves, and `init` did not check at all.
             let key = mint_key(db, &email, &route, &name, floor_tier.as_deref(), admin).await?;
             print_key(&key);
             Ok(())
@@ -827,14 +891,23 @@ type AccountListRow = (
     i16,
     Option<rust_decimal::Decimal>,
     Option<i16>,
+    Option<String>,
 );
 
 async fn list_accounts(db: &Db) -> Result<()> {
     let rows: Vec<AccountListRow> = sqlx::query_as(
         r"
-        SELECT name, provider, kind, schedulable, cooldown_until, rate_limited_until, priority,
-               usage_remaining_pct, usage_reserve_pct
-        FROM account ORDER BY provider, name
+        -- `owner_principal_id` joined to an email, because a credential bound
+        -- to a principal serves that principal and nobody else — the scheduler
+        -- filters on it — and no CLI output mentioned the binding at all. A
+        -- bound seat listed as `ready` is true and misleading in the same
+        -- breath: ready for one person.
+        SELECT a.name, a.provider, a.kind, a.schedulable, a.cooldown_until,
+               a.rate_limited_until, a.priority,
+               a.usage_remaining_pct, a.usage_reserve_pct, p.email
+        FROM account a
+        LEFT JOIN principal p ON p.id = a.owner_principal_id
+        ORDER BY a.provider, a.name
         ",
     )
     .fetch_all(db.pool())
@@ -845,10 +918,22 @@ async fn list_accounts(db: &Db) -> Result<()> {
         println!("no credentials; add one with `oag admin account add`");
         return Ok(());
     }
-    println!("NAME                 PROVIDER     KIND       STATE          PRIORITY  RESERVE");
+    println!(
+        "NAME                 PROVIDER     KIND       STATE          PRIORITY  RESERVE  OWNER"
+    );
     let now = time::OffsetDateTime::now_utc();
-    for (name, provider, kind, schedulable, cooldown, rate_limited, priority, remaining, reserve) in
-        rows
+    for (
+        name,
+        provider,
+        kind,
+        schedulable,
+        cooldown,
+        rate_limited,
+        priority,
+        remaining,
+        reserve,
+        owner,
+    ) in rows
     {
         // "held back" outranks "ready" and nothing else: a reserved-out seat is
         // as unschedulable as a rate limited one, and a listing that called it
@@ -867,7 +952,12 @@ async fn list_accounts(db: &Db) -> Result<()> {
         // A dash rather than a blank where no reserve is set: a column that
         // simply stops has already been read as "the listing is truncated".
         let reserve = reserve.map_or_else(|| "-".to_owned(), |p| format!("{p}%"));
-        println!("{name:<20} {provider:<12} {kind:<10} {state:<14} {priority:<9} {reserve}");
+        // A bound credential reads `ready` and is ready for exactly one person.
+        // The scheduler has always filtered on this; no CLI output said so.
+        let owner = owner.unwrap_or_else(|| "-".to_owned());
+        println!(
+            "{name:<20} {provider:<12} {kind:<10} {state:<14} {priority:<9} {reserve:<8} {owner}"
+        );
     }
     Ok(())
 }
@@ -958,8 +1048,33 @@ async fn show_route(db: &Db, route: &str) -> Result<()> {
     Ok(())
 }
 
+/// What to say when a catalog listing has nothing to show.
+///
+/// Two different emptinesses, and they had one message between them.
+/// `catalog list --provider xai` against a catalog full of Anthropic models
+/// said "catalog is empty; seed it with `oag admin catalog seed`" — so the
+/// operator seeded a catalog that was already seeded, got the same message, and
+/// concluded the seed was broken. The filter is the answer and it was in the
+/// arguments the whole time.
+///
+/// Its own function so the decision can be tested: capturing stdout is a
+/// fixture larger than the thing it would prove.
+fn empty_catalog_lines(total_before_filter: usize, provider: Option<&str>) -> Vec<String> {
+    match provider {
+        Some(p) if total_before_filter > 0 => vec![
+            format!(
+                "no {p} models in the catalog, though it holds {total_before_filter} \
+                 from other providers"
+            ),
+            "  `oag admin catalog list` shows them all".to_owned(),
+        ],
+        _ => vec!["catalog is empty; seed it with `oag admin catalog seed`".to_owned()],
+    }
+}
+
 async fn list_catalog(db: &Db, provider: Option<&str>, limit: Option<usize>) -> Result<()> {
     let mut rows = repo::catalog(db).await?;
+    let total_before_filter = rows.len();
     if let Some(p) = provider {
         let want: oag_core::Provider = p.parse()?;
         rows.retain(|m| m.provider == want.as_str());
@@ -970,7 +1085,15 @@ async fn list_catalog(db: &Db, provider: Option<&str>, limit: Option<usize>) -> 
         rows.truncate(n);
     }
     if rows.is_empty() {
-        println!("catalog is empty; seed it with `oag admin catalog seed`");
+        // Which of the two emptinesses this is. `--provider xai` against a
+        // catalog full of Anthropic models used to print "catalog is empty;
+        // seed it with `oag admin catalog seed`" — so the operator seeded a
+        // catalog that was already seeded, got the same message, and concluded
+        // the seed was broken. The filter is the answer and it is right there
+        // in the arguments.
+        for line in empty_catalog_lines(total_before_filter, provider) {
+            println!("{line}");
+        }
         return Ok(());
     }
     println!(
@@ -1029,8 +1152,17 @@ async fn print_providers(db: &Db) -> Result<()> {
     Ok(())
 }
 
-async fn init(db: &Db, email: &str, route: &str, budget: Option<Decimal>) -> Result<()> {
+async fn init(
+    db: &Db,
+    redis_url: &str,
+    email: &str,
+    route: &str,
+    budget: Option<Decimal>,
+) -> Result<()> {
     let principal_id = upsert_principal(db, email, "admin", budget).await?;
+    if budget.is_some() {
+        evict_principal_keys(db, redis_url, principal_id, email).await;
+    }
     let route_id = upsert_route(db, route).await?;
     println!("principal {email} -> {principal_id}");
     println!("route     {route} -> {route_id}");
@@ -1052,6 +1184,144 @@ async fn init(db: &Db, email: &str, route: &str, budget: Option<Decimal>) -> Res
     Ok(())
 }
 
+/// Create a principal, or update the budget of one that exists.
+///
+/// **The role is written on insert and never on conflict.** `init` asks for
+/// `admin`, which is right for the principal it is creating — promoting the
+/// first admin is what the command is for — and wrong for one that already
+/// exists. `ON CONFLICT ... SET role = EXCLUDED.role` meant that adding a
+/// second route with
+/// `oag admin init --email someone@corp.com --route staging` silently granted
+/// admin to whoever that email named and then minted them an admin key. Nothing
+/// in the output said a role had changed, because from the command's point of
+/// view nothing had: it had asked for an admin and been given one.
+///
+/// The store's own `upsert_principal` has always omitted `role` here and says
+/// why at length — an idempotent bind must not be able to change authority. The
+/// same argument applies in this direction; only the sign is different. Granting
+/// a role is now `oag admin principal promote`, where it is the whole of the
+/// caller's stated intent rather than a side effect of adding a route.
+///
+/// The budget is still `COALESCE`d rather than overwritten, so an `init` that
+/// omits `--budget-usd` cannot erase one an operator set.
+/// The role this principal holds, or `None` if there is no such principal.
+/// Refuse to mint an admin key for a principal who is not an admin.
+///
+/// The gate is an AND of two facts and a key can only carry one of them. A key
+/// minted with `--admin` against a member principal authenticates fine and is
+/// refused by every admin endpoint, which reads as the admin API being broken
+/// rather than as the key being half-privileged.
+async fn require_admin_principal(db: &Db, email: &str) -> Result<()> {
+    match principal_role(db, email).await?.as_deref() {
+        // An admin principal, or no principal at all — the missing case is left
+        // to `mint_key`, which names both lookups it could have been.
+        Some("admin") | None => Ok(()),
+        Some(role) => Err(oag_core::Error::Config(format!(
+            "{email} is a {role}, so an --admin key minted for them would authenticate \
+             and then be refused by every admin endpoint: the gate needs an admin key AND \
+             an admin principal. Grant the role first with \
+             `oag admin principal promote --email {email}`, or drop --admin for an \
+             inference key."
+        ))),
+    }
+}
+
+async fn principal_role(db: &Db, email: &str) -> Result<Option<String>> {
+    sqlx::query_scalar::<_, String>("SELECT role FROM principal WHERE email = $1")
+        .bind(email)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("reading principal role: {e}")))
+}
+
+/// Grant the admin role. The one place a role changes.
+///
+/// Separate from `init` because granting authority should be the whole of what
+/// a command does, not a consequence of asking it to add a route — see
+/// [`upsert_principal`]. Idempotent: promoting an admin is a no-op that says so.
+///
+/// There is deliberately no `demote`. The admin gate wants both an admin key and
+/// an admin principal, so removing the role from the last admin locks every
+/// human out of the admin API with no way back in through it — and the CLI is
+/// reached by whoever holds the database, which is a different and larger
+/// permission. A role that needs removing can be removed there, deliberately,
+/// by someone who has just had to think about it.
+async fn promote_principal(db: &Db, email: &str) -> Result<()> {
+    let Some(role) = principal_role(db, email).await? else {
+        return Err(oag_core::Error::Config(format!(
+            "no principal with email {email}. `oag admin init --email {email}` creates one."
+        )));
+    };
+    if role == "admin" {
+        println!("{email} is already an admin");
+        return Ok(());
+    }
+    sqlx::query("UPDATE principal SET role = 'admin', updated_at = now() WHERE email = $1")
+        .bind(email)
+        .execute(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("promoting principal: {e}")))?;
+
+    // Same target and shape as every other admin write, because granting
+    // authority is the one an auditor most wants to find.
+    tracing::warn!(
+        target: "oag::audit",
+        actor = "cli",
+        action = "principal.promote",
+        subject = %email,
+        from = %role,
+        "admin write"
+    );
+    println!("{email} promoted from {role} to admin");
+    println!("  Existing keys are unaffected; an admin key still needs `--admin`.");
+    Ok(())
+}
+
+/// Drop every cached identity belonging to `principal`'s keys.
+///
+/// A budget lives in the cached auth context, not only in the row, so lowering
+/// a cap without evicting leaves it unenforced for the cache's full five
+/// minutes — on every replica, with nothing in the CLI's output hinting that a
+/// flush is needed. The HTTP path for the same write has always evicted
+/// explicitly; this is the same call from the other surface.
+///
+/// Best-effort, and warns rather than fails: the write has already happened,
+/// and a principal whose keys could not be evicted is worth saying so about,
+/// not worth failing a command that succeeded.
+async fn evict_principal_keys(db: &Db, redis_url: &str, principal: Uuid, email: &str) {
+    let hashes = match repo::key_hashes_for_principal(db, principal).await {
+        Ok(hashes) => hashes,
+        Err(e) => {
+            tracing::warn!(error = %e, %email, "could not list this principal's keys to evict");
+            return;
+        }
+    };
+    if hashes.is_empty() {
+        return;
+    }
+    let cache = match oag_store::Cache::connect(redis_url) {
+        Ok(cache) => cache,
+        Err(e) => {
+            tracing::warn!(error = %e, %email, "could not reach the cache to evict");
+            println!("  NOTE: the new budget is not enforced until the auth cache expires (5m).");
+            return;
+        }
+    };
+    let mut failed = 0usize;
+    for hash in &hashes {
+        if cache.auth_invalidate(hash).await.is_err() {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        println!(
+            "  NOTE: {failed} of {} cached identities could not be evicted; the new budget \
+             is not enforced for them until the cache expires (5m).",
+            hashes.len()
+        );
+    }
+}
+
 async fn upsert_principal(
     db: &Db,
     email: &str,
@@ -1063,7 +1333,6 @@ async fn upsert_principal(
         INSERT INTO principal (id, email, role, monthly_budget_usd)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (email) DO UPDATE SET
-            role = EXCLUDED.role,
             monthly_budget_usd = COALESCE(EXCLUDED.monthly_budget_usd, principal.monthly_budget_usd),
             updated_at = now()
         RETURNING id
@@ -1119,6 +1388,23 @@ async fn mint_key(
 ) -> Result<String> {
     use std::fmt::Write as _;
 
+    // The admin gate lives here, not at the call sites.
+    //
+    // C7 put it on the two `key create` arms and missed the third caller.
+    // `init` mints with `admin = true` unconditionally and then prints "This is
+    // an ADMIN key" — and once C6 stopped `init` promoting an existing
+    // principal, that became exactly the key C7 refuses one command over: it
+    // authenticates, and every admin endpoint then refuses it. The operator is
+    // told they hold admin authority they do not have.
+    //
+    // This function already takes `admin` and already resolves the principal,
+    // so it is the one place a fourth caller cannot forget. `require_admin_
+    // principal` passes when there is no principal at all, leaving the missing
+    // -row diagnosis below to name both lookups it could have been.
+    if admin {
+        require_admin_principal(db, email).await?;
+    }
+
     // 32 bytes of entropy. The prefix is there so a leaked key is recognisable
     // in a log and can be grepped for during an incident.
     let mut raw = [0u8; 32];
@@ -1135,13 +1421,26 @@ async fn mint_key(
     let hash = repo::hash_key(&key);
     let prefix: String = key.chars().take(16).collect();
 
-    sqlx::query(
+    // `RETURNING id` and `fetch_optional`, not `execute`.
+    //
+    // The SELECT yields no rows when either lookup misses, so this INSERT
+    // inserts nothing — and `execute` reports that as a perfectly successful
+    // statement affecting zero rows. The plaintext was then printed with "This
+    // is shown once", which was true in the worst possible way: it had never
+    // been stored, so it could not be recovered and could never authenticate.
+    //
+    // The developer holding it gets 401 on every request, `oag admin key list`
+    // shows nothing, and the incident reads as broken auth rather than as a
+    // mistyped route name. The HTTP twin has always returned `Option` and said
+    // which lookup failed; this is the same answer.
+    let created: Option<Uuid> = sqlx::query_scalar(
         r"
         INSERT INTO api_key
             (id, key_hash, key_prefix, name, principal_id, route_id, floor_tier, admin)
         SELECT $1, $2, $3, $4, p.id, r.id, $7, $8
         FROM principal p, route r
         WHERE p.email = $5 AND r.name = $6
+        RETURNING id
         ",
     )
     .bind(Uuid::now_v7())
@@ -1152,9 +1451,19 @@ async fn mint_key(
     .bind(route)
     .bind(floor_tier)
     .bind(admin)
-    .execute(db.pool())
+    .fetch_optional(db.pool())
     .await
     .map_err(|e| oag_core::Error::Internal(format!("minting key: {e}")))?;
+
+    if created.is_none() {
+        // Both lookups named, because the row that is missing is the whole
+        // diagnosis and the caller cannot see which of the two it was.
+        return Err(oag_core::Error::Config(format!(
+            "no key was created: there is no principal with email {email}, or no route \
+             named {route}. `oag admin route show --route {route}` says whether the route \
+             exists; a principal is created by `oag admin init --email {email}`."
+        )));
+    }
 
     Ok(key)
 }
@@ -1469,6 +1778,30 @@ async fn insert_account(
         .expires_at
         .and_then(|e| time::OffsetDateTime::from_unix_timestamp(e).ok());
 
+    // `account.name` carries no unique constraint, and every CLI command that
+    // addresses a credential does so by name: `disable`, `enable`, `set-cost`,
+    // `set-reserve`. A second credential with an existing name is therefore
+    // creatable and then unaddressable — `disable` updates both or neither, and
+    // nothing in the CLI can tell them apart or rename one.
+    //
+    // Refused here rather than by a unique index, because an index would fail
+    // to build on any deployment that already has a pair, which is precisely
+    // the deployment that needs the tool. `account rename` is the way out for
+    // those, and this is the way in for everyone else.
+    let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM account WHERE name = $1)")
+        .bind(name)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("checking the credential name: {e}")))?;
+    if taken {
+        return Err(oag_core::Error::Config(format!(
+            "a credential named '{name}' already exists. Names are how every other \
+             command addresses one, so two would leave both unaddressable. Pick another \
+             name, or rename the existing one with `oag admin account rename --from {name} \
+             --to <new>`."
+        )));
+    }
+
     let id = Uuid::now_v7();
     sqlx::query(
         r"
@@ -1494,7 +1827,19 @@ async fn insert_account(
     .await
     .map_err(|e| oag_core::Error::Internal(format!("creating account: {e}")))?;
 
-    sqlx::query(
+    // `rows_affected`, because the SELECT is the whole statement's source: a
+    // route name that does not match yields no rows, the INSERT writes nothing,
+    // and `execute` calls that a success. The command then printed "attached to
+    // route 'prod'" over a credential joined to nothing — schedulable, listed
+    // as ready, and unreachable from any route, so every request through the
+    // gateway failed `no_viable_model` while the CLI insisted the credential
+    // was fine.
+    //
+    // The account row itself is left in place rather than rolled back. It holds
+    // a sealed secret the operator has just supplied and may not have kept, and
+    // destroying that to tidy up a typo is the worse of the two failures — the
+    // message below says exactly what is missing and the fix is one command.
+    let attached = sqlx::query(
         "INSERT INTO account_route (account_id, route_id) SELECT $1, id FROM route WHERE name = $2",
     )
     .bind(id)
@@ -1502,6 +1847,15 @@ async fn insert_account(
     .execute(db.pool())
     .await
     .map_err(|e| oag_core::Error::Internal(format!("attaching account to route: {e}")))?;
+
+    if attached.rows_affected() == 0 {
+        return Err(oag_core::Error::Config(format!(
+            "credential '{name}' was created but there is no route named '{route}', so it is \
+             attached to nothing and no request can reach it. Create the route with \
+             `oag admin init --route {route}`, then re-run this command; the credential \
+             already stored is safe to delete or reuse."
+        )));
+    }
 
     Ok(id)
 }
@@ -1526,6 +1880,56 @@ const MONTH_HEADLINE_SQL: &str = r"
     WHERE occurred_at >= date_trunc('month', now())
       AND NOT (cost_usd = 0 AND counterfactual_api_usd > 0)
 ";
+
+/// Rename a credential, which is the only way out of a duplicate pair.
+///
+/// Exists because `account.name` has no unique constraint and never gained one:
+/// an index would fail to build on exactly the deployments that already hold a
+/// pair. Renaming is what makes those addressable again.
+async fn rename_account(db: &Db, from: &str, to: &str) -> Result<()> {
+    if from == to {
+        return Err(oag_core::Error::Config(
+            "the new name is the same as the old one".to_owned(),
+        ));
+    }
+    let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM account WHERE name = $1)")
+        .bind(to)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("checking the credential name: {e}")))?;
+    if taken {
+        return Err(oag_core::Error::Config(format!(
+            "a credential named '{to}' already exists"
+        )));
+    }
+
+    // `rows_affected`, and it is allowed to be more than one: renaming is the
+    // command for undoing a duplicate, so refusing to act on a pair would
+    // refuse the only case it exists for. It says how many it moved, because
+    // moving two when you meant one is worth knowing immediately.
+    let moved = sqlx::query("UPDATE account SET name = $2, updated_at = now() WHERE name = $1")
+        .bind(from)
+        .bind(to)
+        .execute(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("renaming credential: {e}")))?;
+
+    match moved.rows_affected() {
+        0 => Err(oag_core::Error::Config(format!(
+            "no credential named '{from}'; see `oag admin account list`"
+        ))),
+        1 => {
+            println!("renamed {from} -> {to}");
+            Ok(())
+        }
+        n => {
+            println!("renamed {n} credentials named '{from}' -> '{to}'");
+            println!("  They were duplicates and are now one name again — which is still");
+            println!("  ambiguous. Rename them apart one at a time, or disable the spare.");
+            Ok(())
+        }
+    }
+}
 
 async fn set_mode(db: &Db, route: &str, mode: &str) -> Result<()> {
     if !matches!(mode, "passthrough" | "managed") {
@@ -1689,11 +2093,15 @@ async fn revoke_key(db: &Db, redis_url: &str, prefix: &str) -> Result<()> {
     // authenticating from the shared cache for its full TTL — and left the
     // operator believing one key had been dealt with.
     let cache = oag_store::Cache::connect(redis_url)?;
+    let mut evicted = true;
     for (hash, name, prefix) in &revoked {
         // The row update alone is not a revocation: every replica caches auth
         // by hash, so without this the key keeps working until those entries
         // expire.
-        cache.auth_invalidate(hash).await;
+        if let Err(e) = cache.auth_invalidate(hash).await {
+            evicted = false;
+            tracing::warn!(error = %e, %prefix, "the shared cache was not evicted");
+        }
 
         // Same target and shape as the server's audit line, so the CLI is not a
         // hole in the trail — and one line per key, because a collision that
@@ -1719,7 +2127,19 @@ async fn revoke_key(db: &Db, redis_url: &str, prefix: &str) -> Result<()> {
         );
         println!("  If you meant only one, the others are named above and need re-issuing.");
     }
-    println!("  shared cache evicted; each replica's in-process cache expires within 15s");
+    // Said only when it happened. `auth_invalidate` used to swallow both an
+    // unreachable Redis and a failed DEL, so this line printed either way — and
+    // during a leaked-key incident it is the sentence the operator acts on. The
+    // difference between the two outcomes is fifteen seconds and five minutes.
+    if evicted {
+        println!("  shared cache evicted; each replica's in-process cache expires within 15s");
+    } else {
+        println!();
+        println!("  WARNING: the shared cache was NOT evicted — see the log above.");
+        println!("  The key is inactive in the database but every replica will keep");
+        println!("  accepting it from the cache for up to 5 minutes. Retry with");
+        println!("  `oag admin cache flush` once the cache is reachable.");
+    }
     Ok(())
 }
 
@@ -1787,6 +2207,598 @@ async fn status(db: &Db) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// C13. "No xai models" and "no models" are different answers.
+    ///
+    /// `catalog list --provider xai` against a catalog full of Anthropic models
+    /// printed "catalog is empty; seed it with `oag admin catalog seed`" — so
+    /// the operator seeded a catalog that was already seeded, got the same
+    /// message, and concluded the seed was broken.
+    #[test]
+    fn an_empty_filtered_catalog_is_not_an_empty_catalog() {
+        let seeded = |lines: &[String]| lines.iter().any(|l| l.contains("catalog seed"));
+
+        assert!(
+            seeded(&empty_catalog_lines(0, None)),
+            "a genuinely empty catalog is the one to offer seeding for"
+        );
+        assert!(
+            seeded(&empty_catalog_lines(0, Some("xai"))),
+            "and so is one that is empty before any filter"
+        );
+
+        let filtered = empty_catalog_lines(17, Some("xai"));
+        assert!(
+            !seeded(&filtered),
+            "but a catalog holding 17 models of other providers is not empty, and \
+             telling the operator to seed it sends them in a circle: {filtered:?}"
+        );
+        assert!(
+            filtered[0].contains("xai") && filtered[0].contains("17"),
+            "the filter and what it excluded are both the answer: {filtered:?}"
+        );
+    }
+
+    /// C14. A duplicate credential name is refused, and renaming is the way out.    /// C14. A duplicate credential name is refused, and renaming is the way out.
+    ///
+    /// `account.name` carries no unique constraint, and every command that
+    /// addresses a credential does so by name — `disable`, `enable`,
+    /// `set-cost`, `set-reserve`. A second credential with an existing name was
+    /// creatable and then unaddressable: `disable` updated both or neither, and
+    /// nothing could tell them apart or rename one.
+    ///
+    /// Refused at the command rather than by an index, because an index would
+    /// fail to build on any deployment that already holds a pair — which is
+    /// exactly the deployment that needs the tool.
+    #[tokio::test]
+    async fn a_duplicate_credential_name_is_refused_and_renaming_is_the_way_out() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let kek = oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=")
+            .expect("kek");
+
+        let route = format!("c14-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]')")
+            .bind(&route)
+            .execute(db.pool())
+            .await
+            .expect("route");
+
+        let name = format!("c14-{}", Uuid::new_v4());
+        let add = |n: String, r: String| {
+            let (db, kek) = (db.clone(), kek.clone());
+            async move {
+                add_account(
+                    &db,
+                    &kek,
+                    &n,
+                    "anthropic",
+                    "not-a-real-secret",
+                    &r,
+                    4,
+                    0,
+                    None,
+                    None,
+                )
+                .await
+            }
+        };
+        add(name.clone(), route.clone()).await.expect("first");
+
+        let err = add(name.clone(), route.clone())
+            .await
+            .expect_err("the name is taken");
+        assert!(
+            err.to_string().contains("account rename"),
+            "the refusal has to name the way out: {err}"
+        );
+
+        // Exactly one credential holds the name, so every by-name command still
+        // addresses one thing.
+        let held: i64 = sqlx::query_scalar("SELECT count(*) FROM account WHERE name = $1")
+            .bind(&name)
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(held, 1);
+
+        // And renaming frees it.
+        let freed = format!("{name}-old");
+        rename_account(&db, &name, &freed).await.expect("rename");
+        add(name.clone(), route.clone())
+            .await
+            .expect("the name is free again");
+        assert!(
+            rename_account(&db, &freed, &name).await.is_err(),
+            "renaming onto a name in use would recreate the pair"
+        );
+    }
+
+    /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.    /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.
+    ///
+    /// clap treats an env-supplied value as explicitly present when it
+    /// evaluates conflicts. With `env` on `--secret` and a `conflicts_with_all`
+    /// against the importers, exporting the variable — the way this command's
+    /// own help recommends keeping a key out of shell history — made every
+    /// `oag admin account add --from codex` fail with "the argument '--secret'
+    /// cannot be used with '--from'", naming a flag that was not on the command
+    /// line. Only the operator who followed the advice could hit it.
+    ///
+    /// Asserted by introspecting the parser rather than by setting the variable,
+    /// because the environment is process-global and mutating it from a test is
+    /// `unsafe` — which this crate does not permit. Two facts make the bug
+    /// unreachable, and both are checked: clap has no env binding for this
+    /// argument, and no conflict declared against the importers.
+    #[test]
+    fn clap_neither_reads_the_secret_env_var_nor_conflicts_on_it() {
+        use clap::CommandFactory as _;
+
+        let cmd = AdminCli::command();
+        let add = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "account")
+            .expect("account")
+            .get_subcommands()
+            .find(|c| c.get_name() == "add")
+            .expect("add")
+            .clone();
+        let secret = add
+            .get_arguments()
+            .find(|a| a.get_id() == "secret")
+            .expect("--secret");
+
+        assert!(
+            secret.get_env().is_none(),
+            "an env binding here is what made the conflict fire on a variable; \
+             the fallback is read in `add_account_from_args` instead"
+        );
+        // And the observable half: clap no longer refuses the combination at
+        // all. The exclusion moved into `add_account_from_args`, where a typed
+        // flag and an inherited variable can still be told apart — clap has no
+        // public accessor for an argument's conflicts, so this is asserted by
+        // parsing rather than by introspection.
+        AdminCli::try_parse_from([
+            "admin",
+            "account",
+            "add",
+            "--name",
+            "seat",
+            "--from",
+            "codex",
+            "--secret",
+            "typed-on-the-command-line",
+        ])
+        .expect("clap accepts it; the command is what refuses it");
+    }
+
+    /// And an importer parses without a secret, which is the invocation that broke.
+    #[test]
+    fn a_seat_import_parses_with_no_secret_flag() {
+        let cli = AdminCli::try_parse_from([
+            "admin",
+            "account",
+            "add",
+            "--name",
+            "codex-seat",
+            "--from",
+            "codex",
+        ])
+        .expect("an importer needs no secret");
+        let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+            panic!("expected an account add");
+        };
+        assert_eq!(args.from, Some(AccountSource::Codex));
+        assert!(
+            args.secret.is_none(),
+            "the flag was not given, so the struct must not claim it was — the \
+             environment is read later, after the conflict check"
+        );
+    }
+
+    /// C5. Changing a budget at the CLI evicts the identities that cache it.
+    ///
+    /// A budget lives in the cached auth context, not only in the row. The HTTP
+    /// path for this write has always evicted explicitly; `init` did not, so a
+    /// lowered cap was unenforced on every replica for the cache's full five
+    /// minutes, with nothing in the output hinting that a flush was needed. An
+    /// operator who has just capped a runaway principal has every reason to
+    /// believe they have capped them.
+    #[tokio::test]
+    async fn lowering_a_budget_at_the_cli_evicts_the_cached_identities() {
+        let (Ok(url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL or OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("c5-{}@example.invalid", Uuid::new_v4());
+        let route = format!("c5-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]')")
+            .bind(&route)
+            .execute(db.pool())
+            .await
+            .expect("route");
+        let principal: Uuid = sqlx::query_scalar(
+            "INSERT INTO principal (id, email, role, monthly_budget_usd)
+             VALUES (gen_random_uuid(), $1, 'member', 100) RETURNING id",
+        )
+        .bind(&email)
+        .fetch_one(db.pool())
+        .await
+        .expect("principal");
+        let key = mint_key(&db, &email, &route, "c5", None, false)
+            .await
+            .expect("mint");
+        let hash = repo::hash_key(&key);
+
+        // An identity in the shared cache, as a live request would leave.
+        let cache = oag_store::Cache::connect(&redis_url).expect("cache");
+        let mac = oag_store::AuthMac::new("test-signing-secret-for-c5-eviction-0001");
+        let ctx = oag_store::AuthContext {
+            api_key_id: Uuid::new_v4(),
+            principal_id: principal,
+            route_id: Uuid::new_v4(),
+            key_floor_tier: None,
+            admin: false,
+            quota_usd: None,
+            principal_budget_usd: Some(Decimal::from(100)),
+            principal_hard_stop_multiple: Decimal::from(2),
+            key_hash: hash.clone(),
+        };
+        cache
+            .auth_set(&hash, &ctx, std::time::Duration::from_mins(5), &mac)
+            .await;
+        assert!(
+            cache.auth_get(&hash, &mac).await.is_some(),
+            "the fixture has to be cached for the eviction to mean anything"
+        );
+
+        evict_principal_keys(&db, &redis_url, principal, &email).await;
+
+        assert!(
+            cache.auth_get(&hash, &mac).await.is_none(),
+            "the new cap is not enforced until this entry is gone, and five \
+             minutes of an uncapped principal is the whole finding"
+        );
+    }
+
+    /// C3. A credential attached to nothing is an error, not a success line.
+    ///
+    /// The `account_route` insert selects from `route`, so a name that does not
+    /// match yields no rows and the INSERT writes nothing — which `execute`
+    /// reports as success. The command then printed "attached to route 'prod'"
+    /// over a credential joined to nothing: schedulable, listed as ready,
+    /// unreachable from any route, and every request through the gateway
+    /// failing `no_viable_model` while the CLI insisted the credential was fine.
+    #[tokio::test]
+    async fn adding_a_credential_to_a_missing_route_is_an_error() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let kek = oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=")
+            .expect("kek");
+
+        let name = format!("c3-{}", Uuid::new_v4());
+        let err = add_account(
+            &db,
+            &kek,
+            &name,
+            "anthropic",
+            "not-a-real-secret-for-tests",
+            "no-such-route",
+            4,
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect_err("no route, so nothing to attach to");
+        let message = err.to_string();
+        assert!(
+            message.contains("no-such-route") && message.contains(&name),
+            "the operator needs both halves to act on it: {message}"
+        );
+
+        // The credential itself survives: it holds a secret the operator has
+        // just supplied and may not have kept, and destroying that to tidy up a
+        // typo is the worse failure.
+        let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM account WHERE name = $1")
+            .bind(&name)
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(stored, 1, "the sealed secret is not thrown away");
+
+        // And it is joined to nothing, which is what the error said.
+        let joins: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM account_route ar
+               JOIN account a ON a.id = ar.account_id WHERE a.name = $1",
+        )
+        .bind(&name)
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(joins, 0);
+    }
+
+    /// C6. Adding a route does not hand out the admin role.
+    ///
+    /// `init`'s upsert set `role = EXCLUDED.role` with the role hard-coded to
+    /// `admin`, so `oag admin init --email someone@corp.com --route staging` —
+    /// a command whose stated job is adding a route — silently promoted whoever
+    /// that email named and then minted them an admin key. Nothing in the
+    /// output mentioned a role, because from the command's point of view
+    /// nothing had changed: it asked for an admin and got one.
+    ///
+    /// The store's own `upsert_principal` has always omitted `role` here, for
+    /// the mirror-image reason: an idempotent bind must not be able to *remove*
+    /// authority either.
+    #[tokio::test]
+    async fn init_against_an_existing_principal_leaves_their_role_alone() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("c6-{}@example.invalid", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO principal (id, email, role, monthly_budget_usd)
+             VALUES (gen_random_uuid(), $1, 'member', 50)",
+        )
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("seed a member");
+
+        // The call `init` makes, asking for admin as it always has.
+        upsert_principal(&db, &email, "admin", None)
+            .await
+            .expect("upsert");
+        assert_eq!(
+            principal_role(&db, &email).await.expect("role").as_deref(),
+            Some("member"),
+            "adding a route is not a grant of authority"
+        );
+
+        // The budget is still protected from an init that omits it.
+        let budget: Option<Decimal> =
+            sqlx::query_scalar("SELECT monthly_budget_usd FROM principal WHERE email = $1")
+                .bind(&email)
+                .fetch_one(db.pool())
+                .await
+                .expect("budget");
+        assert_eq!(budget, Some(Decimal::from(50)), "COALESCE still guards it");
+
+        // And a principal that does not exist yet is still created as asked —
+        // promoting the first admin is what `init` is for.
+        let fresh = format!("c6-first-{}@example.invalid", Uuid::new_v4());
+        upsert_principal(&db, &fresh, "admin", None)
+            .await
+            .expect("upsert");
+        assert_eq!(
+            principal_role(&db, &fresh).await.expect("role").as_deref(),
+            Some("admin")
+        );
+
+        // Granting is its own command, and it is idempotent.
+        promote_principal(&db, &email).await.expect("promote");
+        assert_eq!(
+            principal_role(&db, &email).await.expect("role").as_deref(),
+            Some("admin")
+        );
+        promote_principal(&db, &email).await.expect("promote again");
+    }
+
+    /// C7. An `--admin` key is refused for a principal who is not an admin.
+    ///
+    /// The admin gate is an AND of two facts — the key's flag and the
+    /// principal's role — and a key can only carry one of them. Minted against
+    /// a member, an admin key authenticates fine and is then refused by every
+    /// admin endpoint, which reads as the admin API being broken rather than as
+    /// the key being half-privileged. Nothing checked it, nothing warned, and
+    /// the CLI had no command that could set a role.
+    #[tokio::test]
+    async fn an_admin_key_is_refused_for_a_principal_who_is_not_one() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("c7-{}@example.invalid", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')",
+        )
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("seed a member");
+
+        let route = format!("c7-{}", Uuid::new_v4());
+        upsert_route(&db, &route).await.expect("route");
+
+        // Through `mint_key`, not `require_admin_principal`. Calling the helper
+        // proved only that the helper works: it passed with both call-site
+        // checks deleted, which is precisely the state `init` was already in.
+        let err = mint_key(&db, &email, &route, "k", None, true)
+            .await
+            .expect_err("a member cannot hold an admin key");
+        let message = err.to_string();
+        assert!(
+            message.contains("oag admin principal promote"),
+            "the operator needs the command that fixes it, not just the refusal: {message}"
+        );
+
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM api_key k JOIN principal p ON p.id = k.principal_id \
+             WHERE p.email = $1",
+        )
+        .bind(&email)
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(
+            keys, 0,
+            "the refusal must happen before anything is written"
+        );
+
+        // An inference key for the same principal is unaffected: only the
+        // combination is refused.
+        mint_key(&db, &email, &route, "inference", None, false)
+            .await
+            .expect("a member may hold an inference key");
+
+        promote_principal(&db, &email).await.expect("promote");
+        mint_key(&db, &email, &route, "admin", None, true)
+            .await
+            .expect("an admin may hold an admin key");
+    }
+
+    /// C7's failure, reached through the door C7 did not close.
+    #[tokio::test]
+    async fn init_refuses_an_admin_key_for_an_existing_member() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let email = format!("b5-{}@example.invalid", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')",
+        )
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("seed a member");
+
+        // `init` mints with `admin = true` unconditionally and prints "This is
+        // an ADMIN key". Once C6 stopped it promoting an existing principal,
+        // that key authenticated and was then refused by every admin endpoint —
+        // the exact scenario C7 refuses one command over, with nothing checked
+        // and nothing warned. The redis URL is unused because no budget is
+        // passed, so no eviction runs.
+        let route = format!("b5-{}", Uuid::new_v4());
+        let err = init(&db, "redis://127.0.0.1:1", &email, &route, None)
+            .await
+            .expect_err("init must not mint an admin key for a member");
+        assert!(
+            err.to_string().contains("oag admin principal promote"),
+            "the refusal names the command that fixes it: {err}"
+        );
+
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM api_key k JOIN principal p ON p.id = k.principal_id \
+             WHERE p.email = $1",
+        )
+        .bind(&email)
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(
+            keys, 0,
+            "a key the operator was told is an admin key must not exist"
+        );
+
+        // Promoted, `init` completes: the refusal is about the role, not about
+        // `init` itself, and the documented first-run path still works.
+        promote_principal(&db, &email).await.expect("promote");
+        init(&db, "redis://127.0.0.1:1", &email, &route, None)
+            .await
+            .expect("init succeeds for an admin principal");
+    }
+
+    /// H9. A key that was not stored is not printed.
+    ///
+    /// The INSERT selects from `principal` and `route`, so it inserts nothing
+    /// when either lookup misses — and `execute` reports that as a successful
+    /// statement affecting zero rows. The plaintext was printed anyway, under
+    /// "This is shown once", which was true in the worst possible way: never
+    /// stored, so unrecoverable and unable to ever authenticate.
+    ///
+    /// The developer holding it gets 401 on every request, `key list` shows
+    /// nothing, and the incident reads as broken auth rather than as a mistyped
+    /// route name.
+    #[tokio::test]
+    async fn minting_against_a_missing_route_or_principal_is_an_error_not_a_key() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        // A route that exists, so only the principal is missing.
+        let route = format!("h9-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]')")
+            .bind(&route)
+            .execute(db.pool())
+            .await
+            .expect("seed route");
+
+        let missing_principal = format!("nobody-{}@example.invalid", Uuid::new_v4());
+        let err = mint_key(&db, &missing_principal, &route, "k", None, false)
+            .await
+            .expect_err("no principal, so no key");
+        let message = err.to_string();
+        assert!(
+            message.contains(&missing_principal) && message.contains(&route),
+            "the operator cannot see which lookup missed, so both are named: {message}"
+        );
+
+        // And nothing was written under either name.
+        let keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM api_key k JOIN route r ON r.id = k.route_id WHERE r.name = $1",
+        )
+        .bind(&route)
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(keys, 0, "a failed mint leaves no row");
+
+        // A principal that exists and a route that does not: the same answer,
+        // because the SELECT is a cross join and either side empties it.
+        let email = format!("h9-{}@example.invalid", Uuid::new_v4());
+        sqlx::query(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member')",
+        )
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("seed principal");
+        mint_key(&db, &email, "no-such-route-here", "k", None, false)
+            .await
+            .expect_err("no route, so no key");
+
+        // Both present: a key, and it is really there.
+        let key = mint_key(&db, &email, &route, "k", None, false)
+            .await
+            .expect("both exist");
+        let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM api_key WHERE key_hash = $1")
+            .bind(repo::hash_key(&key))
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        assert_eq!(
+            stored, 1,
+            "the key that was printed is the key that was stored"
+        );
+    }
 
     /// C4. The CLI headline counts per-token traffic only, as the API does.
     ///

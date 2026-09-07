@@ -470,12 +470,25 @@ impl Cache {
             conn.set_ex(auth_key(hash), sealed, ttl.as_secs()).await;
     }
 
-    /// Evict a cached auth context, fleet-wide.
-    pub async fn auth_invalidate(&self, hash: &str) {
-        let Ok(mut conn) = self.conn().await else {
-            return;
-        };
-        let _: std::result::Result<i64, _> = conn.del(auth_key(hash)).await;
+    /// Evict a cached auth context, fleet-wide. `Err` when the cache could not
+    /// be reached or the DEL failed.
+    ///
+    /// The result matters here in a way it does not for a cache write. This is
+    /// called on the revocation path, where "the shared cache is clear" is
+    /// something the CLI goes on to *tell an operator* during an incident. It
+    /// returned `()` and swallowed both failures, so a Redis that was
+    /// unreachable produced the same output as one that had dropped the key,
+    /// and the operator was told the residue expires in fifteen seconds when it
+    /// was five minutes.
+    ///
+    /// Callers that are merely keeping the cache tidy may still ignore this.
+    pub async fn auth_invalidate(&self, hash: &str) -> Result<()> {
+        let mut conn = self.conn().await?;
+        let _: i64 = conn
+            .del(auth_key(hash))
+            .await
+            .map_err(|e| Error::Internal(format!("evicting a cached identity: {e}")))?;
+        Ok(())
     }
 }
 
@@ -708,7 +721,7 @@ mod tests {
         assert_eq!(got.api_key_id, real.api_key_id);
         assert!(!got.admin);
 
-        cache.auth_invalidate(&hash).await;
+        let _ = cache.auth_invalidate(&hash).await;
     }
 
     #[test]
@@ -894,6 +907,24 @@ mod tests {
                 .expect("must not surface an error")
                 .is_none(),
             "a rate limiter that cannot reach Redis must allow, not refuse"
+        );
+    }
+    /// C9. An eviction that did not happen says so.
+    ///
+    /// `auth_invalidate` returned `()` and swallowed both an unreachable Redis
+    /// and a failed DEL, so the CLI's revoke path printed "shared cache
+    /// evicted" either way. During a leaked-key incident that is the sentence
+    /// the operator acts on, and the difference between the two outcomes is
+    /// fifteen seconds and five minutes of a key that still works.
+    #[tokio::test]
+    async fn evicting_against_an_unreachable_cache_is_an_error() {
+        // A port nothing is listening on. `Cache::connect` is lazy — it must
+        // be, so a replica whose Redis is down still boots — so the failure
+        // surfaces here, on use, which is exactly where the CLI needs it.
+        let cache = Cache::connect("redis://127.0.0.1:1").expect("lazy connect");
+        assert!(
+            cache.auth_invalidate("some-hash").await.is_err(),
+            "an eviction that could not reach the cache is not an eviction"
         );
     }
 }
