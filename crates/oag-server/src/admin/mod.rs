@@ -215,6 +215,12 @@ pub struct OriginRow {
     pub subscription: bool,
     pub requests: i64,
     pub spent_usd: String,
+    /// The pay-per-token bill this credential displaced
+    /// (`usage_event.counterfactual_api_usd`), NOT the ladder's top-rung
+    /// baseline. A seat line and a metered line sit next to each other here and
+    /// the reader is meant to compare them, which they can only do if both are
+    /// the same measurement — and for a seat, whose `cost_usd` is truthfully
+    /// zero, the displaced API bill is the only figure that means anything.
     pub counterfactual_usd: String,
 }
 
@@ -404,35 +410,60 @@ async fn seat_summaries(db: &oag_store::Db, window: &period::Resolved) -> Vec<Se
 /// splits even a purely proxied deployment into a line per seat — which is
 /// interesting only once there is something outside the gateway to compare it
 /// against.
-async fn origin_breakdown(db: &oag_store::Db, window: &period::Resolved) -> Vec<OriginRow> {
-    let rows: Vec<OriginTuple> = sqlx::query_as(
-        r"
+/// The statement [`origin_breakdown`] runs.
+///
+/// A constant so its shape can be asserted without a database. Two things in it
+/// were wrong and neither shows in the output — a collapsed line and a correct
+/// line look the same, and a mixed-measurement column looks like a number.
+const ORIGIN_BREAKDOWN_SQL: &str = r"
+            -- Grouped by the credential's id, not its name. A name is
+            -- mutable and not unique: two seats an operator called the same
+            -- thing collapsed into one line whose numbers belonged to neither,
+            -- and a seat renamed inside the window split into two lines that
+            -- each looked like a whole seat. `a.id` is the primary key, so the
+            -- name, provider and kind beside it are functionally dependent and
+            -- Postgres accepts them ungrouped — and rows with no credential at
+            -- all (an import run without --account) group together on NULL,
+            -- which is the one line they should be.
+            --
+            -- `counterfactual_api_usd`, not `counterfactual_usd`. This table
+            -- puts a seat line next to a metered line and invites the reader to
+            -- compare them, so both have to be the same measurement. The two
+            -- columns are not: `counterfactual_usd` is the routing story — what
+            -- the ladder's top rung would have charged — while
+            -- `counterfactual_api_usd` is the pay-per-token bill this
+            -- credential displaced, which is the only one that means anything
+            -- for a seat, whose `cost_usd` is truthfully zero. Summing the
+            -- first put a routing baseline on the seat rows and an
+            -- apples-to-oranges total in the column.
             SELECT u.origin, a.name, a.provider, a.kind = 'oauth',
                    COUNT(*) FILTER (
                        WHERE u.selection_reason NOT IN ('abandoned', 'lost')
                    ),
                    COALESCE(SUM(u.cost_usd), 0),
-                   COALESCE(SUM(u.counterfactual_usd), 0)
+                   COALESCE(SUM(u.counterfactual_api_usd), 0)
             FROM usage_event u
             LEFT JOIN account a ON a.id = u.account_id
             WHERE ($1::timestamptz IS NULL OR u.occurred_at >= $1)
               AND ($2::timestamptz IS NULL OR u.occurred_at <  $2)
-            GROUP BY u.origin, a.name, a.provider, a.kind
-            ORDER BY u.origin, COALESCE(SUM(u.counterfactual_usd), 0) DESC, a.name
-            ",
-    )
-    .bind(window.start)
-    .bind(window.end)
-    .fetch_all(db.pool())
-    .await
-    // Degrading to an empty section is this helper's documented contract —
-    // one sub-table must not take down the whole summary — but degrading
-    // SILENTLY was not: an empty list rendered as "no seats", indistinguishable
-    // from a query that failed. Say which it was.
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
-        Vec::new()
-    });
+            GROUP BY u.origin, a.id, a.name, a.provider, a.kind
+            ORDER BY u.origin, COALESCE(SUM(u.counterfactual_api_usd), 0) DESC, a.name
+            ";
+
+async fn origin_breakdown(db: &oag_store::Db, window: &period::Resolved) -> Vec<OriginRow> {
+    let rows: Vec<OriginTuple> = sqlx::query_as(ORIGIN_BREAKDOWN_SQL)
+        .bind(window.start)
+        .bind(window.end)
+        .fetch_all(db.pool())
+        .await
+        // Degrading to an empty section is this helper's documented contract —
+        // one sub-table must not take down the whole summary — but degrading
+        // SILENTLY was not: an empty list rendered as "no seats", indistinguishable
+        // from a query that failed. Say which it was.
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
+            Vec::new()
+        });
 
     if rows.iter().all(|r| r.0 == "gateway") {
         return Vec::new();
@@ -941,4 +972,68 @@ pub async fn usage(State(state): State<Arc<AppState>>, Query(page): Query<Page>)
             .collect::<Vec<_>>(),
     )
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ORIGIN_BREAKDOWN_SQL;
+
+    /// A7. The origin table groups by credential identity and measures one thing.
+    ///
+    /// Asserted on the statement rather than on a result, because neither
+    /// defect shows in the output. Two seats an operator happened to give the
+    /// same name collapsed into one line whose numbers belonged to neither, and
+    /// a seat renamed inside the window split into two lines that each looked
+    /// like a whole seat — a collapsed line and a correct line are both just a
+    /// line. And a column summing `counterfactual_usd` for seat rows put the
+    /// ladder's routing baseline beside metered rows' displaced API bill and
+    /// invited the reader to compare them; a mixed measurement still looks like
+    /// a number.
+    #[test]
+    fn the_origin_table_groups_by_credential_id_and_one_counterfactual() {
+        let group_by = ORIGIN_BREAKDOWN_SQL
+            .split_once("GROUP BY u.origin")
+            .expect("the query groups")
+            .1
+            .lines()
+            .next()
+            .unwrap_or_default();
+        assert!(
+            group_by.contains("a.id"),
+            "a name is mutable and not unique; the primary key is the identity: {group_by}"
+        );
+
+        // Only the seat-comparable counterfactual, and no trace of the other.
+        // `counterfactual_api_usd` contains `counterfactual_usd` as a
+        // substring, so this has to compare whole identifiers.
+        // Comments stripped first. The one above the SELECT explains this very
+        // rule and names both columns while doing it — the same trap
+        // `the_upsert_refreshes_prices_without_naming_the_label_column` records
+        // in the store.
+        let statement: String = ORIGIN_BREAKDOWN_SQL
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let selected: Vec<&str> = statement
+            .match_indices("counterfactual")
+            .map(|(i, _)| {
+                let rest = &statement[i..];
+                let end = rest
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+        assert!(
+            !selected.is_empty(),
+            "the query reports a counterfactual at all"
+        );
+        assert!(
+            selected.iter().all(|c| *c == "counterfactual_api_usd"),
+            "a seat's cost_usd is truthfully zero, so the pay-per-token bill it \
+             displaced is the only counterfactual that means anything beside a \
+             metered row: {selected:?}"
+        );
+    }
 }

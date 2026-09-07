@@ -1506,6 +1506,27 @@ async fn insert_account(
     Ok(id)
 }
 
+/// What `oag admin status` prints as this month's headline.
+///
+/// A constant so the statement can be run on its own in a test. The predicate
+/// below is the whole of finding C4 and it is invisible from the outside: the
+/// command prints a number, and a wrong number looks exactly like a right one.
+///
+/// Per-token traffic only, exactly as the admin API's headline does. A seat row
+/// has `cost_usd` of zero and a real API-equivalent price, so folding it in lets
+/// a flat-rate credential's zero marginal cost inflate the frontier saving —
+/// the more a subscription is used, the better this line claims the gateway is
+/// doing. Without it the two surfaces differed by an order of magnitude on any
+/// deployment holding a seat, and an operator comparing `oag admin status` with
+/// the dashboard had no way to tell which of them was lying.
+const MONTH_HEADLINE_SQL: &str = r"
+    SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM(counterfactual_usd),0),
+           COUNT(*) FILTER (WHERE selection_reason NOT IN ('abandoned', 'lost'))
+    FROM usage_event
+    WHERE occurred_at >= date_trunc('month', now())
+      AND NOT (cost_usd = 0 AND counterfactual_api_usd > 0)
+";
+
 async fn set_mode(db: &Db, route: &str, mode: &str) -> Result<()> {
     if !matches!(mode, "passthrough" | "managed") {
         return Err(oag_core::Error::Config(format!(
@@ -1656,28 +1677,48 @@ async fn price_account(
 }
 
 async fn revoke_key(db: &Db, redis_url: &str, prefix: &str) -> Result<()> {
-    let Some((hash, name, prefix)) = repo::revoke_key_by_prefix(db, prefix).await? else {
+    let revoked = repo::revoke_key_by_prefix(db, prefix).await?;
+    if revoked.is_empty() {
         println!("no active key with prefix {prefix}");
         return Ok(());
-    };
+    }
 
-    // The row update alone is not a revocation: every replica caches auth by
-    // hash, so without this the key keeps working until those entries expire.
-    oag_store::Cache::connect(redis_url)?
-        .auth_invalidate(&hash)
-        .await;
+    // Every one of them. `key_prefix` has no unique index, so this UPDATE has
+    // always been capable of matching several rows; taking the first and
+    // dropping the rest left the others deactivated in the database but still
+    // authenticating from the shared cache for its full TTL — and left the
+    // operator believing one key had been dealt with.
+    let cache = oag_store::Cache::connect(redis_url)?;
+    for (hash, name, prefix) in &revoked {
+        // The row update alone is not a revocation: every replica caches auth
+        // by hash, so without this the key keeps working until those entries
+        // expire.
+        cache.auth_invalidate(hash).await;
 
-    // Same target and shape as the server's audit line, so the CLI is not a
-    // hole in the trail.
-    tracing::warn!(
-        target: "oag::audit",
-        actor = "cli",
-        action = "key.revoke",
-        subject = %prefix,
-        name,
-        "admin write"
-    );
-    println!("revoked {name} ({prefix})");
+        // Same target and shape as the server's audit line, so the CLI is not a
+        // hole in the trail — and one line per key, because a collision that
+        // revoked someone else's key is exactly what the trail is for.
+        tracing::warn!(
+            target: "oag::audit",
+            actor = "cli",
+            action = "key.revoke",
+            subject = %prefix,
+            name,
+            "admin write"
+        );
+        println!("revoked {name} ({prefix})");
+    }
+
+    // Said loudly, because it means a key nobody asked about has just stopped
+    // working. The prefix is displayed and not unique, so this is reachable
+    // without anything being wrong with the database.
+    if revoked.len() > 1 {
+        println!(
+            "\n  NOTE: {} keys shared the prefix {prefix} and all of them were revoked.",
+            revoked.len()
+        );
+        println!("  If you meant only one, the others are named above and need re-issuing.");
+    }
     println!("  shared cache evicted; each replica's in-process cache expires within 15s");
     Ok(())
 }
@@ -1728,16 +1769,10 @@ async fn status(db: &Db) -> Result<()> {
     }
 
     // The headline number: what the gateway saved this month.
-    let spend: Option<(Decimal, Decimal, i64)> = sqlx::query_as(
-        r"
-        SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM(counterfactual_usd),0),
-               COUNT(*) FILTER (WHERE selection_reason NOT IN ('abandoned', 'lost'))
-        FROM usage_event WHERE occurred_at >= date_trunc('month', now())
-        ",
-    )
-    .fetch_optional(db.pool())
-    .await
-    .map_err(|e| oag_core::Error::Internal(format!("summing spend: {e}")))?;
+    let spend: Option<(Decimal, Decimal, i64)> = sqlx::query_as(MONTH_HEADLINE_SQL)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("summing spend: {e}")))?;
 
     if let Some((cost, counterfactual, n)) = spend {
         println!("\nthis month  {n} requests");
@@ -1752,6 +1787,75 @@ async fn status(db: &Db) -> Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// C4. The CLI headline counts per-token traffic only, as the API does.
+    ///
+    /// A seat row has `cost_usd` of zero and a real API-equivalent price. The
+    /// admin API filters those out of the headline deliberately — a flat-rate
+    /// credential's zero marginal cost would otherwise inflate the frontier
+    /// saving, so the more a subscription was used the better the gateway would
+    /// claim to be doing. The CLI did not filter, so on any deployment holding
+    /// a seat the two surfaces differed by an order of magnitude and an
+    /// operator comparing them had no way to tell which was lying.
+    ///
+    /// The statement is run directly rather than through `status`, which
+    /// prints: the number is the finding, and a wrong number looks exactly like
+    /// a right one on a terminal.
+    #[tokio::test]
+    async fn the_month_headline_leaves_seat_rows_out() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let before: (Decimal, Decimal, i64) = sqlx::query_as(MONTH_HEADLINE_SQL)
+            .fetch_one(db.pool())
+            .await
+            .expect("headline");
+
+        // One metered row and one seat row, this month, for the same tokens.
+        // The seat's cost is truthfully zero and its displaced API bill is
+        // large — which is exactly what makes it poison for a saving figure.
+        for (cost, api) in [("2.50", "2.50"), ("0", "40.00")] {
+            sqlx::query(
+                "INSERT INTO usage_event (request_id, attempt, model_id, tier, \
+                 selection_reason, input_tokens, output_tokens, cost_usd, \
+                 counterfactual_usd, counterfactual_api_usd, status) \
+                 VALUES ($1, 0, 'anthropic/claude-opus-5', 'frontier', 'classified', \
+                         100, 20, $2::numeric, 9.00, $3::numeric, 200)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(cost)
+            .bind(api)
+            .execute(db.pool())
+            .await
+            .expect("seed");
+        }
+
+        let after: (Decimal, Decimal, i64) = sqlx::query_as(MONTH_HEADLINE_SQL)
+            .fetch_one(db.pool())
+            .await
+            .expect("headline");
+
+        assert_eq!(
+            after.2 - before.2,
+            1,
+            "two rows landed and exactly one of them is per-token traffic"
+        );
+        assert_eq!(
+            after.0 - before.0,
+            Decimal::from_str_exact("2.50").expect("decimal"),
+            "the seat contributed no spend"
+        );
+        assert_eq!(
+            after.1 - before.1,
+            Decimal::from_str_exact("9.00").expect("decimal"),
+            "and no counterfactual — its zero cost against a frontier baseline \
+             is the free saving that made this figure a lie"
+        );
+    }
 
     #[derive(Parser, Debug)]
     #[command(name = "admin")]

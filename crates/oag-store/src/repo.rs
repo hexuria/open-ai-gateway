@@ -696,7 +696,18 @@ pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsa
                      AND u.selection_reason NOT IN ('abandoned', 'lost')
                )
         FROM principal p
-        LEFT JOIN usage_event u ON u.principal_id = p.id
+        -- The window bound belongs in the JOIN, not only inside the FILTERs.
+        -- Every figure below is month-to-date, but with the bound stated only
+        -- in the FILTERs the join still read every row this principal has ever
+        -- written, aggregating a whole history to report one month of it. On a
+        -- ledger of any age that is a sequential scan per admin request.
+        --
+        -- `ON` rather than `WHERE`, because this is a LEFT JOIN: in `WHERE` it
+        -- would drop principals who have spent nothing this month, which is
+        -- the row a budget check most needs to see.
+        LEFT JOIN usage_event u
+               ON u.principal_id = p.id
+              AND u.occurred_at >= date_trunc('month', now())
         WHERE p.email = $1
         GROUP BY p.id, p.email, p.monthly_budget_usd
         ",
@@ -1093,7 +1104,27 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                ), 0)::bigint END AS seven_day_points
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
-        LEFT JOIN usage_event u ON u.api_key_id = k.id
+        -- The widest of the four windows below, in the JOIN. Stated only
+        -- inside the FILTERs, this join read every row the key had ever
+        -- written in order to report a rolling five hours — and this is the
+        -- query a partner service calls before each model call, per member.
+        -- `usage_event_key_idx` is `(api_key_id, occurred_at DESC)`, so with a
+        -- bound here the read is a range scan of the window instead of a walk
+        -- of the key's whole history.
+        --
+        -- LEAST, because which of the two is wider changes through the month:
+        -- month-to-date is hours wide on the 1st and 31 days wide on the 31st,
+        -- while seven days is seven days. Taking the earlier keeps every
+        -- FILTER below able to see the rows it needs.
+        --
+        -- `ON` rather than `WHERE`: a LEFT JOIN, so a key that has not been
+        -- used in the window must still return its row.
+        LEFT JOIN usage_event u
+               ON u.api_key_id = k.id
+              AND u.occurred_at >= LEAST(
+                      date_trunc('month', now()),
+                      now() - interval '7 days'
+                  )
         WHERE k.id = $1
         GROUP BY k.id, k.name, k.key_prefix, p.email, k.active, k.quota_usd, k.spent_usd
         ",
@@ -1161,16 +1192,28 @@ pub async fn set_points_reference(db: &Db, usd_per_mtok: Decimal) -> Result<()> 
 
 /// Revoke by the displayed prefix, for the CLI — during an incident the prefix
 /// is what an operator can actually see.
-pub async fn revoke_key_by_prefix(
-    db: &Db,
-    prefix: &str,
-) -> Result<Option<(String, String, String)>> {
+///
+/// Every match, and every match is returned. `key_prefix` carries no unique
+/// index and this UPDATE has no LIMIT, so a collision has always deactivated
+/// more than one row; what it did not do was say so. The caller took
+/// `fetch_optional`, which keeps the first row and drops the rest — so the
+/// other keys were deactivated in the database, their hashes were never evicted
+/// from the shared cache, and they went on authenticating from L2 for the five
+/// minutes of its TTL. An operator revoking a leaked key during an incident was
+/// told one key was revoked, and got one eviction, while some other customer's
+/// key had been switched off behind their back and the leaked one might not
+/// have stopped.
+///
+/// Over-revoking on a collision is the right direction for an incident tool —
+/// under-revoking is what gets someone breached — but only if it is visible.
+/// Returning the whole set is what makes it visible.
+pub async fn revoke_key_by_prefix(db: &Db, prefix: &str) -> Result<Vec<(String, String, String)>> {
     sqlx::query_as::<_, (String, String, String)>(
         "UPDATE api_key SET active = false WHERE key_prefix = $1 AND active
          RETURNING key_hash, name, key_prefix",
     )
     .bind(prefix)
-    .fetch_optional(db.pool())
+    .fetch_all(db.pool())
     .await
     .map_err(|e| Error::Internal(format!("revoking key by prefix: {e}")))
 }
@@ -2392,8 +2435,28 @@ mod tests {
         assert!(ahead, "a later month is not pulled back");
     }
 
-    /// The race the row lock exists for: debits landing while a pass runs are
+    /// The race the row lock exists for: a debit landing while a pass runs is
     /// never lost from the counter.
+    ///
+    /// The interleaving is forced, not hoped for. This used to spawn twenty-four
+    /// debits against six reconciles and assert the totals agreed, which passes
+    /// whenever no pass happens to overlap a debit's lock window — so it passed
+    /// with the fix reverted about as often as it caught it, and it was the
+    /// scheduler rather than the code that decided which. It also asked thirty
+    /// tasks to share a pool of eight, so its most common failure was a pool
+    /// timeout that had nothing to do with the property.
+    ///
+    /// The construction below is the race written down. A debit holds the
+    /// principal's row lock in an uncommitted transaction; the reconcile pass
+    /// then runs and is *observed* to be blocked on that lock before the debit
+    /// commits. That is exactly the window the bug lives in:
+    ///
+    ///   * With the lock taken first, the pass waits before computing anything,
+    ///     so its `SUM` runs after the debit committed and includes it.
+    ///   * With the obvious single statement, the pass blocks *inside* its
+    ///     UPDATE with the subquery already evaluated. Postgres re-checks the
+    ///     WHERE clause against the new row version but does not re-run the SET
+    ///     subquery, so a stale sum overwrites the debit and the money is gone.
     ///
     /// Skipped when `OAG_TEST_DATABASE_URL` is unset; CI sets it.
     #[tokio::test]
@@ -2402,12 +2465,116 @@ mod tests {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
             return;
         };
-        let db = Db::connect(&url, 8).expect("connect");
+        let db = Db::connect(&url, 4).expect("connect");
         db.migrate().await.expect("migrate");
-        let (principal, route, account) = seed(&db).await;
-        let key = capped_key(&db, principal, route, format!("race-{}", Uuid::new_v4())).await;
-        set_budgets(&db, principal, route).await;
-        old_binary_row(&db, principal, key, route, "0.25").await;
+        let (principal, route, key, write) = budgeted_principal(&db).await;
+
+        // A debit in flight: its ledger row and its counter increment, holding
+        // the principal's row lock until it commits. This is what
+        // `record_usage` does; done by hand only because the test has to stop
+        // in the middle of it.
+        let mut debit = db.pool().begin().await.expect("begin");
+        sqlx::query(
+            "INSERT INTO usage_event (request_id, attempt, principal_id, api_key_id, route_id,
+                                      account_id, model_id, tier, selection_reason,
+                                      input_tokens, output_tokens, cost_usd, status)
+             VALUES ($1, 0, $2, $3, $4, $5, 'kimi-k2', 'cheap', 'default', 0, 0, 0.10, 200)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(principal)
+        .bind(key)
+        .bind(route)
+        .bind(write().account_id)
+        .execute(&mut *debit)
+        .await
+        .expect("ledger row");
+        sqlx::query(
+            "UPDATE principal SET spent_usd = spent_usd + 0.10,
+                                  spent_month = date_trunc('month', now())::date
+              WHERE id = $1",
+        )
+        .bind(principal)
+        .execute(&mut *debit)
+        .await
+        .expect("take the row lock");
+
+        // The pass, which must now be waiting on that lock.
+        let pass = tokio::spawn({
+            let db = db.clone();
+            async move { reconcile_monthly_spend(&db).await }
+        });
+
+        // Observed, not assumed. Without this the debit could commit before the
+        // pass had reached the row at all, and the test would go back to
+        // asserting whatever the scheduler felt like.
+        let mut blocked = false;
+        for _ in 0..200 {
+            // `pg_stat_activity`, not `pg_locks` filtered by relation: a
+            // transaction waiting for another's row lock waits on that
+            // transaction's id, so nothing ungranted is recorded against the
+            // table itself.
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                  WHERE datname = current_database()
+                    AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .expect("read the lock table");
+            if waiting > 0 {
+                blocked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            blocked,
+            "the pass never reached the locked row, so this run proved nothing"
+        );
+
+        debit.commit().await.expect("commit the debit");
+        pass.await.expect("task").expect("reconcile");
+
+        // And a second debit after the pass, so the counter is exercised in
+        // both orders relative to it.
+        record_usage(&db, &write()).await.expect("record");
+
+        let ledger: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_event
+              WHERE principal_id = $1 AND occurred_at >= date_trunc('month', now())",
+        )
+        .bind(principal)
+        .fetch_one(db.pool())
+        .await
+        .expect("sum");
+        assert_eq!(ledger, dec!(0.45), "the old row and two debits");
+
+        let spend = spend_for(&db, key, principal).await.expect("spend");
+        assert_eq!(
+            spend.principal_usd, ledger,
+            "the debit that landed mid-pass is still in the counter"
+        );
+        let row = route_by_id(&db, route)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert_eq!(row.spent_usd, ledger, "and in the route's");
+    }
+
+    /// Fixture: a budgeted principal and route with one debit already counted,
+    /// plus a builder for further debits of ten cents.
+    ///
+    /// Its own function because the race test below is long enough without it,
+    /// and because the pieces only mean something together: reconcile touches
+    /// budgeted rows only, and the pre-existing row is what proves a pass
+    /// rewrites rather than merely adds.
+    async fn budgeted_principal(
+        db: &Db,
+    ) -> (Uuid, Uuid, Uuid, impl Fn() -> UsageWrite + Send + 'static) {
+        let (principal, route, account) = seed(db).await;
+        let key = capped_key(db, principal, route, format!("race-{}", Uuid::new_v4())).await;
+        set_budgets(db, principal, route).await;
+        old_binary_row(db, principal, key, route, "0.25").await;
 
         let write = move || UsageWrite {
             request_id: Uuid::new_v4(),
@@ -2431,43 +2598,7 @@ mod tests {
             ttft_ms: None,
             streamed: false,
         };
-
-        let mut tasks = Vec::new();
-        for _ in 0..24 {
-            let db = db.clone();
-            tasks.push(tokio::spawn(async move {
-                record_usage(&db, &write()).await.expect("record");
-            }));
-        }
-        for _ in 0..6 {
-            let db = db.clone();
-            tasks.push(tokio::spawn(async move {
-                reconcile_monthly_spend(&db).await.expect("reconcile");
-            }));
-        }
-        for task in tasks {
-            task.await.expect("task");
-        }
-
-        let ledger: Decimal = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_event
-              WHERE principal_id = $1 AND occurred_at >= date_trunc('month', now())",
-        )
-        .bind(principal)
-        .fetch_one(db.pool())
-        .await
-        .expect("sum");
-        assert_eq!(ledger, dec!(2.65), "24 debits and the old row");
-        let spend = spend_for(&db, key, principal).await.expect("spend");
-        assert_eq!(
-            spend.principal_usd, ledger,
-            "every debit that landed mid-pass is kept"
-        );
-        let row = route_by_id(&db, route)
-            .await
-            .expect("load")
-            .expect("exists");
-        assert_eq!(row.spent_usd, ledger);
+        (principal, route, key, write)
     }
 
     /// Fixture: one principal, one route, one shared credential joined to it.
@@ -3605,6 +3736,218 @@ mod tests {
             .await
             .expect("replay");
         assert_eq!(key_spend(&db, key).await, dec!(2.00), "replay is a no-op");
+    }
+
+    /// S4. A debit reaches the counter at the ledger's own scale.
+    ///
+    /// `usage_event.cost_usd` is `numeric(14,8)` and the three denormalised
+    /// counters were `numeric(14,6)`, so `SET spent_usd = spent_usd +
+    /// ins.cost_usd` rounded every debit on assignment. A cheap-rung request
+    /// costs on the order of $0.0001; one costing less than $0.0000005 debited
+    /// nothing at all, and traffic made of such requests spent real money
+    /// against a cap that never moved.
+    ///
+    /// It also put the reconciler in an argument it could not win: 0012 exists
+    /// so a budget is enforced against a number that cannot be stale, and that
+    /// number was compared for equality against an eight-place ledger sum it
+    /// could not represent.
+    #[tokio::test]
+    async fn a_debit_keeps_every_place_the_ledger_recorded() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (key, build) = metered_key(&db).await;
+
+        // Eight places, the last two of which the old column could not hold.
+        let cost = "0.00000123";
+        record_usage(&db, &build(Uuid::new_v4(), 0, "classified", cost))
+            .await
+            .expect("record");
+
+        assert_eq!(
+            key_spend(&db, key).await,
+            dec!(0.00000123),
+            "the counter rounded the debit away: at six places this is 0.000001"
+        );
+
+        // And the property the reconciler depends on: counter == ledger sum,
+        // exactly, with no tolerance.
+        let ledger: Decimal = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost_usd), 0) FROM usage_event WHERE api_key_id = $1",
+        )
+        .bind(key)
+        .fetch_one(db.pool())
+        .await
+        .expect("sum");
+        assert_eq!(
+            key_spend(&db, key).await,
+            ledger,
+            "the counter and the ledger have to be comparable for equality"
+        );
+
+        // Repeated, because rounding on assignment compounds: a hundred of
+        // these is where a six-place counter and the ledger visibly part.
+        for _ in 0..99 {
+            record_usage(&db, &build(Uuid::new_v4(), 0, "classified", cost))
+                .await
+                .expect("record");
+        }
+        assert_eq!(
+            key_spend(&db, key).await,
+            dec!(0.00012300),
+            "a hundred debits of 0.00000123 are 0.000123, not 0.0001"
+        );
+    }
+
+    /// S2. A prefix collision revokes several keys, and says so.
+    ///
+    /// `key_prefix` is the displayed half of a key and carries no unique index,
+    /// so this UPDATE has always been able to match more than one row. The
+    /// caller took `fetch_optional`, which keeps the first and drops the rest —
+    /// so on a collision the other keys were deactivated in the database while
+    /// their hashes were never evicted from the shared cache, and they went on
+    /// authenticating from L2 for its full TTL. An operator revoking a leaked
+    /// key during an incident was told one key was dealt with, got one
+    /// eviction, and could have had the leaked one still working.
+    #[tokio::test]
+    async fn revoking_by_prefix_returns_every_key_that_shared_it() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, _) = seed(&db).await;
+
+        // Two keys, one displayed prefix. Nothing prevents this: the prefix is
+        // a display string, not an identifier.
+        let shared = format!("oag_live_{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let mut hashes = Vec::new();
+        for name in ["the-leaked-one", "someone-elses"] {
+            let raw = format!("{name}-{}", Uuid::new_v4());
+            let hash = hash_key(&raw);
+            sqlx::query(
+                "INSERT INTO api_key (id, key_hash, key_prefix, name, principal_id, route_id)
+                 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)",
+            )
+            .bind(&hash)
+            .bind(&shared)
+            .bind(name)
+            .bind(principal)
+            .bind(route)
+            .execute(db.pool())
+            .await
+            .expect("mint");
+            hashes.push(hash);
+        }
+
+        let revoked = revoke_key_by_prefix(&db, &shared).await.expect("revoke");
+        assert_eq!(
+            revoked.len(),
+            2,
+            "both keys carried the prefix and both were deactivated, so the \
+             caller has to be told about both — it is the hashes it evicts"
+        );
+        let returned: std::collections::HashSet<&str> =
+            revoked.iter().map(|(h, _, _)| h.as_str()).collect();
+        for hash in &hashes {
+            assert!(
+                returned.contains(hash.as_str()),
+                "a key was switched off in the database and its hash never came \
+                 back, so nothing evicts it and it authenticates until the TTL"
+            );
+        }
+
+        // Both rows really are inactive, and a second call finds nothing left:
+        // the UPDATE is scoped to `active`, so this is not idempotent by
+        // accident but by the predicate.
+        let still_active: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM api_key WHERE key_prefix = $1 AND active")
+                .bind(&shared)
+                .fetch_one(db.pool())
+                .await
+                .expect("count");
+        assert_eq!(still_active, 0);
+        assert!(
+            revoke_key_by_prefix(&db, &shared)
+                .await
+                .expect("revoke again")
+                .is_empty(),
+            "nothing active left to revoke"
+        );
+    }
+
+    /// S1. The usage panels read a window, not a key's whole history.
+    ///
+    /// Both queries state their windows inside `FILTER` clauses, which decide
+    /// what each aggregate counts and nothing about what the join reads. With
+    /// no bound in the `ON`, the join walked every row the key or principal had
+    /// ever written in order to report a rolling five hours — and `key_usage`
+    /// is the query a partner service calls before each model call, per member.
+    /// The ledger-partitioning design doc classifies both as range-bounded;
+    /// that premise was wrong, which is why this asserts the plan and not the
+    /// numbers. The numbers were always right. They just cost a scan.
+    ///
+    /// What is asserted is that the window bound reaches the *index condition*
+    /// rather than being applied after rows are read. That is the difference
+    /// between a range scan and a full walk, and it is a property of the query
+    /// rather than of how much data happens to be in the table — so the test
+    /// says nothing about which plan the planner prefers today, and turning
+    /// sequential scans off is how it asks the question it actually means.
+    #[tokio::test]
+    async fn the_usage_panels_bound_the_ledger_side_of_their_joins() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (key, build) = metered_key(&db).await;
+        for _ in 0..32 {
+            record_usage(&db, &build(Uuid::new_v4(), 0, "classified", "0.01"))
+                .await
+                .expect("seed");
+        }
+
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .expect("ask for the index plan");
+
+        // The join `key_usage` makes, verbatim from its `FROM` onwards.
+        let plan: String = sqlx::query_scalar(
+            "EXPLAIN SELECT count(*) FROM api_key k
+               JOIN principal p ON p.id = k.principal_id
+               LEFT JOIN usage_event u
+                      ON u.api_key_id = k.id
+                     AND u.occurred_at >= LEAST(
+                             date_trunc('month', now()),
+                             now() - interval '7 days'
+                         )
+              WHERE k.id = $1",
+        )
+        .bind(key)
+        .fetch_all(&mut *tx)
+        .await
+        .map(|rows: Vec<String>| rows.join("\n"))
+        .expect("explain");
+        tx.rollback().await.expect("rollback");
+
+        let ledger_cond = plan
+            .lines()
+            .skip_while(|l| !l.contains("usage_event"))
+            .find(|l| l.contains("Index Cond:"))
+            .unwrap_or_else(|| panic!("the ledger side of the join is not indexed:\n{plan}"));
+        assert!(
+            ledger_cond.contains("occurred_at"),
+            "the window bound must be part of the index range, not a filter \
+             applied to every row the key has ever written:\n{plan}"
+        );
+        assert!(
+            ledger_cond.contains("api_key_id"),
+            "and it rides on `usage_event_key_idx`, which leads with the key:\n{plan}"
+        );
     }
 
     /// A lost stream and the retry that replaced it: two rows, one request.

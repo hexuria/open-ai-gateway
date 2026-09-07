@@ -309,6 +309,58 @@ impl RoutingPolicy {
         self.floor.as_ref().map(|t| t.name.as_str())
     }
 
+    /// The model the savings figure is measured against.
+    ///
+    /// The dearer of two candidates, never simply the first that exists.
+    ///
+    /// The dearest model the credentials are *known* to serve is the better
+    /// answer when it is available, because it is measured against what this
+    /// deployment could really have used rather than against a rung someone
+    /// configured. But that set is a partial discovery, not an inventory: only
+    /// an adapter that overrides `served_models` populates it, and today only
+    /// Codex does. On a route holding a Codex seat beside an Anthropic key it
+    /// therefore lists gpt-5 and says nothing about Opus — so a request Opus
+    /// served took its baseline from a model that costs less than the request
+    /// did, and `SUM(counterfactual - cost)` *subtracted* on exactly the rows
+    /// where the gateway had spent the most.
+    ///
+    /// The ladder's ceiling alone is wrong for the reason `decide` gives at
+    /// length: on a one-rung ladder it is the same model that served, so the
+    /// headline stops meaning "versus your best model".
+    ///
+    /// Taking the dearer keeps both properties and adds the one that matters:
+    /// a baseline can never be cheaper than a rung this route can reach, so a
+    /// served row can never report a negative saving. Ties go to the served
+    /// model, which is the more truthful of two equals — and deterministically,
+    /// because the ledger records the winner as `counterfactual_model`.
+    fn baseline(
+        &self,
+        catalog: &Catalog,
+        served: &std::collections::HashSet<String>,
+        need: &Requirements,
+    ) -> Option<ModelSpec> {
+        // Input plus output per Mtok, the same single scalar `dearest_served`
+        // ranks by and for the same reason: the token split is not known when
+        // the baseline is chosen.
+        fn price(spec: &ModelSpec) -> Decimal {
+            spec.pricing.input_per_mtok + spec.pricing.output_per_mtok
+        }
+        let from_served = catalog.dearest_served(served, need);
+        let from_ladder = self.ladder.pick(&self.ladder.ceiling(), catalog, need);
+        match (from_served, from_ladder) {
+            (Some(served_spec), Some(ladder_spec)) => Some(
+                if price(ladder_spec) > price(served_spec) {
+                    ladder_spec
+                } else {
+                    served_spec
+                }
+                .clone(),
+            ),
+            (Some(spec), None) => Some(spec.clone()),
+            (None, ladder_spec) => ladder_spec.cloned(),
+        }
+    }
+
     /// Choose a model for a request.
     ///
     /// Order matters and is the whole policy:
@@ -351,11 +403,7 @@ impl RoutingPolicy {
         // `need`, and applying capability after choosing one model would throw
         // away the whole served set whenever that one model could not hold the
         // prompt.
-        let ceiling_model = catalog.dearest_served(served, &need).cloned().or_else(|| {
-            self.ladder
-                .pick(&self.ladder.ceiling(), catalog, &need)
-                .cloned()
-        });
+        let ceiling_model = self.baseline(catalog, served, &need);
 
         if budget.pressure() == BudgetPressure::Exhausted {
             return Err(Error::BudgetExhausted {
@@ -465,17 +513,12 @@ impl RoutingPolicy {
     ) -> Option<RoutingDecision> {
         let next = self.ladder.escalate(from)?;
         let need = signal.requirements(max_output_tokens);
-        // The same baseline `decide` computes, for the same reason it gives
-        // fifteen lines to: the dearest model the credentials actually serve,
-        // with the ladder's top rung only as the fallback. This sibling used
-        // the ladder alone, so every escalated row's counterfactual was
-        // priced against a different baseline from the row before it — and
-        // on a short ladder, against the very model that had just served.
-        let ceiling_model = catalog.dearest_served(served, &need).cloned().or_else(|| {
-            self.ladder
-                .pick(&self.ladder.ceiling(), catalog, &need)
-                .cloned()
-        });
+        // The same baseline `decide` computes, and by the same call: this
+        // sibling used the ladder alone, so every escalated row's
+        // counterfactual was priced against a different baseline from the row
+        // before it — and on a short ladder, against the very model that had
+        // just served.
+        let ceiling_model = self.baseline(catalog, served, &need);
         self.resolve_from(
             next,
             SelectionReason::Escalated {
@@ -801,14 +844,29 @@ mod tests {
     }
 
     #[test]
-    fn a_reachable_ceiling_outranks_the_ladders_top_rung() {
-        // The savings baseline must not come from the ladder. `ceiling()` is
-        // the last rung and `pick` is the same call routing makes, so on a
-        // one-rung ladder the baseline and the served model are the same model
-        // and the saving stops meaning "versus your best model".
+    fn on_a_one_rung_ladder_the_baseline_is_not_the_model_that_served() {
+        // Why the served set is consulted at all. `ceiling()` is the last rung
+        // and `pick` is the same call routing makes, so a ladder with one rung
+        // would otherwise baseline every request against the very model that
+        // answered it, and the saving would stop meaning "versus your best
+        // model" — it would mean nothing, being always zero.
+        //
+        // This test used to make the same point with a served model CHEAPER
+        // than the ladder's top rung, and assert that the cheap one won. That
+        // is the defect R2 describes: the served set is a partial discovery,
+        // so "cheaper than the ladder" means "we have not heard about the
+        // dearer model", not "the dearer model is unreachable". The property
+        // worth keeping is this one, and it survives taking the dearer of the
+        // two.
+        let ladder = TierLadder::new(vec![Rung {
+            name: TierName::new("cheap"),
+            models: vec![ModelId::new("kimi/k2")],
+        }])
+        .expect("non-empty");
+        let p = RoutingPolicy::new(ladder, Box::new(HeuristicClassifier::default()));
         let catalog = catalog();
-        let served: HashSet<String> = ["k2"].iter().map(|s| (*s).to_owned()).collect();
-        let d = policy()
+        let served: HashSet<String> = ["opus"].iter().map(|s| (*s).to_owned()).collect();
+        let d = p
             .decide(
                 &RoutingMode::Managed,
                 None,
@@ -822,10 +880,11 @@ mod tests {
                 &served,
             )
             .expect("routes");
+        assert_eq!(d.model.id.as_str(), "kimi/k2", "the one rung served it");
         assert_eq!(
             d.ceiling_model.expect("ceiling exists").id.as_str(),
-            "kimi/k2",
-            "the served set should decide the baseline, not the ladder's top rung"
+            "anthropic/opus",
+            "and the baseline is what the credentials reach, not what served"
         );
     }
 
@@ -1063,6 +1122,93 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn the_baseline_is_never_cheaper_than_a_rung_the_route_can_reach() {
+        // R2. The served set is a partial discovery, not an inventory: only an
+        // adapter that overrides `served_models` populates it, and today only
+        // Codex does. A route holding such a seat beside an Anthropic key
+        // therefore lists the seat's models and says nothing about Opus — and
+        // taking the served answer whenever it existed priced an Opus request
+        // against a model that costs less than the request did. The headline
+        // `SUM(counterfactual - cost)` then *subtracted* on exactly the rows
+        // where the gateway had spent the most.
+        let p = policy();
+        let catalog = catalog();
+        let served: HashSet<String> = ["k2".to_owned()].into_iter().collect();
+
+        let d = p
+            .decide(
+                &RoutingMode::Managed,
+                None,
+                &RequestSignal {
+                    prompt_tokens: 200,
+                    turn_count: 1,
+                    ..RequestSignal::default()
+                },
+                &rich(),
+                &catalog,
+                1024,
+                &served,
+            )
+            .expect("routes");
+        assert_eq!(
+            d.ceiling_model.as_ref().map(|m| m.id.as_str()),
+            Some("anthropic/opus"),
+            "the ladder reaches Opus, so the baseline cannot be the cheap seat"
+        );
+
+        // And `escalate` agrees, because both go through the same call.
+        let d = p
+            .escalate(
+                &p.ladder().floor(),
+                QualityGate::MalformedToolCall,
+                &RequestSignal::default(),
+                &catalog,
+                1024,
+                &served,
+            )
+            .expect("escalates");
+        assert_eq!(
+            d.ceiling_model.as_ref().map(|m| m.id.as_str()),
+            Some("anthropic/opus")
+        );
+    }
+
+    #[test]
+    fn a_served_model_dearer_than_the_ladder_is_still_the_baseline() {
+        // The other direction, which is the whole reason `dearest_served`
+        // exists: what the credentials actually reach beats what someone put
+        // on a rung. Taking the dearer of the two keeps this.
+        let catalog = Catalog::from_entries([
+            model("kimi/k2", Provider::Kimi, 128_000, dec!(0.6)),
+            model("anthropic/haiku", Provider::Anthropic, 200_000, dec!(1)),
+            model("anthropic/opus", Provider::Anthropic, 400_000, dec!(15)),
+            model("openai/gpt-5", Provider::OpenAI, 400_000, dec!(40)),
+        ]);
+        let served: HashSet<String> = ["gpt-5".to_owned()].into_iter().collect();
+
+        let d = policy()
+            .decide(
+                &RoutingMode::Managed,
+                None,
+                &RequestSignal {
+                    prompt_tokens: 200,
+                    turn_count: 1,
+                    ..RequestSignal::default()
+                },
+                &rich(),
+                &catalog,
+                1024,
+                &served,
+            )
+            .expect("routes");
+        assert_eq!(
+            d.ceiling_model.as_ref().map(|m| m.id.as_str()),
+            Some("openai/gpt-5"),
+            "a served model dearer than the ladder's ceiling is the truer baseline"
+        );
     }
 
     #[test]
