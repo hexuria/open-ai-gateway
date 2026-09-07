@@ -304,11 +304,25 @@ _verify-bootstrap:
              cargo run --quiet -p oag -- admin account add --name mock --provider anthropic \
                --secret FAKE-CREDENTIAL-FOR-TESTS --route default >/dev/null'
 
-# The newest row, pipe-separated, for the assertions in local-verify.sh.
-_verify-ledger:
+# The newest served row, pipe-separated, for the assertions in local-verify.sh.
+#
+# `since` is a timestamp taken just before the request, so the assertions cannot
+# pass on a row an earlier run left behind — the dev database is not reset
+# between runs, and the newest row was the newest row whether or not this run
+# metered anything. The default keeps a bare `just _verify-ledger` useful at a
+# prompt. The other three verify scripts take the same mark for the same reason.
+#
+# Abandoned and lost attempts are excluded because the assertions are about the
+# answer the client was served: since 0014 those rows land too, and they carry a
+# counterfactual of zero by design, which the "counterfactual above cost" check
+# reads as a failure.
+_verify-ledger since="-infinity":
     @psql "{{dev_db}}" -At -F'|' -c "SELECT model_id, tier, input_tokens, output_tokens, \
         cost_usd, counterfactual_usd, coalesce(ttft_ms, 0) \
-        FROM usage_event WHERE model_id LIKE 'anthropic%' ORDER BY occurred_at DESC LIMIT 1"
+        FROM usage_event WHERE model_id LIKE 'anthropic%' \
+          AND occurred_at >= '{{since}}' \
+          AND selection_reason NOT IN ('abandoned', 'lost') \
+        ORDER BY occurred_at DESC LIMIT 1"
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 # Deterministic dev-only secrets. Never use these anywhere real.

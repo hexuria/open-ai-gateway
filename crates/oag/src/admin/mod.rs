@@ -1730,7 +1730,8 @@ async fn status(db: &Db) -> Result<()> {
     // The headline number: what the gateway saved this month.
     let spend: Option<(Decimal, Decimal, i64)> = sqlx::query_as(
         r"
-        SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM(counterfactual_usd),0), COUNT(*)
+        SELECT COALESCE(SUM(cost_usd),0), COALESCE(SUM(counterfactual_usd),0),
+               COUNT(*) FILTER (WHERE selection_reason NOT IN ('abandoned', 'lost'))
         FROM usage_event WHERE occurred_at >= date_trunc('month', now())
         ",
     )

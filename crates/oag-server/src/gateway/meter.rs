@@ -139,6 +139,31 @@ fn usage_write(
         Fate::Abandoned | Fate::Lost => (Decimal::ZERO, None),
     };
 
+    // The API-equivalent price, which is what a seat's savings are measured
+    // against. An attempt nobody was served displaced no bill, so it must not
+    // claim to have displaced one — the same argument the paragraph above makes
+    // for the frontier baseline, applied to the column beside it, which was
+    // left saying the opposite.
+    //
+    // `cost`, not zero, and that distinction is the whole fix:
+    //
+    // - On a **metered** credential `cost` already *is* the API price, so this
+    //   changes nothing and the row still records what those tokens cost us.
+    //   Zeroing it here would make `api - cost` negative and understate the
+    //   very savings figure the column feeds.
+    // - On a **flat-rate seat** `cost` is zero, which is the point. The row
+    //   stops matching `cost_usd = 0 AND counterfactual_api_usd > 0` — the
+    //   predicate `seat_summaries` uses to recognise a seat row at all — so a
+    //   generation the client never received no longer appears in that seat's
+    //   displaced-spend total, or in the ordering that ranks seats by it.
+    //
+    // Since 0014 these rows land for the first time, so this was latent until
+    // the migration that made abandoned and lost attempts real.
+    let counterfactual_api = match fate {
+        Fate::Served => api_equivalent,
+        Fate::Abandoned | Fate::Lost => cost,
+    };
+
     // `escalated_from_tier` is set only when we actually climbed a rung;
     // `escalation_gate` is set whenever a gate tripped. Keeping them separate
     // is what lets you count missed escalation opportunities — the streamed
@@ -177,7 +202,7 @@ fn usage_write(
         cost_usd: cost,
         counterfactual_usd: counterfactual,
         counterfactual_model_id: counterfactual_model,
-        counterfactual_api_usd: api_equivalent,
+        counterfactual_api_usd: counterfactual_api,
         status: if outcome.error.is_some() { 502 } else { 200 },
         latency_ms: i32::try_from(outcome.total.as_millis()).ok(),
         ttft_ms: outcome.ttft.and_then(|d| i32::try_from(d.as_millis()).ok()),
@@ -203,11 +228,12 @@ pub async fn record_collected(
 /// An attempt the quality gate condemned, captured at the moment we gave up on
 /// it and held until the request it belongs to is finished.
 ///
-/// Captured rather than written there and then because of when it has to reach
-/// the ledger, not what it contains. Until the primary key is contracted onto
-/// `(request_id, attempt)`, only the first row for a request survives — and the
-/// row that has to survive is the one the client was served. Captured here, its
-/// latency and usage are still its own rather than the retry's.
+/// Captured rather than written there and then because of where it has to be
+/// written, not what it contains. The row belongs on the detached task that
+/// writes the served row, so that a client hanging up mid-write cannot cancel
+/// it; writing it at the point of abandonment would put it back on the request
+/// future. Captured here, its latency and usage are still its own rather than
+/// the retry's.
 #[derive(Debug, Clone)]
 pub struct Abandoned {
     ctx: Context,
@@ -234,9 +260,9 @@ pub fn abandon(
 ///
 /// The row carries the client's request id, so it stays attributable to the one
 /// request that was made, and `attempt` plus a `selection_reason` of
-/// `abandoned` separate it from the answer that was actually served. Until the
-/// ledger's key contracts, this write loses to the served row it follows and is
-/// dropped; the served row is the one that must not be.
+/// `abandoned` separate it from the answer that was actually served. Since 0014
+/// contracted the ledger's key onto `(request_id, attempt)` it lands beside that
+/// served row rather than losing to it.
 pub async fn record_abandoned(state: &AppState, abandoned: &Abandoned) {
     record_with_gate(
         state,
@@ -249,24 +275,42 @@ pub async fn record_abandoned(state: &AppState, abandoned: &Abandoned) {
     .await;
 }
 
+/// An answer the provider generated and the stream then lost, captured while
+/// the lease that identifies it is still in hand.
+///
+/// Held for the same reason [`Abandoned`] is. Written where it used to be — in
+/// the failover loop, inline — it sat on the request future, so a client that
+/// hung up during the retry cancelled the one write that says the first
+/// generation was paid for. It is also written *after* the served row now,
+/// which is what makes the ordering deliberate rather than incidental.
+#[derive(Debug, Clone)]
+pub struct Lost {
+    ctx: Context,
+    outcome: StreamOutcome,
+}
+
+/// Take note of an answer the stream lost.
+pub fn lose(
+    ctx: Context,
+    accumulator: &oag_proto::StreamAccumulator,
+    error: &oag_core::Error,
+) -> Lost {
+    let outcome = StreamOutcome {
+        error: Some(error.to_string()),
+        ..collected(&ctx, accumulator)
+    };
+    Lost { ctx, outcome }
+}
+
 /// Record an attempt the provider generated and the stream then lost.
 ///
 /// A collected stream that fails after its first frames — a Codex seat's
 /// connection dropping mid-generation — still cost what it generated, and
 /// the retry on another credential is a second generation, not a free
-/// replacement. This row is the first one. Status 502, because that is what
-/// the attempt was; the served row that follows says what the client got.
-pub async fn record_lost(
-    state: &AppState,
-    ctx: &Context,
-    accumulator: &oag_proto::StreamAccumulator,
-    error: &oag_core::Error,
-) {
-    let outcome = StreamOutcome {
-        error: Some(error.to_string()),
-        ..collected(ctx, accumulator)
-    };
-    record_with_gate(state, ctx, &outcome, None, false, Fate::Lost).await;
+/// replacement. Status 502, because that is what the attempt was; the served
+/// row it sits beside says what the client got.
+pub async fn record_lost(state: &AppState, lost: &Lost) {
+    record_with_gate(state, &lost.ctx, &lost.outcome, None, false, Fate::Lost).await;
 }
 
 /// The outcome of a response that arrived in one piece.
@@ -558,6 +602,51 @@ mod tests {
         // The frontier baseline is still recorded; it is a different question
         // (what the top rung would have cost) and stays on its own column.
         assert!(row.counterfactual_usd > Decimal::ZERO);
+    }
+
+    #[test]
+    fn an_unserved_seat_row_displaces_no_api_bill() {
+        // The seat table recognises its rows by `cost_usd = 0 AND
+        // counterfactual_api_usd > 0`, and an abandoned attempt on a seat used
+        // to match it — so a generation the client never received was credited
+        // to that seat as displaced spend, and the seats that wasted the most
+        // ranked highest. Latent until 0014 made these rows land at all.
+        let mut ctx = context(0);
+        ctx.flat_rate = true;
+
+        for fate in [Fate::Abandoned, Fate::Lost] {
+            let row = usage_write(&ctx, &outcome(300), None, false, fate);
+            assert_eq!(row.cost_usd, Decimal::ZERO, "{fate:?}");
+            assert_eq!(
+                row.counterfactual_api_usd,
+                Decimal::ZERO,
+                "{fate:?}: nobody was served, so no pay-per-token bill was displaced"
+            );
+            assert!(
+                !(row.cost_usd == Decimal::ZERO && row.counterfactual_api_usd > Decimal::ZERO),
+                "{fate:?}: the row must not match the seat predicate"
+            );
+        }
+
+        // The served row on the same seat still books what it displaced: this
+        // narrows the claim to unserved attempts, it does not withdraw it.
+        let served = usage_write(&ctx, &outcome(300), None, false, Fate::Served);
+        assert!(served.counterfactual_api_usd > Decimal::ZERO);
+    }
+
+    #[test]
+    fn an_unserved_metered_row_still_records_what_it_cost() {
+        // The other half, and the reason the fix is `cost` rather than zero.
+        // These tokens were bought and the invoice will show them. Zeroing the
+        // API-equivalent price here would make (api - cost) negative on this
+        // row and understate the savings figure it feeds.
+        let ctx = context(0); // flat_rate: false
+        let row = usage_write(&ctx, &outcome(300), None, false, Fate::Abandoned);
+        assert!(row.cost_usd > Decimal::ZERO, "we paid for these tokens");
+        assert_eq!(
+            row.counterfactual_api_usd, row.cost_usd,
+            "a metered row contributes nothing to (api - cost), whatever its fate"
+        );
     }
 
     #[test]

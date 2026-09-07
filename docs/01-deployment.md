@@ -239,16 +239,24 @@ filter is a free-form string and an operator quietening a noisy deployment to
 ## Migrations
 
 `oag migrate` runs them under a Postgres advisory lock; `oag serve` does not run
-them at all. There are six files:
+them at all. There are fourteen files:
 
 | File | What it is |
 |---|---|
 | `migrations/0001_baseline.sql` | The original schema. Still edited in place — only safe while no database anyone cares about has applied it. |
 | `migrations/0002_services.sql` | Capability-service catalog. Shipped. |
-| `migrations/0003_usage_event_attempt.sql` | Ledger expand: `attempt` column and a unique index on `(request_id, attempt)`. The primary key on `request_id` stays for this release so a rolling deploy does not 42P10. |
+| `migrations/0003_usage_event_attempt.sql` | Ledger expand: `attempt` column and a unique index on `(request_id, attempt)`. The primary key on `request_id` stayed for that release so a rolling deploy could not 42P10; 0014 is the contract half. |
 | `migrations/0004_seat_accounting.sql` | Subscription-seat accounting: flat-rate cost against the metered counterfactual. |
 | `migrations/0005_subscription_usage.sql` | The seat quota the poller reads, so an exhausted seat parks instead of failing every request. |
 | `migrations/0006_model_display_label.sql` | `display_label` on the catalog, nullable so NULL means "derive one". |
+| `migrations/0007_usage_reserve.sql` | A floor under a seat's quota, so a seat leaves rotation before the provider starts refusing. |
+| `migrations/0008_usage_origin.sql` | `origin` on the ledger: which rows this gateway served, and which were imported from a CLI's own transcripts. |
+| `migrations/0009_usage_key_window.sql` | `(api_key_id, occurred_at DESC)`, so a per-key window sum does not walk that key's whole history. |
+| `migrations/0010_points_reference.sql` | The one reference price a point is denominated in. Points are derived at read time, never stored. |
+| `migrations/0011_account_served_models.sql` | What a credential can actually be used with, as the provider reported it — rather than inferring visibility from ladder membership. |
+| `migrations/0012_denormalised_monthly_spend.sql` | Month-to-date spend on the row it caps, so a budget is enforced against a number that cannot be stale. |
+| `migrations/0013_account_index_without_last_used_at.sql` | `account_schedulable_idx` without the column that made every request's write to it a non-HOT update. |
+| `migrations/0014_usage_event_attempt_key.sql` | Ledger contract: the primary key becomes `(request_id, attempt)` by promoting 0003's index. Abandoned and lost attempts stop being dropped by `ON CONFLICT`, so a request that escalated leaves a row per attempt. |
 
 sqlx checksums applied migrations. Against a database that ran an earlier
 version of `0001`, `oag migrate` fails closed with *migration 1 was previously

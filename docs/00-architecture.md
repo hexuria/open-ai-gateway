@@ -73,8 +73,8 @@ POST /v1/messages
   │              a mid-flight death is named; the buffer is capped
   │
   ├─ meter       merge usage patches → price actual and counterfactual
-  │              → usage_event per attempt; charge only the written row
-  │              (PK still request_id this release; see 0003)
+  │              → usage_event per attempt; every attempt lands and is charged
+  │              (PK is (request_id, attempt) since 0014)
   │
   └─ on failure  classify → retry same credential
                           → or escalate a tier (context reject included)
