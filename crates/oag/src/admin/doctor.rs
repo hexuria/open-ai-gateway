@@ -8,13 +8,15 @@ use oag_store::Db;
 /// credential query now selects, so a binary on the old schema selects no
 /// candidate at all — a failure that reads as an empty pool unless something
 /// says the schema is behind, which is this. 0008 added `usage_event.origin`,
-/// which the reporting queries group on and the importer writes.
+/// which the reporting queries group on and the importer writes. 0017 re-keys
+/// the rows a Claude Code import already wrote, so a binary on the old schema
+/// re-imports the whole corpus the first time anybody runs `usage import`.
 ///
 /// Raise this with every migration that existing queries depend on. The test
 /// below counts the files rather than trusting this line, because the number
 /// that matters is the one on disk and a constant is exactly the thing that
 /// gets forgotten.
-const EXPECTED_MIGRATIONS: usize = 16;
+const EXPECTED_MIGRATIONS: usize = 17;
 
 pub async fn run(db: &Db, config: &Config, route: &str) -> Result<()> {
     let mut failed = 0u32;
