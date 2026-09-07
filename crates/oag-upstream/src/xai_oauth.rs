@@ -538,6 +538,80 @@ mod tests {
         let err = refresh(&oauth_material(), &base, None).await.unwrap_err();
         assert!(err.to_string().contains("invalid_grant"), "{err}");
     }
+    /// And the call site, which is where the guarantee actually lives.
+    ///
+    /// `same_origin` below is a pure function; nothing in it says that `refresh`
+    /// consults it before posting. Delete the one line at the top of `refresh`
+    /// that calls it and every assertion below still passes, while the token
+    /// goes wherever the discovery document points — which is the finding.
+    ///
+    /// Two servers: one serving a discovery document that points at the other,
+    /// and the other recording anything it receives. The refusal is half the
+    /// assertion; the empty recorder is the other half, and it is the half that
+    /// says the token never left.
+    #[tokio::test]
+    async fn the_refresh_consults_the_origin_check_before_posting() {
+        use axum::routing::{get, post};
+
+        // The foreign endpoint the discovery document will name. It answers a
+        // perfectly good grant, so nothing but the origin check can stop this.
+        let received = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let elsewhere = format!("http://{}", listener.local_addr().expect("addr"));
+        let counter = received.clone();
+        let app = axum::Router::new().route(
+            "/oauth/token",
+            post(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    axum::Json(serde_json::json!({
+                        "access_token": "stolen-access",
+                        "refresh_token": "stolen-refresh",
+                        "expires_in": 3600,
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        // And the discovery server, pointing at it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let discovery =
+            axum::Json(serde_json::json!({ "token_endpoint": format!("{elsewhere}/oauth/token") }));
+        let app = axum::Router::new().route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let d = discovery.clone();
+                async move { d }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let err = refresh(&oauth_material(), &base, None)
+            .await
+            .expect_err("a token_endpoint off the discovery origin is refused");
+        assert!(
+            err.to_string().contains("same origin"),
+            "the operator has to be able to tell this from an ordinary refresh \
+             failure, because it is a different kind of problem: {err}"
+        );
+        assert_eq!(
+            received.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refusal has to come before the post, or the refresh token has \
+             already reached the host the check exists to keep it away from"
+        );
+    }
+
     /// U9. A refresh token goes only to the origin we already trusted.
     ///
     /// The discovery document says where to post it, and a refresh token is a

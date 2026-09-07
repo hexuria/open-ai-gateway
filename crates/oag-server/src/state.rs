@@ -386,6 +386,67 @@ gateway:
         assert!(err.to_string().contains("codex"), "{err}");
     }
 
+    /// U5, at every adapter rather than at the normaliser.
+    ///
+    /// `a_base_url_is_trimmed_or_refused_at_startup` above proves the
+    /// normaliser; `a_codex_base_url_is_normalised_like_every_other` proves one
+    /// call site. Between them sat eight more adapters, each constructed with
+    /// its own line, any of which could have been written to pass
+    /// `provider_base_urls` straight through — which is exactly what Codex did,
+    /// and nothing failed until somebody read it.
+    ///
+    /// The refusal is the proof, as it was for Codex: a `?` can only be
+    /// rejected by the normaliser, so a provider whose configured base URL is
+    /// refused is a provider whose base URL went through it. `vertex` is absent
+    /// on purpose — it has no adapter here, so its key is inert, and asserting
+    /// a refusal for it would pin a behaviour that does not exist.
+    #[tokio::test]
+    async fn every_configured_base_url_goes_through_the_normaliser() {
+        let build = |provider: &str, url: &str| {
+            let config = oag_core::config::Config::from_yaml(&format!(
+                r#"
+database:
+  url: "postgres://oag:oag@127.0.0.1:1/oag"
+redis:
+  url: "redis://127.0.0.1:1"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+gateway:
+  provider_base_urls:
+    {provider}: "{url}"
+"#
+            ))
+            .expect("a base URL override is valid configuration in its own right");
+            let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+            let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+            AppState::new(config, db, cache)
+        };
+
+        for provider in [
+            "anthropic",
+            "bedrock",
+            "gemini",
+            "openai",
+            "kimi",
+            "deepseek",
+            "zhipu",
+            "xai",
+        ] {
+            build(provider, "https://proxy.internal/upstream/")
+                .unwrap_or_else(|e| panic!("{provider}: a trailing slash normalises away: {e}"));
+
+            let Err(err) = build(provider, "https://proxy.internal/upstream?token=secret") else {
+                panic!("{provider}: a query cannot be normalised away, so it is refused");
+            };
+            assert!(
+                err.to_string().contains(provider),
+                "the operator has to be told which provider's base URL was \
+                 rejected, because they configured several: {err}"
+            );
+        }
+    }
+
     /// G8. A stream ceiling that outlives a concurrency slot is refused here.
     ///
     /// A slot must outlive the longest request it guards. One that expires

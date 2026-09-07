@@ -1018,6 +1018,119 @@ security:
         assert_eq!(reserve_holding_back(&rows), None);
     }
 
+    /// R5, at the call site: a pin is namespaced by the provider that made it.
+    ///
+    /// `oag_pool::sticky` tests `SessionKey::redis_key` and proves it puts the
+    /// provider in the key. Nothing there says `lease` passes one. With
+    /// `provider.as_str()` replaced by a constant the pool tests all still pass,
+    /// and a conversation that escalates from a Kimi rung to an Anthropic one
+    /// writes its Anthropic credential over the Kimi pin under the same key —
+    /// so the next turn on the cheap rung finds a pin naming a credential of
+    /// the wrong provider, discards it, and picks afresh. Both providers lose
+    /// affinity, and the only symptom is a prompt-cache hit rate that drifts.
+    ///
+    /// Gated, because the observable difference is `via_sticky` on the third
+    /// lease and that needs the real Redis and the real candidate query. The
+    /// order is the finding: pin Anthropic, serve Kimi on the same session,
+    /// come back to Anthropic. Under one namespace the third lease still
+    /// returns the Anthropic credential — it is the only one of its provider —
+    /// but by the cascade, not by the pin, and `via_sticky` is how that shows.
+    #[tokio::test]
+    async fn a_pin_made_for_one_provider_is_not_read_for_another() {
+        let (Ok(db_url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&format!(
+            r#"
+database:
+  url: "{db_url}"
+redis:
+  url: "{redis_url}"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+"#
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 4).expect("pool");
+        db.migrate().await.expect("migrate");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("client");
+        let state = Arc::new(AppState::new(config, db.clone(), cache).expect("state"));
+
+        let tag = uuid::Uuid::new_v4();
+        let principal: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member') \
+             RETURNING id",
+        )
+        .bind(format!("r5-{tag}@example.invalid"))
+        .fetch_one(db.pool())
+        .await
+        .expect("principal");
+        let route: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]') RETURNING id",
+        )
+        .bind(format!("r5-{tag}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("route");
+        for provider in ["anthropic", "kimi"] {
+            let account: uuid::Uuid = sqlx::query_scalar(
+                "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+                 credentials_nonce) \
+                 VALUES (gen_random_uuid(), $1, $2, 'api_key', '\\x00', '\\x00') RETURNING id",
+            )
+            .bind(format!("r5-{provider}-{tag}"))
+            .bind(provider)
+            .fetch_one(db.pool())
+            .await
+            .expect("account");
+            sqlx::query("INSERT INTO account_route (account_id, route_id) VALUES ($1, $2)")
+                .bind(account)
+                .bind(route)
+                .execute(db.pool())
+                .await
+                .expect("join");
+        }
+
+        let session = oag_pool::SessionKey::from_caller(&format!("key-{tag}"), "a-model");
+        let none = HashSet::<AccountId, std::collections::hash_map::RandomState>::new();
+        let lease_from = async |provider, request_id: &str| {
+            lease(
+                &state, route, principal, provider, &session, &none, request_id, None,
+            )
+            .await
+            .expect("a credential of this provider is on the route")
+        };
+
+        let first = lease_from(Provider::Anthropic, &format!("r5a-{tag}")).await;
+        assert!(!first.via_sticky, "nothing was pinned yet");
+        first.release().await;
+
+        // The turn that used to clobber the pin.
+        lease_from(Provider::Kimi, &format!("r5k-{tag}"))
+            .await
+            .release()
+            .await;
+
+        let third = lease_from(Provider::Anthropic, &format!("r5b-{tag}")).await;
+        assert_eq!(
+            third.account.account_id(),
+            first.account.account_id(),
+            "the same credential either way — which is why the pin is what has \
+             to be asserted, not the choice"
+        );
+        assert!(
+            third.via_sticky,
+            "the Anthropic pin survived a Kimi turn on the same session, which \
+             it only can if the two live under different keys"
+        );
+        third.release().await;
+    }
+
     // The slot-TTL-against-the-ceiling assertion used to live here and compared
     // `SLOT_TTL` against the shipped default — two constants, agreeing by
     // construction. It is now
