@@ -257,9 +257,9 @@ pub struct Summary {
     /// summary — one slow sub-query must not take down the page — but an empty
     /// Subscriptions section reads exactly like a deployment with no seats, so
     /// an operator whose seat query timed out concluded the seats had been
-    /// removed. The three sibling queries return 500 for the same failure and
-    /// say in comments why they do; these two cannot, so they say which of them
-    /// is missing instead.
+    /// removed. `summary`'s other two queries — the totals and the tier
+    /// breakdown — return 500 for the same failure and say in comments why they
+    /// do; these two cannot, so they say which of them is missing instead.
     ///
     /// Empty on a healthy response, which is the common case and costs a caller
     /// nothing to ignore.
@@ -322,27 +322,12 @@ pub struct TierRow {
     pub saved_usd: String,
 }
 
-/// One row per subscription seat, each metered on its own.
+/// The statement [`seat_summaries`] runs.
 ///
-/// Each flat-rate account (`kind='oauth'`) is its own row so three Grok seats
-/// read as three lines, not one blur. A `LEFT JOIN` keeps a seat with no
-/// traffic this window visible at zero rather than vanishing, and the seat-row
-/// predicate on the join (`cost_usd = 0 AND counterfactual_api_usd > 0`) counts
-/// only what the seat actually served. Failures degrade to an empty list — a
-/// missing subscriptions table should not take down the whole summary.
-///
-/// Usage imported with `admin usage import --account <seat>` is written in that
-/// exact shape and counts here, deliberately: it is that subscription's traffic
-/// whether or not this gateway carried it, and the fee it is measured against
-/// was paid either way. The same predicate keeps it out of the headline, so it
-/// is stated once.
-async fn seat_summaries(
-    db: &oag_store::Db,
-    window: &period::Resolved,
-    degraded: &mut Vec<&'static str>,
-) -> Vec<SeatRow> {
-    let seats: Vec<SeatTuple> = sqlx::query_as(
-        r"
+/// A constant for the same reason `ORIGIN_BREAKDOWN_SQL` is one: a test that
+/// retypes a `COUNT ... FILTER` is a copy, and a copy agrees with its original
+/// only until somebody edits one of them.
+const SEAT_SUMMARIES_SQL: &str = r"
             SELECT a.name,
                    COUNT(u.request_id) FILTER (
                        WHERE u.selection_reason NOT IN ('abandoned', 'lost')
@@ -363,21 +348,41 @@ async fn seat_summaries(
             GROUP BY a.id, a.name, a.monthly_cost_usd, a.usage_remaining_pct,
                      a.usage_window_label, a.created_at
             ORDER BY COALESCE(SUM(u.counterfactual_api_usd), 0) DESC, a.name
-            ",
-    )
-    .bind(window.start)
-    .bind(window.end)
-    .fetch_all(db.pool())
-    .await
-    // Degrading to an empty section is this helper's documented contract —
-    // one sub-table must not take down the whole summary — but degrading
-    // SILENTLY was not: an empty list rendered as "no seats", indistinguishable
-    // from a query that failed. Say which it was.
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
-        degraded.push("subscriptions");
-        Vec::new()
-    });
+            ";
+
+/// One row per subscription seat, each metered on its own.
+///
+/// Each flat-rate account (`kind='oauth'`) is its own row so three Grok seats
+/// read as three lines, not one blur. A `LEFT JOIN` keeps a seat with no
+/// traffic this window visible at zero rather than vanishing, and the seat-row
+/// predicate on the join (`cost_usd = 0 AND counterfactual_api_usd > 0`) counts
+/// only what the seat actually served. Failures degrade to an empty list — a
+/// missing subscriptions table should not take down the whole summary.
+///
+/// Usage imported with `admin usage import --account <seat>` is written in that
+/// exact shape and counts here, deliberately: it is that subscription's traffic
+/// whether or not this gateway carried it, and the fee it is measured against
+/// was paid either way. The same predicate keeps it out of the headline, so it
+/// is stated once.
+async fn seat_summaries(
+    db: &oag_store::Db,
+    window: &period::Resolved,
+    degraded: &mut Vec<&'static str>,
+) -> Vec<SeatRow> {
+    let seats: Vec<SeatTuple> = sqlx::query_as(SEAT_SUMMARIES_SQL)
+        .bind(window.start)
+        .bind(window.end)
+        .fetch_all(db.pool())
+        .await
+        // Degrading to an empty section is this helper's documented contract —
+        // one sub-table must not take down the whole summary — but degrading
+        // SILENTLY was not: an empty list rendered as "no seats", indistinguishable
+        // from a query that failed. Say which it was.
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "summary section unavailable; rendering it empty");
+            degraded.push("subscriptions");
+            Vec::new()
+        });
 
     seats
         .into_iter()
@@ -415,20 +420,6 @@ async fn seat_summaries(
         .collect()
 }
 
-/// Usage grouped by where the rows came from and whose credential paid.
-///
-/// Unlike the headline, this counts flat-rate seat rows too: the question here
-/// is "what ran, and did this gateway see it", and excluding a subscription's
-/// traffic would answer a different one. The `LEFT JOIN` is what lets a row keep
-/// its seat's name; rows attributed to nothing group together under a null,
-/// which is the honest rendering of an import nobody said the owner of.
-///
-/// Returns nothing while every row came from the gateway, so a deployment that
-/// has never imported sees no section it would have to learn to ignore. The test
-/// is on the origins and not on the row count, because grouping by credential
-/// splits even a purely proxied deployment into a line per seat — which is
-/// interesting only once there is something outside the gateway to compare it
-/// against.
 /// The statement [`origin_breakdown`] runs.
 ///
 /// A constant so its shape can be asserted without a database. Two things in it
@@ -469,6 +460,20 @@ const ORIGIN_BREAKDOWN_SQL: &str = r"
             ORDER BY u.origin, COALESCE(SUM(u.counterfactual_api_usd), 0) DESC, a.name
             ";
 
+/// Usage grouped by where the rows came from and whose credential paid.
+///
+/// Unlike the headline, this counts flat-rate seat rows too: the question here
+/// is "what ran, and did this gateway see it", and excluding a subscription's
+/// traffic would answer a different one. The `LEFT JOIN` is what lets a row keep
+/// its seat's name; rows attributed to nothing group together under a null,
+/// which is the honest rendering of an import nobody said the owner of.
+///
+/// Returns nothing while every row came from the gateway, so a deployment that
+/// has never imported sees no section it would have to learn to ignore. The test
+/// is on the origins and not on the row count, because grouping by credential
+/// splits even a purely proxied deployment into a line per seat — which is
+/// interesting only once there is something outside the gateway to compare it
+/// against.
 async fn origin_breakdown(
     db: &oag_store::Db,
     window: &period::Resolved,
@@ -527,25 +532,13 @@ fn tier_row(
         saved_usd: format!("{:.4}", cf - spent),
     }
 }
-
-pub async fn summary(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<period::Window>,
-) -> Response {
-    let window = match period::resolve(&query, time::OffsetDateTime::now_utc()) {
-        Ok(w) => w,
-        // A window nobody can name is not a window to guess at: an operator who
-        // typed `period=quarter` and silently got a rolling 30 days would trust
-        // the answer to a question they did not ask.
-        Err(message) => return invalid(&message),
-    };
-
-    // The headline is per-token traffic only. A seat row (cost 0, real
-    // API-equivalent price) is flat-rate, so folding it in here would let its
-    // zero marginal cost inflate the frontier saving — the subscription's worth
-    // is a separate question, answered per seat below.
-    let totals: Result<SummaryTotals, _> = sqlx::query_as(
-        r"
+/// The statement the headline runs.
+///
+/// A constant for the same reason `SEAT_SUMMARIES_SQL` and
+/// `ORIGIN_BREAKDOWN_SQL` are: what it excludes is invisible in the output — a
+/// wrong number looks exactly like a right one — so a test has to be able to
+/// run the statement itself rather than a retyped copy of its predicates.
+const SUMMARY_TOTALS_SQL: &str = r"
             -- The count filters out abandoned and lost attempts and the sums
             -- do not. Since 0014 contracted the ledger key onto
             -- `(request_id, attempt)`, one request can leave several rows —
@@ -567,13 +560,50 @@ pub async fn summary(
             FROM usage_event
             WHERE ($1::timestamptz IS NULL OR occurred_at >= $1)
               AND ($2::timestamptz IS NULL OR occurred_at <  $2)
-              AND NOT (cost_usd = 0 AND counterfactual_api_usd > 0)
-            ",
-    )
-    .bind(window.start)
-    .bind(window.end)
-    .fetch_one(state.db.pool())
-    .await;
+              -- The seat-row predicate, and the reason it needs its second
+              -- clause. `cost_usd = 0 AND counterfactual_api_usd > 0` was the
+              -- whole of it, and it worked because a seat row's displaced API
+              -- bill was always positive. Zeroing `counterfactual_api_usd` on
+              -- unserved rows took that away: an abandoned or lost attempt on a
+              -- flat-rate seat is now 0 and 0, so it passes a test written to
+              -- catch seats and lands in this per-token headline. Its count is
+              -- filtered and its money is zero, so the visible effect is the
+              -- token sums below — a seat's tokens in the denominator of a
+              -- cache-hit rate that is supposed to describe metered traffic.
+              --
+              -- An unserved row on a METERED credential is not caught: its
+              -- `cost_usd` is what those tokens cost and stays positive, which
+              -- is the distinction this whole column exists to make.
+              AND NOT (
+                  cost_usd = 0
+                  AND (
+                      counterfactual_api_usd > 0
+                      OR selection_reason IN ('abandoned', 'lost')
+                  )
+              )
+            ";
+
+pub async fn summary(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<period::Window>,
+) -> Response {
+    let window = match period::resolve(&query, time::OffsetDateTime::now_utc()) {
+        Ok(w) => w,
+        // A window nobody can name is not a window to guess at: an operator who
+        // typed `period=quarter` and silently got a rolling 30 days would trust
+        // the answer to a question they did not ask.
+        Err(message) => return invalid(&message),
+    };
+
+    // The headline is per-token traffic only. A seat row (cost 0, real
+    // API-equivalent price) is flat-rate, so folding it in here would let its
+    // zero marginal cost inflate the frontier saving — the subscription's worth
+    // is a separate question, answered per seat below.
+    let totals: Result<SummaryTotals, _> = sqlx::query_as(SUMMARY_TOTALS_SQL)
+        .bind(window.start)
+        .bind(window.end)
+        .fetch_one(state.db.pool())
+        .await;
 
     let (requests, spent, counterfactual, cached, prompt) = match totals {
         Ok(t) => t,
@@ -1014,7 +1044,10 @@ pub async fn usage(State(state): State<Arc<AppState>>, Query(page): Query<Page>)
 
 #[cfg(test)]
 mod tests {
-    use super::{ORIGIN_BREAKDOWN_SQL, Summary};
+    use super::{
+        ORIGIN_BREAKDOWN_SQL, OriginTuple, SEAT_SUMMARIES_SQL, SUMMARY_TOTALS_SQL, SeatTuple,
+        Summary, SummaryTotals,
+    };
 
     /// A3, end to end: a section whose query fails names itself.
     ///
@@ -1057,6 +1090,343 @@ mod tests {
         let origins = super::origin_breakdown(&db, &window, &mut degraded).await;
         assert!(origins.is_empty());
         assert_eq!(degraded, vec!["subscriptions", "origins"]);
+    }
+
+    /// B7's other edge: an unserved seat row still reads as a seat row.
+    ///
+    /// The headline is per-token traffic only, and it recognises a flat-rate row
+    /// by `cost_usd = 0 AND counterfactual_api_usd > 0` — a proxy that held
+    /// because a seat's displaced API bill was always positive. Zeroing
+    /// `counterfactual_api_usd` on unserved rows took that away: an abandoned or
+    /// lost attempt on a seat is now 0 and 0, and passes a test written to
+    /// exclude seats.
+    ///
+    /// Money and counts survive it — both are zero or filtered — so what showed
+    /// was the token sums, which are neither: a seat's tokens in the denominator
+    /// of a cache-hit rate describing metered traffic. The statement is run
+    /// directly, because that rate is computed in Rust from these two sums and
+    /// asserting on the percentage would test the division.
+    #[tokio::test]
+    async fn an_unserved_seat_row_stays_out_of_the_per_token_headline() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = oag_store::Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let window = super::period::resolve(
+            &super::period::Window::default(),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("window");
+
+        // One repeatable-read transaction, rolled back: this aggregates the
+        // whole window with nothing to key on.
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .expect("a stable snapshot");
+        let before: SummaryTotals = sqlx::query_as(SUMMARY_TOTALS_SQL)
+            .bind(window.start)
+            .bind(window.end)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("headline");
+
+        // Three rows for one request on a flat-rate seat: two attempts nobody
+        // was served, and the answer that was. Only the served one is a seat
+        // row the headline should recognise, and none of the three is
+        // per-token traffic.
+        let request_id = uuid::Uuid::new_v4();
+        for (attempt, reason, api) in [
+            (0i16, "abandoned", "0"),
+            (1, "lost", "0"),
+            (2, "classified", "40.00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO usage_event (request_id, attempt, model_id, tier, \
+                 selection_reason, input_tokens, output_tokens, cache_read_tokens, \
+                 cost_usd, counterfactual_usd, counterfactual_api_usd, status) \
+                 VALUES ($1, $2, 'anthropic/claude-opus-5', 'frontier', $3, \
+                         1000, 20, 500, 0, 0, $4::numeric, 200)",
+            )
+            .bind(request_id)
+            .bind(attempt)
+            .bind(reason)
+            .bind(api)
+            .execute(&mut *tx)
+            .await
+            .expect("seed");
+        }
+
+        let after: SummaryTotals = sqlx::query_as(SUMMARY_TOTALS_SQL)
+            .bind(window.start)
+            .bind(window.end)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("headline");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(
+            (after.3 - before.3, after.4 - before.4),
+            (0, 0),
+            "no flat-rate row belongs in a per-token headline, served or not — \
+             and the two unserved ones are the pair that used to slip through, \
+             carrying 1000 cache-read tokens into a cache-hit denominator that \
+             is supposed to describe metered traffic"
+        );
+        assert_eq!(after.0 - before.0, 0, "and none of them is a request here");
+    }
+
+    /// The `64fc95b` filter, on the admin surface: attempts are not requests.
+    ///
+    /// Since 0014 contracted the ledger key onto `(request_id, attempt)`, one
+    /// client request leaves a row per attempt — a gate abandoning an answer, a
+    /// stream lost, then the one that served. Every one was generated upstream
+    /// and every one is money; only one of them is a request. Both aggregates
+    /// here carry `COUNT(...) FILTER (WHERE selection_reason NOT IN
+    /// ('abandoned', 'lost'))` and neither had a test, so either could be
+    /// deleted and the panels would quietly report a gateway serving more
+    /// traffic the more often escalation saved a bad answer.
+    ///
+    /// Seeded and read inside one transaction, rolled back: these statements
+    /// aggregate over the whole window with nothing to key on, so counting a
+    /// difference against the pool would move under any other test writing a
+    /// ledger row.
+    #[tokio::test]
+    async fn the_admin_panels_count_requests_and_sum_attempts() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = oag_store::Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let window = super::period::resolve(
+            &super::period::Window::default(),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("window");
+
+        let tag = uuid::Uuid::new_v4();
+        let mut tx = db.pool().begin().await.expect("begin");
+        let seat: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce) \
+             VALUES (gen_random_uuid(), $1, 'anthropic', 'oauth', '\\x00', '\\x00') \
+             RETURNING id",
+        )
+        .bind(format!("seat-{tag}"))
+        .fetch_one(&mut *tx)
+        .await
+        .expect("a seat to attribute the rows to");
+
+        // A seat row is `cost_usd = 0` with a real displaced API bill, which is
+        // what `seat_summaries` joins on.
+        let request_id = uuid::Uuid::new_v4();
+        for (attempt, reason) in [(0i16, "abandoned"), (1, "lost"), (2, "classified")] {
+            sqlx::query(
+                "INSERT INTO usage_event (request_id, attempt, account_id, origin, \
+                 model_id, tier, selection_reason, input_tokens, output_tokens, \
+                 cost_usd, counterfactual_usd, counterfactual_api_usd, status) \
+                 VALUES ($1, $2, $3, 'gateway', 'anthropic/claude-opus-5', 'frontier', \
+                         $4, 100, 20, 0, 3.00, 1.00, 200)",
+            )
+            .bind(request_id)
+            .bind(attempt)
+            .bind(seat)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await
+            .expect("seed");
+        }
+
+        // The statements the handlers run, on this transaction's snapshot.
+        // Not copies of them: both are constants, so what is planned here is
+        // what `seat_summaries` and `origin_breakdown` plan, and a `FILTER`
+        // deleted from either shows up here.
+        let seats: Vec<SeatTuple> = sqlx::query_as(SEAT_SUMMARIES_SQL)
+            .bind(window.start)
+            .bind(window.end)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("the subscriptions panel");
+        let origins: Vec<OriginTuple> = sqlx::query_as(ORIGIN_BREAKDOWN_SQL)
+            .bind(window.start)
+            .bind(window.end)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("the origins panel");
+        tx.rollback().await.expect("rollback");
+
+        let name = format!("seat-{tag}");
+        let seat_row = seats
+            .iter()
+            .find(|r| r.0 == name)
+            .unwrap_or_else(|| panic!("the seat this test made is not in the panel"));
+        assert_eq!(
+            seat_row.1, 1,
+            "three ledger rows for one client request, and the subscriptions \
+             panel has to say one"
+        );
+
+        let origin_row = origins
+            .iter()
+            .find(|r| r.1.as_deref() == Some(name.as_str()))
+            .unwrap_or_else(|| panic!("the seat this test made is not in the origins panel"));
+        assert_eq!(
+            origin_row.4, 1,
+            "and so does the origins panel, which groups the same three rows"
+        );
+    }
+
+    /// A4's other half: a read that failed is not a principal with no cap.
+    ///
+    /// The read-back was `.ok().flatten()`, which folds two different facts —
+    /// "the row could not be read" and "the row has no cap" — into one `None`,
+    /// and `null` on the wire is the second of them. So a failed read asserted,
+    /// beside a 200, that a cap the caller had just set was not in force. The
+    /// write really did succeed; what is unknown is what it left behind, and
+    /// saying so is the only honest answer.
+    #[tokio::test]
+    async fn a_budget_that_cannot_be_read_back_is_not_reported_as_absent() {
+        use axum::extract::{Json, State};
+
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        // A reachable Postgres and a database that is not there: the write
+        // fails, so this cannot reach the read-back — which is the point of the
+        // shape below, not of this call.
+        let Some((prefix, _)) = url.rsplit_once('/') else {
+            eprintln!("skipped: no database name in OAG_TEST_DATABASE_URL");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            &format!("{prefix}/oag_no_such_database"),
+            "redis://127.0.0.1:1",
+            "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        let state = std::sync::Arc::new(crate::AppState::new(config, db, cache).expect("state"));
+
+        let response = super::upsert_principal(
+            State(state),
+            super::AdminActor {
+                principal_id: uuid::Uuid::nil(),
+                email: "a4-admin@example.invalid".to_owned(),
+            },
+            Json(super::write::PrincipalInput {
+                email: "a4-unreadable@example.invalid".to_owned(),
+                role: None,
+                monthly_budget_usd: Some("12.50".to_owned()),
+            }),
+        )
+        .await;
+
+        assert_ne!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "a database that cannot answer must not produce a 200 asserting \
+             anything about a budget"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            json["monthly_budget_usd"].is_null() && json.get("error").is_some(),
+            "and it must not carry `monthly_budget_usd: null` as though the \
+             principal had no cap: {json}"
+        );
+    }
+
+    /// A4. The principal upsert echoes the budget that is now in force.
+    ///
+    /// The reply used to say nothing about the budget, so a caller could not
+    /// tell an upsert that set one from an upsert that left an existing one
+    /// alone — and the idempotent form (no budget in the body) does leave it
+    /// alone rather than clearing it, which is the guess callers got wrong.
+    /// Driven through the handler with a real `AdminActor` and a real
+    /// database, because the echo is a read-back after the write and a shape
+    /// test on the JSON would not prove the read happens.
+    ///
+    /// Gated on both backends: the upsert evicts the principal's cached keys,
+    /// and against a closed Redis port that eviction waits out the connection
+    /// manager's backoff.
+    #[tokio::test]
+    async fn the_principal_upsert_reports_the_budget_now_in_force() {
+        use axum::body::to_bytes;
+        use axum::extract::{Json, State};
+
+        let (Ok(db_url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            &db_url, &redis_url, "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 2).expect("pool");
+        db.migrate().await.expect("migrate");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("client");
+        let state = std::sync::Arc::new(crate::AppState::new(config, db, cache).expect("state"));
+
+        let actor = || super::AdminActor {
+            principal_id: uuid::Uuid::nil(),
+            email: "a4-admin@example.invalid".to_owned(),
+        };
+        let email = format!("a4-{}@example.invalid", uuid::Uuid::new_v4());
+        let upsert = async |budget: Option<&str>| {
+            let response = super::upsert_principal(
+                State(std::sync::Arc::clone(&state)),
+                actor(),
+                Json(super::write::PrincipalInput {
+                    email: email.clone(),
+                    role: None,
+                    monthly_budget_usd: budget.map(str::to_owned),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1 << 16).await.expect("body");
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json")
+        };
+
+        // As money, not as text: the column is `numeric(14,6)`, so the read-back
+        // carries the stored scale and `12.50` comes back as `12.500000`.
+        let budget = |reply: &serde_json::Value| -> Option<rust_decimal::Decimal> {
+            reply["monthly_budget_usd"]
+                .as_str()
+                .map(|b| b.parse().expect("a decimal"))
+        };
+        let twelve_fifty = Some(rust_decimal::Decimal::new(1250, 2));
+
+        let set = upsert(Some("12.50")).await;
+        assert_eq!(budget(&set), twelve_fifty);
+        assert_eq!(set["budget_unchanged"], serde_json::json!(false));
+
+        // The idempotent re-bind: no budget in the body leaves the existing one
+        // in force, and the reply has to say both that it is in force and that
+        // this call did not set it.
+        let again = upsert(None).await;
+        assert_eq!(
+            budget(&again),
+            twelve_fifty,
+            "the budget that is now in force, read back rather than echoed"
+        );
+        assert_eq!(
+            again["budget_unchanged"],
+            serde_json::json!(true),
+            "and said plainly, because the alternative is every caller \
+             discovering it from a support thread"
+        );
     }
 
     /// A3. A section that failed is distinguishable from one that is empty.

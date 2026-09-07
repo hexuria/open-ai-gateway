@@ -154,33 +154,117 @@ mod tests {
     use super::overloaded;
     use axum::http::StatusCode;
 
-    /// A2, the wiring. The shed arm is actually on the path.
+    /// A2, the wiring, driven: a shed lookup really does leave here as a 503.
     ///
-    /// Reads this file's own source, because driving `require_admin_layer` to
-    /// the `Overloaded` branch needs an `AppState` whose auth semaphore is
-    /// exhausted — a fixture larger and less reliable than the thing it would
-    /// prove. The test below covers what the response looks like; this covers
-    /// that anything reaches it, which is the half that was missing.
-    #[test]
-    fn the_shed_arm_is_wired_into_the_admin_layer() {
-        let src = include_str!("auth.rs");
-        let layer = src
-            .split_once("pub async fn require_admin_layer(")
-            .expect("the layer is in this file")
-            .1;
-        let body = &layer[..layer.find("\n}\n").unwrap_or(layer.len())];
-        assert!(
-            body.contains("Err(oag_core::Error::Overloaded) => return overloaded()"),
-            "without this arm every error collapses into 401, and the operator \
-             opening the dashboard to stop a key flood is told their key is wrong"
+    /// The permit is what has to be exhausted. `AuthCache` takes twice
+    /// `database.max_connections` with a floor of one, so a configured zero
+    /// buys exactly one permit — and the pool is sized separately, at four, so
+    /// the second request is refused by the permit rather than queued at the
+    /// pool.
+    ///
+    /// The holder parks in the Postgres handshake against a listener that
+    /// accepts and never speaks, so it keeps its permit for as long as the test
+    /// needs. The listener signals its first accept, and the second request is
+    /// sent only then: the pool dials after the permit is taken, so the accept
+    /// is proof the permit is held, and no sleep has to guess at it. The holder
+    /// is aborted rather than awaited: waiting out the pool's ten-second
+    /// acquire timeout would put thirty-odd seconds into every run of this
+    /// crate's tests to observe something already observed.
+    ///
+    /// Distinct keys on purpose: `authenticate` single-flights by hash, so two
+    /// requests carrying the same key would be one lookup holding one permit.
+    /// Redis is a closed port, refused immediately, so the lookup reaches the
+    /// permit rather than being answered from L2.
+    #[tokio::test]
+    async fn a_shed_admin_lookup_leaves_the_layer_as_a_503() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        // Accepts the connection and never sends a byte, so the Postgres
+        // startup message is never answered and the lookup holds its permit.
+        // The first accept is signalled: the pool dials only after the permit
+        // is taken, so a connection arriving here *is* the permit being held,
+        // and the second request can be sent the moment that is true rather
+        // than after a sleep that guesses at it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let hangs = listener.local_addr().expect("addr");
+        let (dialled, permit_held) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut dialled = Some(dialled);
+            while let Ok((conn, _)) = listener.accept().await {
+                held.push(conn);
+                if let Some(tx) = dialled.take() {
+                    let _ = tx.send(());
+                }
+            }
+        });
+
+        let config = crate::testing::config_yaml(
+            &format!("postgres://oag:oag@{hangs}/oag"),
+            "redis://127.0.0.1:1",
+            "",
         );
-        // Above the catch-all, or it never matches.
-        let shed = body.find("Error::Overloaded").expect("checked above");
-        let catch_all = body
-            .find("Err(e) => {")
-            .expect("the layer still has a catch-all");
-        assert!(shed < catch_all, "a later arm would never be reached");
+        let mut config = oag_core::config::Config::from_yaml(&config).expect("test config");
+        // One permit. The pool is sized separately below, so the second
+        // request is refused by the permit rather than queued at the pool.
+        config.database.max_connections = 0;
+        let db = oag_store::Db::connect(&config.database.url, 4).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        let state = std::sync::Arc::new(crate::AppState::new(config, db, cache).expect("state"));
+        let app = crate::admin_router(state);
+
+        let ask = |key: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/admin/api/summary")
+                        .header("authorization", format!("Bearer {key}"))
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+            }
+        };
+
+        // One request takes the only permit and parks in the handshake. It is
+        // never awaited: it would sit there for the pool's whole acquire
+        // timeout, and what it is for is holding the permit while the next
+        // request asks for one.
+        let holder = tokio::spawn(ask("oag_live_a_aaaaaaaaaaaaaaaaaaaaaaaa"));
+        tokio::time::timeout(std::time::Duration::from_secs(30), permit_held)
+            .await
+            .expect("the holder reached the handshake, so it holds the permit")
+            .expect("the listener is alive");
+
+        let shed = ask("oag_live_b_bbbbbbbbbbbbbbbbbbbbbbbb").await;
+        holder.abort();
+
+        assert_eq!(
+            shed.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a refused permit has to leave this layer as a shed, not as a 401 \
+             telling the operator their admin key is wrong"
+        );
+        assert_eq!(
+            shed.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "a 503 without a Retry-After is one a dashboard cannot recover from"
+        );
     }
+
+    // The source scan that used to sit here — reading this file for the
+    // `Overloaded` arm and checking it came before the catch-all — is retired.
+    // The test above drives the layer to that arm, which proves both facts:
+    // an arm below the catch-all would never match, and the request would come
+    // back 401.
 
     /// A2. Shedding is not a bad key, and the difference matters most now.
     ///

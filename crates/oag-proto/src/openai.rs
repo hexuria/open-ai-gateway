@@ -28,6 +28,38 @@ use serde_json::{Value, json};
 const DIALECT: Dialect = Dialect::OpenAIChatCompletions;
 
 /// Canonical → Chat Completions wire JSON.
+/// Whether this model refuses `max_tokens` and wants `max_completion_tokens`.
+///
+/// OpenAI split its API here and gave no capability endpoint to ask, so the
+/// name is all there is to go on — the same bet `anthropic::thinking_mode`
+/// makes, and for the same reason: sending the wrong spelling is a 400, which
+/// is worse than any degraded answer.
+///
+/// The o-series and gpt-5 and later. `gpt-4o` is deliberately not matched:
+/// the `o` there is part of the model's name, not the o-series, and it takes
+/// `max_tokens` like every other 4-generation model.
+///
+/// Unknown names get `max_tokens`, because every OpenAI-compatible upstream
+/// this dialect reaches — Kimi, DeepSeek, Zhipu, xAI, and anything self-hosted
+/// — knows that spelling and many have never heard of the other.
+fn reasoning_model(upstream_model: &str) -> bool {
+    // The bare name, after any vendor's routing prefix (`openai/gpt-5`,
+    // `azure/o3`) and before any suffix (`o3-mini`, `gpt-5.5-turbo`).
+    let name = upstream_model.rsplit('/').next().unwrap_or(upstream_model);
+
+    if let Some(rest) = name.strip_prefix('o') {
+        // `o1`, `o3`, `o4-mini` — a digit right after the `o`. This is what
+        // keeps `gpt-4o` out: its `o` is not at the start of the name.
+        if rest.starts_with(|c: char| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    name.strip_prefix("gpt-")
+        .and_then(|rest| rest.split(['.', '-']).next())
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 5)
+}
+
 pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Value> {
     let mut messages = Vec::new();
 
@@ -55,15 +87,25 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
         "model": upstream_model,
         "messages": messages,
         "stream": req.stream,
-        // Both spellings. `max_tokens` is deprecated and rejected outright by
-        // the reasoning models — a gpt-5 or o-series request carrying it comes
-        // back 400 — while older models and most OpenAI-compatible upstreams
-        // know only that one. Sending both is what the SDKs settled on: a model
-        // that understands `max_completion_tokens` uses it, the rest read
-        // `max_tokens`, and the two never disagree because they are one value.
-        "max_tokens": req.max_tokens,
-        "max_completion_tokens": req.max_tokens,
     });
+
+    // One spelling, chosen by the model. `max_tokens` is not merely deprecated
+    // on the reasoning models — it is refused, `Unsupported parameter:
+    // 'max_tokens' is not supported with this model` — so a request carrying it
+    // comes back 400 whatever else it also carries. The first fix for P11 sent
+    // both names on the grounds that the SDKs do, which is true and is not the
+    // same thing: an SDK sends the name its target understands, and sending the
+    // other one alongside is exactly what the 400 is about. That left the
+    // finding's own failure in place, under a comment describing it.
+    //
+    // Every other upstream that speaks this dialect knows `max_tokens` and many
+    // have never heard of `max_completion_tokens`, so it stays the default and
+    // only a recognised reasoning model gets the new name.
+    if reasoning_model(upstream_model) {
+        body["max_completion_tokens"] = json!(req.max_tokens);
+    } else {
+        body["max_tokens"] = json!(req.max_tokens);
+    }
 
     // The level, where the client gave one. A budget is rendered as the nearest
     // level rather than dropped, so an Anthropic client reaching an OpenAI
@@ -1138,19 +1180,65 @@ mod tests {
         assert_eq!(acc.stop_reason(), Some(StopReason::ToolUse));
     }
 
-    /// P11. The reasoning models reject `max_tokens` outright.
+    /// P11. The reasoning models reject `max_tokens` outright — so it is not sent.
+    ///
+    /// The first fix for this sent both spellings, on the grounds that the SDKs
+    /// do. They do, but they send the name their target understands; sending
+    /// the other one alongside is what the 400 is about
+    /// (`Unsupported parameter: 'max_tokens' is not supported with this model`).
+    /// So the finding's own failure survived its fix, under a comment that
+    /// described it, with a test that asserted it.
+    ///
+    /// The name is all there is to go on: OpenAI offers no capability endpoint,
+    /// which is the same bet `anthropic::thinking_mode` makes for the same
+    /// reason.
     #[test]
-    fn the_output_cap_is_sent_under_both_spellings() {
-        // A gpt-5 or o-series request carrying `max_tokens` comes back 400;
-        // older models and most compatible upstreams know only that spelling.
-        // One value, both names, so neither kind of upstream is excluded.
+    fn only_a_reasoning_model_gets_the_new_output_cap_spelling() {
         let req = parse_request(&json!(
             {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1024}
         ))
         .expect("parses");
-        let body = render_request(&req, "gpt-5").expect("renders");
-        assert_eq!(body["max_tokens"], json!(1024));
-        assert_eq!(body["max_completion_tokens"], json!(1024));
+        let render = |model: &str| render_request(&req, model).expect("renders");
+
+        for model in [
+            "gpt-5",
+            "gpt-5.5",
+            "openai/gpt-5",
+            "o1",
+            "o3-mini",
+            "azure/o4-mini",
+        ] {
+            let body = render(model);
+            assert_eq!(
+                body["max_completion_tokens"],
+                json!(1024),
+                "{model} takes the new spelling"
+            );
+            assert!(
+                body["max_tokens"].is_null(),
+                "{model} refuses `max_tokens` outright, so carrying it is the 400 \
+                 this finding is about: {body}"
+            );
+        }
+
+        // Everything else, including every OpenAI-compatible upstream this
+        // dialect reaches — many of which have never heard of the new name.
+        for model in ["gpt-4o", "gpt-4.1", "kimi-k2", "deepseek-chat", "grok-4"] {
+            let body = render(model);
+            assert_eq!(
+                body["max_tokens"],
+                json!(1024),
+                "{model} takes the old spelling"
+            );
+            assert!(
+                body["max_completion_tokens"].is_null(),
+                "and must not be sent a name it does not know: {body}"
+            );
+        }
+
+        // `gpt-4o` is the trap: the `o` is part of the name, not the o-series.
+        assert!(!reasoning_model("gpt-4o"));
+        assert!(reasoning_model("o1-preview"));
     }
 
     /// P6. A collected answer keeps the reasoning a streamed one delivers.

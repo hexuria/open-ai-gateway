@@ -1072,8 +1072,19 @@ fn empty_catalog_lines(total_before_filter: usize, provider: Option<&str>) -> Ve
     }
 }
 
-async fn list_catalog(db: &Db, provider: Option<&str>, limit: Option<usize>) -> Result<()> {
-    let mut rows = repo::catalog(db).await?;
+/// Everything `catalog list` decides, given what the catalog holds.
+///
+/// Separated from the printing so the filter and the two emptinesses are
+/// reachable from a test. `empty_catalog_lines` below is the decision; this is
+/// the code that has to feed it the count from *before* the filter, and that
+/// was the half nothing exercised — pass `rows.len()` after filtering instead
+/// and every assertion on the helper still passes while the command tells the
+/// operator to seed a catalog that is already full.
+fn catalog_lines(
+    mut rows: Vec<oag_store::ModelRow>,
+    provider: Option<&str>,
+    limit: Option<usize>,
+) -> Result<Vec<String>> {
     let total_before_filter = rows.len();
     if let Some(p) = provider {
         let want: oag_core::Provider = p.parse()?;
@@ -1091,26 +1102,31 @@ async fn list_catalog(db: &Db, provider: Option<&str>, limit: Option<usize>) -> 
         // catalog that was already seeded, got the same message, and concluded
         // the seed was broken. The filter is the answer and it is right there
         // in the arguments.
-        for line in empty_catalog_lines(total_before_filter, provider) {
-            println!("{line}");
-        }
-        return Ok(());
+        return Ok(empty_catalog_lines(total_before_filter, provider));
     }
-    println!(
+
+    let mut lines = vec![format!(
         "{:<36} {:<12} {:>8} {:>8} {:>8}",
         "ID", "PROVIDER", "IN/MTok", "OUT/MTok", "CTX"
-    );
+    )];
     for m in &rows {
-        println!(
+        lines.push(format!(
             "{:<36} {:<12} {:>8} {:>8} {:>8}",
             m.id, m.provider, m.input_per_mtok, m.output_per_mtok, m.context_window
-        );
+        ));
     }
     if rows.len() < total {
-        println!(
+        lines.push(format!(
             "({} of {total}; pass --limit to see more or less)",
             rows.len()
-        );
+        ));
+    }
+    Ok(lines)
+}
+
+async fn list_catalog(db: &Db, provider: Option<&str>, limit: Option<usize>) -> Result<()> {
+    for line in catalog_lines(repo::catalog(db).await?, provider, limit)? {
+        println!("{line}");
     }
     Ok(())
 }
@@ -1852,8 +1868,9 @@ async fn insert_account(
         return Err(oag_core::Error::Config(format!(
             "credential '{name}' was created but there is no route named '{route}', so it is \
              attached to nothing and no request can reach it. Create the route with \
-             `oag admin init --route {route}`, then re-run this command; the credential \
-             already stored is safe to delete or reuse."
+             `oag admin init --route {route}`, then attach this credential to it — \
+             re-running this command is refused, because the name is now taken by the \
+             row it just made. The secret is stored and does not need supplying again."
         )));
     }
 
@@ -2094,11 +2111,25 @@ async fn price_account(
 }
 
 async fn revoke_key(db: &Db, redis_url: &str, prefix: &str) -> Result<()> {
+    for line in revoke_key_lines(db, redis_url, prefix).await? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What `oag admin key revoke` says, and what it had to reach to say it.
+///
+/// Returns the lines rather than printing them, so a test can read the one
+/// sentence that matters. Which of the two closing paragraphs comes back is the
+/// whole of finding C9 and is invisible from outside the process: during a
+/// leaked-key incident the operator acts on it, and the two outcomes are
+/// fifteen seconds and five minutes of a key that still works.
+async fn revoke_key_lines(db: &Db, redis_url: &str, prefix: &str) -> Result<Vec<String>> {
     let revoked = repo::revoke_key_by_prefix(db, prefix).await?;
     if revoked.is_empty() {
-        println!("no active key with prefix {prefix}");
-        return Ok(());
+        return Ok(vec![format!("no active key with prefix {prefix}")]);
     }
+    let mut lines = Vec::new();
 
     // Every one of them. `key_prefix` has no unique index, so this UPDATE has
     // always been capable of matching several rows; taking the first and
@@ -2127,33 +2158,37 @@ async fn revoke_key(db: &Db, redis_url: &str, prefix: &str) -> Result<()> {
             name,
             "admin write"
         );
-        println!("revoked {name} ({prefix})");
+        lines.push(format!("revoked {name} ({prefix})"));
     }
 
     // Said loudly, because it means a key nobody asked about has just stopped
     // working. The prefix is displayed and not unique, so this is reachable
     // without anything being wrong with the database.
     if revoked.len() > 1 {
-        println!(
+        lines.push(format!(
             "\n  NOTE: {} keys shared the prefix {prefix} and all of them were revoked.",
             revoked.len()
+        ));
+        lines.push(
+            "  If you meant only one, the others are named above and need re-issuing.".to_owned(),
         );
-        println!("  If you meant only one, the others are named above and need re-issuing.");
     }
     // Said only when it happened. `auth_invalidate` used to swallow both an
     // unreachable Redis and a failed DEL, so this line printed either way — and
     // during a leaked-key incident it is the sentence the operator acts on. The
     // difference between the two outcomes is fifteen seconds and five minutes.
     if evicted {
-        println!("  shared cache evicted; each replica's in-process cache expires within 15s");
+        lines.push(
+            "  shared cache evicted; each replica's in-process cache expires within 15s".to_owned(),
+        );
     } else {
-        println!();
-        println!("  WARNING: the shared cache was NOT evicted — see the log above.");
-        println!("  The key is inactive in the database but every replica will keep");
-        println!("  accepting it from the cache for up to 5 minutes. Retry with");
-        println!("  `oag admin cache flush` once the cache is reachable.");
+        lines.push(String::new());
+        lines.push("  WARNING: the shared cache was NOT evicted — see the log above.".to_owned());
+        lines.push("  The key is inactive in the database but every replica will keep".to_owned());
+        lines.push("  accepting it from the cache for up to 5 minutes. Retry with".to_owned());
+        lines.push("  `oag admin cache flush` once the cache is reachable.".to_owned());
     }
-    Ok(())
+    Ok(lines)
 }
 
 async fn flush_cache(redis_url: &str) -> Result<()> {
@@ -2250,6 +2285,139 @@ mod tests {
             filtered[0].contains("xai") && filtered[0].contains("17"),
             "the filter and what it excluded are both the answer: {filtered:?}"
         );
+    }
+
+    /// C9 at the call site: a revocation that could not evict says so.
+    ///
+    /// `oag_store`'s `evicting_against_an_unreachable_cache_is_an_error` proves
+    /// `auth_invalidate` returns an error when it cannot reach Redis. Nothing
+    /// proved the CLI reads it. Drop the result on the floor — which is what
+    /// this code did — and the command prints "shared cache evicted" over an
+    /// eviction that never happened, which during a leaked-key incident is the
+    /// sentence the operator acts on.
+    ///
+    /// Gated on Postgres, because a key has to be revoked before there is
+    /// anything to evict. Redis is a closed port, so the eviction genuinely
+    /// fails; the connection manager's backoff is why this test is not quick.
+    #[tokio::test]
+    async fn a_revocation_that_could_not_evict_warns_instead_of_reassuring() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        let tag = Uuid::new_v4();
+        let principal: Uuid = sqlx::query_scalar(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member') \
+             RETURNING id",
+        )
+        .bind(format!("c9-{tag}@example.invalid"))
+        .fetch_one(db.pool())
+        .await
+        .expect("principal");
+        let route: Uuid = sqlx::query_scalar(
+            "INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]') RETURNING id",
+        )
+        .bind(format!("c9-{tag}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("route");
+        let prefix = format!("oag_live_c9{}", &tag.simple().to_string()[..8]);
+        sqlx::query(
+            "INSERT INTO api_key (id, key_hash, key_prefix, name, principal_id, route_id) \
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)",
+        )
+        .bind(format!("hash-{tag}"))
+        .bind(&prefix)
+        .bind(format!("c9-{tag}"))
+        .bind(principal)
+        .bind(route)
+        .execute(db.pool())
+        .await
+        .expect("mint");
+
+        let lines = revoke_key_lines(&db, "redis://127.0.0.1:1", &prefix)
+            .await
+            .expect("the database half succeeds; the cache half is what fails");
+
+        assert!(
+            lines.iter().any(|l| l.contains("revoked")),
+            "the row was deactivated, and the command has to say so: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("NOT evicted")),
+            "the cache was unreachable, so the key keeps working for five more \
+             minutes and the operator has to be told: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("shared cache evicted; each replica")),
+            "and must not be told the opposite in the same breath: {lines:?}"
+        );
+    }
+
+    /// C13 at the call site: the count handed to the message is the one from
+    /// before the filter.
+    ///
+    /// `an_empty_filtered_catalog_is_not_an_empty_catalog` above proves
+    /// `empty_catalog_lines` decides correctly given the right number. Nothing
+    /// proved the command passes it. `catalog_lines` is the code that does, and
+    /// passing `rows.len()` after the filter instead — the obvious mistake, and
+    /// the one the original bug was — leaves every assertion on the helper
+    /// green while the command again tells the operator to seed a catalog that
+    /// is already full.
+    #[test]
+    fn a_filtered_listing_reports_what_the_catalog_holds_not_what_survived() {
+        let model = |id: &str, provider: &str| oag_store::ModelRow {
+            id: id.to_owned(),
+            provider: provider.to_owned(),
+            upstream_name: id.to_owned(),
+            input_per_mtok: Decimal::ONE,
+            output_per_mtok: Decimal::ONE,
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: None,
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            supports_vision: false,
+            supports_tools: true,
+            supports_reasoning: false,
+            supports_prompt_cache: false,
+            display_label: None,
+        };
+        let catalog = vec![
+            model("anthropic/claude-opus-5", "anthropic"),
+            model("anthropic/claude-sonnet-5", "anthropic"),
+            model("kimi/k2", "kimi"),
+        ];
+
+        let filtered =
+            catalog_lines(catalog.clone(), Some("xai"), None).expect("xai is a real provider");
+        assert!(
+            filtered[0].contains("xai") && filtered[0].contains('3'),
+            "the filter and the size of what it excluded are the answer: {filtered:?}"
+        );
+        assert!(
+            !filtered.iter().any(|l| l.contains("catalog seed")),
+            "a catalog of three models is not empty, and sending the operator \
+             to seed it sends them in a circle: {filtered:?}"
+        );
+
+        // A genuinely empty catalog still gets the seeding advice, filter or no.
+        for provider in [None, Some("xai")] {
+            let empty = catalog_lines(Vec::new(), provider, None).expect("provider");
+            assert!(
+                empty.iter().any(|l| l.contains("catalog seed")),
+                "{provider:?}: nothing is in there to list: {empty:?}"
+            );
+        }
+
+        // And a filter that matches lists only its own provider.
+        let kimi = catalog_lines(catalog, Some("kimi"), None).expect("kimi is a real provider");
+        assert_eq!(kimi.len(), 2, "a header and one model: {kimi:?}");
+        assert!(kimi[1].contains("kimi/k2"), "{kimi:?}");
     }
 
     /// C14. A duplicate credential name is refused, and renaming is the way out.
@@ -2409,6 +2577,49 @@ mod tests {
             args.secret.is_none(),
             "the flag was not given, so the struct must not claim it was — the \
              environment is read later, after the conflict check"
+        );
+    }
+
+    /// C8 at the call site: the exclusion, at the place that now owns it.
+    ///
+    /// The two tests above pin clap: it reads no environment variable, and it
+    /// refuses nothing. Neither reaches `add_account_from_args`, which is where
+    /// the refusal moved to — so with that check deleted both still pass, and a
+    /// `--secret` typed beside `--from` would be silently discarded. This one
+    /// parses the same command line and hands the parsed args to the command.
+    ///
+    /// The database is never reached: the check precedes every query, so a pool
+    /// pointed at a closed port is enough, and that it returns at all is part of
+    /// the assertion — a refusal made after the first query would hang here.
+    #[tokio::test]
+    async fn a_typed_secret_beside_an_importer_is_refused_by_the_command() {
+        let cli = AdminCli::try_parse_from([
+            "admin",
+            "account",
+            "add",
+            "--name",
+            "seat",
+            "--from",
+            "codex",
+            "--secret",
+            "typed-on-the-command-line",
+        ])
+        .expect("clap accepts it; the command is what refuses it");
+        let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+            panic!("expected an account add");
+        };
+
+        let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag_g0", 1).expect("lazy pool");
+        let kek = oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=")
+            .expect("kek");
+        let err = add_account_from_args(&db, &kek, args)
+            .await
+            .expect_err("a typed --secret beside --from is refused");
+        assert!(
+            err.to_string()
+                .contains("--secret cannot be combined with --from"),
+            "the error names the exclusion, so the operator knows which flag to \
+             drop and that the environment fallback is not the problem: {err}"
         );
     }
 
@@ -2845,8 +3056,19 @@ mod tests {
         let db = Db::connect(&url, 2).expect("connect");
         db.migrate().await.expect("migrate");
 
+        // Inside one repeatable-read transaction, rolled back. The statement is
+        // a whole-month aggregate with nothing to key on, so a `before` and an
+        // `after` taken against the pool would move under any other test that
+        // wrote a ledger row in between — and two tests doing this at once
+        // would each spoil the other's arithmetic.
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .expect("a stable snapshot to count against");
+
         let before: (Decimal, Decimal, i64) = sqlx::query_as(MONTH_HEADLINE_SQL)
-            .fetch_one(db.pool())
+            .fetch_one(&mut *tx)
             .await
             .expect("headline");
 
@@ -2864,15 +3086,16 @@ mod tests {
             .bind(Uuid::new_v4())
             .bind(cost)
             .bind(api)
-            .execute(db.pool())
+            .execute(&mut *tx)
             .await
             .expect("seed");
         }
 
         let after: (Decimal, Decimal, i64) = sqlx::query_as(MONTH_HEADLINE_SQL)
-            .fetch_one(db.pool())
+            .fetch_one(&mut *tx)
             .await
             .expect("headline");
+        tx.rollback().await.expect("rollback");
 
         assert_eq!(
             after.2 - before.2,
@@ -2889,6 +3112,76 @@ mod tests {
             Decimal::from_str_exact("9.00").expect("decimal"),
             "and no counterfactual — its zero cost against a frontier baseline \
              is the free saving that made this figure a lie"
+        );
+    }
+
+    /// The `64fc95b` filter in the CLI headline: attempts are not requests.
+    ///
+    /// `the_month_headline_leaves_seat_rows_out` above seeds only `classified`
+    /// rows, so `COUNT(*) FILTER (WHERE selection_reason NOT IN ('abandoned',
+    /// 'lost'))` could be deleted and it would stay green. Since 0014
+    /// contracted the ledger key onto `(request_id, attempt)`, one client
+    /// request leaves a row per attempt — every one generated and invoiced, so
+    /// every one is money, but only one of them is a request. Counting them all
+    /// makes the headline claim the gateway served more requests the more often
+    /// escalation saved a bad answer.
+    #[tokio::test]
+    async fn the_month_headline_counts_requests_and_sums_attempts() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        // One repeatable-read transaction, rolled back: see the note in
+        // `the_month_headline_leaves_seat_rows_out`.
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .expect("a stable snapshot to count against");
+
+        let before: (Decimal, Decimal, i64) = sqlx::query_as(MONTH_HEADLINE_SQL)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("headline");
+
+        // One client request, three ledger rows: a gate abandoned the first
+        // answer, a stream lost the second, the third was served. All three
+        // were generated upstream and all three are billed.
+        let request_id = Uuid::new_v4();
+        for (attempt, reason) in [(0i16, "abandoned"), (1, "lost"), (2, "classified")] {
+            sqlx::query(
+                "INSERT INTO usage_event (request_id, attempt, model_id, tier, \
+                 selection_reason, input_tokens, output_tokens, cost_usd, \
+                 counterfactual_usd, counterfactual_api_usd, status) \
+                 VALUES ($1, $2, 'anthropic/claude-opus-5', 'frontier', $3, \
+                         100, 20, 1.00, 3.00, 1.00, 200)",
+            )
+            .bind(request_id)
+            .bind(attempt)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await
+            .expect("seed");
+        }
+
+        let after: (Decimal, Decimal, i64) = sqlx::query_as(MONTH_HEADLINE_SQL)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("headline");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(
+            after.2 - before.2,
+            1,
+            "three rows landed and the client made one request"
+        );
+        assert_eq!(
+            after.0 - before.0,
+            Decimal::from_str_exact("3.00").expect("decimal"),
+            "and every one of them was generated, so every one is paid for"
         );
     }
 

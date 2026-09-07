@@ -178,13 +178,27 @@ pub async fn upsert_principal(
             //
             // Clearing stays that endpoint's job, where it is the caller's
             // stated intent; this one now at least reports what it did.
-            let effective: Option<rust_decimal::Decimal> =
+            // `Option<Option<_>>`, and the two layers mean different things:
+            // the outer is "the row was read", the inner is "it has a cap".
+            // Flattening them with `.ok().flatten()` made a failed read
+            // indistinguishable from an uncapped principal, and `null` is the
+            // wire form of "no cap" — so a read that failed asserted, beside a
+            // 200, that a cap just written is not in force. The write
+            // succeeded either way; what is unknown is what it left behind.
+            let effective: Result<Option<rust_decimal::Decimal>, _> =
                 sqlx::query_scalar("SELECT monthly_budget_usd FROM principal WHERE id = $1")
                     .bind(id)
-                    .fetch_optional(state.db.pool())
-                    .await
-                    .ok()
-                    .flatten();
+                    .fetch_one(state.db.pool())
+                    .await;
+            let effective = match effective {
+                Ok(effective) => effective,
+                Err(e) => {
+                    return failed(&oag_core::Error::Internal(format!(
+                        "the principal was written, but reading its budget back failed, so \
+                         this reply cannot say what is in force: {e}"
+                    )));
+                }
+            };
 
             Json(json!({
                 "id": id,
@@ -329,7 +343,7 @@ pub async fn principal_usage(
 /// One key's cap and spend — the per-member (or per-coworker) figure a partner
 /// service shows next to the holder, and evaluates its own per-key limits
 /// against. `spent_usd` is what the gateway's cap is enforced against (lifetime);
-/// the three windows are the ledger since an instant, each with the moment it
+/// the four windows are the ledger since an instant, each with the moment it
 /// next frees up (a rolling window: when its oldest spend ages out; the month:
 /// the first of next month). All given so the caller cannot mistake one for
 /// another. Instants are RFC 3339; money is a string.

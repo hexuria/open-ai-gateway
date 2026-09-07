@@ -34,6 +34,15 @@ pub struct AppState {
     /// that started with one catalog finishes with it — a price changing
     /// halfway through a request would make the ledger disagree with itself.
     catalog: Arc<RwLock<Arc<Catalog>>>,
+    /// A8. The readiness answer, memoised for a second by `health::ready`.
+    ///
+    /// A field rather than the process-global `OnceLock` it was: that made the
+    /// memo shared by every `AppState` in the process, so a test priming one
+    /// state's readiness answered for another's, and two gateways in one binary
+    /// would report each other's backends. Nothing else on this struct is
+    /// process-global, and this had no reason to be.
+    pub(crate) readiness:
+        Arc<tokio::sync::Mutex<Option<(std::time::Instant, oag_store::Readiness)>>>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -226,6 +235,7 @@ impl AppState {
             adapters: Arc::new(adapters),
             codex,
             catalog: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
+            readiness: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -352,25 +362,9 @@ mod tests {
     // runtime in scope even though it dials nothing.
     #[tokio::test]
     async fn a_codex_base_url_is_normalised_like_every_other() {
-        let config = |base: &str| {
-            oag_core::config::Config::from_yaml(&format!(
-                r#"
-database:
-  url: "postgres://oag:oag@127.0.0.1:1/oag"
-redis:
-  url: "redis://127.0.0.1:1"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-gateway:
-  codex:
-    base_url: "{base}"
-"#
-            ))
-            .expect("test config")
-        };
         let build = |base: &str| {
-            let config = config(base);
+            let config =
+                crate::testing::config(&format!("gateway:\n  codex:\n    base_url: \"{base}\"\n"));
             let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
             let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
             AppState::new(config, db, cache)
@@ -384,5 +378,93 @@ gateway:
         let err = build("https://chatgpt.com/backend-api/codex?token=secret")
             .expect_err("a query in a base URL is refused for codex too");
         assert!(err.to_string().contains("codex"), "{err}");
+    }
+
+    /// U5, at every adapter rather than at the normaliser.
+    ///
+    /// `a_base_url_is_trimmed_or_refused_at_startup` above proves the
+    /// normaliser; `a_codex_base_url_is_normalised_like_every_other` proves one
+    /// call site. Between them sat eight more adapters, each constructed with
+    /// its own line, any of which could have been written to pass
+    /// `provider_base_urls` straight through — which is exactly what Codex did,
+    /// and nothing failed until somebody read it.
+    ///
+    /// The refusal is the proof, as it was for Codex: a `?` can only be
+    /// rejected by the normaliser, so a provider whose configured base URL is
+    /// refused is a provider whose base URL went through it. `vertex` is absent
+    /// on purpose — it has no adapter here, so its key is inert, and asserting
+    /// a refusal for it would pin a behaviour that does not exist.
+    #[tokio::test]
+    async fn every_configured_base_url_goes_through_the_normaliser() {
+        let build = |provider: &str, url: &str| {
+            let config = crate::testing::config(&format!(
+                "gateway:\n  provider_base_urls:\n    {provider}: \"{url}\"\n"
+            ));
+            let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+            let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+            AppState::new(config, db, cache)
+        };
+
+        for provider in [
+            "anthropic",
+            "bedrock",
+            "gemini",
+            "openai",
+            "kimi",
+            "deepseek",
+            "zhipu",
+            "xai",
+        ] {
+            build(provider, "https://proxy.internal/upstream/")
+                .unwrap_or_else(|e| panic!("{provider}: a trailing slash normalises away: {e}"));
+
+            let Err(err) = build(provider, "https://proxy.internal/upstream?token=secret") else {
+                panic!("{provider}: a query cannot be normalised away, so it is refused");
+            };
+            assert!(
+                err.to_string().contains(provider),
+                "the operator has to be told which provider's base URL was \
+                 rejected, because they configured several: {err}"
+            );
+        }
+    }
+
+    /// G8. A stream ceiling that outlives a concurrency slot is refused here.
+    ///
+    /// A slot must outlive the longest request it guards. One that expires
+    /// under a live request oversubscribes the credential silently — nothing
+    /// observes a slot vanishing, so the first symptom is the provider's own
+    /// rate limit on a deployment that believes it is inside its limits.
+    ///
+    /// `select.rs` used to assert this by comparing `SLOT_TTL` against the
+    /// shipped default: two constants, which could only disagree if somebody
+    /// edited one of them, and which said nothing about the deployment that
+    /// raises the ceiling in its own YAML. That is precisely the deployment the
+    /// check exists for, so the assertion lives on the call instead — delete the
+    /// refusal in `AppState::new` and this fails, whereas the old one did not.
+    #[tokio::test]
+    async fn a_stream_ceiling_that_outlives_a_slot_is_refused_at_startup() {
+        let build = |max_stream_duration: u64| {
+            let config = crate::testing::config(&format!(
+                "gateway:\n  max_stream_duration: {max_stream_duration}\n"
+            ));
+            let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+            let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+            AppState::new(config, db, cache)
+        };
+
+        let ttl = crate::gateway::select::SLOT_TTL.as_secs();
+        build(oag_core::config::Config::default_gateway_max_stream_duration().as_secs())
+            .expect("the shipped default must leave room, or no deployment starts");
+        build(ttl - 1).expect("a ceiling one second inside the TTL still fits");
+
+        for over in [ttl, ttl + 60] {
+            let err = build(over).expect_err("a ceiling at or past the slot TTL is refused");
+            assert!(
+                err.to_string().contains("max_stream_duration") && err.to_string().contains("slot"),
+                "the refusal names both numbers, because only the operator can \
+                 reconcile them: {err}"
+            );
+        }
     }
 }

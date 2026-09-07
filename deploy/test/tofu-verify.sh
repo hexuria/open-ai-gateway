@@ -153,20 +153,180 @@ print("tofu: every private endpoint carries a DNS zone group")
 # or Cloud Logging. Cloud Run set it and Container Apps did not, so one
 # platform's logs arrived as prose — and the review's own note for this, "missing
 # Azure LOG_JSON", was answered against the wrong claim the first time.
-unstructured = [
-    d
-    for d in sorted(glob.glob("deploy/tofu/modules/compute-*/"))
-    if not any(
-        "OAG_TELEMETRY__LOG_JSON" in open(f).read() for f in glob.glob(f"{d}*.tf")
-    )
-]
+# In the block that SERVES, not merely somewhere in the file. D23 set this on
+# Azure's `init_container` — the one-shot migrate container — and left the
+# gateway container logging prose; the first version of this check grepped the
+# file, found the string, and passed. A guard that cannot tell those two apart
+# is the thing it was written to prevent.
+#
+# Two shapes to satisfy, because the three modules use both. Cloud Run and
+# Container Apps declare env inline per container, so the setting has to appear
+# after the line that marks the serving container — an init container is always
+# declared before the container it precedes. Fargate builds one
+# `local.container_env` and hands it to both containers, so what has to appear
+# after the marker is a reference to a local that sets it.
+SERVES = re.compile(r'args\s*=\s*\["serve"\]|command\s*=\s*\["serve"\]')
+LOG_JSON = "OAG_TELEMETRY__LOG_JSON"
+
+
+def locals_that_set(body, needle):
+    """Names of `locals` entries whose value mentions `needle`."""
+    names = set()
+    for opener in re.finditer(r"^locals\s*\{", body, re.M):
+        rest = body[opener.end():]
+        closer = re.search(r"^\}", rest, re.M)
+        block = rest[: closer.start()] if closer else rest
+        # Top-level entries in a `locals` block are indented two spaces.
+        parts = re.split(r"^  (\w+)\s*=", block, flags=re.M)
+        for k in range(1, len(parts) - 1, 2):
+            if needle in parts[k + 1]:
+                names.add(parts[k])
+    return names
+
+
+unstructured = []
+for d in sorted(glob.glob("deploy/tofu/modules/compute-*/")):
+    files = glob.glob(f"{d}*.tf")
+    if not any(LOG_JSON in open(f).read() for f in files):
+        unstructured.append(f"  {d}: never sets {LOG_JSON}")
+        continue
+
+    served = False
+    for f in files:
+        body = open(f).read()
+        marker = SERVES.search(body)
+        if not marker:
+            continue
+        after = body[marker.start():]
+        via_local = any(f"local.{n}" in after for n in locals_that_set(body, LOG_JSON))
+        if LOG_JSON in after or via_local:
+            served = True
+            break
+
+    if not served:
+        unstructured.append(
+            f"  {d}: sets {LOG_JSON}, but not where the serving container reads it"
+        )
 
 if unstructured:
-    print("\nCompute modules that never set OAG_TELEMETRY__LOG_JSON:\n")
-    for d in unstructured:
-        print(f"  {d}")
-    print("\nTheir logs arrive as prose, and nothing can query them by field.")
+    print("\nCompute modules whose serving container logs prose:\n")
+    print("\n".join(unstructured))
+    print("\nNothing can query those lines by field, and the replica that")
+    print("writes them is the one every request goes through.")
     sys.exit(1)
 
-print("tofu: every compute module asks for structured logs")
+print("tofu: every compute module's SERVING container asks for structured logs")
+
+# D11. The guarded number and the deployed number are the same number.
+#
+# `stream_keepalive_interval_seconds` reaches the Cloudflare module, which
+# preconditions on it staying under Cloudflare's ~100s Proxy Read Timeout. The
+# gateway read its own `OAG_GATEWAY__STREAM_KEEPALIVE_INTERVAL` out of
+# `gateway_env`, so the two were independent: raise the real one and you get the
+# 524s the precondition promised to prevent, with the precondition still green.
+#
+# Every stack has to merge the *same variable* the precondition sees into the
+# compute env. A literal, or a second variable, would apply cleanly and re-open
+# the gap.
+ungated = []
+for f in sorted(glob.glob("deploy/tofu/stacks/*/main.tf")):
+    body = open(f).read()
+    if "keepalive_interval_seconds" not in body:
+        continue  # a stack with no edge in front of it has nothing to reconcile
+    merged = re.search(
+        r"OAG_GATEWAY__STREAM_KEEPALIVE_INTERVAL\s*=\s*tostring\("
+        r"var\.stream_keepalive_interval_seconds\)",
+        body,
+    )
+    guarded = re.search(
+        r"keepalive_interval_seconds\s*=\s*var\.stream_keepalive_interval_seconds", body
+    )
+    if not merged:
+        ungated.append(
+            f"  {f}: the compute env does not carry var.stream_keepalive_interval_seconds"
+        )
+    elif not guarded:
+        ungated.append(f"  {f}: the edge module is not given the variable the env carries")
+
+if ungated:
+    print("\nStacks where the guarded keepalive is not the deployed keepalive:\n")
+    print("\n".join(ungated))
+    print("\nThe precondition then guards a number nothing runs on.")
+    sys.exit(1)
+
+print("tofu: every stack guards the keepalive it actually deploys")
+
+# H11. A secret pinned by ARN alone is not pinned.
+#
+# ECS resolves a bare ARN to AWSCURRENT at task start, so rotating a secret left
+# the task definition byte-identical: no new revision, no deployment, every
+# running task keeping the old value. The break arrives weeks later, when an
+# unrelated image bump finally rolls the tasks onto a KEK that cannot decrypt
+# anything sealed under the old one — with nothing in the change log between
+# then and now that touched credentials.
+#
+# `:::${version_id}` is the ARN's own syntax for "no label, this version".
+bare = []
+for f in sorted(glob.glob("deploy/tofu/stacks/*/main.tf")):
+    body = open(f).read()
+    # Any indent, so a `terraform fmt` that re-indents the stack does not
+    # quietly turn this into a scan that iterates nothing.
+    block = re.search(r"secret_env\s*=\s*\{(.*?)\n\s*\}", body, re.S)
+    if not block:
+        continue
+    for line in block.group(1).splitlines():
+        if "=" not in line or not line.strip():
+            continue
+        value = line.split("=", 1)[1].strip()
+        # Only Secrets Manager ARNs need this pin; a Cloud Run secret reference
+        # or a Key Vault id is a different shape and pins its own way.
+        if "secretsmanager_secret" in value and ":::" not in value:
+            bare.append(f"  {f}: {line.strip()}")
+
+if bare:
+    print("\nSecrets referenced by a bare ARN, which ECS resolves at task start:\n")
+    print("\n".join(bare))
+    print("\nA rotation then changes nothing in the task definition, and nothing rolls.")
+    sys.exit(1)
+
+print("tofu: every Secrets Manager reference pins a version")
 PY
+
+# H10. Envoy health-checks the port readiness is served on.
+#
+# `/health/ready` lives on 8081 and traffic on 8080. An endpoint without its own
+# `health_check_config` is checked on its traffic port, where that path does not
+# exist — so either every endpoint fails and the cluster has no healthy hosts,
+# or the check passes against the wrong handler and a replica that cannot reach
+# Postgres keeps taking work.
+python3 - <<'ENVOY'
+import re
+import sys
+
+body = open("deploy/envoy/envoy.yaml").read()
+starts = [m.start() for m in re.finditer(r"^\s*- endpoint:", body, re.M)]
+if not starts:
+    print("envoy: no endpoints found, so this assertion checks nothing")
+    sys.exit(1)
+
+missing = []
+for i, start in enumerate(starts):
+    end = starts[i + 1] if i + 1 < len(starts) else len(body)
+    block = body[start:end]
+    # Flow or block style — `health_check_config: { port_value: 8081 }` and the
+    # two-line spelling are the same YAML, and a reformat must not un-guard this.
+    if not re.search(r"health_check_config:.*?port_value:\s*8081\b", block, re.S):
+        address = next(
+            (l.strip() for l in block.splitlines() if "socket_address" in l), block.strip()
+        )
+        missing.append(address)
+
+if missing:
+    print("\nEnvoy endpoints health-checked on their traffic port:\n")
+    for m in missing:
+        print(f"  {m}")
+    print("\n/health/ready is on 8081; on 8080 the check tests the wrong handler.")
+    sys.exit(1)
+
+print(f"envoy: all {len(starts)} endpoints health-check port 8081")
+ENVOY

@@ -291,7 +291,7 @@ version of `0001`, `oag migrate` fails closed with *migration 1 was previously
 applied but has been modified* and applies nothing — including any later
 migration. In development the fix is to recreate the database. In production it
 is a hand-patched `_sqlx_migrations.checksum`, so once this project has a real
-deployment the baseline stops being editable and changes become `0007` and on.
+deployment the baseline stops being editable and changes become `0017` and on.
 Take the next unused number from `migrations/`, never from this table — a doc is
 the one place that can be out of date, and a reused number is a checksum failure
 on somebody else's database. This table has been out of date twice; `ls

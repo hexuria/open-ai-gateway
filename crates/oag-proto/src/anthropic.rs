@@ -41,6 +41,13 @@ const MIN_THINKING_BUDGET: u32 = 1024;
 ///
 /// The replacement is `type: "adaptive"` with the depth on
 /// `output_config.effort`, whose levels are the ones [`Effort`] already spells.
+///
+/// Checked against the vendor's own documentation rather than inferred from a
+/// 400, and cited here because the commit that made the change
+/// (`fa58580`) cannot be rewritten to carry them:
+///
+/// - <https://platform.claude.com/docs/en/build-with-claude/extended-thinking>
+/// - <https://platform.claude.com/docs/en/build-with-claude/effort>
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ThinkingMode {
     Budget,
@@ -287,9 +294,36 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         .map(|arr| arr.iter().filter_map(parse_tool).collect())
         .unwrap_or_default();
 
+    // Both forms this dialect speaks, because this renderer emits both.
+    //
+    // `render_request` sends `{type:"enabled", budget_tokens: N}` to 4.5 and
+    // earlier and `{type:"adaptive"}` with `output_config.effort` from 4.6 on.
+    // Reading only the budget meant a client speaking the newer form — which
+    // includes anything this gateway itself renders for a 4.6+ model — had its
+    // reasoning request dropped on the floor: the canonical form carried
+    // neither a budget nor a level, so every downstream renderer saw a request
+    // that had asked for nothing. That is H3/P4's failure exactly, reintroduced
+    // for the one dialect the others are translated through.
+    //
+    // `budget_tokens` wins where both are present: it is the more precise of
+    // the two, which is the same rule `gemini.rs` and `openai.rs` apply.
     let thinking_budget = body["thinking"]["budget_tokens"]
         .as_u64()
         .and_then(|b| u32::try_from(b).ok());
+    let thinking_effort = thinking_budget.map(Effort::from_budget).or_else(|| {
+        (body["thinking"]["type"].as_str() == Some("adaptive"))
+            .then(|| {
+                body["output_config"]["effort"]
+                    .as_str()
+                    .and_then(Effort::parse)
+                    // `adaptive` with no effort is a request to think at the
+                    // model's own default. `Medium` is this gateway's name for
+                    // that, and dropping it would be the silent non-thinking
+                    // answer again.
+                    .or(Some(Effort::Medium))
+            })
+            .flatten()
+    });
 
     // Claude Code puts a session id inside metadata.user_id. Preferred over
     // content hashing for affinity because it is exact and survives the
@@ -312,7 +346,7 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         thinking_budget,
         // This dialect speaks budgets. Carry the nearest level too, so a hop to
         // one that speaks levels does not silently drop the request to think.
-        thinking_effort: thinking_budget.map(Effort::from_budget),
+        thinking_effort,
         client_session,
         tool_choice: parse_tool_choice(&body["tool_choice"]),
         // Neither exists in this dialect, so a client speaking it never set one.
@@ -1004,6 +1038,71 @@ mod tests {
     use crate::canonical::extract_cache_blocks;
 
     /// H3. A client that asks for reasoning in levels still gets reasoning.
+    /// The 4.6 form this renderer emits, read back by the parser that has to.
+    ///
+    /// `render_request` sends `{type:"adaptive"}` with `output_config.effort`
+    /// to every model from 4.6, and `parse_request` read only
+    /// `thinking.budget_tokens` — so a client speaking the newer form, or this
+    /// gateway's own output fed back through the canonical form, asked for
+    /// reasoning and had it dropped: no budget, no level, and every downstream
+    /// renderer seeing a request that had asked for nothing. That is H3/P4's
+    /// failure on the dialect the other three are translated through.
+    #[test]
+    fn the_adaptive_form_survives_a_round_trip_through_the_canonical_request() {
+        let adaptive = |effort: Option<&str>| {
+            let mut body = json!({
+                "model": "claude-opus-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "adaptive"},
+            });
+            if let Some(e) = effort {
+                body["output_config"] = json!({"effort": e});
+            }
+            parse_request(&body).expect("parses")
+        };
+
+        assert_eq!(
+            adaptive(Some("high")).thinking_effort,
+            Some(Effort::High),
+            "the level the client asked for has to reach the canonical form, or \
+             every renderer downstream of it sees a request that asked for nothing"
+        );
+        assert_eq!(
+            adaptive(Some("none")).thinking_effort,
+            Some(Effort::Off),
+            "and `none` is a request too — it says do not think"
+        );
+        assert_eq!(
+            adaptive(None).thinking_effort,
+            Some(Effort::Medium),
+            "`adaptive` with no effort asks the model for its own default; \
+             dropping it is the silent non-thinking answer again"
+        );
+
+        // Round trip: what this renderer emits, its own parser reads back.
+        let rendered = render_request(&adaptive(Some("high")), "claude-opus-5").expect("renders");
+        assert_eq!(rendered["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(rendered["output_config"]["effort"], json!("high"));
+        assert_eq!(
+            parse_request(&rendered).expect("parses").thinking_effort,
+            Some(Effort::High)
+        );
+
+        // And the older form still wins where a client sends both, because a
+        // budget is the more precise of the two.
+        let both = parse_request(&json!({
+            "model": "claude-sonnet-4-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "output_config": {"effort": "max"},
+        }))
+        .expect("parses");
+        assert_eq!(both.thinking_budget, Some(2048));
+        assert_eq!(both.thinking_effort, Some(Effort::from_budget(2048)));
+    }
+
     #[test]
     fn a_reasoning_effort_becomes_a_thinking_budget() {
         // `openai::parse_request` deliberately leaves `thinking_budget` empty,

@@ -6,6 +6,11 @@
 //! multipliers here are derived from the catalog's prices at read time, never stored, so a
 //! price refresh or a change of R moves them together. This gateway derives and reports; the
 //! partner service that reads them (`OpenGrok`) is the one that enforces a limit in points.
+//!
+//! A *served* request's points, to be exact. `counterfactual_api_usd` is zero on an attempt
+//! nobody was served — a quality gate abandoned it, or the stream was lost — so those tokens
+//! cost the gateway (`cost_usd` records it) and cost the member nothing in points. See the
+//! note at `meter.rs` where the column is written.
 
 use super::{AdminActor, failed, invalid, not_found};
 use crate::AppState;

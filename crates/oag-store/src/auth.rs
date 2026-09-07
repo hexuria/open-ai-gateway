@@ -247,6 +247,95 @@ mod tests {
         assert!(matches!(err, oag_core::Error::Overloaded), "{err:?}");
         drop(held);
     }
+    /// S7 at the call site: the cap reaches Redis.
+    ///
+    /// `cacheable_for` below is a pure function and correct. `authenticate` is
+    /// what has to hand its answer to `auth_set` rather than `L2_TTL` — one
+    /// argument, and with it wrong the cached identity outlives the key on
+    /// every replica while the database row already says no.
+    ///
+    /// The TTL on the key itself is the assertion, because that is the number
+    /// that decides how long the key keeps working. Gated on both backends: a
+    /// real key has to exist for `authenticate` to find it, and a real Redis
+    /// for it to be written to.
+    #[tokio::test]
+    async fn the_cap_reaches_the_cached_entry_and_not_just_the_helper() {
+        let (Ok(db_url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let db = Db::connect(&db_url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let cache = Cache::connect(&redis_url).expect("connect");
+
+        let tag = uuid::Uuid::new_v4();
+        let principal: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member') \
+             RETURNING id",
+        )
+        .bind(format!("s7-{tag}@example.invalid"))
+        .fetch_one(db.pool())
+        .await
+        .expect("principal");
+        let route: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]') RETURNING id",
+        )
+        .bind(format!("s7-{tag}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("route");
+
+        // Thirty seconds of life left, against an L2 TTL of five minutes.
+        let raw = format!("oag_live_s7{}", tag.simple());
+        sqlx::query(
+            "INSERT INTO api_key (id, key_hash, key_prefix, name, principal_id, route_id, \
+             expires_at) \
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, now() + interval '30 seconds')",
+        )
+        .bind(repo::hash_key(&raw))
+        .bind(&raw[..16])
+        .bind(format!("s7-{tag}"))
+        .bind(principal)
+        .bind(route)
+        .execute(db.pool())
+        .await
+        .expect("mint a short-lived key");
+
+        let auth = AuthCache::new(db.clone(), cache.clone(), 16, "s7-signing-secret", 4);
+        auth.authenticate(&raw)
+            .await
+            .expect("the lookup succeeds")
+            .expect("the key is live for another thirty seconds");
+
+        // A connection of its own rather than reaching into `Cache`: reading a
+        // TTL is not something the gateway ever does, and production code
+        // should not grow an accessor for a test.
+        let mut conn = redis::Client::open(redis_url.as_str())
+            .expect("client")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("a connection to read the TTL");
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(format!("oag:auth:{}", repo::hash_key(&raw)))
+            .query_async(&mut conn)
+            .await
+            .expect("TTL");
+        auth.invalidate(&raw).await;
+
+        assert!(
+            ttl > 0,
+            "the identity was cached at all, or this asserts nothing: {ttl}"
+        );
+        assert!(
+            ttl <= 30,
+            "the entry must not outlive the key: {ttl}s against thirty seconds \
+             of remaining life and an L2 TTL of {L2_TTL:?}"
+        );
+    }
+
     /// S7. A cached identity cannot outlive the key it belongs to.
     ///
     /// `authenticate` filters expired keys at read time, so an expired key

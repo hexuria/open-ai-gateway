@@ -434,6 +434,59 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
 ///
 /// One call site each, above the branch, is the property. A second call site
 /// anywhere in `serve` means the two paths can differ again.
+/// Test fixtures shared across this crate's test modules.
+///
+/// The minimal configuration a test needs was spelled out nine times, byte for
+/// byte, with the same two base64 secrets. One copy here, with the sections a
+/// test wants to add on the end.
+#[cfg(test)]
+pub(crate) mod testing {
+    use crate::AppState;
+    use std::sync::Arc;
+
+    /// The four required sections, followed by `extra` verbatim.
+    ///
+    /// `extra` is appended, so it can add sections (`gateway:`, `server:`) but
+    /// not repeat one — a second `database:` is a YAML error. Mutate the parsed
+    /// `Config` for a field under a section this already writes.
+    pub(crate) fn config_yaml(database_url: &str, redis_url: &str, extra: &str) -> String {
+        format!(
+            r#"
+database:
+  url: "{database_url}"
+redis:
+  url: "{redis_url}"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+{extra}"#
+        )
+    }
+
+    /// Closed ports on both backends: nothing here dials.
+    pub(crate) fn config(extra: &str) -> oag_core::config::Config {
+        oag_core::config::Config::from_yaml(&config_yaml(
+            "postgres://oag:oag@127.0.0.1:1/oag",
+            "redis://127.0.0.1:1",
+            extra,
+        ))
+        .expect("test config")
+    }
+
+    /// A state that dials nothing.
+    ///
+    /// `Db::connect` builds a lazy pool and `Cache::connect` only opens a redis
+    /// client, so neither touches the network. Every assertion made against
+    /// one of these is about routing, layering or construction, which run
+    /// before any backend does.
+    pub(crate) fn state(extra: &str) -> Arc<AppState> {
+        let config = config(extra);
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        Arc::new(AppState::new(config, db, cache).expect("state"))
+    }
+}
+
 #[cfg(test)]
 mod background_task_tests {
     /// `serve`'s body, from its signature to the closing brace in column zero.
@@ -588,11 +641,8 @@ mod router_tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
 
-    /// A state that dials nothing.
-    ///
-    /// `Db::connect` builds a lazy pool and `Cache::connect` only opens a redis
-    /// client, so neither touches the network here. Every assertion below is
-    /// about routing and the auth layer, which run before any backend does.
+    /// See `crate::testing::state`: every assertion below is about routing and
+    /// the auth layer, which run before any backend does.
     fn state(single_listener: bool) -> Arc<AppState> {
         state_with(single_listener, 32 * 1024 * 1024)
     }
@@ -606,25 +656,9 @@ mod router_tests {
         max_body_bytes: usize,
         max_in_flight: usize,
     ) -> Arc<AppState> {
-        let src = format!(
-            r#"
-database:
-  url: "postgres://oag:oag@127.0.0.1:1/oag"
-redis:
-  url: "redis://127.0.0.1:1"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-server:
-  single_listener: {single_listener}
-  max_body_bytes: {max_body_bytes}
-  max_in_flight: {max_in_flight}
-"#
-        );
-        let config = oag_core::config::Config::from_yaml(&src).expect("test config");
-        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
-        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
-        Arc::new(AppState::new(config, db, cache).expect("state"))
+        crate::testing::state(&format!(
+            "server:\n  single_listener: {single_listener}\n  max_body_bytes: {max_body_bytes}\n  max_in_flight: {max_in_flight}\n"
+        ))
     }
 
     #[tokio::test]

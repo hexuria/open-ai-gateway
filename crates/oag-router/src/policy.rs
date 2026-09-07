@@ -349,9 +349,20 @@ impl RoutingPolicy {
     ///
     /// Taking the dearer keeps both properties and adds the one that matters:
     /// a baseline can never be cheaper than a rung this route can reach, so a
-    /// served row can never report a negative saving. Ties go to the served
-    /// model, which is the more truthful of two equals — and deterministically,
-    /// because the ledger records the winner as `counterfactual_model`.
+    /// row served from the ladder can never report a negative saving. Ties go
+    /// to the served model, which is the more truthful of two equals — and
+    /// deterministically, because the ledger records the winner as
+    /// `counterfactual_model`.
+    ///
+    /// "From the ladder" is the limit of the claim, and it is worth stating.
+    /// A passthrough to an off-ladder model takes this same baseline, and that
+    /// model is only in `served` — and so only in `dearest_served` — if a
+    /// credential on the route advertises it. One that does not, or one priced
+    /// at zero (`dearest_served` skips free models, since a seat's zero would
+    /// win nothing), is compared against the ladder's ceiling instead, and a
+    /// dearer named model then reports a negative saving on its own row. The
+    /// headline excludes those rows by the seat predicate; a per-request view
+    /// does not.
     fn baseline(
         &self,
         catalog: &Catalog,
@@ -581,9 +592,11 @@ impl RoutingPolicy {
         max_output_tokens: u32,
         served: &std::collections::HashSet<String>,
     ) -> Option<RoutingDecision> {
+        let origin = from.clone();
+        let need = signal.requirements(max_output_tokens);
         let mut from = from.clone();
         loop {
-            let next = self.escalate(
+            let mut next = self.escalate(
                 &from,
                 QualityGate::NoCredential,
                 signal,
@@ -591,7 +604,36 @@ impl RoutingPolicy {
                 max_output_tokens,
                 served,
             )?;
+
+            // A rung is a list, and `pick` takes its first satisfying entry.
+            // So a rung of `[kimi/k2, anthropic/opus]` answers "kimi", and this
+            // loop — asking only whether that answer is the provider to avoid —
+            // skipped the whole rung on the strength of its first model, with
+            // the one that could have served sitting right beside it. Mixed
+            // rungs are the documented shape, not a corner: `docs/02-cost-routing.md`
+            // gives one as its example. Ask the rung again, excluding the
+            // provider, before deciding it has nothing.
+            if next.model.provider == avoid
+                && let Some(tier) = next.tier.as_ref()
+                && let Some(spec) = self.ladder.pick_without(tier, catalog, &need, avoid)
+            {
+                next.model = spec.clone();
+            }
+
             if next.model.provider != avoid {
+                // Relabelled to the rung the request actually left.
+                //
+                // `escalate` builds the reason from whatever `from` it was
+                // handed, and this loop hands it a cursor. So a climb that
+                // skipped `balanced` on its way from `cheap` to `frontier`
+                // recorded `escalated_from = balanced` — a rung nothing was
+                // ever dispatched to. The ledger's whole use for that column
+                // is answering "which rung is mis-set for this workload", and
+                // it was naming a rung the request never touched.
+                next.reason = SelectionReason::Escalated {
+                    from: origin.name.clone(),
+                    gate: QualityGate::NoCredential,
+                };
                 return Some(next);
             }
             // Strictly ascending — `escalate` resolves the rung above `from`,
@@ -829,6 +871,90 @@ mod tests {
     /// land on the third. Looking one rung up stopped at the middle and
     /// returned nothing, which the caller turns into a 503 while a rung able to
     /// serve sat above it.
+    /// A rung holding both providers is not a rung to skip.
+    ///
+    /// `pick` takes a rung's first satisfying entry, so a rung of
+    /// `[kimi/k2-turbo, anthropic/opus]` answers "kimi" — and the climb, asking
+    /// only whether that answer was the provider to avoid, skipped the whole
+    /// rung with the model that could have served sitting right beside it. On a
+    /// two-rung ladder there is nothing above it, so R1's 503 came back on
+    /// exactly the shape `docs/02-cost-routing.md` gives as its example of a
+    /// rung: several models, ordered by preference.
+    #[test]
+    fn a_mixed_rung_offers_its_other_provider_rather_than_being_skipped() {
+        let catalog = Catalog::from_entries([
+            model("kimi/k2", Provider::Kimi, 128_000, dec!(0.6)),
+            model("kimi/k2-turbo", Provider::Kimi, 128_000, dec!(0.9)),
+            model("anthropic/opus", Provider::Anthropic, 400_000, dec!(15)),
+        ]);
+        let ladder = TierLadder::new(vec![
+            Rung {
+                name: TierName::new("cheap"),
+                models: vec![ModelId::new("kimi/k2")],
+            },
+            // Kimi first, so `pick` answers Kimi and the rung reads as one to
+            // skip. Anthropic is right there.
+            Rung {
+                name: TierName::new("frontier"),
+                models: vec![
+                    ModelId::new("kimi/k2-turbo"),
+                    ModelId::new("anthropic/opus"),
+                ],
+            },
+        ])
+        .expect("non-empty");
+        let policy = RoutingPolicy::new(ladder, Box::new(HeuristicClassifier::default()));
+
+        let next = policy
+            .escalate_past_provider(
+                &Tier::new("cheap", 0),
+                Provider::Kimi,
+                &RequestSignal::default(),
+                &catalog,
+                1024,
+                &HashSet::new(),
+            )
+            .expect("the rung above holds a model of another provider");
+        assert_eq!(
+            next.model.id.as_str(),
+            "anthropic/opus",
+            "the rung has something to offer that is not the dead provider, and \
+             offering it is the whole of R1"
+        );
+        assert_eq!(
+            next.rung_name(),
+            Some("frontier"),
+            "and it is that rung's model, so the ledger names that rung"
+        );
+
+        // The rung genuinely has nothing else: still skipped, still None.
+        let all_kimi = TierLadder::new(vec![
+            Rung {
+                name: TierName::new("cheap"),
+                models: vec![ModelId::new("kimi/k2")],
+            },
+            Rung {
+                name: TierName::new("frontier"),
+                models: vec![ModelId::new("kimi/k2-turbo")],
+            },
+        ])
+        .expect("non-empty");
+        assert!(
+            RoutingPolicy::new(all_kimi, Box::new(HeuristicClassifier::default()))
+                .escalate_past_provider(
+                    &Tier::new("cheap", 0),
+                    Provider::Kimi,
+                    &RequestSignal::default(),
+                    &catalog,
+                    1024,
+                    &HashSet::new(),
+                )
+                .is_none(),
+            "a ladder that is one provider all the way up has nowhere to climb \
+             to, and saying so is what makes the 503 honest"
+        );
+    }
+
     #[test]
     fn a_climb_past_a_dead_provider_skips_its_other_rungs() {
         let catalog = Catalog::from_entries([
@@ -870,21 +996,58 @@ mod tests {
              skipped, not settled for"
         );
 
-        // And when every rung above is the same provider, there is genuinely
+        // And the ledger is told the rung the request LEFT, not the cursor the
+        // walk happened to stop on. `escalate` builds the reason from whatever
+        // `from` it is handed, so a climb that skipped `balanced` recorded it
+        // as the origin — a rung nothing was ever dispatched to, in the column
+        // an operator reads to find a mis-set rung.
+        assert_eq!(
+            next.reason,
+            SelectionReason::Escalated {
+                from: TierName::new("cheap"),
+                gate: QualityGate::NoCredential,
+            },
+            "the climb started at cheap; balanced was skipped, never tried"
+        );
+
+        // And when every rung above really is the same provider, there is
         // nowhere to go: the original error is the honest answer, not a climb
         // onto a rung that will fail the same way.
+        //
+        // Its own ladder, because the fixture above cannot express it — its
+        // rungs above `cheap` are Kimi then Anthropic, so avoiding Anthropic
+        // from `cheap` lands on kimi-2 and the assertion passed without ever
+        // reaching the `None` this is about.
+        let all_one = Catalog::from_entries([
+            model("anthropic/haiku", Provider::Anthropic, 200_000, dec!(1)),
+            model("anthropic/sonnet", Provider::Anthropic, 200_000, dec!(3)),
+        ]);
+        let all_one_policy = RoutingPolicy::new(
+            TierLadder::new(vec![
+                Rung {
+                    name: TierName::new("cheap"),
+                    models: vec![ModelId::new("anthropic/haiku")],
+                },
+                Rung {
+                    name: TierName::new("frontier"),
+                    models: vec![ModelId::new("anthropic/sonnet")],
+                },
+            ])
+            .expect("non-empty"),
+            Box::new(HeuristicClassifier::default()),
+        );
         assert!(
-            policy
+            all_one_policy
                 .escalate_past_provider(
                     &Tier::new("cheap", 0),
                     Provider::Anthropic,
                     &RequestSignal::default(),
-                    &catalog,
+                    &all_one,
                     1024,
                     &HashSet::new(),
                 )
-                .is_none_or(|d| d.model.provider != Provider::Anthropic),
-            "a climb must never land on the provider it was climbing away from"
+                .is_none(),
+            "every rung above names the provider being climbed away from"
         );
 
         // The ceiling still terminates the walk rather than looping.
@@ -1273,13 +1436,6 @@ mod tests {
         ));
     }
 
-    /// R1. A rung nothing can be dispatched to is a reason to climb.
-    ///
-    /// `NoCredential`, `ReserveHeld` and `NoViableModel` all classify as
-    /// `EscalateTier`, and nothing read that: the selection error went straight
-    /// back to the caller as a 503 while a rung naming a different provider sat
-    /// there able to serve. This pins the classification the gateway now acts
-    /// on; `escalate` accepting the gate is what makes acting on it possible.
     /// R10. A hard-stop multiple below 1 would invert degrade-before-deny.
     ///
     /// The multiple exists to let spend run PAST the limit before refusing:
@@ -1324,6 +1480,13 @@ mod tests {
         assert_eq!(at(200, double), BudgetPressure::Exhausted);
     }
 
+    /// R1. A rung nothing can be dispatched to is a reason to climb.
+    ///
+    /// `NoCredential`, `ReserveHeld` and `NoViableModel` all classify as
+    /// `EscalateTier`, and nothing read that: the selection error went straight
+    /// back to the caller as a 503 while a rung naming a different provider sat
+    /// there able to serve. This pins the classification the gateway now acts
+    /// on; `escalate` accepting the gate is what makes acting on it possible.
     #[test]
     fn a_rung_with_no_usable_credential_escalates_rather_than_failing() {
         use oag_core::{Disposition, Error, Provider};

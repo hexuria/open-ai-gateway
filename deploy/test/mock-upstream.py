@@ -315,7 +315,54 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+def _selftest():
+    """Check the mock's own credential handling, which no script can see.
+
+    `_credential` reads two headers and strips one scheme, and everything the
+    breaker and failover checks assert about *which* credential served a request
+    goes through it. A mock that got this wrong would not fail — it would agree
+    with itself, report one credential where two were used, and the scripts
+    would pass while proving nothing. That is rr-C9: the fix was verified by
+    reading the diff, because the mock is the thing the tests trust.
+
+    Run with `MOCK_SELFTEST=1`, from CI, instead of serving.
+    """
+    global _credentials
+
+    checks = [
+        ({"x-api-key": "abc"}, "abc", "an x-api-key arrives as the credential"),
+        ({"authorization": "Bearer abc"}, "abc", "and a bearer token without its scheme"),
+        ({"authorization": "abc"}, "abc", "an unschemed authorization is the credential itself"),
+        ({}, "", "no header, no credential"),
+    ]
+    failures = []
+    for headers, want, why in checks:
+        got = _credential(headers)
+        if got != want:
+            failures.append(f"{why}: _credential({headers!r}) == {got!r}, wanted {want!r}")
+
+    # The two spellings are the same credential, so a script comparing counts
+    # sees one and not two. This is the half MOCK_FAIL_FOR_KEY depends on.
+    _credentials = []
+    _credential({"x-api-key": "same-secret"})
+    _credential({"authorization": "Bearer same-secret"})
+    if len(_credentials) != 1:
+        failures.append(
+            "the same secret in either header must digest to one credential, "
+            f"not {len(_credentials)}"
+        )
+
+    for line in failures:
+        print(f"mock selftest: {line}", file=sys.stderr)
+    if failures:
+        sys.exit(1)
+    print("mock selftest: ok", file=sys.stderr)
+
+
 if __name__ == "__main__":
+    if os.environ.get("MOCK_SELFTEST"):
+        _selftest()
+        sys.exit(0)
     port = int(os.environ.get("PORT", "8088"))
     print(
         f"mock upstream on :{port} "

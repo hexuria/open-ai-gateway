@@ -176,23 +176,41 @@ fn usage_write(
     // for the frontier baseline, applied to the column beside it, which was
     // left saying the opposite.
     //
-    // `cost`, not zero, and that distinction is the whole fix:
+    // Zero, exactly as `counterfactual_usd` above. The two columns answer the
+    // same question against different baselines — what this displaced, at the
+    // ceiling's price and at the API's — and an attempt nobody was served
+    // displaced nothing at either. Disagreeing about that on one row and not
+    // the other is how a reader ends up trusting neither.
     //
-    // - On a **metered** credential `cost` already *is* the API price, so this
-    //   changes nothing and the row still records what those tokens cost us.
-    //   Zeroing it here would make `api - cost` negative and understate the
-    //   very savings figure the column feeds.
-    // - On a **flat-rate seat** `cost` is zero, which is the point. The row
-    //   stops matching `cost_usd = 0 AND counterfactual_api_usd > 0` — the
-    //   predicate `seat_summaries` uses to recognise a seat row at all — so a
-    //   generation the client never received no longer appears in that seat's
-    //   displaced-spend total, or in the ordering that ranks seats by it.
+    // On a **flat-rate seat** this is what closes the finding: the row stops
+    // matching `cost_usd = 0 AND counterfactual_api_usd > 0`, which is the
+    // predicate `seat_summaries` uses to recognise a seat row at all, so a
+    // generation the client never received leaves the seat's displaced-spend
+    // total and the ordering that ranks seats by it.
+    //
+    // On a **metered** credential the row still records what those tokens cost:
+    // `cost_usd` is untouched and is the number an invoice will match. This was
+    // briefly `cost` here instead, on the argument that zeroing it would make
+    // `api - cost` negative. The savings figures do not sum that difference —
+    // they read `counterfactual_usd`, zeroed the same way — but two readers do
+    // read this column on its own, and both now see zero for an unserved
+    // metered attempt: `key_usage_by_model`'s `list_usd`, and the **points**
+    // it derives from this column for a partner service to enforce limits in.
+    // A member is therefore not charged points for an answer a quality gate
+    // threw away or a stream lost, while the ledger's `cost_usd` still says
+    // what the tokens cost. That is the trade this decision makes, and it is
+    // said again at both readers.
+    //
+    // 0004's own comment — "for a metered account this equals `cost_usd`" —
+    // is true of served rows only, since 0014 made unserved rows real. It is
+    // left as written: editing an applied migration changes its checksum and
+    // fails `migrate` on every database that already ran it.
     //
     // Since 0014 these rows land for the first time, so this was latent until
     // the migration that made abandoned and lost attempts real.
     let counterfactual_api = match fate {
         Fate::Served => api_equivalent,
-        Fate::Abandoned | Fate::Lost => cost,
+        Fate::Abandoned | Fate::Lost => Decimal::ZERO,
     };
 
     // `escalated_from_tier` is set only when we actually climbed a rung;
@@ -663,21 +681,24 @@ mod tests {
         // narrows the claim to unserved attempts, it does not withdraw it.
         let served = usage_write(&ctx, &outcome(300), None, false, Fate::Served);
         assert!(served.counterfactual_api_usd > Decimal::ZERO);
-    }
 
-    #[test]
-    fn an_unserved_metered_row_still_records_what_it_cost() {
-        // The other half, and the reason the fix is `cost` rather than zero.
-        // These tokens were bought and the invoice will show them. Zeroing the
-        // API-equivalent price here would make (api - cost) negative on this
-        // row and understate the savings figure it feeds.
-        let ctx = context(0); // flat_rate: false
-        let row = usage_write(&ctx, &outcome(300), None, false, Fate::Abandoned);
+        // A METERED unserved row: the displaced figure is zero for the same
+        // reason, and `cost_usd` is untouched because those tokens were bought
+        // and an invoice will show them. The two are separate questions and
+        // only one of them is about what was displaced.
+        let metered = context(0); // flat_rate: false
+        let row = usage_write(&metered, &outcome(300), None, false, Fate::Abandoned);
         assert!(row.cost_usd > Decimal::ZERO, "we paid for these tokens");
         assert_eq!(
-            row.counterfactual_api_usd, row.cost_usd,
-            "a metered row contributes nothing to (api - cost), whatever its fate"
+            row.counterfactual_api_usd,
+            Decimal::ZERO,
+            "nobody was served, so nothing was displaced — on any credential"
         );
+
+        // And both counterfactual columns agree on every unserved row. They
+        // disagreed while this one was `cost`, which is the state a reader
+        // cannot make sense of.
+        assert_eq!(row.counterfactual_usd, row.counterfactual_api_usd);
     }
 
     #[test]

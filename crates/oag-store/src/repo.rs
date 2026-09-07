@@ -669,23 +669,13 @@ pub async fn key_hashes_for_principal(db: &Db, principal_id: Uuid) -> Result<Vec
         .map_err(|e| Error::Internal(format!("listing a principal's keys: {e}")))
 }
 
-/// A principal's budget and month-to-date spend. `None` means no such principal.
+/// The statement [`principal_usage`] runs.
 ///
-/// Month-to-date is computed from the ledger rather than a running counter: the
-/// ledger is the record, and a counter that drifts from it is a bill nobody can
-/// reconcile.
-///
-/// The spend sums every row and the request count does not, which is the split
-/// 0014 made necessary rather than an inconsistency. Since the ledger's key
-/// contracted onto `(request_id, attempt)`, one client request can leave
-/// several rows: the answer it was served, plus any attempt a quality gate
-/// abandoned or a stream lost. All of them were generated and invoiced, so all
-/// of them are money; only one of them was a request. Counting the attempts
-/// would report a principal making twice the requests they made on exactly the
-/// traffic where escalation is working.
-pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsage>> {
-    sqlx::query_as::<_, (Uuid, String, Option<Decimal>, Decimal, i64)>(
-        r"
+/// Lifted out so a test can `EXPLAIN` the statement that runs rather than a
+/// copy of it, exactly as `KEY_USAGE_SQL` was. A copy in a test drifts from its
+/// original silently, and the drift is invisible precisely when it matters —
+/// which is the defect class this whole round is about.
+const PRINCIPAL_USAGE_SQL: &str = r"
         SELECT p.id,
                p.email,
                p.monthly_budget_usd,
@@ -711,25 +701,41 @@ pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsa
               AND u.occurred_at >= date_trunc('month', now())
         WHERE p.email = $1
         GROUP BY p.id, p.email, p.monthly_budget_usd
-        ",
-    )
-    .bind(email)
-    .fetch_optional(db.pool())
-    .await
-    .map(|row| {
-        row.map(
-            |(principal_id, email, monthly_budget_usd, month_to_date_usd, requests)| {
-                PrincipalUsage {
-                    principal_id,
-                    email,
-                    monthly_budget_usd,
-                    month_to_date_usd,
-                    requests,
-                }
-            },
-        )
-    })
-    .map_err(|e| Error::Internal(format!("reading principal usage: {e}")))
+";
+
+/// A principal's budget and month-to-date spend. `None` means no such principal.
+///
+/// Month-to-date is computed from the ledger rather than a running counter: the
+/// ledger is the record, and a counter that drifts from it is a bill nobody can
+/// reconcile.
+///
+/// The spend sums every row and the request count does not, which is the split
+/// 0014 made necessary rather than an inconsistency. Since the ledger's key
+/// contracted onto `(request_id, attempt)`, one client request can leave
+/// several rows: the answer it was served, plus any attempt a quality gate
+/// abandoned or a stream lost. All of them were generated and invoiced, so all
+/// of them are money; only one of them was a request. Counting the attempts
+/// would report a principal making twice the requests they made on exactly the
+/// traffic where escalation is working.
+pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsage>> {
+    sqlx::query_as::<_, (Uuid, String, Option<Decimal>, Decimal, i64)>(PRINCIPAL_USAGE_SQL)
+        .bind(email)
+        .fetch_optional(db.pool())
+        .await
+        .map(|row| {
+            row.map(
+                |(principal_id, email, monthly_budget_usd, month_to_date_usd, requests)| {
+                    PrincipalUsage {
+                        principal_id,
+                        email,
+                        monthly_budget_usd,
+                        month_to_date_usd,
+                        requests,
+                    }
+                },
+            )
+        })
+        .map_err(|e| Error::Internal(format!("reading principal usage: {e}")))
 }
 
 /// One key's cap and spend — what a partner service shows next to the member (or the
@@ -737,8 +743,9 @@ pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsa
 ///
 /// Four spend figures, on purpose. `spent_usd` is the counter the gateway's own quota check
 /// runs against: lifetime, denormalised on `api_key`, debited by `record_usage` in the same
-/// statement as the ledger row. The three windows are the ledger summed since an instant —
-/// a rolling five hours, a rolling seven days, the first of the current UTC month — the shape
+/// statement as the ledger row. The windows are the ledger summed since an instant —
+/// a rolling five hours, a rolling twenty-four hours, a rolling seven days, the first of the
+/// current UTC month — the shape
 /// of a subscription's limits, which is what a partner service writes its rules in. A cap on
 /// the key is a wall on the first number; a service that showed a window figure as if it were
 /// what that cap measures would be lying about when the wall is reached, so all four are given.
@@ -931,6 +938,12 @@ pub async fn key_usage_by_model(
                COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
                COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens,
                COALESCE(SUM(cost_usd), 0)::numeric(16,8) AS cost_usd,
+               -- `list_usd` and `points` read `counterfactual_api_usd`, which is
+               -- zero on an abandoned or lost attempt while `cost_usd` is not.
+               -- So over a window with unserved attempts `list_usd` can sit
+               -- below `cost_usd` on a metered key: the gateway paid for tokens
+               -- the member is not charged points for. Deliberate; see the note
+               -- at `meter.rs` where the column is written.
                COALESCE(SUM(counterfactual_api_usd), 0)::numeric(16,8) AS list_usd,
                CASE WHEN $3::numeric IS NULL THEN NULL
                     ELSE SUM(ROUND(counterfactual_api_usd * 1000000 / $3::numeric))::bigint
@@ -1128,7 +1141,7 @@ const KEY_USAGE_SQL: &str = r"
 
 /// One key's cap and spend; `None` for an id that is not a key. Every figure comes from the
 /// ledger, not the counter, for the same reason `principal_usage` reads the ledger: the ledger
-/// is the record. One statement, three windows, the key's own rows only.
+/// is the record. One statement, four windows, the key's own rows only.
 /// `reference` is the points price, read first by the caller; without one the points fields
 /// are `None`, never zero.
 // One statement, four windows, ten figures each: the length is the SELECT list, and splitting
@@ -2665,16 +2678,31 @@ mod tests {
         (principal, route, AccountId::from_uuid(account))
     }
 
-    /// The three windows after one spend six hours ago and one just now: the five-hour window
-    /// holds only the recent one and frees up when it ages out; the week holds both and frees
-    /// up when the older one does; the month resets on the first.
+    /// All four windows after one spend six hours ago and one just now: the five-hour window
+    /// holds only the recent one and frees up when it ages out; the day and the week hold both,
+    /// and each frees up when the older one leaves it; the month resets on the first.
+    ///
+    /// The day was the one window with no assertion here, which left the only figure whose
+    /// bound sits *between* the two spends untested — the case that tells a correct window
+    /// from one that is merely wide enough.
     fn assert_windows(usage: &KeyUsage) {
         assert_eq!(
             usage.five_hour_usd,
             dec!(0.500000),
             "the six-hour-old spend is outside"
         );
-        assert_eq!(usage.seven_day_usd, dec!(1.750000), "and inside the week");
+        assert_eq!(
+            usage.day_usd,
+            dec!(1.750000),
+            "and inside the day, which is the window the six-hour-old spend \
+             distinguishes: a five-hour bound excludes it and a day includes it"
+        );
+        assert_eq!(
+            usage.seven_day_usd,
+            dec!(2.000000),
+            "the week holds the three-day-old spend the day excludes — the pair that \
+             makes the two windows distinguishable at all"
+        );
         let now = OffsetDateTime::now_utc();
         let frees = usage
             .five_hour_frees_at
@@ -2689,8 +2717,9 @@ mod tests {
             .expect("a non-empty window frees up");
         let hours = (frees - now).whole_hours();
         assert!(
-            (7 * 24 - 7..=7 * 24 - 5).contains(&hours),
-            "the seven-day window frees up when the six-hour-old spend ages out: {frees}"
+            (4 * 24 - 1..=4 * 24).contains(&hours),
+            "the seven-day window frees up when its OLDEST spend ages out, and that \
+             is the three-day-old one — four days from now, not seven: {frees}"
         );
         assert!(
             usage.month_resets_at > now,
@@ -2786,6 +2815,11 @@ mod tests {
         };
         let early = write(own, "1.25", "2.00");
         record_usage(&db, &early).await.expect("record");
+        // Three days old: inside the week and the month, outside the day. Without a spend
+        // between the two bounds, `day_usd` and `seven_day_usd` hold the same figure and a
+        // day window widened to seven days passes every assertion here — which it did.
+        let older = write(own, "0.25", "0.40");
+        record_usage(&db, &older).await.expect("record");
         record_usage(&db, &write(own, "0.50", "0.80"))
             .await
             .expect("record");
@@ -2801,6 +2835,13 @@ mod tests {
         .execute(db.pool())
         .await
         .expect("backdate");
+        sqlx::query(
+            "UPDATE usage_event SET occurred_at = now() - interval '3 days' WHERE request_id = $1",
+        )
+        .bind(older.request_id)
+        .execute(db.pool())
+        .await
+        .expect("backdate");
 
         let usage = key_usage(&db, own, Some(dec!(0.20)))
             .await
@@ -2812,29 +2853,30 @@ mod tests {
         assert_eq!(usage.quota_usd, Some(dec!(5.000000)));
         assert_eq!(
             usage.spent_usd,
-            dec!(1.750000),
+            dec!(2.000000),
             "the counter the cap is enforced against"
         );
         assert_eq!(
             usage.month_to_date_usd,
-            dec!(1.750000),
+            dec!(2.000000),
             "this key's rows only"
         );
-        assert_eq!(usage.requests, 2);
+        assert_eq!(usage.requests, 3);
         assert_windows(&usage);
         assert_eq!(
             usage.five_hour_requests, 1,
             "only the recent spend is inside five hours"
         );
-        assert_eq!(usage.seven_day_requests, 2);
+        assert_eq!(usage.seven_day_requests, 3);
         assert_eq!(
             usage.month_counterfactual_usd,
-            dec!(2.800000),
+            dec!(3.200000),
             "the list-price bill the same tokens would have carried"
         );
         assert_eq!(usage.five_hour_counterfactual_usd, dec!(0.800000));
-        assert_eq!(usage.seven_day_counterfactual_usd, dec!(2.800000));
-        // The rolling day holds both (six hours ago is inside it).
+        assert_eq!(usage.seven_day_counterfactual_usd, dec!(3.200000));
+        // The rolling day holds the six-hour-old spend and not the three-day-old one, which
+        // is the only thing that tells this window from the week.
         assert_eq!(usage.day_usd, dec!(1.750000));
         assert_eq!(usage.day_requests, 2);
         assert_eq!(usage.day_counterfactual_usd, dec!(2.800000));
@@ -2842,12 +2884,12 @@ mod tests {
         // Points at R = 0.20: list price × 1e6 / 0.20, per request, summed.
         assert_eq!(
             usage.month_points,
-            Some(14_000_000),
-            "2.00 and 0.80 at list price"
+            Some(16_000_000),
+            "2.00, 0.80 and 0.40 at list price"
         );
         assert_eq!(usage.five_hour_points, Some(4_000_000));
         assert_eq!(usage.day_points, Some(14_000_000));
-        assert_eq!(usage.seven_day_points, Some(14_000_000));
+        assert_eq!(usage.seven_day_points, Some(16_000_000));
         // Per model, inside the month and inside five hours.
         let by_model = key_usage_by_model(
             &db,
@@ -2860,14 +2902,15 @@ mod tests {
         .expect("by model");
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model_id, "kimi-k2");
-        assert_eq!(by_model[0].requests, 2);
+        // The month, so all three of this key's spends.
+        assert_eq!(by_model[0].requests, 3);
         assert_eq!(
             (by_model[0].input_tokens, by_model[0].output_tokens),
-            (20, 10)
+            (30, 15)
         );
-        assert_eq!(by_model[0].cost_usd, dec!(1.750000));
-        assert_eq!(by_model[0].list_usd, dec!(2.800000));
-        assert_eq!(by_model[0].points, Some(14_000_000));
+        assert_eq!(by_model[0].cost_usd, dec!(2.000000));
+        assert_eq!(by_model[0].list_usd, dec!(3.200000));
+        assert_eq!(by_model[0].points, Some(16_000_000));
         let recent = key_usage_by_model(
             &db,
             own,
@@ -2893,7 +2936,7 @@ mod tests {
         .await
         .expect("points");
         let of = |key: Uuid| pool.iter().find(|(k, _)| *k == key).map(|(_, p)| *p);
-        assert_eq!(of(own), Some(14_000_000));
+        assert_eq!(of(own), Some(16_000_000), "2.00, 0.80 and 0.40 over 0.20");
         assert_eq!(of(theirs), Some(45_000_000), "9.00 at list price over 0.20");
 
         let other = key_usage(&db, theirs, None)
@@ -3899,23 +3942,6 @@ mod tests {
         );
     }
 
-    /// S1. The usage panels read a window, not a key's whole history.
-    ///
-    /// Both queries state their windows inside `FILTER` clauses, which decide
-    /// what each aggregate counts and nothing about what the join reads. With
-    /// no bound in the `ON`, the join walked every row the key or principal had
-    /// ever written in order to report a rolling five hours — and `key_usage`
-    /// is the query a partner service calls before each model call, per member.
-    /// The ledger-partitioning design doc classifies both as range-bounded;
-    /// that premise was wrong, which is why this asserts the plan and not the
-    /// numbers. The numbers were always right. They just cost a scan.
-    ///
-    /// What is asserted is that the window bound reaches the *index condition*
-    /// rather than being applied after rows are read. That is the difference
-    /// between a range scan and a full walk, and it is a property of the query
-    /// rather than of how much data happens to be in the table — so the test
-    /// says nothing about which plan the planner prefers today, and turning
-    /// sequential scans off is how it asks the question it actually means.
     /// C4: the reason 0016 gives for dropping `account_schedulable_idx`.
     ///
     /// Its first draft said the seat poller was the only query filtering
@@ -3929,62 +3955,143 @@ mod tests {
     /// already removed it: asserting that a plan does not use an index that
     /// does not exist would pass for the wrong reason, which is the shape of
     /// check this whole review was about.
+    ///
+    /// The first draft asked the wrong question, though: whether any plan
+    /// *named* the index. Ask the planner for an index plan — `SET LOCAL
+    /// enable_seqscan = off` — and it names it, every time, for any partial
+    /// index on `schedulable`: it bitmap-scans the whole index and rechecks on
+    /// the heap. `Recheck Cond: schedulable` with `Filter: (kind = ...)` is the
+    /// planner using the index's *predicate* and ignoring its columns, which is
+    /// available from any index with that `WHERE` and is not what 0013 was for.
+    /// So the first draft would have reported a regression that was not one the
+    /// moment anybody made it ask.
+    ///
+    /// The question that means something is whether the index's columns did any
+    /// work, and the plan answers it: `Index Cond` under the scan node is the
+    /// planner saying they narrowed the search. That is asserted here, and the
+    /// control below proves the arrangement can say yes — the same queries,
+    /// the same rows, an index whose columns the poller genuinely uses
+    /// (`ON account (kind) WHERE schedulable`) produces exactly the `Index
+    /// Cond` the real one does not.
+    ///
+    /// The rows are seeded inside the same rolled-back transaction so the plan
+    /// does not depend on what other tests happen to have left in `account`.
     #[tokio::test]
     async fn an_index_on_provider_cannot_serve_a_query_without_one() {
+        // `route_channels`: filters `schedulable`, does not bound `provider`.
+        const ROUTE_CHANNELS: &str = "EXPLAIN SELECT DISTINCT a.provider, a.kind, a.served_models \
+             FROM account a JOIN account_route ar ON ar.account_id = a.id \
+             WHERE ar.route_id = $1 AND a.schedulable \
+               AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $2)";
+        // The seat poller: same predicate, same absence of a provider bound.
+        const POLLER: &str = "EXPLAIN SELECT id FROM account WHERE kind = 'oauth' AND schedulable";
+
         let Some(db) = test_db() else {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
             return;
         };
         db.migrate().await.expect("migrate");
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS account_schedulable_idx \
-             ON account (provider, priority) WHERE schedulable",
-        )
-        .execute(db.pool())
-        .await
-        .expect("recreate the index 0013 defined");
-
-        let route = Uuid::now_v7();
-        let principal = Uuid::now_v7();
-        let plans = [
-            // `route_channels`: filters `schedulable`, does not bound `provider`.
-            sqlx::query_scalar::<_, String>(
-                "EXPLAIN SELECT DISTINCT a.provider, a.kind, a.served_models \
-                 FROM account a JOIN account_route ar ON ar.account_id = a.id \
-                 WHERE ar.route_id = $1 AND a.schedulable \
-                   AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $2)",
+        // Every plan is taken inside a transaction with sequential scans
+        // disabled, so a plan that does not use the index is the planner
+        // refusing it rather than the planner never having looked.
+        let explain = async |index: &'static str| -> [Vec<String>; 2] {
+            let mut tx = db.pool().begin().await.expect("begin");
+            sqlx::query("SET LOCAL enable_seqscan = off")
+                .execute(&mut *tx)
+                .await
+                .expect("ask for the index plan");
+            sqlx::query(index)
+                .execute(&mut *tx)
+                .await
+                .expect("create the index under test");
+            // Enough rows for an index plan to be worth considering: below a
+            // page or so the planner seq-scans whatever exists, and then this
+            // test proves nothing. Seeded inside the transaction, so the table
+            // is left exactly as it was found however this run ends.
+            sqlx::query(
+                "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+                 credentials_nonce, priority) \
+                 SELECT gen_random_uuid(), 'c4-' || i, \
+                        (ARRAY['anthropic','kimi','openai','xai'])[1 + (i % 4)], \
+                        'oauth', '\\x00', '\\x00', (i % 8)::smallint \
+                 FROM generate_series(1, 64) i",
             )
-            .bind(route)
-            .bind(principal)
-            .fetch_all(db.pool())
+            .execute(&mut *tx)
             .await
-            .expect("explain route_channels"),
-            // The seat poller: same predicate, same absence of a provider bound.
-            sqlx::query_scalar::<_, String>(
-                "EXPLAIN SELECT id FROM account WHERE kind = 'oauth' AND schedulable",
-            )
-            .fetch_all(db.pool())
-            .await
-            .expect("explain the poller"),
-        ];
+            .expect("seed accounts");
+            sqlx::query("ANALYZE account")
+                .execute(&mut *tx)
+                .await
+                .expect("statistics, or the planner is guessing at row counts");
 
-        let used: Vec<String> = plans
-            .iter()
-            .flatten()
-            .filter(|line| line.contains("account_schedulable_idx"))
-            .cloned()
-            .collect();
+            let route_channels = sqlx::query_scalar::<_, String>(ROUTE_CHANNELS)
+                .bind(Uuid::now_v7())
+                .bind(Uuid::now_v7())
+                .fetch_all(&mut *tx)
+                .await
+                .expect("explain route_channels");
+            let poller = sqlx::query_scalar::<_, String>(POLLER)
+                .fetch_all(&mut *tx)
+                .await
+                .expect("explain the poller");
+            // Rolled back, so the index never outlives the plan it was made
+            // for and the schema stays as 0016 left it.
+            tx.rollback().await.expect("rollback");
+            // Kept apart. A plan's root node carries no `->`, so a window that
+            // scanned forward from the last node of one plan would run into
+            // the next and could match its `Index Cond` — the cross-plan
+            // coupling the first fix to this test removed on one side only.
+            [route_channels, poller]
+        };
 
-        sqlx::query("DROP INDEX IF EXISTS account_schedulable_idx")
-            .execute(db.pool())
-            .await
-            .expect("leave the schema as 0016 left it");
+        // Did the index supply a bound anywhere, or was it merely walked?
+        // `Index Cond` under a scan node is the planner saying the index's own
+        // columns narrowed the search; without one it read every entry and
+        // filtered on the heap, which a partial index on `schedulable` allows
+        // whatever it is keyed on.
+        //
+        // *Every* occurrence in a plan, not the first, and each plan on its
+        // own. The index can appear in either query's plan, and which one is a
+        // property of the table's statistics rather than of the index: with
+        // `account` nearly empty the planner takes the partial index for
+        // `route_channels` too, as a plain Index Scan with a `Filter` and no
+        // `Index Cond` — and a check that stopped at the first occurrence
+        // concluded the control could not say yes, failing on a fresh database
+        // while passing on a developer's populated one.
+        let bounded = |plan: &[String]| {
+            plan.iter().enumerate().any(|(i, line)| {
+                line.contains("account_schedulable_idx")
+                    && plan[i + 1..]
+                        .iter()
+                        .take_while(|l| !l.contains("->"))
+                        .any(|l| l.contains("Index Cond:"))
+            })
+        };
+        let bounded_anywhere = |plans: &[Vec<String>; 2]| plans.iter().any(|p| bounded(p));
 
+        // The control. An index whose columns the poller can genuinely use, so
+        // a "no" below is a real answer.
+        let control =
+            explain("CREATE INDEX account_schedulable_idx ON account (kind) WHERE schedulable")
+                .await;
         assert!(
-            used.is_empty(),
-            "a query DOES use account_schedulable_idx, so 0016 dropped an index \
-             something needed: {used:?}"
+            bounded_anywhere(&control),
+            "the arrangement cannot say yes, so its no would mean nothing:\n{}",
+            control.concat().join("\n")
+        );
+
+        // And 0013's index, on the same table, the same rows, the same settings.
+        let plans = explain(
+            "CREATE INDEX account_schedulable_idx ON account (provider, priority) \
+             WHERE schedulable",
+        )
+        .await;
+        assert!(
+            !bounded_anywhere(&plans),
+            "a query bounds its search with account_schedulable_idx, so 0016 \
+             dropped an index something needed:\n{}",
+            plans.concat().join("\n")
         );
     }
 
@@ -4036,6 +4143,23 @@ mod tests {
         );
     }
 
+    /// S1. The usage panels read a window, not a key's whole history.
+    ///
+    /// Both queries state their windows inside `FILTER` clauses, which decide
+    /// what each aggregate counts and nothing about what the join reads. With
+    /// no bound in the `ON`, the join walked every row the key or principal had
+    /// ever written in order to report a rolling five hours — and `key_usage`
+    /// is the query a partner service calls before each model call, per member.
+    /// The ledger-partitioning design doc classifies both as range-bounded;
+    /// that premise was wrong, which is why this asserts the plan and not the
+    /// numbers. The numbers were always right. They just cost a scan.
+    ///
+    /// What is asserted is that the window bound reaches the *index condition*
+    /// rather than being applied after rows are read. That is the difference
+    /// between a range scan and a full walk, and it is a property of the query
+    /// rather than of how much data happens to be in the table — so the test
+    /// says nothing about which plan the planner prefers today, and turning
+    /// sequential scans off is how it asks the question it actually means.
     #[tokio::test]
     async fn the_usage_panels_bound_the_ledger_side_of_their_joins() {
         let Some(db) = test_db() else {
@@ -4049,6 +4173,15 @@ mod tests {
                 .await
                 .expect("seed");
         }
+        // The same rows carry a `principal_id`, so one seed serves both panels.
+        let principal_email: String = sqlx::query_scalar(
+            "SELECT p.email FROM principal p JOIN api_key k ON k.principal_id = p.id \
+             WHERE k.id = $1",
+        )
+        .bind(key)
+        .fetch_one(db.pool())
+        .await
+        .expect("the principal that owns the key");
 
         let mut tx = db.pool().begin().await.expect("begin");
         sqlx::query("SET LOCAL enable_seqscan = off")
@@ -4089,6 +4222,40 @@ mod tests {
         assert!(
             ledger_cond.contains("api_key_id"),
             "and it rides on `usage_event_key_idx`, which leads with the key:\n{plan}"
+        );
+
+        // And `principal_usage`, whose join carries the same bound and whose
+        // panel is read on every budget check. S1 moved the bound in both
+        // statements; only one of them had an assertion, so deleting it from
+        // this one left the group green.
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .expect("ask for the index plan");
+        let explain: &'static str =
+            Box::leak(format!("EXPLAIN {PRINCIPAL_USAGE_SQL}").into_boxed_str());
+        let plan: String = sqlx::query_scalar(explain)
+            .bind(principal_email)
+            .fetch_all(&mut *tx)
+            .await
+            .map(|rows: Vec<String>| rows.join("\n"))
+            .expect("explain");
+        tx.rollback().await.expect("rollback");
+
+        let ledger_cond = plan
+            .lines()
+            .skip_while(|l| !l.contains("usage_event"))
+            .find(|l| l.contains("Index Cond:"))
+            .unwrap_or_else(|| panic!("the ledger side of the join is not indexed:\n{plan}"));
+        assert!(
+            ledger_cond.contains("occurred_at"),
+            "a month's figures must not be read out of a principal's whole \
+             history:\n{plan}"
+        );
+        assert!(
+            ledger_cond.contains("principal_id"),
+            "and it rides on `usage_event_principal_idx`:\n{plan}"
         );
     }
 

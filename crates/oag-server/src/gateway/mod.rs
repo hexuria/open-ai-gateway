@@ -272,12 +272,6 @@ async fn handle(
     .await
 }
 
-/// Whether this attempt may be retried one rung up.
-///
-/// Failover (same model, another credential) is a different path. Climbing
-/// changes the model. A named passthrough request must not walk onto the
-/// next ladder provider; hitting the caller's own `max_tokens` is not a
-/// weaker-model failure; budget pressure must not undo a downgrade.
 /// Whether the budget, and nothing else, is what stopped this climb.
 ///
 /// G4. `oag_escalations_suppressed_total` answers one question — how much
@@ -331,6 +325,12 @@ fn budget_alone_prevented_the_climb(
         .is_some()
 }
 
+/// Whether this attempt may be retried one rung up.
+///
+/// Failover (same model, another credential) is a different path. Climbing
+/// changes the model. A named passthrough request must not walk onto the
+/// next ladder provider; hitting the caller's own `max_tokens` is not a
+/// weaker-model failure; budget pressure must not undo a downgrade.
 fn should_climb(
     reason: &oag_router::SelectionReason,
     gate: oag_router::QualityGate,
@@ -423,9 +423,25 @@ async fn run_with_escalation(
                 // must not be quietly moved onto another provider's, however
                 // unavailable theirs is — that is the same rule that stops a
                 // quality gate doing it.
+                //
+                // And so does the budget, by `escalation_allowed`, which is the
+                // same call `should_climb` makes sixty lines below. This branch
+                // checked the escalation count alone, so a principal the router
+                // had just downgraded for being near their cap — reason
+                // `BudgetDowngraded`, which `climb_allowed` permits — was
+                // promoted to a rung fifteen times dearer the moment their
+                // cheap rung had no credential, and debited against the very
+                // budget the downgrade was protecting.
+                //
+                // The two paths ask the same question and gave opposite
+                // answers, which is the defect whichever answer is right. This
+                // is the documented one: the refusal is a 503 naming the rung
+                // that could not be dispatched to, which is a truthful answer an
+                // operator can act on, and `hard_stop_multiple` remains the
+                // wall rather than this.
                 if matches!(e.disposition(), oag_core::Disposition::EscalateTier)
                     && oag_router::climb_allowed(&decision.reason)
-                    && escalations < MAX_ESCALATIONS
+                    && oag_router::escalation_allowed(pressure, escalations, MAX_ESCALATIONS)
                     && let Some(from) = decision.tier.as_ref()
                     && let Some(next) = policy.escalate_past_provider(
                         from,
@@ -1612,11 +1628,22 @@ async fn try_credential(
                 if let Some(d) = transport_failure(&state.breakers, account, retrying) {
                     apply_disposition(state, account, d).await;
                 }
-                if retrying {
-                    tokio::time::sleep(backoff(attempt)).await;
-                } else {
+                if !retrying {
                     return Outcome::Switch(last);
                 }
+                // The same re-check the `Step::Retry` arm makes, for the same
+                // reason and against the same failure it has just recorded.
+                // G7 added it there and not here, so a connect, TLS or DNS
+                // failure that tripped the breaker still received every
+                // remaining same-credential retry — the traffic a breaker
+                // exists to stop, aimed at the credential it has this moment
+                // decided is unhealthy. `transport_failure` above is what
+                // records that failure, so the breaker's answer here is fresh.
+                let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                if !state.breakers.permits(account, now) {
+                    return Outcome::Switch(last);
+                }
+                tokio::time::sleep(backoff(attempt)).await;
             }
         }
     }
@@ -2215,6 +2242,69 @@ mod tests {
         );
     }
 
+    /// G7's other arm: the transport failures retry against the breaker too.
+    ///
+    /// The re-check went onto the `Step::Retry` arm — the one reached from an
+    /// upstream *response* — and not onto the arm below it, which is where a
+    /// connect, TLS or DNS failure lands. Both loop back to the same credential
+    /// and both have just recorded a failure that may have opened its breaker,
+    /// so a credential that tripped on a connect error still received every
+    /// remaining retry: exactly the traffic a breaker exists to stop, aimed at
+    /// the credential it had this moment decided was unhealthy.
+    ///
+    /// A source scan for the same reason its sibling is one: reaching either
+    /// arm needs a live upstream failing in a specific way against a real
+    /// lease. What is checkable is that both arms ask, and that is what this
+    /// asks.
+    #[test]
+    fn both_retry_arms_re_ask_the_breaker() {
+        // The function's own text, cut before this module — a scan whose
+        // haystack includes the test doing the scanning counts its own string
+        // literals, which is how the first version of this passed with the fix
+        // reverted. It found that on its first revert-check.
+        let src = include_str!("mod.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]\n")
+            .map_or(src, |(code, _)| code);
+        let body = code
+            .split_once("async fn try_credential(")
+            .expect("the retry loop is in this file")
+            .1;
+        let loop_body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+
+        // Both arms that loop back to the same credential, and only those.
+        assert_eq!(
+            loop_body
+                .matches("tokio::time::sleep(backoff(attempt)).await")
+                .count(),
+            2,
+            "a third arm sleeping into another attempt is one this does not \
+             know to check: {loop_body}"
+        );
+        assert_eq!(
+            loop_body
+                .matches("state.breakers.permits(account, now)")
+                .count(),
+            2,
+            "one on the response-failure arm and one on the transport arm; \
+             either without the other is a credential retried past its own \
+             breaker on half the ways a request can fail"
+        );
+
+        // And each check must come before the sleep it guards, not after it.
+        for (i, segment) in loop_body
+            .split("tokio::time::sleep(backoff(attempt)).await")
+            .enumerate()
+            .take(2)
+        {
+            assert!(
+                segment.contains("!state.breakers.permits(account, now)"),
+                "the retry at sleep {i} goes out without asking the breaker \
+                 about the failure it has just recorded"
+            );
+        }
+    }
+
     /// G7. Every same-credential retry asks the breaker, not just the first.
     #[test]
     fn a_retry_rechecks_the_breaker_it_may_have_just_tripped() {
@@ -2233,14 +2323,6 @@ mod tests {
         );
     }
 
-    /// R1, the wiring. The selection error path consults `disposition`.
-    ///
-    /// Reads this file's own source, because reaching that branch needs a
-    /// gateway with a real route, a real ladder, and a credential pool that is
-    /// empty in the specific way the finding is about — a fixture larger and
-    /// less reliable than the thing it would prove. `oag-router` pins the
-    /// classification and the escalation this depends on; what is left is that
-    /// anything asks, and this is that.
     /// G3's wiring: the streamed path hands the ledger the gate that caused
     /// the climb.
     ///
@@ -2272,6 +2354,14 @@ mod tests {
         );
     }
 
+    /// R1, the wiring. The selection error path consults `disposition`.
+    ///
+    /// Reads this file's own source, because reaching that branch needs a
+    /// gateway with a real route, a real ladder, and a credential pool that is
+    /// empty in the specific way the finding is about — a fixture larger and
+    /// less reliable than the thing it would prove. `oag-router` pins the
+    /// classification and the escalation this depends on; what is left is that
+    /// anything asks, and this is that.
     #[test]
     fn the_selection_error_path_asks_the_disposition() {
         let src = include_str!("mod.rs");
@@ -2298,6 +2388,34 @@ mod tests {
             path.contains("oag_router::climb_allowed(&decision.reason)"),
             "a caller who named a model must not be moved onto another \
              provider's, however unavailable theirs is"
+        );
+
+        // Both guards, and the same call the quality-gate path makes.
+        //
+        // This branch checked the escalation count alone, so a principal the
+        // router had just downgraded for being near their cap — whose reason
+        // `climb_allowed` permits — was promoted to a rung fifteen times
+        // dearer the moment their cheap rung had no credential, and debited
+        // against the budget the downgrade was protecting. Two paths asking one
+        // question and answering it differently is the defect; the assertion is
+        // that they now make the same call.
+        let guard = "oag_router::escalation_allowed(pressure, escalations, MAX_ESCALATIONS)";
+        assert!(
+            path.contains(guard),
+            "the selection-failure climb must ask the budget what the quality-gate \
+             climb asks it"
+        );
+        // The module's code, not its tests — this assertion's own string
+        // literal is a match otherwise, and a count that includes the thing
+        // doing the counting is not a count.
+        let code = src
+            .split_once("\n#[cfg(test)]\n")
+            .map_or(src, |(code, _)| code);
+        assert_eq!(
+            code.matches(guard).count(),
+            2,
+            "once on each climb; a third call site means somewhere else is \
+             deciding this and is not covered here"
         );
     }
 
@@ -2690,6 +2808,63 @@ mod tests {
         );
     }
 
+    /// H4's other half: the call sites, which the test above cannot see.
+    ///
+    /// `unserved_rows_are_spawned_off_the_request_future` proves
+    /// `spawn_unserved` detaches. It says nothing about whether
+    /// `run_with_escalation` uses it — put an inline `.await` back on any of the
+    /// three exits and that test stays green while the rows go with the dropped
+    /// request future, which is H4 exactly.
+    ///
+    /// A source scan, and it says so: the three exits are a client hang-up, a
+    /// budget refusal and an exhausted ladder, each reached only by driving a
+    /// real request to a real upstream failure. What is checkable without that
+    /// is the shape of the code, so that is what this checks.
+    ///
+    /// The served path's own `record_abandoned` / `record_lost` are inline on
+    /// purpose and are not a violation: they sit inside the `tokio::spawn` that
+    /// already writes the served row, after it, so the answer the client got is
+    /// in the ledger before the attempts that failed to be it. The assertion is
+    /// therefore about position, not about absence.
+    #[test]
+    fn every_unserved_exit_detaches_its_writes() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split_once("async fn run_with_escalation(")
+            .expect("the function is in this file")
+            .1;
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+
+        assert_eq!(
+            body.matches("spawn_unserved(state, abandoned, lost);")
+                .count(),
+            3,
+            "three exits leave without serving — a hang-up, a budget refusal \
+             and an exhausted ladder — and each owes the ledger its attempts"
+        );
+
+        // The served path's spawn. Everything after it is already detached.
+        let detached = body
+            .find("let state2 = Arc::clone(state);")
+            .expect("the served path spawns its writes");
+        for call in ["meter::record_abandoned(", "meter::record_lost("] {
+            let sites: Vec<usize> = body.match_indices(call).map(|(i, _)| i).collect();
+            assert_eq!(
+                sites.len(),
+                1,
+                "{call} appears {} times; every unserved exit should be going \
+                 through `spawn_unserved`",
+                sites.len()
+            );
+            assert!(
+                sites[0] > detached,
+                "{call} is awaited on the request's own future, so a client \
+                 that hangs up takes the row with it and the provider invoices \
+                 tokens the ledger never heard of"
+            );
+        }
+    }
+
     /// A three-rung ladder with somewhere to climb to, for the suppression
     /// predicate: the question it asks is counterfactual, so the fixture has to
     /// make the *other* blockers absent rather than merely unlikely.
@@ -2981,19 +3156,7 @@ mod tests {
     /// `Cache::connect` only opens a redis client, so the adapter lookup these
     /// tests are about runs long before any backend would.
     fn state() -> Arc<AppState> {
-        let src = r#"
-database:
-  url: "postgres://oag:oag@127.0.0.1:1/oag"
-redis:
-  url: "redis://127.0.0.1:1"
-security:
-  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
-  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
-"#;
-        let config = oag_core::config::Config::from_yaml(src).expect("test config");
-        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
-        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
-        Arc::new(AppState::new(config, db, cache).expect("state"))
+        crate::testing::state("")
     }
 
     fn auth_context() -> oag_store::AuthContext {

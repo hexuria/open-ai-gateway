@@ -32,7 +32,41 @@ pub fn load(path: Option<&str>) -> Result<Config> {
     let cfg: Config = serde_yaml_ng::from_value(doc)
         .map_err(|e| Error::Config(format!("building config: {e}")))?;
     cfg.validate()?;
+
     Ok(cfg)
+}
+
+/// What a configuration that validates still deserves to be told about.
+///
+/// Returned rather than logged so a test can read it: a `tracing` line has no
+/// seam, and the R12 warning went in with no test at all — delete it and every
+/// test in the workspace stayed green, which is the shape of gap this round
+/// exists to close.
+///
+/// Public, and emitted by the caller rather than here, for a second reason the
+/// first fix missed: `load` runs before `init_telemetry`, so a `tracing::warn!`
+/// inside it has no subscriber and goes nowhere. The one path a running gateway
+/// takes told the operator nothing at all while a unit test called this
+/// function directly and passed.
+///
+/// R12. Zero is a legitimate `usage_poll_interval` — a deployment with no
+/// subscription seats has no reserve for the poller to protect — but it also
+/// silently disables every seat's `usage_reserve_pct`, which is a different
+/// feature from the one the operator turned off. Refusing it was tried and was
+/// wrong: it stopped deployments that had chosen zero on purpose. Naming the
+/// consequence is the part that was actually missing.
+pub fn startup_warnings(cfg: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if cfg.gateway.usage_poll_interval.is_zero() {
+        warnings.push(
+            "gateway.usage_poll_interval is 0, so the usage poller will not run — and \
+             with it every seat's usage_reserve_pct stops being enforced, because the \
+             figure it is evaluated against is only refreshed by that poller. Set a \
+             positive interval if any credential relies on a reserve."
+                .to_owned(),
+        );
+    }
+    warnings
 }
 
 /// The top-level sections an override may address.
@@ -121,6 +155,49 @@ fn set_path(doc: &mut Value, path: &[String], value: Value) {
 
 #[cfg(test)]
 mod tests {
+    /// R12. A zero poll interval is accepted, and the operator is told what it costs.
+    ///
+    /// `oag-core` proves zero parses; the warning is this crate's and had
+    /// nothing. Both halves matter: a warning that fires on every interval is
+    /// noise the operator learns to skip, and one that never fires is the
+    /// silent disablement the finding is about.
+    #[test]
+    fn a_zero_poll_interval_is_warned_about_and_a_positive_one_is_not() {
+        let cfg = |secs: u64| {
+            oag_core::config::Config::from_yaml(&format!(
+                r#"
+database:
+  url: "postgres://oag:oag@127.0.0.1:1/oag"
+redis:
+  url: "redis://127.0.0.1:1"
+security:
+  signing_secret: "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0="
+  credential_kek: "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+gateway:
+  usage_poll_interval: {secs}
+"#
+            ))
+            .expect("zero and sixty are both valid configuration")
+        };
+
+        let warned = startup_warnings(&cfg(0));
+        assert_eq!(
+            warned.len(),
+            1,
+            "one warning, for the one thing: {warned:?}"
+        );
+        assert!(
+            warned[0].contains("usage_reserve_pct"),
+            "the consequence is the point — the operator turned off polling, not \
+             reserves, and has to be told those went with it: {}",
+            warned[0]
+        );
+        assert!(
+            startup_warnings(&cfg(60)).is_empty(),
+            "a positive interval has nothing to warn about"
+        );
+    }
+
     use super::*;
 
     fn doc(src: &str) -> Value {
