@@ -743,8 +743,9 @@ pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsa
 ///
 /// Four spend figures, on purpose. `spent_usd` is the counter the gateway's own quota check
 /// runs against: lifetime, denormalised on `api_key`, debited by `record_usage` in the same
-/// statement as the ledger row. The three windows are the ledger summed since an instant —
-/// a rolling five hours, a rolling seven days, the first of the current UTC month — the shape
+/// statement as the ledger row. The windows are the ledger summed since an instant —
+/// a rolling five hours, a rolling twenty-four hours, a rolling seven days, the first of the
+/// current UTC month — the shape
 /// of a subscription's limits, which is what a partner service writes its rules in. A cap on
 /// the key is a wall on the first number; a service that showed a window figure as if it were
 /// what that cap measures would be lying about when the wall is reached, so all four are given.
@@ -1140,7 +1141,7 @@ const KEY_USAGE_SQL: &str = r"
 
 /// One key's cap and spend; `None` for an id that is not a key. Every figure comes from the
 /// ledger, not the counter, for the same reason `principal_usage` reads the ledger: the ledger
-/// is the record. One statement, three windows, the key's own rows only.
+/// is the record. One statement, four windows, the key's own rows only.
 /// `reference` is the points price, read first by the caller; without one the points fields
 /// are `None`, never zero.
 // One statement, four windows, ten figures each: the length is the SELECT list, and splitting
@@ -2677,16 +2678,31 @@ mod tests {
         (principal, route, AccountId::from_uuid(account))
     }
 
-    /// The three windows after one spend six hours ago and one just now: the five-hour window
-    /// holds only the recent one and frees up when it ages out; the week holds both and frees
-    /// up when the older one does; the month resets on the first.
+    /// All four windows after one spend six hours ago and one just now: the five-hour window
+    /// holds only the recent one and frees up when it ages out; the day and the week hold both,
+    /// and each frees up when the older one leaves it; the month resets on the first.
+    ///
+    /// The day was the one window with no assertion here, which left the only figure whose
+    /// bound sits *between* the two spends untested — the case that tells a correct window
+    /// from one that is merely wide enough.
     fn assert_windows(usage: &KeyUsage) {
         assert_eq!(
             usage.five_hour_usd,
             dec!(0.500000),
             "the six-hour-old spend is outside"
         );
-        assert_eq!(usage.seven_day_usd, dec!(1.750000), "and inside the week");
+        assert_eq!(
+            usage.day_usd,
+            dec!(1.750000),
+            "and inside the day, which is the window the six-hour-old spend \
+             distinguishes: a five-hour bound excludes it and a day includes it"
+        );
+        assert_eq!(
+            usage.seven_day_usd,
+            dec!(2.000000),
+            "the week holds the three-day-old spend the day excludes — the pair that \
+             makes the two windows distinguishable at all"
+        );
         let now = OffsetDateTime::now_utc();
         let frees = usage
             .five_hour_frees_at
@@ -2701,8 +2717,9 @@ mod tests {
             .expect("a non-empty window frees up");
         let hours = (frees - now).whole_hours();
         assert!(
-            (7 * 24 - 7..=7 * 24 - 5).contains(&hours),
-            "the seven-day window frees up when the six-hour-old spend ages out: {frees}"
+            (4 * 24 - 1..=4 * 24).contains(&hours),
+            "the seven-day window frees up when its OLDEST spend ages out, and that \
+             is the three-day-old one — four days from now, not seven: {frees}"
         );
         assert!(
             usage.month_resets_at > now,
@@ -2798,6 +2815,11 @@ mod tests {
         };
         let early = write(own, "1.25", "2.00");
         record_usage(&db, &early).await.expect("record");
+        // Three days old: inside the week and the month, outside the day. Without a spend
+        // between the two bounds, `day_usd` and `seven_day_usd` hold the same figure and a
+        // day window widened to seven days passes every assertion here — which it did.
+        let older = write(own, "0.25", "0.40");
+        record_usage(&db, &older).await.expect("record");
         record_usage(&db, &write(own, "0.50", "0.80"))
             .await
             .expect("record");
@@ -2813,6 +2835,13 @@ mod tests {
         .execute(db.pool())
         .await
         .expect("backdate");
+        sqlx::query(
+            "UPDATE usage_event SET occurred_at = now() - interval '3 days' WHERE request_id = $1",
+        )
+        .bind(older.request_id)
+        .execute(db.pool())
+        .await
+        .expect("backdate");
 
         let usage = key_usage(&db, own, Some(dec!(0.20)))
             .await
@@ -2824,29 +2853,30 @@ mod tests {
         assert_eq!(usage.quota_usd, Some(dec!(5.000000)));
         assert_eq!(
             usage.spent_usd,
-            dec!(1.750000),
+            dec!(2.000000),
             "the counter the cap is enforced against"
         );
         assert_eq!(
             usage.month_to_date_usd,
-            dec!(1.750000),
+            dec!(2.000000),
             "this key's rows only"
         );
-        assert_eq!(usage.requests, 2);
+        assert_eq!(usage.requests, 3);
         assert_windows(&usage);
         assert_eq!(
             usage.five_hour_requests, 1,
             "only the recent spend is inside five hours"
         );
-        assert_eq!(usage.seven_day_requests, 2);
+        assert_eq!(usage.seven_day_requests, 3);
         assert_eq!(
             usage.month_counterfactual_usd,
-            dec!(2.800000),
+            dec!(3.200000),
             "the list-price bill the same tokens would have carried"
         );
         assert_eq!(usage.five_hour_counterfactual_usd, dec!(0.800000));
-        assert_eq!(usage.seven_day_counterfactual_usd, dec!(2.800000));
-        // The rolling day holds both (six hours ago is inside it).
+        assert_eq!(usage.seven_day_counterfactual_usd, dec!(3.200000));
+        // The rolling day holds the six-hour-old spend and not the three-day-old one, which
+        // is the only thing that tells this window from the week.
         assert_eq!(usage.day_usd, dec!(1.750000));
         assert_eq!(usage.day_requests, 2);
         assert_eq!(usage.day_counterfactual_usd, dec!(2.800000));
@@ -2854,12 +2884,12 @@ mod tests {
         // Points at R = 0.20: list price × 1e6 / 0.20, per request, summed.
         assert_eq!(
             usage.month_points,
-            Some(14_000_000),
-            "2.00 and 0.80 at list price"
+            Some(16_000_000),
+            "2.00, 0.80 and 0.40 at list price"
         );
         assert_eq!(usage.five_hour_points, Some(4_000_000));
         assert_eq!(usage.day_points, Some(14_000_000));
-        assert_eq!(usage.seven_day_points, Some(14_000_000));
+        assert_eq!(usage.seven_day_points, Some(16_000_000));
         // Per model, inside the month and inside five hours.
         let by_model = key_usage_by_model(
             &db,
@@ -2872,14 +2902,15 @@ mod tests {
         .expect("by model");
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model_id, "kimi-k2");
-        assert_eq!(by_model[0].requests, 2);
+        // The month, so all three of this key's spends.
+        assert_eq!(by_model[0].requests, 3);
         assert_eq!(
             (by_model[0].input_tokens, by_model[0].output_tokens),
-            (20, 10)
+            (30, 15)
         );
-        assert_eq!(by_model[0].cost_usd, dec!(1.750000));
-        assert_eq!(by_model[0].list_usd, dec!(2.800000));
-        assert_eq!(by_model[0].points, Some(14_000_000));
+        assert_eq!(by_model[0].cost_usd, dec!(2.000000));
+        assert_eq!(by_model[0].list_usd, dec!(3.200000));
+        assert_eq!(by_model[0].points, Some(16_000_000));
         let recent = key_usage_by_model(
             &db,
             own,
@@ -2905,7 +2936,7 @@ mod tests {
         .await
         .expect("points");
         let of = |key: Uuid| pool.iter().find(|(k, _)| *k == key).map(|(_, p)| *p);
-        assert_eq!(of(own), Some(14_000_000));
+        assert_eq!(of(own), Some(16_000_000), "2.00, 0.80 and 0.40 over 0.20");
         assert_eq!(of(theirs), Some(45_000_000), "9.00 at list price over 0.20");
 
         let other = key_usage(&db, theirs, None)
