@@ -538,7 +538,7 @@ mod tests {
         let err = refresh(&oauth_material(), &base, None).await.unwrap_err();
         assert!(err.to_string().contains("invalid_grant"), "{err}");
     }
-    /// And the call site, which is where the guarantee actually lives.
+    /// U9 at the call site, which is where the guarantee actually lives.
     ///
     /// `same_origin` below is a pure function; nothing in it says that `refresh`
     /// consults it before posting. Delete the one line at the top of `refresh`

@@ -2579,7 +2579,7 @@ mod tests {
         );
     }
 
-    /// And the exclusion itself, at the place that now owns it.
+    /// C8 at the call site: the exclusion, at the place that now owns it.
     ///
     /// The two tests above pin clap: it reads no environment variable, and it
     /// refuses nothing. Neither reaches `add_account_from_args`, which is where
@@ -3114,7 +3114,7 @@ mod tests {
         );
     }
 
-    /// And the other filter in the same statement: attempts are not requests.
+    /// The `64fc95b` filter in the CLI headline: attempts are not requests.
     ///
     /// `the_month_headline_leaves_seat_rows_out` above seeds only `classified`
     /// rows, so `COUNT(*) FILTER (WHERE selection_reason NOT IN ('abandoned',

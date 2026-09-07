@@ -1368,7 +1368,6 @@ mod tests {
         assert_eq!(at(200, double), BudgetPressure::Exhausted);
     }
 
-    #[test]
     /// R1. A rung nothing can be dispatched to is a reason to climb.
     ///
     /// `NoCredential`, `ReserveHeld` and `NoViableModel` all classify as
@@ -1376,6 +1375,7 @@ mod tests {
     /// back to the caller as a 503 while a rung naming a different provider sat
     /// there able to serve. This pins the classification the gateway now acts
     /// on; `escalate` accepting the gate is what makes acting on it possible.
+    #[test]
     fn a_rung_with_no_usable_credential_escalates_rather_than_failing() {
         use oag_core::{Disposition, Error, Provider};
 

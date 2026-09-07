@@ -135,7 +135,6 @@ mod side_channel_tests {
         super::builder_client().expect("and the cached outcome is reusable");
     }
 
-    #[test]
     /// U12. A credential's proxy applies to every call made with it.
     ///
     /// `proxy_url` is set per credential and was applied only by `transport`,
@@ -144,6 +143,7 @@ mod side_channel_tests {
     /// sometimes succeeding and quietly bypassing the control the proxy existed
     /// to enforce. A credential's proxy is a property of the credential, not of
     /// one kind of request made with it.
+    #[test]
     fn a_side_channel_client_accepts_a_proxy_and_refuses_a_broken_one() {
         side_channel_client(None, Duration::from_secs(20)).expect("no proxy is fine");
         side_channel_client(Some("http://127.0.0.1:3128"), Duration::from_secs(20))

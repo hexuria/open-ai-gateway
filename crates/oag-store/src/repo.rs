@@ -669,10 +669,12 @@ pub async fn key_hashes_for_principal(db: &Db, principal_id: Uuid) -> Result<Vec
         .map_err(|e| Error::Internal(format!("listing a principal's keys: {e}")))
 }
 
-/// Lifted out of `principal_usage` so a test can `EXPLAIN` the statement that
-/// runs rather than a copy of it, exactly as `KEY_USAGE_SQL` was. A copy in a
-/// test drifts from its original silently, and the drift is invisible precisely
-/// when it matters — which is the defect class this whole round is about.
+/// The statement [`principal_usage`] runs.
+///
+/// Lifted out so a test can `EXPLAIN` the statement that runs rather than a
+/// copy of it, exactly as `KEY_USAGE_SQL` was. A copy in a test drifts from its
+/// original silently, and the drift is invisible precisely when it matters —
+/// which is the defect class this whole round is about.
 const PRINCIPAL_USAGE_SQL: &str = r"
         SELECT p.id,
                p.email,
@@ -4101,7 +4103,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
     /// S1. The usage panels read a window, not a key's whole history.
     ///
     /// Both queries state their windows inside `FILTER` clauses, which decide
@@ -4119,6 +4120,7 @@ mod tests {
     /// rather than of how much data happens to be in the table — so the test
     /// says nothing about which plan the planner prefers today, and turning
     /// sequential scans off is how it asks the question it actually means.
+    #[tokio::test]
     async fn the_usage_panels_bound_the_ledger_side_of_their_joins() {
         let Some(db) = test_db() else {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");

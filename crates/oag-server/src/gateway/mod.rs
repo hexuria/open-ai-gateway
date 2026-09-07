@@ -2264,7 +2264,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// R1, the wiring. The selection error path consults `disposition`.
     ///
     /// Reads this file's own source, because reaching that branch needs a
@@ -2273,6 +2272,7 @@ mod tests {
     /// less reliable than the thing it would prove. `oag-router` pins the
     /// classification and the escalation this depends on; what is left is that
     /// anything asks, and this is that.
+    #[test]
     fn the_selection_error_path_asks_the_disposition() {
         let src = include_str!("mod.rs");
         let body = src
