@@ -257,9 +257,9 @@ pub struct Summary {
     /// summary — one slow sub-query must not take down the page — but an empty
     /// Subscriptions section reads exactly like a deployment with no seats, so
     /// an operator whose seat query timed out concluded the seats had been
-    /// removed. The three sibling queries return 500 for the same failure and
-    /// say in comments why they do; these two cannot, so they say which of them
-    /// is missing instead.
+    /// removed. `summary`'s other two queries — the totals and the tier
+    /// breakdown — return 500 for the same failure and say in comments why they
+    /// do; these two cannot, so they say which of them is missing instead.
     ///
     /// Empty on a healthy response, which is the common case and costs a caller
     /// nothing to ignore.
@@ -1162,6 +1162,70 @@ mod tests {
         assert_eq!(
             origin_row.4, 1,
             "and so does the origins panel, which groups the same three rows"
+        );
+    }
+
+    /// A4's other half: a read that failed is not a principal with no cap.
+    ///
+    /// The read-back was `.ok().flatten()`, which folds two different facts —
+    /// "the row could not be read" and "the row has no cap" — into one `None`,
+    /// and `null` on the wire is the second of them. So a failed read asserted,
+    /// beside a 200, that a cap the caller had just set was not in force. The
+    /// write really did succeed; what is unknown is what it left behind, and
+    /// saying so is the only honest answer.
+    #[tokio::test]
+    async fn a_budget_that_cannot_be_read_back_is_not_reported_as_absent() {
+        use axum::extract::{Json, State};
+
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        // A reachable Postgres and a database that is not there: the write
+        // fails, so this cannot reach the read-back — which is the point of the
+        // shape below, not of this call.
+        let Some((prefix, _)) = url.rsplit_once('/') else {
+            eprintln!("skipped: no database name in OAG_TEST_DATABASE_URL");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            &format!("{prefix}/oag_no_such_database"),
+            "redis://127.0.0.1:1",
+            "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        let state = std::sync::Arc::new(crate::AppState::new(config, db, cache).expect("state"));
+
+        let response = super::upsert_principal(
+            State(state),
+            super::AdminActor {
+                principal_id: uuid::Uuid::nil(),
+                email: "a4-admin@example.invalid".to_owned(),
+            },
+            Json(super::write::PrincipalInput {
+                email: "a4-unreadable@example.invalid".to_owned(),
+                role: None,
+                monthly_budget_usd: Some("12.50".to_owned()),
+            }),
+        )
+        .await;
+
+        assert_ne!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "a database that cannot answer must not produce a 200 asserting \
+             anything about a budget"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert!(
+            json["monthly_budget_usd"].is_null() && json.get("error").is_some(),
+            "and it must not carry `monthly_budget_usd: null` as though the \
+             principal had no cap: {json}"
         );
     }
 
