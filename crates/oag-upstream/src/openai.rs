@@ -68,7 +68,7 @@ impl ProviderAdapter for OpenAICompatAdapter {
 
         let body = openai::render_request(req.canonical, &req.model.upstream_name)?;
 
-        crate::builder_client()
+        crate::builder_client()?
             .post(format!("{}/chat/completions", self.base_url))
             .header("content-type", "application/json")
             // Bearer for every one of them; the dialect's single convention.

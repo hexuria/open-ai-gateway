@@ -1135,6 +1135,71 @@ mod tests {
         );
     }
 
+    /// G2, through `pump` rather than through `fold_payloads`.
+    ///
+    /// The existing tests pin the fold: they check that an in-band `Error`
+    /// event is collected, and that the first one wins. Neither reaches the two
+    /// lines that stop the failure — the ledger taking the provider's own
+    /// reason, and the second error frame not being synthesised — so a partial
+    /// revert of either left them green.
+    ///
+    /// The stream here says what went wrong and then stops without its terminal
+    /// event, which is exactly the shape the finding describes: an upstream
+    /// that puts an error inside a 200 and closes.
+    #[tokio::test]
+    async fn an_in_band_error_is_the_reason_and_the_only_frame() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let outcome = pump(
+            streamed(vec![
+                sse(
+                    r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an "}}"#,
+                ),
+                sse(r#"{"type":"error","error":{"type":"overloaded_error","message":"upstream is overloaded"}}"#),
+            ]),
+            anthropic(),
+            tx,
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_secs(5),
+                keepalive: Duration::from_secs(10),
+            },
+            Egress::AnthropicMessages {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+        )
+        .await;
+
+        // The ledger records what the provider said, not what we inferred from
+        // the stream stopping. "Overloaded" and "closed before the response was
+        // complete" send an operator to two different places.
+        let error = outcome.error.expect("the stream failed");
+        assert!(
+            error.contains("upstream is overloaded"),
+            "the provider's own reason outranks the inferred truncation: {error}"
+        );
+        assert!(
+            !error.contains("closed before"),
+            "and replaces it rather than being appended to it: {error}"
+        );
+
+        // One error frame. The fold already rendered the provider's `Error`
+        // through this same renderer; synthesising another sent two for one
+        // failure, the second claiming a truncation and contradicting the
+        // first — which had the truth in it.
+        let sent = drain(&mut rx).await;
+        assert_eq!(
+            sent.matches("event: error").count(),
+            1,
+            "one failure, one frame: {sent}"
+        );
+        assert!(
+            sent.contains("upstream is overloaded"),
+            "and it is the provider's words that reach the client: {sent}"
+        );
+    }
+
     #[tokio::test]
     async fn a_truncated_stream_ends_with_an_error_in_anthropic_s_dialect() {
         // Same cause, and the dialect with no sentinel to get wrong: here the

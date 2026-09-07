@@ -691,7 +691,7 @@ pub async fn principal_usage(db: &Db, email: &str) -> Result<Option<PrincipalUsa
                p.monthly_budget_usd,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
-               ), 0)::numeric(14,6),
+               ), 0)::numeric(16,8),
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
                      AND u.selection_reason NOT IN ('abandoned', 'lost')
@@ -930,8 +930,8 @@ pub async fn key_usage_by_model(
                COALESCE(SUM(output_tokens), 0)::bigint AS output_tokens,
                COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
                COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens,
-               COALESCE(SUM(cost_usd), 0)::numeric(14,6) AS cost_usd,
-               COALESCE(SUM(counterfactual_api_usd), 0)::numeric(14,6) AS list_usd,
+               COALESCE(SUM(cost_usd), 0)::numeric(16,8) AS cost_usd,
+               COALESCE(SUM(counterfactual_api_usd), 0)::numeric(16,8) AS list_usd,
                CASE WHEN $3::numeric IS NULL THEN NULL
                     ELSE SUM(ROUND(counterfactual_api_usd * 1000000 / $3::numeric))::bigint
                END AS points
@@ -1023,17 +1023,13 @@ struct KeyUsageRow {
     seven_day_points: Option<i64>,
 }
 
-/// One key's cap and spend; `None` for an id that is not a key. Every figure comes from the
-/// ledger, not the counter, for the same reason `principal_usage` reads the ledger: the ledger
-/// is the record. One statement, three windows, the key's own rows only.
-/// `reference` is the points price, read first by the caller; without one the points fields
-/// are `None`, never zero.
-// One statement, four windows, ten figures each: the length is the SELECT list, and splitting
-// it would read the ledger twice.
-#[allow(clippy::too_many_lines)]
-pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<Option<KeyUsage>> {
-    sqlx::query_as::<_, KeyUsageRow>(
-        r"
+/// The key-usage panel, as one statement.
+///
+/// A `const` so the `EXPLAIN` test can plan the statement this function
+/// actually runs. The test used to inline the join "verbatim from its `FROM`
+/// onwards", which meant deleting S1's window bound from the real query left
+/// it green: a copy of a fix cannot fail with it.
+const KEY_USAGE_SQL: &str = r"
         SELECT k.id,
                k.name,
                k.key_prefix,
@@ -1043,7 +1039,7 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                k.spent_usd,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
-               ), 0)::numeric(14,6) AS month_usd,
+               ), 0)::numeric(16,8) AS month_usd,
                COUNT(u.request_id) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
                      AND u.selection_reason NOT IN ('abandoned', 'lost')
@@ -1051,13 +1047,13 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                date_trunc('month', now()) + interval '1 month' AS month_resets_at,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '5 hours'
-               ), 0)::numeric(14,6) AS five_hour_usd,
+               ), 0)::numeric(16,8) AS five_hour_usd,
                MIN(u.occurred_at) FILTER (
                    WHERE u.occurred_at >= now() - interval '5 hours'
                ) + interval '5 hours' AS five_hour_frees_at,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '7 days'
-               ), 0)::numeric(14,6) AS seven_day_usd,
+               ), 0)::numeric(16,8) AS seven_day_usd,
                MIN(u.occurred_at) FILTER (
                    WHERE u.occurred_at >= now() - interval '7 days'
                ) + interval '7 days' AS seven_day_frees_at,
@@ -1071,16 +1067,16 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                ) AS seven_day_requests,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
-               ), 0)::numeric(14,6) AS month_counterfactual_usd,
+               ), 0)::numeric(16,8) AS month_counterfactual_usd,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '5 hours'
-               ), 0)::numeric(14,6) AS five_hour_counterfactual_usd,
+               ), 0)::numeric(16,8) AS five_hour_counterfactual_usd,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '7 days'
-               ), 0)::numeric(14,6) AS seven_day_counterfactual_usd,
+               ), 0)::numeric(16,8) AS seven_day_counterfactual_usd,
                COALESCE(SUM(u.cost_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '24 hours'
-               ), 0)::numeric(14,6) AS day_usd,
+               ), 0)::numeric(16,8) AS day_usd,
                MIN(u.occurred_at) FILTER (
                    WHERE u.occurred_at >= now() - interval '24 hours'
                ) + interval '24 hours' AS day_frees_at,
@@ -1090,7 +1086,7 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                ) AS day_requests,
                COALESCE(SUM(u.counterfactual_api_usd) FILTER (
                    WHERE u.occurred_at >= now() - interval '24 hours'
-               ), 0)::numeric(14,6) AS day_counterfactual_usd,
+               ), 0)::numeric(16,8) AS day_counterfactual_usd,
                CASE WHEN $2::numeric IS NULL THEN NULL ELSE COALESCE(SUM(ROUND(u.counterfactual_api_usd * 1000000 / $2::numeric)) FILTER (
                    WHERE u.occurred_at >= date_trunc('month', now())
                ), 0)::bigint END AS month_points,
@@ -1128,44 +1124,54 @@ pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<
                   )
         WHERE k.id = $1
         GROUP BY k.id, k.name, k.key_prefix, p.email, k.active, k.quota_usd, k.spent_usd
-        ",
-    )
-    .bind(id)
-    .bind(reference)
-    .fetch_optional(db.pool())
-    .await
-    .map(|row| {
-        row.map(|row| KeyUsage {
-            key_id: row.id,
-            name: row.name,
-            prefix: row.key_prefix,
-            principal_email: row.email,
-            active: row.active,
-            quota_usd: row.quota_usd,
-            spent_usd: row.spent_usd,
-            month_to_date_usd: row.month_usd,
-            requests: row.month_requests,
-            month_resets_at: row.month_resets_at,
-            five_hour_usd: row.five_hour_usd,
-            five_hour_frees_at: row.five_hour_frees_at,
-            seven_day_usd: row.seven_day_usd,
-            seven_day_frees_at: row.seven_day_frees_at,
-            five_hour_requests: row.five_hour_requests,
-            seven_day_requests: row.seven_day_requests,
-            month_counterfactual_usd: row.month_counterfactual_usd,
-            five_hour_counterfactual_usd: row.five_hour_counterfactual_usd,
-            seven_day_counterfactual_usd: row.seven_day_counterfactual_usd,
-            day_usd: row.day_usd,
-            day_frees_at: row.day_frees_at,
-            day_requests: row.day_requests,
-            day_counterfactual_usd: row.day_counterfactual_usd,
-            month_points: row.month_points,
-            five_hour_points: row.five_hour_points,
-            day_points: row.day_points,
-            seven_day_points: row.seven_day_points,
+";
+
+/// One key's cap and spend; `None` for an id that is not a key. Every figure comes from the
+/// ledger, not the counter, for the same reason `principal_usage` reads the ledger: the ledger
+/// is the record. One statement, three windows, the key's own rows only.
+/// `reference` is the points price, read first by the caller; without one the points fields
+/// are `None`, never zero.
+// One statement, four windows, ten figures each: the length is the SELECT list, and splitting
+// it would read the ledger twice.
+#[allow(clippy::too_many_lines)]
+pub async fn key_usage(db: &Db, id: Uuid, reference: Option<Decimal>) -> Result<Option<KeyUsage>> {
+    sqlx::query_as::<_, KeyUsageRow>(KEY_USAGE_SQL)
+        .bind(id)
+        .bind(reference)
+        .fetch_optional(db.pool())
+        .await
+        .map(|row| {
+            row.map(|row| KeyUsage {
+                key_id: row.id,
+                name: row.name,
+                prefix: row.key_prefix,
+                principal_email: row.email,
+                active: row.active,
+                quota_usd: row.quota_usd,
+                spent_usd: row.spent_usd,
+                month_to_date_usd: row.month_usd,
+                requests: row.month_requests,
+                month_resets_at: row.month_resets_at,
+                five_hour_usd: row.five_hour_usd,
+                five_hour_frees_at: row.five_hour_frees_at,
+                seven_day_usd: row.seven_day_usd,
+                seven_day_frees_at: row.seven_day_frees_at,
+                five_hour_requests: row.five_hour_requests,
+                seven_day_requests: row.seven_day_requests,
+                month_counterfactual_usd: row.month_counterfactual_usd,
+                five_hour_counterfactual_usd: row.five_hour_counterfactual_usd,
+                seven_day_counterfactual_usd: row.seven_day_counterfactual_usd,
+                day_usd: row.day_usd,
+                day_frees_at: row.day_frees_at,
+                day_requests: row.day_requests,
+                day_counterfactual_usd: row.day_counterfactual_usd,
+                month_points: row.month_points,
+                five_hour_points: row.five_hour_points,
+                day_points: row.day_points,
+                seven_day_points: row.seven_day_points,
+            })
         })
-    })
-    .map_err(|e| Error::Internal(format!("reading key usage: {e}")))
+        .map_err(|e| Error::Internal(format!("reading key usage: {e}")))
 }
 
 /// The points reference price — one token at this many USD per million is one point — if the
@@ -2514,10 +2520,24 @@ mod tests {
             // transaction waiting for another's row lock waits on that
             // transaction's id, so nothing ungranted is recorded against the
             // table itself.
+            //
+            // Narrowed to the reconcile's own statements, and to somebody else's
+            // backend. "Any backend waiting on a lock in this database" is
+            // satisfied by any sibling test's `db.migrate()`, which takes an
+            // advisory lock — so under parallel load the probe returned true
+            // for a stranger, the debit committed before this pass reached the
+            // row, and the reverted code passed. The test was interleaving
+            // nothing and asserting it had.
+            //
+            // Both statements, because the pass blocks on whichever comes
+            // first: it takes the row lock with `SELECT ... FOR UPDATE` before
+            // it runs the `SET spent_usd` that needs it.
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_stat_activity
                   WHERE datname = current_database()
-                    AND wait_event_type = 'Lock'",
+                    AND pid <> pg_backend_pid()
+                    AND wait_event_type = 'Lock'
+                    AND (query LIKE '%FOR UPDATE%' OR query LIKE '%SET spent_usd%')",
             )
             .fetch_one(db.pool())
             .await
@@ -2565,7 +2585,7 @@ mod tests {
     /// Fixture: a budgeted principal and route with one debit already counted,
     /// plus a builder for further debits of ten cents.
     ///
-    /// Its own function because the race test below is long enough without it,
+    /// Its own function because the race test above is long enough without it,
     /// and because the pieces only mean something together: reconcile touches
     /// budgeted rows only, and the pre-existing row is what proves a pass
     /// rewrites rather than merely adds.
@@ -3896,6 +3916,126 @@ mod tests {
     /// rather than of how much data happens to be in the table — so the test
     /// says nothing about which plan the planner prefers today, and turning
     /// sequential scans off is how it asks the question it actually means.
+    /// C4: the reason 0016 gives for dropping `account_schedulable_idx`.
+    ///
+    /// Its first draft said the seat poller was the only query filtering
+    /// `schedulable`. `route_channels` does too, and the claim was
+    /// load-bearing — had a `schedulable` query led with `provider`, dropping
+    /// the index would have been a regression rather than a saving.
+    ///
+    /// So this asks the planner rather than arguing. The index is recreated
+    /// exactly as 0013 defined it, both queries are explained, and neither may
+    /// choose it. Recreated and dropped inside the test because 0016 has
+    /// already removed it: asserting that a plan does not use an index that
+    /// does not exist would pass for the wrong reason, which is the shape of
+    /// check this whole review was about.
+    #[tokio::test]
+    async fn an_index_on_provider_cannot_serve_a_query_without_one() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS account_schedulable_idx \
+             ON account (provider, priority) WHERE schedulable",
+        )
+        .execute(db.pool())
+        .await
+        .expect("recreate the index 0013 defined");
+
+        let route = Uuid::now_v7();
+        let principal = Uuid::now_v7();
+        let plans = [
+            // `route_channels`: filters `schedulable`, does not bound `provider`.
+            sqlx::query_scalar::<_, String>(
+                "EXPLAIN SELECT DISTINCT a.provider, a.kind, a.served_models \
+                 FROM account a JOIN account_route ar ON ar.account_id = a.id \
+                 WHERE ar.route_id = $1 AND a.schedulable \
+                   AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $2)",
+            )
+            .bind(route)
+            .bind(principal)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain route_channels"),
+            // The seat poller: same predicate, same absence of a provider bound.
+            sqlx::query_scalar::<_, String>(
+                "EXPLAIN SELECT id FROM account WHERE kind = 'oauth' AND schedulable",
+            )
+            .fetch_all(db.pool())
+            .await
+            .expect("explain the poller"),
+        ];
+
+        let used: Vec<String> = plans
+            .iter()
+            .flatten()
+            .filter(|line| line.contains("account_schedulable_idx"))
+            .cloned()
+            .collect();
+
+        sqlx::query("DROP INDEX IF EXISTS account_schedulable_idx")
+            .execute(db.pool())
+            .await
+            .expect("leave the schema as 0016 left it");
+
+        assert!(
+            used.is_empty(),
+            "a query DOES use account_schedulable_idx, so 0016 dropped an index \
+             something needed: {used:?}"
+        );
+    }
+
+    /// C7: 0015 says "nothing rounds on the way out". It has to be true.
+    ///
+    /// The migration widened the three spend counters to `numeric(16,8)`, the
+    /// scale the ledger already carries, so a debit is no longer rounded on the
+    /// way in. Every read path then cast its ledger sums back to
+    /// `numeric(14,6)` — while returning the widened counter beside them
+    /// untouched — so a panel could show a key's `spent_usd` and its own ledger
+    /// sum disagreeing in the last two digits, which is the exact symptom 0015
+    /// claims to have removed.
+    ///
+    /// A single sub-cent debit is enough to see it: at six places
+    /// `0.00000001` reads as `0.00000000`.
+    #[tokio::test]
+    async fn a_sub_cent_debit_survives_the_read_path() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (key, build) = metered_key(&db).await;
+
+        let tiny: Decimal = "0.00000001".parse().expect("decimal");
+        record_usage(&db, &build(Uuid::now_v7(), 0, "classified", "0.00000001"))
+            .await
+            .expect("record");
+
+        let usage = key_usage(&db, key, None)
+            .await
+            .expect("read the panel")
+            .expect("the key exists");
+        assert_eq!(
+            usage.month_to_date_usd, tiny,
+            "the ledger sum was rounded on the way out, so it no longer matches \
+             the counter 0015 widened to hold it"
+        );
+
+        let counter: Decimal = sqlx::query_scalar("SELECT spent_usd FROM api_key WHERE id = $1")
+            .bind(key)
+            .fetch_one(db.pool())
+            .await
+            .expect("read the counter");
+        assert_eq!(
+            usage.month_to_date_usd, counter,
+            "the panel and the counter must agree to the last place: they are \
+             the same money, read two ways"
+        );
+    }
+
     #[tokio::test]
     async fn the_usage_panels_bound_the_ledger_side_of_their_joins() {
         let Some(db) = test_db() else {
@@ -3916,23 +4056,24 @@ mod tests {
             .await
             .expect("ask for the index plan");
 
-        // The join `key_usage` makes, verbatim from its `FROM` onwards.
-        let plan: String = sqlx::query_scalar(
-            "EXPLAIN SELECT count(*) FROM api_key k
-               JOIN principal p ON p.id = k.principal_id
-               LEFT JOIN usage_event u
-                      ON u.api_key_id = k.id
-                     AND u.occurred_at >= LEAST(
-                             date_trunc('month', now()),
-                             now() - interval '7 days'
-                         )
-              WHERE k.id = $1",
-        )
-        .bind(key)
-        .fetch_all(&mut *tx)
-        .await
-        .map(|rows: Vec<String>| rows.join("\n"))
-        .expect("explain");
+        // The statement `key_usage` runs, not a copy of its join. This test
+        // used to inline the join "verbatim from its `FROM` onwards", so
+        // deleting S1's window bound from the real query left it green — which
+        // is the failure this whole group is about. `EXPLAIN` on the const is
+        // the only form that cannot drift from what runs.
+        // `Box::leak` because sqlx refuses a non-`'static` statement — the same
+        // "static SQL only" rule the rest of this crate follows, enforced by
+        // the driver. One leaked string per test run is the cost of planning
+        // the real query instead of a copy, and it is a cost worth paying
+        // exactly once.
+        let explain: &'static str = Box::leak(format!("EXPLAIN {KEY_USAGE_SQL}").into_boxed_str());
+        let plan: String = sqlx::query_scalar(explain)
+            .bind(key)
+            .bind(Option::<Decimal>::None)
+            .fetch_all(&mut *tx)
+            .await
+            .map(|rows: Vec<String>| rows.join("\n"))
+            .expect("explain");
         tx.rollback().await.expect("rollback");
 
         let ledger_cond = plan

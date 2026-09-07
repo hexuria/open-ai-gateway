@@ -17,7 +17,9 @@ Behaviour is set by environment:
   MOCK_FAIL_FIRST      fail only the first N POSTs, then serve normally
   MOCK_FAIL_FOR_KEY    `credential=status` pairs, comma separated: only these
                        upstream credentials fail, each with its own status, and
-                       every other credential is served
+                       every other credential is served. Matched against the
+                       credential itself, whichever header carried it: a
+                       `Bearer ` prefix is stripped first
   MOCK_FAIL_FIRST_CREDENTIAL
                        fail every POST from whichever credential POSTed first
                        since the last `/_credentials?reset=1`, with this status.
@@ -74,6 +76,13 @@ def _credential(headers):
     secret in CI output on every run.
     """
     raw = headers.get("x-api-key") or headers.get("authorization") or ""
+    # `authorization` arrives as `Bearer <token>`, so matching the raw header
+    # against a credential never matched for a bearer provider — MOCK_FAIL_FOR_KEY
+    # worked only because Anthropic sends `x-api-key`. The scheme is not part of
+    # the credential, and the digest should not depend on which header carried it.
+    scheme, _, rest = raw.partition(" ")
+    if scheme.lower() == "bearer" and rest:
+        raw = rest
     if raw:
         digest = _digest(raw)
         with _lock:

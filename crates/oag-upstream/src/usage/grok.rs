@@ -18,11 +18,10 @@ const BILLING_URL: &str = "https://cli-chat-proxy.grok.com/v1/billing?format=cre
 /// mislabelling a monthly figure as weekly would be worse than a blank.
 const WEEKLY_PERIOD: &str = "USAGE_PERIOD_TYPE_WEEKLY";
 
-pub async fn fetch(access_token: &str) -> Result<Option<UsageSnapshot>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::Internal(format!("building usage client: {e}")))?;
+pub async fn fetch(access_token: &str, proxy: Option<&str>) -> Result<Option<UsageSnapshot>> {
+    // See the note in `codex::fetch`: the quota poll is the one side-channel
+    // call U12 missed, and a mandated egress proxy is not optional for it.
+    let client = crate::side_channel_client(proxy, std::time::Duration::from_secs(10))?;
 
     let response = client
         .get(BILLING_URL)

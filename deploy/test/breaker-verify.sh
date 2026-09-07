@@ -58,7 +58,10 @@ seen() {
 # "more than before" is true whenever a later stage merely uses a different
 # account, which is not a failover.
 credentials() {
-  curl -fsS "http://127.0.0.1:$MOCK_PORT/_credentials?reset=1" 2>/dev/null | grep -c . || echo 0
+  # `|| true`, not `|| echo 0`: `grep -c` prints its count AND exits 1 when the
+  # count is zero, so the fallback appended a second zero and the diagnostic
+  # below read "saw 0\n0 distinct credential(s)".
+  curl -fsS "http://127.0.0.1:$MOCK_PORT/_credentials?reset=1" 2>/dev/null | grep -c . || true
 }
 
 cleanup() {

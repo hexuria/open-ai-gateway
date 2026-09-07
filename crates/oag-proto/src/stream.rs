@@ -112,6 +112,15 @@ pub struct StreamAccumulator {
     open_tool: Option<String>,
     /// Set when nothing here was read from the response at all.
     unparsed: bool,
+    /// Whether this stream has carried a refusal, in any chunk.
+    ///
+    /// A refusal's text and its `finish_reason` arrive in different frames —
+    /// Chat Completions sends the finish in a chunk whose delta is empty — so a
+    /// parser that looks for both in one place finds them together almost
+    /// never. Remembered here because this is the only thing that outlives a
+    /// chunk, and because the distinction is lost the moment refusal text is
+    /// emitted as an ordinary `TextDelta`, which is what every dialect does.
+    saw_refusal: bool,
 }
 
 impl StreamAccumulator {
@@ -213,6 +222,17 @@ impl StreamAccumulator {
     #[must_use]
     pub fn tool_ids(&self) -> Vec<String> {
         self.tool_buffers.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    /// Note that a refusal has been seen, whatever chunk it arrived in.
+    pub const fn note_refusal(&mut self) {
+        self.saw_refusal = true;
+    }
+
+    /// Whether a refusal has been seen at any point in this stream.
+    #[must_use]
+    pub const fn saw_refusal(&self) -> bool {
+        self.saw_refusal
     }
 
     /// Whether any tool call has opened in this response so far.

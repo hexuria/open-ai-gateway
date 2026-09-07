@@ -173,7 +173,7 @@ impl ProviderAdapter for BedrockAdapter {
             time::OffsetDateTime::now_utc(),
         );
 
-        let mut builder = crate::builder_client()
+        let mut builder = crate::builder_client()?
             .post(url)
             .header("content-type", "application/json")
             .header("host", &host)

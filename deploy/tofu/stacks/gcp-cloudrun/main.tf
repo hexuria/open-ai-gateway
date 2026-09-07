@@ -122,6 +122,12 @@ module "gateway" {
   image      = var.image
   vpc_subnet = local.vpc_subnet
 
+  # Passed, not left to the module's default. A variable no caller can set is
+  # exactly the shape this repository's own `tofu-verify.sh` refuses elsewhere,
+  # and the module's description invites an operator to set it — which, from
+  # this stack, they could not.
+  deletion_protection = var.deletion_protection
+
   # Secret AND version. The version is what rolls the service when a value
   # changes: the data module composes the Memorystore AUTH string into the
   # Redis URL, so turning AUTH on writes a new version, and a template that

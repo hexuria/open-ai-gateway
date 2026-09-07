@@ -405,18 +405,39 @@ mod tests {
         // came out mangled. Decoding strictly instead would be worse: `None`
         // puts us back in the silent stall this exists to prevent, for a frame
         // where the provider had actually said what was wrong.
-        let mut payload = br#"{"message":"rate limited "#.to_vec();
-        payload.extend_from_slice(&[0xff, 0xfe]);
-        payload.extend_from_slice(br#""}"#);
-
-        let msg = Message {
-            headers: Headers {
-                event_type: None,
-                exception_type: Some("modelStreamErrorException".to_owned()),
-            },
-            payload,
+        let exception = |payload: Vec<u8>| {
+            inner_event(&Message {
+                headers: Headers {
+                    event_type: None,
+                    exception_type: Some("modelStreamErrorException".to_owned()),
+                },
+                payload,
+            })
+            .expect("an exception frame is an error however its body decodes")
         };
-        let raw = inner_event(&msg).expect("an unreadable body is still an exception");
+
+        // A VALID multi-byte sequence, which is the case that tells the two
+        // decodings apart. `C3 A9` is `é` in UTF-8 and `Ã©` in Latin-1 — and
+        // the previous fixture used `FF FE`, which is invalid UTF-8, so it came
+        // out mangled either way and the test passed with the bug restored.
+        let mut valid = br#"{"message":"quota d"#.to_vec();
+        valid.extend_from_slice(&[0xc3, 0xa9]);
+        valid.extend_from_slice(br#"pass\u00e9"}"#);
+        let raw = exception(valid);
+        assert!(
+            raw.contains("dépassé"),
+            "a message an operator is meant to read came through mangled: {raw}"
+        );
+        assert!(!raw.contains("Ã©"), "that is Latin-1 output: {raw}");
+
+        // And a body that is not valid UTF-8 at all is still an error rather
+        // than a silent stall. Decoding strictly would put us back in the
+        // failure this exists to prevent, for a frame where the provider had
+        // actually said what was wrong.
+        let mut invalid = br#"{"message":"rate limited "#.to_vec();
+        invalid.extend_from_slice(&[0xff, 0xfe]);
+        invalid.extend_from_slice(br#""}"#);
+        let raw = exception(invalid);
 
         let mut acc = oag_proto::StreamAccumulator::new();
         let events = oag_proto::anthropic::parse_event(&raw, &mut acc).expect("parses");

@@ -2,7 +2,14 @@
 {{- /*
 The alert rules, as a PrometheusRule the operator can actually install.
 
-`deploy/prometheus/alerts.yml` holds the same rules for a standalone Prometheus,
+`deploy/prometheus/alerts.yml` holds the standalone Prometheus rules. Not the
+same set, and the difference is worth knowing before treating one as a copy of
+the other: that file has six rules and this has five, only
+`OagReplicaShedding` is common to both by name, `OagUsageWriteFailed` and
+`OagReplicaUnreachable` appear here as `OagUsageWriteFailing` and `OagDown`
+with a longer window, `OagSlotAccountingDegraded`, `OagProviderAtCapacity` and
+`OagDrainStuck` have no counterpart here, and `OagPanics` and
+`OagTokenRefreshFailing` have none there.
 and on Kubernetes there was no way to get them: the chart shipped a
 ServiceMonitor, so metrics were scraped and nothing was ever paged on. An
 operator following the runbooks found the alerts they name do not exist.

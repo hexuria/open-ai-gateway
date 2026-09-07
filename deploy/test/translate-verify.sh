@@ -205,6 +205,11 @@ pass "stream translated + [DONE] + ledger"
 # stream events, and `output_text` where every other dialect says `text`.
 say "5/6  Responses client, Anthropic upstream"
 since="$(mark)"
+# The mock's log is cumulative for the run, and stage 4 has already put a
+# `POST /v1/messages` line in it — so grepping the whole file below could not
+# fail, whatever this stage's request did. Stage 6 takes this mark for the same
+# reason; this stage did not.
+before="$(wc -l <"$WORK/mock.log")"
 curl -sS --max-time 30 -o "$WORK/responses.json" -w "%{http_code}" \
   -X POST "http://$PUBLIC/v1/responses" \
   -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
@@ -241,8 +246,10 @@ if usage.get("input_tokens") != 100 or usage.get("output_tokens") != 12:
 if usage.get("total_tokens") != 112:
     sys.exit(f"total_tokens={usage.get('total_tokens')!r}, expected 112")
 PY
-grep -q 'POST /v1/messages' "$WORK/mock.log" \
-  || fail "mock never saw /v1/messages — the adapter did not fire"
+tail -n "+$((before + 1))" "$WORK/mock.log" | grep -q 'POST /v1/messages' \
+  || fail "the mock saw no /v1/messages for THIS request — the Responses adapter
+  did not fire. (Stage 4 has already logged one, which is why this reads only
+  the lines written since.)"
 assert_ledger 12 "$since"
 pass "responses translated + ledger"
 

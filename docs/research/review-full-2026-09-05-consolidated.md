@@ -96,7 +96,7 @@ column means the defect also depends on documented third-party behaviour.
 | G2 | confirmed | `sse.rs:356` | in-band error not extracted in `pump`; second frame emitted |
 | S1 | confirmed | `repo.rs:1080`, `:689` | window bounds inside `FILTER`, none in `WHERE` |
 | S2 | confirmed | `repo.rs:1152` | multi-row UPDATE read with `fetch_optional`; no unique index on prefix |
-| S3 | **refuted 2026-09-06** | `db.rs:59` | premise false: sqlx sends `TimeZone=UTC` in its startup packet, so `pg_settings.source` for it reads `client` and the server's default never applies. Proved against a database forced to `Pacific/Auckland`. No code change; the assumption is now asserted by `the_session_timezone_is_utc_whatever_the_server_prefers` |
+| S3 | **refuted 2026-09-06** | `db.rs:59` | premise false: sqlx sends `TimeZone=UTC` in its startup packet, so `pg_settings.source` for it reads `client` and the server's default never applies. Proved against a database forced to `Pacific/Auckland`. No code change; the assumption is now asserted by `the_session_timezone_is_utc_because_the_client_asked` |
 | R1 | confirmed | `error.rs:300` | four dispositions never consulted by the selection error path |
 | R2 | confirmed | `catalog.rs:208`, `policy.rs:354` | `dearest_served` wins over the ladder ceiling on a partial served set |
 | R3 | confirmed | `config.rs:491` | no `client_write_timeout < max_stream_duration` check |
@@ -184,6 +184,7 @@ column means the defect also depends on documented third-party behaviour.
 | C14 | confirmed | `admin/mod.rs:1452` | no unique name; no rename or remove command |
 | C15 | confirmed | `usage_import.rs:829` | last-write-wins on ambiguous names |
 | C16 | confirmed | `doctor.rs:48` | counts rows, ignores versions and `success` |
+| C17 | confirmed, closed by S2 | `admin/mod.rs:1658` | revoking a shared prefix evicted one of the keys it deactivated. Never assigned to a group — S2 gave `revoke_key_by_prefix` every row and the CLI now loops them, evicting and naming each, which is the whole of C17. Verified 2026-09-06 |
 | D16 | confirmed | `data-neutral/main.tf:25` | TLS check gated on `upstash.io` |
 | D17 | confirmed | `compute-fargate/main.tf:217` | invented 120s cap |
 | D18 | confirmed | `aws-fargate/variables.tf:24`, `module:34` | `public_subnet_ids` always used |

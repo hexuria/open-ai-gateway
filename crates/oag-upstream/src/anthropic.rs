@@ -36,7 +36,7 @@ impl ProviderAdapter for AnthropicAdapter {
         let body = anthropic::render_request(req.canonical, &req.model.upstream_name)?;
         let url = format!("{}/v1/messages", self.base_url);
 
-        let mut builder = crate::builder_client()
+        let mut builder = crate::builder_client()?
             .post(&url)
             .header("content-type", "application/json")
             .header("anthropic-version", anthropic::API_VERSION)

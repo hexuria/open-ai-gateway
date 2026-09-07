@@ -19,16 +19,16 @@ pub async fn live() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(json!({ "status": "live" })))
 }
 
-/// The process can serve a request right now.
-///
-/// Checks Postgres and Redis, and reports not-ready during shutdown drain so
-/// the load balancer stops sending new work while in-flight streams finish.
 /// The readiness answer, recomputed at most once a second.
 ///
 /// Held per process rather than per handler so every prober shares it. The lock
 /// is only ever held across a clone of a small struct or the lookup itself; a
 /// second caller arriving mid-lookup waits for it rather than starting another,
 /// which is the contention this exists to avoid.
+///
+/// The drain check is not here — see `ready`. This answers "can the backends be
+/// reached", which is a question about Postgres and Redis and not about this
+/// process's own lifecycle.
 async fn cached_readiness(state: &AppState) -> oag_store::Readiness {
     use std::time::{Duration, Instant};
 
@@ -49,6 +49,10 @@ async fn cached_readiness(state: &AppState) -> oag_store::Readiness {
     fresh
 }
 
+/// The process can serve a request right now.
+///
+/// Checks Postgres and Redis, and reports not-ready during shutdown drain so
+/// the load balancer stops sending new work while in-flight streams finish.
 pub async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serde_json::Value>) {
     if state.lifecycle.is_draining() {
         return (

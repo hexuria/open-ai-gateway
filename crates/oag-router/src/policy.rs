@@ -551,6 +551,55 @@ impl RoutingPolicy {
         .ok()
     }
 
+    /// The nearest rung above `from` that names a **different** provider.
+    ///
+    /// For R1. A rung nobody can be dispatched to — an empty credential pool, a
+    /// seat parked at its reserve, no viable model — is a reason to climb, and
+    /// `Error::disposition` already says so. But climbing to another rung on
+    /// the *same* provider re-runs the selection that has just failed for a
+    /// reason the rung cannot change, so those rungs are **skipped** rather
+    /// than tried.
+    ///
+    /// Skipped, and not given up on: that distinction is the whole method.
+    /// Looking only one rung up left a ladder of `[kimi, kimi-2, anthropic]`
+    /// returning 503 when kimi's only seat sat at its reserve, because the one
+    /// rung it examined was kimi-2 and it stopped there. The frontier rung that
+    /// could have served was one step further than the fix reached.
+    ///
+    /// Skipping is not escalating. No request is dispatched to the rungs passed
+    /// over, so the whole climb is one escalation against whatever budget the
+    /// caller keeps for them.
+    ///
+    /// `None` at the ceiling, and `None` when every rung above names `avoid` —
+    /// in which case the original error is the honest answer.
+    pub fn escalate_past_provider(
+        &self,
+        from: &Tier,
+        avoid: Provider,
+        signal: &RequestSignal,
+        catalog: &Catalog,
+        max_output_tokens: u32,
+        served: &std::collections::HashSet<String>,
+    ) -> Option<RoutingDecision> {
+        let mut from = from.clone();
+        loop {
+            let next = self.escalate(
+                &from,
+                QualityGate::NoCredential,
+                signal,
+                catalog,
+                max_output_tokens,
+                served,
+            )?;
+            if next.model.provider != avoid {
+                return Some(next);
+            }
+            // Strictly ascending — `escalate` resolves the rung above `from`,
+            // so each pass starts higher and the ladder's length bounds this.
+            from = next.tier.clone()?;
+        }
+    }
+
     /// Walk up from `tier` until a rung has a model that can serve the request.
     fn resolve_from(
         &self,
@@ -770,6 +819,87 @@ mod tests {
 
     fn rich() -> Budgets {
         Budgets::principal_only(BudgetState::unlimited(dec!(0)))
+    }
+
+    /// R1, and the rung the first fix could not reach.
+    ///
+    /// A ladder whose first two rungs are one provider and whose third is
+    /// another. When the bottom rung has nothing that can be dispatched to, the
+    /// climb must pass over the middle rung — same provider, same failure — and
+    /// land on the third. Looking one rung up stopped at the middle and
+    /// returned nothing, which the caller turns into a 503 while a rung able to
+    /// serve sat above it.
+    #[test]
+    fn a_climb_past_a_dead_provider_skips_its_other_rungs() {
+        let catalog = Catalog::from_entries([
+            model("kimi/k2", Provider::Kimi, 128_000, dec!(0.6)),
+            model("kimi/k2-turbo", Provider::Kimi, 128_000, dec!(0.9)),
+            model("anthropic/opus", Provider::Anthropic, 400_000, dec!(15)),
+        ]);
+        let ladder = TierLadder::new(vec![
+            Rung {
+                name: TierName::new("cheap"),
+                models: vec![ModelId::new("kimi/k2")],
+            },
+            Rung {
+                name: TierName::new("balanced"),
+                models: vec![ModelId::new("kimi/k2-turbo")],
+            },
+            Rung {
+                name: TierName::new("frontier"),
+                models: vec![ModelId::new("anthropic/opus")],
+            },
+        ])
+        .expect("non-empty");
+        let policy = RoutingPolicy::new(ladder, Box::new(HeuristicClassifier::default()));
+
+        let next = policy
+            .escalate_past_provider(
+                &Tier::new("cheap", 0),
+                Provider::Kimi,
+                &RequestSignal::default(),
+                &catalog,
+                1024,
+                &HashSet::new(),
+            )
+            .expect("a rung naming another provider is reachable two steps up");
+        assert_eq!(
+            next.model.id.as_str(),
+            "anthropic/opus",
+            "the middle rung is the same provider and the same failure; it is \
+             skipped, not settled for"
+        );
+
+        // And when every rung above is the same provider, there is genuinely
+        // nowhere to go: the original error is the honest answer, not a climb
+        // onto a rung that will fail the same way.
+        assert!(
+            policy
+                .escalate_past_provider(
+                    &Tier::new("cheap", 0),
+                    Provider::Anthropic,
+                    &RequestSignal::default(),
+                    &catalog,
+                    1024,
+                    &HashSet::new(),
+                )
+                .is_none_or(|d| d.model.provider != Provider::Anthropic),
+            "a climb must never land on the provider it was climbing away from"
+        );
+
+        // The ceiling still terminates the walk rather than looping.
+        assert!(
+            policy
+                .escalate_past_provider(
+                    &Tier::new("frontier", 2),
+                    Provider::Anthropic,
+                    &RequestSignal::default(),
+                    &catalog,
+                    1024,
+                    &HashSet::new(),
+                )
+                .is_none()
+        );
     }
 
     #[test]

@@ -754,5 +754,33 @@ mod tests {
             0,
             "and the restore really restored it"
         );
+
+        // A migration that ran and FAILED. C16 asks for versions `1..=N` and
+        // every one of them successful; the gap above only exercises the first
+        // half, so reverting the `success` filter left this test green. A
+        // half-applied schema is the worse of the two states: the rows are all
+        // present and the tables are not.
+        sqlx::query("UPDATE _sqlx_migrations SET success = false WHERE version = $1")
+            .bind(newest)
+            .execute(db.pool())
+            .await
+            .expect("mark the newest as failed");
+        let with_failure = check_migrations(&db).await.expect("check");
+        sqlx::query("UPDATE _sqlx_migrations SET success = true WHERE version = $1")
+            .bind(newest)
+            .execute(db.pool())
+            .await
+            .expect("restore");
+
+        assert_eq!(
+            with_failure, 1,
+            "every version was present and one of them had not succeeded: \
+             counting versions cannot see that either"
+        );
+        assert_eq!(
+            check_migrations(&db).await.expect("check"),
+            0,
+            "and this restore restored it too"
+        );
     }
 }
