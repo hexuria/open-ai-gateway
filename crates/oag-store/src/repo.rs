@@ -937,6 +937,12 @@ pub async fn key_usage_by_model(
                COALESCE(SUM(cache_read_tokens), 0)::bigint AS cache_read_tokens,
                COALESCE(SUM(cache_write_tokens), 0)::bigint AS cache_write_tokens,
                COALESCE(SUM(cost_usd), 0)::numeric(16,8) AS cost_usd,
+               -- `list_usd` and `points` read `counterfactual_api_usd`, which is
+               -- zero on an abandoned or lost attempt while `cost_usd` is not.
+               -- So over a window with unserved attempts `list_usd` can sit
+               -- below `cost_usd` on a metered key: the gateway paid for tokens
+               -- the member is not charged points for. Deliberate; see the note
+               -- at `meter.rs` where the column is written.
                COALESCE(SUM(counterfactual_api_usd), 0)::numeric(16,8) AS list_usd,
                CASE WHEN $3::numeric IS NULL THEN NULL
                     ELSE SUM(ROUND(counterfactual_api_usd * 1000000 / $3::numeric))::bigint

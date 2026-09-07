@@ -191,8 +191,20 @@ fn usage_write(
     // On a **metered** credential the row still records what those tokens cost:
     // `cost_usd` is untouched and is the number an invoice will match. This was
     // briefly `cost` here instead, on the argument that zeroing it would make
-    // `api - cost` negative — but nothing sums that difference. The savings
-    // figures read `counterfactual_usd`, which is already zeroed the same way.
+    // `api - cost` negative. The savings figures do not sum that difference —
+    // they read `counterfactual_usd`, zeroed the same way — but two readers do
+    // read this column on its own, and both now see zero for an unserved
+    // metered attempt: `key_usage_by_model`'s `list_usd`, and the **points**
+    // it derives from this column for a partner service to enforce limits in.
+    // A member is therefore not charged points for an answer a quality gate
+    // threw away or a stream lost, while the ledger's `cost_usd` still says
+    // what the tokens cost. That is the trade this decision makes, and it is
+    // said again at both readers.
+    //
+    // 0004's own comment — "for a metered account this equals `cost_usd`" —
+    // is true of served rows only, since 0014 made unserved rows real. It is
+    // left as written: editing an applied migration changes its checksum and
+    // fails `migrate` on every database that already ran it.
     //
     // Since 0014 these rows land for the first time, so this was latent until
     // the migration that made abandoned and lost attempts real.
