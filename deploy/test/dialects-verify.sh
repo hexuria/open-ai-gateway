@@ -166,14 +166,38 @@ grep -q 'dialect mock' "$WORK/openai.json" || fail "openai body had no fixture t
 assert_ledger 'openai%' "$since"
 pass "openai non-stream + ledger"
 
+since="$(mark)"
 curl -sN --max-time 30 -X POST "http://$PUBLIC/v1/chat/completions" \
   -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hello"}],"stream":true}' \
   >"$WORK/openai.sse"
 grep -q '^data: ' "$WORK/openai.sse" || fail "openai stream had no data frames"
-grep -q 'dialect mock\|\[DONE\]' "$WORK/openai.sse" \
-  || fail "openai stream did not complete: $(head -c 400 "$WORK/openai.sse")"
-pass "openai stream"
+# The text branch used to be an OR alternative with `[DONE]`, and every SSE
+# stream ends with `[DONE]` whether or not a single token was delivered — so
+# the check could not fail. Reassembled the way the Gemini check below does it.
+python3 - "$WORK/openai.sse" <<'PY' || fail "openai stream text did not reassemble"
+import json, sys
+text = []
+for line in open(sys.argv[1]):
+    if not line.startswith("data: "):
+        continue
+    payload = line[6:].strip()
+    if payload in ("", "[DONE]"):
+        continue
+    body = json.loads(payload)
+    for choice in body.get("choices", []):
+        piece = choice.get("delta", {}).get("content")
+        if isinstance(piece, str):
+            text.append(piece)
+joined = "".join(text)
+if joined != "dialect mock":
+    sys.exit(f"reassembled {joined!r}, expected 'dialect mock'")
+PY
+# A streamed request is metered on a different path from a whole one — the row
+# is written by a spawned task after the last frame — and neither streamed
+# request here asserted the ledger at all.
+assert_ledger 'openai%' "$since"
+pass "openai stream + ledger"
 
 say "5/5  Gemini generateContent"
 since="$(mark)"
@@ -188,6 +212,7 @@ grep -q 'dialect mock' "$WORK/gemini.json" || fail "gemini body had no fixture t
 assert_ledger 'gemini%' "$since"
 pass "gemini non-stream + ledger"
 
+since="$(mark)"
 curl -sN --max-time 30 -X POST "http://$PUBLIC/v1beta/models/gemini-2.0-flash:streamGenerateContent" \
   -H "x-goog-api-key: $KEY" -H 'content-type: application/json' \
   -d '{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}' \
@@ -211,7 +236,8 @@ joined = "".join(text)
 if joined != "dialect mock":
     sys.exit(f"reassembled {joined!r}, expected 'dialect mock'")
 PY
-pass "gemini stream"
+assert_ledger 'gemini%' "$since"
+pass "gemini stream + ledger"
 
 OK=1
 printf '\n\033[32mPASS: OpenAI and Gemini adapters work against aimock\033[0m\n'

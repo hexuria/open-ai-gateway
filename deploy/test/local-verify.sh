@@ -79,7 +79,7 @@ say "4/5  a real streamed completion"
 # three verify scripts have taken this mark for a while; this one had not.
 SINCE="$(psql "$OAG_DATABASE__URL" -At -c "SELECT now()")"
 started="$(python3 -c 'import time; print(time.time())')"
-curl -sN --max-time 120 -X POST "http://$PUBLIC/v1/messages" \
+curl -sN --max-time 120 -D "$WORK/stream.headers" -X POST "http://$PUBLIC/v1/messages" \
   -H "x-api-key: $KEY" -H 'content-type: application/json' \
   -d '{"model":"oag/auto","max_tokens":256,"stream":true,
        "messages":[{"role":"user","content":"hello"}]}' >"$WORK/stream.txt"
@@ -89,6 +89,24 @@ grep -q 'event: message_start'       "$WORK/stream.txt" || fail "no message_star
 grep -q 'event: content_block_delta' "$WORK/stream.txt" || fail "no content deltas"
 grep -q 'event: message_stop'        "$WORK/stream.txt" || fail "stream never completed"
 pass "SSE complete ($(grep -c '^event:' "$WORK/stream.txt") events)"
+
+# The routing headers. `oag/auto` means the client did not choose a model, so
+# these are the only place it is told which one answered — and no script asserted
+# them, on any dialect. A response that omits them is not a broken stream, which
+# is why it would have gone unnoticed: every other check here still passes.
+OAG_MODEL="$(sed -n 's/^[Xx]-[Oo][Aa][Gg]-[Mm]odel: *//p' "$WORK/stream.headers" | tr -d '\r')"
+OAG_REQUEST_ID="$(sed -n 's/^[Xx]-[Oo][Aa][Gg]-[Rr]equest-[Ii]d: *//p' "$WORK/stream.headers" | tr -d '\r')"
+OAG_TIER="$(sed -n 's/^[Xx]-[Oo][Aa][Gg]-[Tt]ier: *//p' "$WORK/stream.headers" | tr -d '\r')"
+[ -n "$OAG_MODEL" ] \
+  || fail "no x-oag-model on the response; the client asked for oag/auto and was never
+  told what answered: $(tr -d '\r' < "$WORK/stream.headers" | head -20)"
+[ -n "$OAG_REQUEST_ID" ] \
+  || fail "no x-oag-request-id on the response; nothing ties this answer to its ledger row"
+case "$OAG_MODEL" in
+  */*) : ;;
+  *) fail "x-oag-model is '$OAG_MODEL', which is not a provider-qualified id" ;;
+esac
+pass "x-oag-model $OAG_MODEL, x-oag-tier ${OAG_TIER:-<off-ladder>}, x-oag-request-id present"
 
 # A stream that hangs until the 180s idle watchdog looks identical to a healthy
 # one if you only check the events.
@@ -112,12 +130,20 @@ for _ in $(seq 1 40); do
   sleep 0.25
 done
 cat "$WORK/ledger.txt" | sed 's/^/  /'
-python3 - "$WORK/ledger.txt" <<'PY'
+python3 - "$WORK/ledger.txt" "$OAG_MODEL" <<'PY'
 import sys
 row = open(sys.argv[1]).read().strip().split("|")
 if len(row) < 7:
     sys.exit("no ledger row for the request — metering did not run")
 model, tier, inp, out, cost, counterfactual, ttft = (c.strip() for c in row[:7])
+# The header the client was given and the row the operator will read have to
+# name the same model. They are produced by different code on different paths —
+# one on the response builder, one in a task detached from it — so agreeing is a
+# property, not an identity, and a client billed for one model while told it got
+# another is the kind of disagreement nobody notices until an invoice.
+header_model = sys.argv[2]
+if header_model and header_model != model:
+    sys.exit(f"x-oag-model said {header_model!r} and the ledger recorded {model!r}")
 if int(inp) == 0 or int(out) == 0:
     sys.exit(f"usage was not merged: in={inp} out={out}. Anthropic splits it across "
              "message_start and message_delta, and a naive overwrite zeroes one of them.")

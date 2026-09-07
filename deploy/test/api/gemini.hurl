@@ -70,3 +70,24 @@ Content-Type: application/json
   "contents": [{ "role": "user", "parts": [{ "text": "reply with the single word: ok" }] }]
 }
 HTTP 200
+
+# ── an action this gateway does not implement ──
+# 404 `not_found`, and it is the only assertion anywhere on `UnsupportedAction`
+# — a kind ERRORS.md listed as covered while no file sent a request that could
+# produce it. The path parses and the model is real; it is the verb after the
+# colon that is not ours, which is why answering 400 would be wrong: it would
+# send the caller to look at their body.
+#
+# It matters more than a spelling check. Every action used to fall through to a
+# billed completion, so the failure this pins is a preflight call that cost
+# money and answered nothing.
+POST {{host}}/v1beta/models/oag/default:embedContent
+x-goog-api-key: {{api_key}}
+Content-Type: application/json
+{
+  "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }]
+}
+HTTP 404
+[Asserts]
+jsonpath "$.error.type" == "not_found"
+jsonpath "$.error.message" contains "embedContent"

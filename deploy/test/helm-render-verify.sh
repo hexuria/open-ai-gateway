@@ -24,8 +24,11 @@ say()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
 pass() { printf '  \033[32mok\033[0m  %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; exit 1; }
 
-# Test-only values, byte-identical to the ones in ci.yml. The KEK must decode to
-# exactly 32 bytes or the chart's validation refuses to render.
+# Test-only values, byte-identical to the ones in ci.yml. The KEK decodes to
+# exactly 32 bytes because `Kek::from_base64` refuses anything else at process
+# start — not because the chart checks: it does not. A 48-byte KEK renders
+# perfectly here and then crash-loops every replica, which is worth knowing
+# before you conclude from a green render that the value is good.
 render() {
   helm template t "$CHART" -s templates/migrate-job.yaml \
     --set security.signingSecret="ci-only-signing-secret-0123456789abcdefghij" \

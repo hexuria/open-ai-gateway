@@ -95,6 +95,14 @@ Covered, and asserted against a live gateway:
 `upstream_error` (a model the seat refuses), and the 403 an inference key gets
 on the admin listener.
 
+Two of those were listed here before they were true. `no_viable_model` asserted
+only that `$.error.type` *exists*, which any error on that request would have
+satisfied; it now asserts the kind and that the message names the route. And
+`not_found` covered the router's own 404 for an unrouted path, not
+`UnsupportedAction` — the kind a real dialect path with an unimplemented verb
+produces. `gemini.hurl` sends `:embedContent` for that one, because it is a
+Gemini-shaped failure and belongs beside the Gemini requests.
+
 413 is real and verified, but not asserted in the suite: the fixture would be a
 five-megabyte blob committed to test one status code. `errors.hurl` carries the
 one-line reproduction in a comment instead.
@@ -107,7 +115,7 @@ one-line reproduction in a comment instead.
 | `at_capacity` | needs every credential saturated | mock, or `max_concurrency: 1` plus concurrent calls |
 | `quota_reserve_held` | needs a reserve set and a spent window | `oag admin account set-reserve` on a scratch credential |
 | `unsupported_field` | needs an **Anthropic** target; this route serves OpenAI | add an Anthropic credential, then send `response_format` |
-| `stream_idle` | needs an upstream that stalls mid-stream | the mock, with a long `MOCK_STREAM_SECONDS` |
+| `stream_idle` | needs an upstream that stalls mid-stream | the mock, with `MOCK_CHUNKS=1 MOCK_STREAM_SECONDS=300` |
 | `internal_error` | is a bug | — |
 
 ## Simulating the rest without breaking anything
@@ -125,19 +133,41 @@ key. Same trick works for a floor, a reserve, or a disabled credential.
 already exists for the drain and breaker checks, and takes:
 
 ```
-MOCK_FAIL_STATUS=429   every POST returns this status
-MOCK_FAIL_FIRST=2      only the first N fail, then it serves normally
-MOCK_STREAM_SECONDS=60 how long a streamed response takes end to end
+MOCK_FAIL_STATUS=429            every POST returns this status
+MOCK_FAIL_FIRST=2               only the first N fail, then it serves normally
+MOCK_FAIL_FOR_KEY=<cred>=408    only this credential fails, with this status
+MOCK_FAIL_FIRST_CREDENTIAL=529  whichever credential POSTs first fails
+MOCK_STREAM_SECONDS=60          how long a streamed response takes end to end
+MOCK_CHUNKS=20                  how many deltas are spread across it
 ```
 
 Add a credential whose `provider_base_urls` entry points at it, and you can
 produce any `upstream_error` on demand — 429 with its `Retry-After`, a 500, a
-502, or a stall that trips `stream_idle`. `MOCK_FAIL_FIRST` is how
-`breaker-verify.sh` trips the circuit breaker without a real provider having a
-bad afternoon.
+502, or a stall that trips `stream_idle`.
+
+`MOCK_FAIL_FOR_KEY=<credential>=408` is how `breaker-verify.sh` trips the
+circuit breaker, and the status matters. `MOCK_FAIL_FIRST` returns **529**,
+which fails over and cools the account down for 30 seconds through the
+scheduler — so the breaker never sees five consecutive failures and never opens.
+408 is `RetrySameAccount`: one inbound request records `same_account_retries + 1`
+failures against the same credential, and the second request trips the threshold
+partway through its own retries. Naming `MOCK_FAIL_FIRST` here sent readers to
+the one knob that cannot produce the thing described.
+
+`MOCK_FAIL_FIRST_CREDENTIAL` is the failover counterpart: whichever of two
+accounts the scheduler happens to try first fails, so the check does not depend
+on that choice.
+
+For `stream_idle`, a long `MOCK_STREAM_SECONDS` alone does **not** reproduce it:
+the mock spreads `MOCK_CHUNKS` deltas evenly across that window, so a 300-second
+stream with the default 20 chunks sends something every 15 seconds and the idle
+watchdog — `gateway.stream_idle_timeout`, three minutes by default — never
+fires. The gap between frames is what it measures, not the length of the
+stream. `MOCK_CHUNKS=1 MOCK_STREAM_SECONDS=300` makes that gap 300 seconds and
+the watchdog fires with a request in flight, which is the condition.
 
 **3. Render the shapes without a gateway at all.** `errors.json`, beside this
-file, holds every error exactly as the wire carries it — 18 shapes, each with
+file, holds every error exactly as the wire carries it — 20 shapes, each with
 its status, its `Retry-After` when it has one, and the Rust variant that
 produced it. Build a client against those bytes and you need no gateway, no
 credential and no failure.
