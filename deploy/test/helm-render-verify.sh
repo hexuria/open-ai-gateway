@@ -179,4 +179,4 @@ grep -qF 'OAG_NOT_A_CHART_KEY: "hello"' <<<"$out" \
   || fail "extraEnv did not win: $(grep 'OAG_SERVER__MAX_IN_FLIGHT:' <<<"$out")"
 pass "an unknown key is carried, and a known one is overridden last"
 
-printf '\n\033[32mPASS: the chart renders in all three data modes\033[0m\n'
+printf '\n\033[32mPASS: three data modes, the runbook tunables, the secret checksum, the PDB floor, extraEnv\033[0m\n'

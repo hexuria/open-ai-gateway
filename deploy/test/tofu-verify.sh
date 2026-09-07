@@ -222,7 +222,9 @@ print("tofu: every stack guards the keepalive it actually deploys")
 bare = []
 for f in sorted(glob.glob("deploy/tofu/stacks/*/main.tf")):
     body = open(f).read()
-    block = re.search(r"secret_env\s*=\s*\{(.*?)\n  \}", body, re.S)
+    # Any indent, so a `terraform fmt` that re-indents the stack does not
+    # quietly turn this into a scan that iterates nothing.
+    block = re.search(r"secret_env\s*=\s*\{(.*?)\n\s*\}", body, re.S)
     if not block:
         continue
     for line in block.group(1).splitlines():
@@ -264,7 +266,9 @@ missing = []
 for i, start in enumerate(starts):
     end = starts[i + 1] if i + 1 < len(starts) else len(body)
     block = body[start:end]
-    if "health_check_config: { port_value: 8081 }" not in block:
+    # Flow or block style — `health_check_config: { port_value: 8081 }` and the
+    # two-line spelling are the same YAML, and a reformat must not un-guard this.
+    if not re.search(r"health_check_config:.*?port_value:\s*8081\b", block, re.S):
         address = next(
             (l.strip() for l in block.splitlines() if "socket_address" in l), block.strip()
         )
