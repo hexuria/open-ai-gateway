@@ -3964,7 +3964,7 @@ mod tests {
         // Every plan is taken inside a transaction with sequential scans
         // disabled, so a plan that does not use the index is the planner
         // refusing it rather than the planner never having looked.
-        let explain = async |index: &'static str| -> Vec<String> {
+        let explain = async |index: &'static str| -> [Vec<String>; 2] {
             let mut tx = db.pool().begin().await.expect("begin");
             sqlx::query("SET LOCAL enable_seqscan = off")
                 .execute(&mut *tx)
@@ -3994,22 +3994,24 @@ mod tests {
                 .await
                 .expect("statistics, or the planner is guessing at row counts");
 
-            let mut lines = sqlx::query_scalar::<_, String>(ROUTE_CHANNELS)
+            let route_channels = sqlx::query_scalar::<_, String>(ROUTE_CHANNELS)
                 .bind(Uuid::now_v7())
                 .bind(Uuid::now_v7())
                 .fetch_all(&mut *tx)
                 .await
                 .expect("explain route_channels");
-            lines.extend(
-                sqlx::query_scalar::<_, String>(POLLER)
-                    .fetch_all(&mut *tx)
-                    .await
-                    .expect("explain the poller"),
-            );
+            let poller = sqlx::query_scalar::<_, String>(POLLER)
+                .fetch_all(&mut *tx)
+                .await
+                .expect("explain the poller");
             // Rolled back, so the index never outlives the plan it was made
             // for and the schema stays as 0016 left it.
             tx.rollback().await.expect("rollback");
-            lines
+            // Kept apart. A plan's root node carries no `->`, so a window that
+            // scanned forward from the last node of one plan would run into
+            // the next and could match its `Index Cond` — the cross-plan
+            // coupling the first fix to this test removed on one side only.
+            [route_channels, poller]
         };
 
         // Did the index supply a bound anywhere, or was it merely walked?
@@ -4018,14 +4020,14 @@ mod tests {
         // filtered on the heap, which a partial index on `schedulable` allows
         // whatever it is keyed on.
         //
-        // *Every* occurrence, not the first. Both plans are searched together
-        // and the index can appear in each, so which one comes first is a
+        // *Every* occurrence in a plan, not the first, and each plan on its
+        // own. The index can appear in either query's plan, and which one is a
         // property of the table's statistics rather than of the index: with
         // `account` nearly empty the planner takes the partial index for
         // `route_channels` too, as a plain Index Scan with a `Filter` and no
-        // `Index Cond` — and a check that stopped there would conclude the
-        // control could not say yes and fail on a fresh database while passing
-        // on a developer's populated one.
+        // `Index Cond` — and a check that stopped at the first occurrence
+        // concluded the control could not say yes, failing on a fresh database
+        // while passing on a developer's populated one.
         let bounded = |plan: &[String]| {
             plan.iter().enumerate().any(|(i, line)| {
                 line.contains("account_schedulable_idx")
@@ -4035,6 +4037,7 @@ mod tests {
                         .any(|l| l.contains("Index Cond:"))
             })
         };
+        let bounded_anywhere = |plans: &[Vec<String>; 2]| plans.iter().any(|p| bounded(p));
 
         // The control. An index whose columns the poller can genuinely use, so
         // a "no" below is a real answer.
@@ -4042,9 +4045,9 @@ mod tests {
             explain("CREATE INDEX account_schedulable_idx ON account (kind) WHERE schedulable")
                 .await;
         assert!(
-            bounded(&control),
+            bounded_anywhere(&control),
             "the arrangement cannot say yes, so its no would mean nothing:\n{}",
-            control.join("\n")
+            control.concat().join("\n")
         );
 
         // And 0013's index, on the same table, the same rows, the same settings.
@@ -4054,10 +4057,10 @@ mod tests {
         )
         .await;
         assert!(
-            !bounded(&plans),
+            !bounded_anywhere(&plans),
             "a query bounds its search with account_schedulable_idx, so 0016 \
              dropped an index something needed:\n{}",
-            plans.join("\n")
+            plans.concat().join("\n")
         );
     }
 
