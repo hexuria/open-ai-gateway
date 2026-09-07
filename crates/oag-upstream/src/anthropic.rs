@@ -36,23 +36,32 @@ impl ProviderAdapter for AnthropicAdapter {
         let body = anthropic::render_request(req.canonical, &req.model.upstream_name)?;
         let url = format!("{}/v1/messages", self.base_url);
 
-        let mut builder = reqwest::Client::new()
+        let mut builder = crate::builder_client()
             .post(&url)
             .header("content-type", "application/json")
             .header("anthropic-version", anthropic::API_VERSION)
             .json(&body);
 
-        // OAuth credentials authenticate as a bearer token; API keys use the
-        // x-api-key header. Anthropic rejects the wrong one rather than
-        // accepting either, so this is not cosmetic.
-        builder = if req.credential.refresh_token.is_some() {
-            builder.header(
-                "authorization",
-                format!("Bearer {}", req.credential.access_token),
-            )
-        } else {
-            builder.header("x-api-key", &req.credential.access_token)
-        };
+        // `x-api-key`, always. Anthropic credentials in this gateway are API
+        // keys and only API keys.
+        //
+        // There used to be a bearer-token branch here, taken when the
+        // credential carried a refresh token — for a Claude.ai subscription
+        // seat. Nothing can produce one: `account add` creates an API key and
+        // the two seat importers read Grok and Codex sessions. Nor should
+        // anything — `docs/03-providers.md` lists Anthropic OAuth as
+        // Prohibited, quoting Anthropic's own terms in `docs/compliance.md`:
+        // third parties may not "store, or intermediate Claude.ai credentials
+        // or session tokens".
+        // So the branch was unreachable, and it would not have worked if
+        // reached: a Claude.ai token needs the `anthropic-beta: oauth` header
+        // this request never sends, and Anthropic rejects a bearer token
+        // without it rather than accepting either form.
+        //
+        // Dead code that looks like a supported path is worse than no code:
+        // it is the first thing someone reads when asking whether seats work
+        // here, and it answers yes.
+        builder = builder.header("x-api-key", &req.credential.access_token);
 
         builder
             .build()
@@ -162,23 +171,46 @@ mod tests {
         assert_eq!(req.headers()["anthropic-version"], anthropic::API_VERSION);
     }
 
+    /// U13. Anthropic credentials authenticate with `x-api-key`, always.
+    ///
+    /// This test used to require the opposite for a credential carrying a
+    /// refresh token — a Claude.ai subscription seat. That branch was
+    /// unreachable (nothing can produce such a credential: `account add`
+    /// creates an API key and the two importers read Grok and Codex sessions)
+    /// and would not have worked if reached: a Claude.ai token needs an
+    /// `anthropic-beta: oauth` header this request never sends.
+    ///
+    /// It should also never be reachable. `docs/03-providers.md` lists
+    /// Anthropic OAuth as Prohibited, quoting Anthropic's own terms in
+    /// `docs/compliance.md`: third parties may not "store, or intermediate
+    /// Claude.ai credentials or session tokens". So the test asserts the rule
+    /// rather than the dead branch — including for a credential that happens to
+    /// carry a refresh token, which is the shape that used to divert.
     #[test]
-    fn an_oauth_credential_authenticates_with_bearer() {
-        // Anthropic rejects the wrong header rather than accepting either.
+    fn every_anthropic_credential_authenticates_with_the_api_key_header() {
         let a = AnthropicAdapter::default();
         let canonical = request();
         let m = model();
-        let cred = oauth();
-        let req = a
-            .build(&UpstreamRequest {
-                canonical: &canonical,
-                model: &m,
-                credential: &cred,
-            })
-            .expect("builds");
 
-        assert!(req.headers().contains_key("authorization"));
-        assert!(!req.headers().contains_key("x-api-key"));
+        for cred in [api_key(), oauth()] {
+            let req = a
+                .build(&UpstreamRequest {
+                    canonical: &canonical,
+                    model: &m,
+                    credential: &cred,
+                })
+                .expect("builds");
+
+            assert!(
+                req.headers().contains_key("x-api-key"),
+                "an Anthropic credential is an API key, whatever else it carries"
+            );
+            assert!(
+                !req.headers().contains_key("authorization"),
+                "a bearer token here would be intermediating a Claude.ai session, \
+                 which Anthropic's terms forbid"
+            );
+        }
     }
 
     #[test]

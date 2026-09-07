@@ -44,6 +44,17 @@ pub struct Candidate {
     /// Requests currently in flight against this credential.
     pub in_flight: u32,
     /// Requests queued waiting for a slot.
+    ///
+    /// Always zero. Nothing queues: `acquire_slot` either takes a slot or
+    /// reports the credential full, and the caller moves to the next candidate
+    /// rather than waiting — which is the design, because waiting behind one
+    /// credential while another sits idle is the failure the cascade exists to
+    /// prevent.
+    ///
+    /// Kept rather than removed because `busy` is the sum of this and
+    /// `in_flight`, and a future queueing scheduler would want exactly that
+    /// sum. Its test set it to 5 by hand and asserted the arithmetic, which
+    /// pinned behaviour no code can produce; that test now says so.
     pub waiting: u32,
     /// Operator switch. A disabled credential is never chosen.
     pub schedulable: bool,
@@ -371,6 +382,9 @@ mod tests {
         // unqueued one is genuinely freer even though in_flight is equal.
         let mut queued = candidate(0);
         queued.in_flight = 1;
+        // Set by hand: nothing produces a non-zero `waiting` today — see the
+        // field's own note — so this pins the arithmetic `busy` would do if a
+        // queueing scheduler ever existed, and nothing about what happens now.
         queued.waiting = 5;
         let mut clear = candidate(0);
         clear.in_flight = 1;

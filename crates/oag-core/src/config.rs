@@ -465,7 +465,7 @@ impl Default for GatewayConfig {
         Self {
             stream_idle_timeout: Duration::from_mins(3),
             stream_keepalive_interval: Duration::from_secs(10),
-            max_stream_duration: Duration::from_mins(30),
+            max_stream_duration: Config::default_gateway_max_stream_duration(),
             // Generous on purpose: a slow-but-healthy provider under load can
             // take tens of seconds to begin a large reasoning response, and
             // failing those over is worse than waiting. What this bounds is a
@@ -561,6 +561,18 @@ impl Default for TelemetryConfig {
 }
 
 impl Config {
+    /// The shipped ceiling on one streamed response.
+    ///
+    /// Exposed so `oag-server` can assert its concurrency-slot TTL leaves room
+    /// for it: a slot that expires under a live request oversubscribes the
+    /// credential, silently. The two numbers have to be compared somewhere, and
+    /// the alternative was a test comparing a constant against a copy of this
+    /// one written out by hand.
+    #[must_use]
+    pub const fn default_gateway_max_stream_duration() -> Duration {
+        Duration::from_mins(30)
+    }
+
     /// Parse YAML and validate.
     pub fn from_yaml(src: &str) -> crate::Result<Self> {
         let cfg: Self = serde_yaml_ng::from_str(src)
@@ -595,6 +607,54 @@ impl Config {
                 "gateway.client_write_timeout must be positive".to_owned(),
             ));
         }
+        // And below the stream ceiling, or it can never fire.
+        //
+        // The ceiling is checked at the top of the pump's loop, and the loop is
+        // where the send happens — so a send parked on a client that has
+        // stopped reading is not interrupted by the ceiling, only by this
+        // deadline. Set longer than the ceiling it becomes unreachable: the
+        // parked send holds the credential's concurrency slot, the socket and
+        // the shutdown guard for its full length, and a drain waits for a
+        // client that is never coming back.
+        if self.gateway.client_write_timeout >= self.gateway.max_stream_duration {
+            return Err(crate::Error::Config(
+                "gateway.client_write_timeout must be shorter than \
+                 gateway.max_stream_duration, or a parked send outlives the ceiling \
+                 meant to bound it"
+                    .to_owned(),
+            ));
+        }
+        // Zero here means "try exactly one credential", which is not what zero
+        // means anywhere else in this section: for every neighbouring duration
+        // it means "no deadline". So an operator disabling a budget got silent
+        // single-credential dispatch instead, voiding `max_account_switches`
+        // with nothing said. There is no way to spell "unbounded" for this one,
+        // and inventing one would make a stuck failover loop unbounded too.
+        // Zero disables the usage poller, and the poller is what keeps
+        // `usage_remaining_pct` current — the number every seat's reserve is
+        // evaluated against. With it stale at whatever the last poll saw, or
+        // never set at all on a fresh replica, `usage_reserve_pct` holds nothing
+        // back and a seat runs to the provider's own refusal. So "disabled"
+        // here silently disables a different feature the operator did not
+        // mention, which is why it is now said rather than assumed: `oag serve`
+        // still honours zero, and this makes choosing it deliberate.
+        if self.gateway.usage_poll_interval.is_zero() {
+            return Err(crate::Error::Config(
+                "gateway.usage_poll_interval of 0 disables the usage poller, and with it \
+                 every seat's reserve — usage_reserve_pct is evaluated against a figure \
+                 only the poller refreshes. Set an interval, or unset every \
+                 usage_reserve_pct first."
+                    .to_owned(),
+            ));
+        }
+        if self.gateway.failover_budget.is_zero() {
+            return Err(crate::Error::Config(
+                "gateway.failover_budget must be positive; zero would try exactly one \
+                 credential rather than removing the deadline, which is what zero means \
+                 for every other duration here"
+                    .to_owned(),
+            ));
+        }
         // The period of a live interval. Zero is clamped in the pump so it
         // cannot panic, but a one-millisecond keepalive is a stream of
         // comments nobody meant; and one at or past the idle watchdog keeps
@@ -623,7 +683,9 @@ impl Config {
 }
 
 /// Serialise `Duration` as whole seconds. Keeps the config file readable
-/// without pulling in a date-parsing dependency for four fields.
+/// without pulling in a date-parsing dependency for the dozen-odd duration
+/// fields in this file — it was four when this was written, and the number is
+/// not the argument anyway.
 mod humantime_secs {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
@@ -1024,5 +1086,80 @@ security:
             "not-base64-at-all!!!",
         );
         assert!(Config::from_yaml(&src).is_err());
+    }
+    /// R3. A write deadline above the stream ceiling can never fire.
+    ///
+    /// The ceiling is checked at the top of the pump's loop, and the send
+    /// happens inside it — so a send parked on a client that has stopped
+    /// reading is bounded by this deadline and by nothing else. Longer than the
+    /// ceiling it is unreachable, and the parked send holds the credential's
+    /// concurrency slot, the socket and the shutdown guard for its full length
+    /// while a drain waits for a client that is never coming back.
+    ///
+    /// The default already satisfies this, which is why nothing noticed: only a
+    /// config that changes one of the two can reach it.
+    #[test]
+    fn a_write_deadline_at_or_above_the_stream_ceiling_is_refused() {
+        // `stream_idle_timeout` comes down with the ceiling, or an earlier
+        // constraint fires first and this proves nothing.
+        let cfg = |write: u32| {
+            format!(
+                "{MINIMAL}\ngateway:\n  stream_idle_timeout: 30\n  \
+                 max_stream_duration: 60\n  client_write_timeout: {write}\n"
+            )
+        };
+        let over = cfg(120);
+        let err = Config::from_yaml(&over).expect_err("refused");
+        assert!(err.to_string().contains("client_write_timeout"), "{err}");
+
+        // Equal is refused too: a deadline that fires at the same instant as
+        // the ceiling has the same problem with an extra race in it.
+        assert!(
+            Config::from_yaml(&cfg(60)).is_err(),
+            "equal has the same problem with a race added"
+        );
+
+        Config::from_yaml(&cfg(30)).expect("shorter is the only sane ordering");
+    }
+
+    /// R4. Zero means "no deadline" everywhere here except one place.
+    ///
+    /// For every neighbouring duration zero means unbounded. For
+    /// `failover_budget` it meant "try exactly one credential", so an operator
+    /// disabling the budget got silent single-credential dispatch instead —
+    /// `max_account_switches` voided, with nothing said.
+    #[test]
+    fn a_failover_budget_of_zero_is_refused_rather_than_disabling_failover() {
+        let zero = format!("{MINIMAL}\ngateway:\n  failover_budget: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("refused");
+        assert!(err.to_string().contains("failover_budget"), "{err}");
+        assert!(
+            err.to_string().contains("one credential"),
+            "the message has to say what zero would actually have done: {err}"
+        );
+
+        let one = format!("{MINIMAL}\ngateway:\n  failover_budget: 1\n");
+        Config::from_yaml(&one).expect("a short budget is a budget");
+    }
+    /// R12. Zero disables the usage poller, and with it every seat reserve.
+    ///
+    /// `usage_reserve_pct` is evaluated against `usage_remaining_pct`, and only
+    /// the poller refreshes that. With the poller off it is stale at whatever
+    /// the last poll saw — or never set at all on a fresh replica — so every
+    /// reserve holds nothing back and a seat runs to the provider's own
+    /// refusal. "Disabled" silently disabled a different feature the operator
+    /// had not mentioned.
+    #[test]
+    fn a_usage_poll_interval_of_zero_is_refused_because_reserves_depend_on_it() {
+        let zero = format!("{MINIMAL}\ngateway:\n  usage_poll_interval: 0\n");
+        let err = Config::from_yaml(&zero).expect_err("refused");
+        assert!(err.to_string().contains("usage_poll_interval"), "{err}");
+        assert!(
+            err.to_string().contains("reserve"),
+            "the message has to name what else stops working: {err}"
+        );
+
+        let set = format!("{MINIMAL}\ngateway:\n  usage_poll_interval: 60\n");
+        Config::from_yaml(&set).expect("an interval is an interval");
     }
 }

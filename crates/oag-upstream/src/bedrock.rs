@@ -63,12 +63,22 @@ impl BedrockAdapter {
     }
 
     /// The value of the `host` header, which is also what gets signed.
+    ///
+    /// The authority only — everything up to the first `/` after the scheme.
+    /// An endpoint override carrying a path, which is what a VPC endpoint
+    /// behind a prefix or a mock on a sub-path looks like, put that path into
+    /// the `Host` header: `https://proxy.internal/bedrock` signed and sent
+    /// `Host: proxy.internal/bedrock`. SigV4 signs the header it is given, so
+    /// the signature was self-consistent and AWS rejected it as invalid —
+    /// which reads as a credential problem and is a URL problem.
     fn host(&self) -> String {
         self.origin()
-            .split("://")
-            .nth(1)
+            .split_once("://")
+            .map(|(_, rest)| rest)
             .unwrap_or_default()
-            .trim_end_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or_default()
             .to_owned()
     }
 
@@ -163,7 +173,7 @@ impl ProviderAdapter for BedrockAdapter {
             time::OffsetDateTime::now_utc(),
         );
 
-        let mut builder = reqwest::Client::new()
+        let mut builder = crate::builder_client()
             .post(url)
             .header("content-type", "application/json")
             .header("host", &host)
@@ -440,6 +450,40 @@ mod tests {
             auth.contains("SignedHeaders=host;"),
             "host must still be signed"
         );
+
+        // U15. That assertion cannot fail: `SignedHeaders` is built from the
+        // headers we set, and we always set `host`. It says the name is in a
+        // list, not that the signature covers the value — which is the thing
+        // U6 was about.
+        //
+        // Signing the same request against a different endpoint has to produce
+        // a different signature. Nothing but the host differs, so if the two
+        // match, the host is not reaching the signing input and an endpoint
+        // override is being signed as though it were the default.
+        let signature = |endpoint: &str| {
+            let a = BedrockAdapter::new("us-east-1".to_owned())
+                .with_endpoint(Some(endpoint.to_owned()));
+            let req = a
+                .build(&UpstreamRequest {
+                    canonical: &c,
+                    model: &m,
+                    credential: &cr,
+                })
+                .expect("builds");
+            let auth = req.headers()["authorization"]
+                .to_str()
+                .expect("header")
+                .to_owned();
+            auth.split("Signature=")
+                .nth(1)
+                .expect("a signature")
+                .to_owned()
+        };
+        assert_ne!(
+            signature("http://127.0.0.1:9012"),
+            signature("http://127.0.0.1:9013"),
+            "the host has to reach the signing input, not merely the header list"
+        );
     }
 
     #[test]
@@ -469,5 +513,40 @@ mod tests {
         assert!(BedrockAdapter::credentials("").is_err());
         assert!(BedrockAdapter::credentials("key:secret").is_ok());
         assert!(BedrockAdapter::credentials("key:secret:token").is_ok());
+    }
+    /// U6. An endpoint with a path does not put that path in the `Host` header.
+    ///
+    /// `origin().split("://").nth(1)` took everything after the scheme, so a
+    /// VPC endpoint behind a prefix — or a mock on a sub-path — signed and sent
+    /// `Host: proxy.internal/bedrock`. SigV4 signs the header it is given, so
+    /// the signature was internally consistent and AWS rejected it as invalid:
+    /// a URL problem that reads as a credential problem, which is the most
+    /// expensive kind to diagnose.
+    #[test]
+    fn an_endpoint_with_a_path_signs_the_authority_alone() {
+        let plain = BedrockAdapter::new("us-east-1".to_owned());
+        assert_eq!(plain.host(), "bedrock-runtime.us-east-1.amazonaws.com");
+
+        for endpoint in [
+            "https://proxy.internal/bedrock",
+            "https://proxy.internal/bedrock/",
+            "https://proxy.internal/",
+            "https://proxy.internal",
+        ] {
+            let adapter = BedrockAdapter::new("us-east-1".to_owned())
+                .with_endpoint(Some(endpoint.to_owned()));
+            assert_eq!(
+                adapter.host(),
+                "proxy.internal",
+                "the Host header is the authority, whatever path the endpoint carries: \
+                 {endpoint}"
+            );
+        }
+
+        // A port belongs to the authority and must survive, or the signature
+        // is computed over a host the request never reaches.
+        let adapter = BedrockAdapter::new("us-east-1".to_owned())
+            .with_endpoint(Some("http://127.0.0.1:8099/bedrock".to_owned()));
+        assert_eq!(adapter.host(), "127.0.0.1:8099");
     }
 }

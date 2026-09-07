@@ -180,13 +180,57 @@ fn parse_headers(mut b: &[u8]) -> Headers {
     headers
 }
 
+/// An AWS exception frame, rewritten as the dialect's own error event.
+///
+/// The old code returned the body verbatim, and the doc claimed that surfaced
+/// the message. It did not: the caller passes this to `anthropic::parse_event`,
+/// whose dispatch is on `v["type"]`, and an AWS exception payload is
+/// `{"message":"…"}` with no `type` at all. It fell to the `_ => vec![]` arm and
+/// was erased — so a stream that emitted content deltas and then a
+/// `throttlingException` reached the client as HTTP 200 with a half-finished
+/// answer and no error. The credential was never cooled down, the breaker
+/// recorded nothing, and the ledger charged for the partial generation.
+///
+/// Rewritten here because `exception_type` is in hand here and nowhere
+/// afterwards: the kind is a *header* on the envelope rather than a field in the
+/// body, so anything downstream would be guessing at what sort of failure it was
+/// even if it noticed there had been one.
+fn exception_event(kind: &str, payload: &[u8]) -> String {
+    // Lossy, not strict. A frame whose bytes are not valid UTF-8 is still an
+    // exception, and refusing it puts us back in the silent stall — with the
+    // added insult that the provider had said what was wrong. Latin-1 through
+    // `char::from`, which is what this used to do, mangles every multi-byte
+    // character in a message an operator is meant to read.
+    let body = String::from_utf8_lossy(payload);
+    let message = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["message"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| body.into_owned());
+
+    serde_json::json!({
+        "type": "error",
+        "error": { "type": kind, "message": message },
+    })
+    .to_string()
+}
+
 /// The provider's own event JSON, unwrapped from Bedrock's envelope.
 ///
 /// Returns `None` for a frame that carries no inner event — a heartbeat, or a
-/// payload shaped differently from what we expect. An exception frame yields
-/// its body so the caller can surface the message rather than a silent stall.
+/// payload shaped differently from what we expect. An exception frame is
+/// rewritten into the dialect's own error event so the caller can surface the
+/// message rather than a silent stall.
 #[must_use]
 pub fn inner_event(msg: &Message) -> Option<String> {
+    // The exception check comes first, before the payload is required to be
+    // JSON. The envelope header is what says this is an exception, and a body
+    // we cannot parse is still one — asking `serde_json` for permission first
+    // put an unreadable exception back into the silent stall this exists to
+    // prevent.
+    if let Some(kind) = msg.headers.exception_type.as_deref() {
+        return Some(exception_event(kind, &msg.payload));
+    }
+
     let v: serde_json::Value = serde_json::from_slice(&msg.payload).ok()?;
 
     if let Some(encoded) = v["bytes"].as_str() {
@@ -194,12 +238,6 @@ pub fn inner_event(msg: &Message) -> Option<String> {
             .decode(encoded)
             .ok()?;
         return String::from_utf8(decoded).ok();
-    }
-
-    // An exception frame is JSON already, and saying so beats stalling until
-    // the idle watchdog fires with no explanation.
-    if msg.headers.exception_type.is_some() {
-        return Some(msg.payload.clone().into_iter().map(char::from).collect());
     }
 
     None
@@ -323,8 +361,17 @@ mod tests {
     }
 
     #[test]
-    fn an_exception_frame_surfaces_its_body() {
-        // Better than stalling until the idle watchdog fires with no reason.
+    fn an_exception_frame_becomes_an_error_event_the_parser_dispatches_on() {
+        // H7. This used to return the body verbatim and assert only that the
+        // message text was in it — which the old code satisfied while the
+        // defect was live. The body goes to `anthropic::parse_event`, whose
+        // dispatch is on `v["type"]`, and an AWS exception payload is
+        // `{"message":"…"}` with no `type`: it fell to the `_ => vec![]` arm
+        // and was erased. A stream that emitted deltas and then a
+        // `throttlingException` reached the client as a 200 with a
+        // half-finished answer, no error, no cooldown, and a ledger charge.
+        //
+        // So the assertion is the round trip, not the substring.
         let msg = Message {
             headers: Headers {
                 event_type: None,
@@ -332,10 +379,52 @@ mod tests {
             },
             payload: br#"{"message":"Too many requests"}"#.to_vec(),
         };
+        let raw = inner_event(&msg).expect("an exception yields an event");
+
+        let mut acc = oag_proto::StreamAccumulator::new();
+        let events = oag_proto::anthropic::parse_event(&raw, &mut acc).expect("parses");
+        let message = events
+            .iter()
+            .find_map(|e| match e {
+                oag_proto::StreamEvent::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .expect("the parser has to see an error, which is the whole finding");
+        assert!(message.contains("Too many requests"), "{message}");
         assert!(
-            inner_event(&msg)
-                .expect("body")
-                .contains("Too many requests")
+            raw.contains("throttlingException"),
+            "the kind is a header on the envelope and exists nowhere downstream, \
+             so it has to be carried into the body here: {raw}"
+        );
+    }
+
+    #[test]
+    fn an_exception_body_that_is_not_utf8_still_becomes_an_error() {
+        // U14. The body was decoded through `char::from`, which is Latin-1 —
+        // every multi-byte character in a message an operator is meant to read
+        // came out mangled. Decoding strictly instead would be worse: `None`
+        // puts us back in the silent stall this exists to prevent, for a frame
+        // where the provider had actually said what was wrong.
+        let mut payload = br#"{"message":"rate limited "#.to_vec();
+        payload.extend_from_slice(&[0xff, 0xfe]);
+        payload.extend_from_slice(br#""}"#);
+
+        let msg = Message {
+            headers: Headers {
+                event_type: None,
+                exception_type: Some("modelStreamErrorException".to_owned()),
+            },
+            payload,
+        };
+        let raw = inner_event(&msg).expect("an unreadable body is still an exception");
+
+        let mut acc = oag_proto::StreamAccumulator::new();
+        let events = oag_proto::anthropic::parse_event(&raw, &mut acc).expect("parses");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, oag_proto::StreamEvent::Error { .. })),
+            "{raw}"
         );
     }
 

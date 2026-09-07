@@ -238,8 +238,16 @@ impl Cache {
             }
         };
 
+        // `try_from_secs_f64`, not `from_secs_f64`, which panics on a
+        // non-finite or out-of-range value. This number comes back from a Lua
+        // script in Redis, so it is data from another process — and a panic
+        // here is a 500 on a request the rate limiter was only meant to delay.
+        // A value we cannot make a duration of means "no wait", which is the
+        // same answer this already gives for an unparseable one.
         let wait: f64 = wait.parse().unwrap_or(0.0);
-        Ok((wait > 0.0).then(|| Duration::from_secs_f64(wait)))
+        Ok((wait > 0.0)
+            .then(|| Duration::try_from_secs_f64(wait).ok())
+            .flatten())
     }
 
     /// Give a slot back.
@@ -621,7 +629,7 @@ mod tests {
             quota_usd: None,
             principal_budget_usd: None,
             principal_hard_stop_multiple: Decimal::ONE,
-            key_hash: "deadbeef".to_owned(),
+            expires_at: None,
         }
     }
 
@@ -925,6 +933,35 @@ mod tests {
         assert!(
             cache.auth_invalidate("some-hash").await.is_err(),
             "an eviction that could not reach the cache is not an eviction"
+        );
+    }
+    /// S8. A value from Redis cannot panic the process.
+    ///
+    /// `Duration::from_secs_f64` panics on a non-finite or out-of-range value,
+    /// and this number comes back from a Lua script in another process. A panic
+    /// here is a 500 on a request the rate limiter was only meant to delay —
+    /// the limiter turning a slowdown into an outage.
+    #[test]
+    fn a_nonsense_wait_from_redis_is_no_wait_rather_than_a_panic() {
+        // The conversion, exercised over the values a `parse::<f64>()` of
+        // arbitrary bytes can actually produce.
+        let wait = |raw: &str| -> Option<Duration> {
+            let wait: f64 = raw.parse().unwrap_or(0.0);
+            (wait > 0.0)
+                .then(|| Duration::try_from_secs_f64(wait).ok())
+                .flatten()
+        };
+
+        assert_eq!(wait("1.5"), Some(Duration::from_millis(1500)));
+        assert_eq!(wait("0"), None);
+        assert_eq!(wait("-1"), None);
+        assert_eq!(wait("not a number"), None, "already handled, and still is");
+        assert_eq!(wait("inf"), None, "`from_secs_f64` panics on this one");
+        assert_eq!(wait("NaN"), None);
+        assert_eq!(
+            wait("1e300"),
+            None,
+            "beyond what a Duration can hold, which is also a panic"
         );
     }
 }

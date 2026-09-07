@@ -246,8 +246,17 @@ async fn probe_and_record(state: &AppState, row: ServiceRow) -> ServiceRow {
     } else {
         // The row vanished or the write failed; return what we have so
         // the operator still sees the probe outcome on this response.
+        //
+        // Including `last_ok`, which health is derived from and which this used
+        // to leave untouched. Clearing `last_error` on success was not enough:
+        // the view reports `ok` only when `last_ok` is set, so a successful
+        // probe whose write failed came back as `unknown` for a service that
+        // had never been probed before — the operator saw "unknown" for a
+        // service that had just answered them, which is the one thing this
+        // endpoint exists to say.
         let mut fallback = row;
         if ok {
+            fallback.last_ok = Some(time::OffsetDateTime::now_utc());
             fallback.last_error = None;
         } else {
             fallback.last_error = error;

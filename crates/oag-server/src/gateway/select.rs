@@ -20,8 +20,14 @@ const STICKY_TTL: Duration = Duration::from_mins(30);
 ///
 /// The backstop for a replica that dies holding slots. Must exceed the longest
 /// request, or a live request's slot expires under it and the credential is
-/// oversubscribed.
-const SLOT_TTL: Duration = Duration::from_mins(35);
+/// oversubscribed — silently, because nothing observes a slot vanishing.
+///
+/// "The longest request" is `gateway.max_stream_duration`, which is
+/// configurable, and this is not. `AppState::new` refuses a configuration that
+/// sets the ceiling at or above this, because the alternative is a deployment
+/// that looks fine and dispatches more concurrent requests to a credential than
+/// its limit allows.
+pub(crate) const SLOT_TTL: Duration = Duration::from_mins(35);
 
 /// Where a concurrency slot goes back to.
 ///
@@ -216,7 +222,9 @@ pub async fn lease(
     }
 
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let sticky_key = session.redis_key(&route_id.to_string());
+    // Namespaced by provider: a pin names a credential, and a credential
+    // belongs to one provider. See `SessionKey::redis_key`.
+    let sticky_key = session.redis_key(&route_id.to_string(), provider.as_str());
 
     // 1. The pin. Skipped during failover: the whole point of failing over is
     //    that the pinned credential just failed us.
@@ -1014,6 +1022,16 @@ security:
     fn a_slot_outlives_the_longest_permitted_request() {
         // If a slot expired under a live request, the credential would be
         // oversubscribed rather than merely leaky.
-        assert!(SLOT_TTL > Duration::from_mins(30));
+        //
+        // Against the configured ceiling, not against a copy of its default.
+        // `assert!(SLOT_TTL > Duration::from_mins(30))` compared two constants
+        // and could only fail if someone edited one of them in this file — it
+        // said nothing about the deployment, which is where the ceiling
+        // actually comes from and where it can be raised past the TTL.
+        let default = oag_core::config::Config::default_gateway_max_stream_duration();
+        assert!(
+            SLOT_TTL > default,
+            "the shipped default must leave room: {SLOT_TTL:?} vs {default:?}"
+        );
     }
 }

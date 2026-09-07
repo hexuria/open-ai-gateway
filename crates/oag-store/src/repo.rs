@@ -82,13 +82,14 @@ pub async fn authenticate(db: &Db, raw_key: &str) -> Result<Option<AuthContext>>
             Option<Decimal>,
             Decimal,
             bool,
+            Option<OffsetDateTime>,
         ),
     >(
         r"
         SELECT k.id, k.principal_id, k.route_id, k.floor_tier,
                k.quota_usd,
                p.monthly_budget_usd, p.hard_stop_multiple,
-               k.admin
+               k.admin, k.expires_at
         FROM api_key k
         JOIN principal p ON p.id = k.principal_id
         JOIN route    r ON r.id = k.route_id
@@ -112,7 +113,7 @@ pub async fn authenticate(db: &Db, raw_key: &str) -> Result<Option<AuthContext>>
         principal_budget_usd: r.5,
         principal_hard_stop_multiple: r.6,
         admin: r.7,
-        key_hash: hash,
+        expires_at: r.8,
     }))
 }
 

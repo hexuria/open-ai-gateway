@@ -266,10 +266,11 @@ pub fn public_router(state: Arc<AppState>) -> Router {
     // live, so they join this listener rather than vanishing entirely.
     //
     // What joins it is all of [`admin_routes`], not just `/admin/api`. The
-    // three routes that sit outside the admin layer on purpose — `/`,
-    // `/metrics`, `/health/ready` — have nothing but reachability protecting
-    // them, and here there is none: the dashboard and every gauge in it answer
-    // whoever can reach the port. `/admin/api` keeps its key, so the writes
+    // routes that sit outside the admin layer on purpose — `/`, `/metrics` and
+    // `/health/ready` here, plus `/health/live`, which `admin_router` adds on
+    // the admin listener and which this function adds separately below — have
+    // nothing but reachability protecting them, and here there is none: the
+    // dashboard and every gauge in it answer whoever can reach the port. `/admin/api` keeps its key, so the writes
     // lose one layer of two and the reads lose the only one they had. Restrict
     // the service with the platform's ingress rules or IAM.
     let routes = if state.config.server.single_listener {
@@ -954,6 +955,16 @@ server:
         for path in ["/", "/metrics"] {
             let got = status(admin_router(state(false)), "GET", path).await;
             assert_ne!(got, StatusCode::UNAUTHORIZED, "{path} must not need a key");
+            // A9. `assert_ne!(401)` alone passes for a route that does not
+            // exist: an unmatched path 404s, which is also not 401. So a
+            // refactor that dropped the dashboard or the metrics endpoint
+            // entirely would have left this test green — the one test standing
+            // between "open on purpose" and "gone".
+            assert_ne!(
+                got,
+                StatusCode::NOT_FOUND,
+                "{path} has to still be routed, not merely unauthenticated"
+            );
         }
     }
 

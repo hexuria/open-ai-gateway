@@ -177,7 +177,7 @@ column means the defect also depends on documented third-party behaviour.
 | A7 | confirmed | `admin/mod.rs:406` | grouped by name; mixed counterfactuals |
 | A8 | confirmed | `lib.rs:262` | `/health/ready` outside the ceiling, costs a connection |
 | A9 | confirmed | `lib.rs:880` | passes on 404 |
-| A10 | confirmed | `lib.rs:268`, `:291` | "three" is four |
+| A10 | confirmed | `lib.rs:268`, `:291` | "three" is four — `/health/live` is added by `admin_router` rather than by `admin_routes`, which is why the count reads right until you follow the second line reference |
 | A11 | confirmed | `services.rs:242` | fallback never sets `last_ok` |
 | C12 | confirmed | `doctor.rs:291` | returns 0 on every path; tests assert 0 |
 | C13 | confirmed | `admin/mod.rs:961` | empty-after-filter reads as empty catalog |

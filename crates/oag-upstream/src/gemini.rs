@@ -48,7 +48,7 @@ impl ProviderAdapter for GeminiAdapter {
             self.base_url, req.model.upstream_name, method
         );
 
-        reqwest::Client::new()
+        crate::builder_client()
             .post(&url)
             .header("content-type", "application/json")
             // Its own header, not Authorization and not x-api-key.

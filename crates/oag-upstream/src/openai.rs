@@ -68,7 +68,7 @@ impl ProviderAdapter for OpenAICompatAdapter {
 
         let body = openai::render_request(req.canonical, &req.model.upstream_name)?;
 
-        reqwest::Client::new()
+        crate::builder_client()
             .post(format!("{}/chat/completions", self.base_url))
             .header("content-type", "application/json")
             // Bearer for every one of them; the dialect's single convention.
@@ -88,16 +88,21 @@ impl ProviderAdapter for OpenAICompatAdapter {
     async fn refresh(
         &self,
         credential: &oag_core::credential::SecretMaterial,
+        proxy: Option<&str>,
     ) -> Result<Option<oag_core::credential::SecretMaterial>> {
         // Two of these providers issue subscription OAuth tokens; the rest hold
         // static keys, for which "nothing to refresh" is the correct answer.
         // Both OAuth paths no-op on a credential with no refresh token, so a
         // plain OpenAI or xAI API key falls through them safely.
         match self.provider {
-            Provider::XAI => crate::xai_oauth::refresh(credential, &self.auth_base).await,
+            Provider::XAI => crate::xai_oauth::refresh(credential, &self.auth_base, proxy).await,
             Provider::OpenAI => {
-                crate::openai_oauth::refresh(credential, crate::openai_oauth::DEFAULT_TOKEN_URL)
-                    .await
+                crate::openai_oauth::refresh(
+                    credential,
+                    crate::openai_oauth::DEFAULT_TOKEN_URL,
+                    proxy,
+                )
+                .await
             }
             _ => Ok(None),
         }

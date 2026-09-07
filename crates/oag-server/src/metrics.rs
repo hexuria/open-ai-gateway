@@ -96,9 +96,20 @@ pub fn describe() {
         "oag_time_to_first_token_seconds",
         "Latency to the first streamed token. The number users actually feel."
     );
-    describe_gauge!(
-        "oag_credentials_schedulable",
-        "Credentials currently eligible, by provider."
+    describe_counter!(
+        "oag_failover_budget_exhausted_total",
+        "Requests that ran out of failover budget before a credential answered. \
+         Rising means `gateway.failover_budget` is shorter than the fleet's slow path."
+    );
+    describe_counter!(
+        "oag_panics_total",
+        "Handler panics caught and answered as 500. Should be zero; any value at all \
+         names a bug the `catch_panic` layer only stopped from severing the connection."
+    );
+    describe_counter!(
+        "oag_token_refreshes_total",
+        "OAuth credential refreshes, by outcome. A rising `failed` means seats are \
+         about to start 401ing, some minutes before they do."
     );
     describe_gauge!(
         "oag_slots_in_use",

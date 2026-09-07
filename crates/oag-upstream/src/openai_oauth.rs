@@ -121,6 +121,7 @@ struct TokenResponse {
 pub async fn refresh(
     credential: &SecretMaterial,
     token_url: &str,
+    proxy: Option<&str>,
 ) -> Result<Option<SecretMaterial>> {
     let Some(refresh_token) = credential.refresh_token.as_deref() else {
         return Ok(None);
@@ -128,10 +129,7 @@ pub async fn refresh(
 
     // Bounded below the fleet refresh lock's 30s TTL so a hung endpoint surfaces
     // as this credential's failure rather than a wedged lock.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| Error::Internal(format!("building refresh client: {e}")))?;
+    let client = crate::side_channel_client(proxy, std::time::Duration::from_secs(20))?;
 
     let response = client
         .post(token_url)
@@ -243,7 +241,7 @@ mod tests {
             account_id: None,
         };
         assert!(
-            refresh(&material, "http://127.0.0.1:9")
+            refresh(&material, "http://127.0.0.1:9", None)
                 .await
                 .expect("ok")
                 .is_none()
@@ -290,7 +288,7 @@ mod tests {
             format!(r#"{{"access_token":"{new}","refresh_token":"new-refresh"}}"#).into_boxed_str(),
         );
         let url = mock_token_endpoint(200, body).await;
-        let fresh = refresh(&oauth_material(), &url)
+        let fresh = refresh(&oauth_material(), &url, None)
             .await
             .expect("ok")
             .expect("some");
@@ -304,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn a_reused_refresh_token_is_named_in_the_error() {
         let url = mock_token_endpoint(400, r#"{"error":{"code":"refresh_token_reused"}}"#).await;
-        let err = refresh(&oauth_material(), &url).await.unwrap_err();
+        let err = refresh(&oauth_material(), &url, None).await.unwrap_err();
         assert!(err.to_string().contains("refresh_token_reused"), "{err}");
     }
 }

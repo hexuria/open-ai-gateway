@@ -24,11 +24,35 @@ use sha2::{Digest, Sha256};
 type HmacSha256 = Hmac<Sha256>;
 
 /// What a request needs signing against.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Credentials {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: Option<String>,
+}
+
+/// Hand-written, because the derived one printed an AWS secret key.
+///
+/// Nothing formats this today, which is the only reason it has not leaked — and
+/// "nothing formats it today" is a property of every call site that exists now,
+/// not of the type. A `tracing` field, a `dbg!` during an incident, or an error
+/// wrapping the struct is one line away at any time, and this is the type whose
+/// two fields are a long-lived AWS credential.
+///
+/// The access key id survives: it is an identifier rather than a secret, it
+/// appears in `CloudTrail`, and it is the one thing that makes a signing problem
+/// diagnosable at all.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// One signed request's headers.
@@ -179,11 +203,19 @@ fn uri_encode_path(path: &str) -> String {
 }
 
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
-    // The only failure mode is a key length HMAC cannot accept, and HMAC
-    // accepts any length — so this cannot fail in practice.
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap_or_else(|_| {
-        <HmacSha256 as Mac>::new_from_slice(&[]).unwrap_or_else(|_| unreachable!())
-    });
+    // HMAC accepts a key of any length, so this does not fail for any input this
+    // crate can produce. What it does not do is panic if that ever stops being
+    // true — which is what `unreachable!()` did, on the request path, guarded by
+    // a comment reasoning about someone else's crate.
+    //
+    // An empty digest here produces a wrong signature, and a wrong signature is
+    // a 403 from AWS with a name on it: a diagnosable failure that cools the
+    // credential down and fails over. A panic is a severed connection with no
+    // response at all, and on HTTP/2 it resets every other stream multiplexed
+    // onto it — one request's impossible branch taking out unrelated callers.
+    let Ok(mut mac) = <HmacSha256 as Mac>::new_from_slice(key) else {
+        return Vec::new();
+    };
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }

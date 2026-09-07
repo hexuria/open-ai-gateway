@@ -132,6 +132,31 @@ struct Discovery {
     token_endpoint: String,
 }
 
+/// Refuse a discovery document that points its token endpoint somewhere else.
+///
+/// Compared on scheme, host and port — the origin — rather than on the whole
+/// prefix, because a provider legitimately serves discovery at
+/// `/.well-known/...` and tokens at `/oauth2/token`, and requiring a path
+/// prefix would break a correct deployment to guard against nothing.
+fn same_origin(auth_base: &str, token_endpoint: &str) -> Result<()> {
+    fn origin(url: &str) -> Option<(&str, &str)> {
+        let (scheme, rest) = url.split_once("://")?;
+        Some((scheme, rest.split('/').next().unwrap_or(rest)))
+    }
+    let (Some(base), Some(target)) = (origin(auth_base), origin(token_endpoint)) else {
+        return Err(Error::Internal(format!(
+            "xai oauth discovery: token_endpoint is not an absolute URL: {token_endpoint}"
+        )));
+    };
+    if base != target {
+        return Err(Error::Internal(format!(
+            "xai oauth discovery: token_endpoint {token_endpoint} is not on the same origin \
+             as {auth_base}; refusing to post a refresh token to it"
+        )));
+    }
+    Ok(())
+}
+
 /// Refresh an xAI OAuth credential. `Ok(None)` means "not refreshable" — a
 /// static API key on the same provider takes this path.
 ///
@@ -142,6 +167,7 @@ struct Discovery {
 pub async fn refresh(
     credential: &SecretMaterial,
     auth_base: &str,
+    proxy: Option<&str>,
 ) -> Result<Option<SecretMaterial>> {
     let Some(refresh_token) = credential.refresh_token.as_deref() else {
         return Ok(None);
@@ -158,10 +184,7 @@ pub async fn refresh(
 
     // Bounded below the fleet refresh lock's 30s TTL, so a hung endpoint
     // surfaces as this credential's failure rather than a wedged lock.
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|e| Error::Internal(format!("building refresh client: {e}")))?;
+    let client = crate::side_channel_client(proxy, std::time::Duration::from_secs(20))?;
 
     let discovery: Discovery = client
         .get(format!("{auth_base}/.well-known/openid-configuration"))
@@ -173,6 +196,18 @@ pub async fn refresh(
         .json()
         .await
         .map_err(|e| Error::Internal(format!("xai oauth discovery body: {e}")))?;
+
+    // The discovery document says where to post the refresh token, and a
+    // refresh token is a long-lived credential. Following that pointer wherever
+    // it leads makes the token's destination a property of whatever answered
+    // the discovery request — a compromised or misconfigured `auth_base`, a
+    // DNS answer, a proxy — rather than of anything this gateway decided.
+    //
+    // So the endpoint has to be on the same origin the discovery came from.
+    // That is the whole guarantee available here and it is the one that
+    // matters: we already trusted `auth_base` enough to ask it, and we are not
+    // extending that trust to a host it names.
+    same_origin(auth_base, &discovery.token_endpoint)?;
 
     let response = client
         .post(&discovery.token_endpoint)
@@ -328,7 +363,9 @@ mod tests {
             client_id: None,
             account_id: None,
         };
-        let refreshed = refresh(&material, "http://127.0.0.1:9").await.expect("ok");
+        let refreshed = refresh(&material, "http://127.0.0.1:9", None)
+            .await
+            .expect("ok");
         assert!(
             refreshed.is_none(),
             "a static key must not attempt the grant"
@@ -345,7 +382,9 @@ mod tests {
             client_id: None,
             account_id: None,
         };
-        let err = refresh(&material, "http://127.0.0.1:9").await.unwrap_err();
+        let err = refresh(&material, "http://127.0.0.1:9", None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("--from grok"), "{err}");
     }
 
@@ -416,7 +455,7 @@ mod tests {
         .await;
 
         let before = time::OffsetDateTime::now_utc().unix_timestamp();
-        let fresh = refresh(&oauth_material(), &base)
+        let fresh = refresh(&oauth_material(), &base, None)
             .await
             .expect("refresh ok")
             .expect("refreshable");
@@ -448,7 +487,7 @@ mod tests {
         // token we still hold would make the *next* refresh impossible.
         let (base, _) = mock_oidc(200, r#"{"access_token":"new-access"}"#).await;
 
-        let fresh = refresh(&oauth_material(), &base)
+        let fresh = refresh(&oauth_material(), &base, None)
             .await
             .expect("refresh ok")
             .expect("refreshable");
@@ -481,7 +520,7 @@ mod tests {
         held.expires_at = Some(known);
         let (base, _) = mock_oidc(200, r#"{"access_token":"new-access"}"#).await;
 
-        let fresh = refresh(&held, &base)
+        let fresh = refresh(&held, &base, None)
             .await
             .expect("refresh ok")
             .expect("refreshable");
@@ -496,7 +535,35 @@ mod tests {
     async fn invalid_grant_is_named_in_the_error() {
         let (base, _) = mock_oidc(400, r#"{"error":"invalid_grant"}"#).await;
 
-        let err = refresh(&oauth_material(), &base).await.unwrap_err();
+        let err = refresh(&oauth_material(), &base, None).await.unwrap_err();
         assert!(err.to_string().contains("invalid_grant"), "{err}");
+    }
+    /// U9. A refresh token goes only to the origin we already trusted.
+    ///
+    /// The discovery document says where to post it, and a refresh token is a
+    /// long-lived credential. Following that pointer wherever it leads made the
+    /// token's destination a property of whatever answered the discovery
+    /// request — a compromised or misconfigured `auth_base`, a DNS answer, a
+    /// proxy — rather than of anything this gateway decided.
+    #[test]
+    fn a_token_endpoint_off_the_discovery_origin_is_refused() {
+        let base = "https://auth.x.ai";
+
+        // The shapes a real provider uses: a different path, and the same one.
+        same_origin(base, "https://auth.x.ai/oauth2/token").expect("same origin");
+        same_origin(base, "https://auth.x.ai/.well-known/token").expect("same origin");
+
+        // A different host, which is the attack.
+        assert!(same_origin(base, "https://evil.example/token").is_err());
+        // A different scheme: downgrading to plaintext would put the token on
+        // the wire in clear, which is the same failure by another route.
+        assert!(same_origin(base, "http://auth.x.ai/oauth2/token").is_err());
+        // A different port is a different origin, and on a host we do not
+        // control it is a different service.
+        assert!(same_origin(base, "https://auth.x.ai:8443/token").is_err());
+        // A near-miss that a prefix check would have accepted.
+        assert!(same_origin(base, "https://auth.x.ai.evil.example/token").is_err());
+        // Not a URL at all.
+        assert!(same_origin(base, "/oauth2/token").is_err());
     }
 }

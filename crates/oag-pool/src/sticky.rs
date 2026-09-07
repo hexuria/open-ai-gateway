@@ -90,9 +90,16 @@ impl SessionKey {
 
     /// Resolve the best available key, in descending order of precision.
     ///
-    /// `principal_id` scopes every form: a pin belongs to one tenant's
-    /// conversation, and neither a session id nor a prompt prefix is unique
-    /// across tenants.
+    /// `principal_id` scopes the first two forms: a pin belongs to one tenant's
+    /// conversation, and neither a client session id nor a prompt prefix is
+    /// unique across tenants.
+    ///
+    /// The fallback form does not take it, and does not need to. It hashes
+    /// `api_key_id`, which belongs to exactly one principal — so the scoping is
+    /// there by transitivity rather than by inclusion. Saying "every form" was
+    /// a claim about this function that reading it disproves, which is worse
+    /// than saying nothing: the next person to add a form will look here for
+    /// the rule and find one that is not enforced.
     #[must_use]
     pub fn resolve(
         principal_id: &str,
@@ -113,9 +120,18 @@ impl SessionKey {
     }
 
     /// The Redis key this session's pin lives under.
+    ///
+    /// Namespaced by provider as well as route, because a pin names a
+    /// *credential* and a credential belongs to one provider. A conversation
+    /// that escalates from a Kimi rung to an Anthropic one wrote its Anthropic
+    /// credential over the Kimi pin under the same key — so the next turn on
+    /// the cheap rung found a pin naming a credential of the wrong provider,
+    /// discarded it, and picked afresh. Both providers lost affinity, and the
+    /// only symptom is a prompt-cache hit rate that drifts down with nothing
+    /// else to look at.
     #[must_use]
-    pub fn redis_key(&self, route: &str) -> String {
-        format!("oag:sticky:{route}:{}", self.0)
+    pub fn redis_key(&self, route: &str, provider: &str) -> String {
+        format!("oag:sticky:{route}:{provider}:{}", self.0)
     }
 }
 
@@ -212,5 +228,35 @@ mod tests {
         // No session, no cache blocks: still pinned, just coarsely.
         let k = SessionKey::resolve(TENANT, None, &[], "key1", "opus");
         assert_eq!(k, SessionKey::from_caller("key1", "opus"));
+    }
+    /// R5. A pin names a credential, so its key names the provider too.
+    ///
+    /// A conversation that escalates from a Kimi rung to an Anthropic one wrote
+    /// its Anthropic credential over the Kimi pin, under the same key — so the
+    /// next turn on the cheap rung found a pin naming a credential of the wrong
+    /// provider, discarded it, and picked afresh. Both providers lost affinity,
+    /// and the only symptom is a prompt-cache hit rate drifting down with
+    /// nothing else to look at.
+    #[test]
+    fn one_session_pins_each_provider_separately() {
+        let session = SessionKey::from_caller("key-1", "oag/auto");
+        let route = "default";
+
+        assert_ne!(
+            session.redis_key(route, "anthropic"),
+            session.redis_key(route, "kimi"),
+            "one conversation, two providers, two pins — or each overwrites the other"
+        );
+        // Still one pin per session per provider per route, which is what makes
+        // it a pin at all.
+        assert_eq!(
+            session.redis_key(route, "anthropic"),
+            session.redis_key(route, "anthropic")
+        );
+        assert_ne!(
+            session.redis_key("default", "anthropic"),
+            session.redis_key("other", "anthropic"),
+            "and routes stay separate, as they always were"
+        );
     }
 }

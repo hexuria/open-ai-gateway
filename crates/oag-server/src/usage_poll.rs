@@ -132,7 +132,10 @@ async fn discover_served(
     let Ok(adapter) = crate::gateway::adapter_for(state, provider, row) else {
         return;
     };
-    match adapter.served_models(material).await {
+    match adapter
+        .served_models(material, row.proxy_url.as_deref())
+        .await
+    {
         Ok(Some(models)) => {
             if let Err(e) =
                 oag_store::repo::set_served_models(&state.db, account.as_uuid(), &models).await

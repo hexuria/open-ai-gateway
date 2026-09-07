@@ -137,12 +137,22 @@ pub struct AuthContext {
     pub quota_usd: Option<Decimal>,
     pub principal_budget_usd: Option<Decimal>,
     pub principal_hard_stop_multiple: Decimal,
-    /// sha256 of the key, so a write that changes this identity's limits can
-    /// evict it from every cache tier without the plaintext — see
-    /// `AuthCache::invalidate_hash`. `#[serde(default)]` for the same reason
-    /// as `admin`: an L2 entry written by an older binary must still open.
+    /// When this key stops working, if it ever does.
+    ///
+    /// Carried so the cache cannot outlive it. `authenticate` filters expired
+    /// keys at read time, but an entry cached just before expiry kept
+    /// authenticating for the L2 TTL's full five minutes — on every replica, and
+    /// with the row in the database already saying no. A key with an expiry is a
+    /// key someone chose to time-box, and five minutes past the deadline is a
+    /// promise broken quietly.
+    ///
+    /// `#[serde(default)]` for the same reason `admin` has it: this struct is
+    /// the L2 cache value, and an entry written by an older binary must still
+    /// deserialise rather than poisoning every request that hits it. An older
+    /// entry reads as `None`, which is the pre-existing behaviour and expires
+    /// on the TTL as it always did.
     #[serde(default)]
-    pub key_hash: String,
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// What the caller has spent: the key's lifetime total and the principal's
