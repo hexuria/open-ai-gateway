@@ -41,7 +41,8 @@ pub struct AppState {
     /// state's readiness answered for another's, and two gateways in one binary
     /// would report each other's backends. Nothing else on this struct is
     /// process-global, and this had no reason to be.
-    pub readiness: Arc<tokio::sync::Mutex<Option<(std::time::Instant, oag_store::Readiness)>>>,
+    pub(crate) readiness:
+        Arc<tokio::sync::Mutex<Option<(std::time::Instant, oag_store::Readiness)>>>,
 }
 
 impl std::fmt::Debug for AppState {
