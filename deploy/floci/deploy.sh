@@ -112,13 +112,39 @@ echo "  service created"
 
 say "6/6  wait for OAG to come up, then health-check it"
 IP=""
+READY=0
 for _ in $(seq 1 30); do
   C=$(docker ps --format '{{.Names}}' | grep 'floci-gcp-cloudrun-open-ai-gateway' | head -1 || true)
   [ -n "$C" ] && IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NETWORK\").IPAddress}}" "$C" 2>/dev/null || true)
-  [ -n "$IP" ] && docker run --rm --network "$NETWORK" curlimages/curl:latest -sf -o /dev/null "http://$IP:8080/health/ready" && break
+  if [ -n "$IP" ] && docker run --rm --network "$NETWORK" curlimages/curl:latest \
+      -sf -o /dev/null "http://$IP:8080/health/ready"; then
+    READY=1
+    break
+  fi
   sleep 2
 done
 echo
+
+# The loop falling through is not success.
+#
+# It used to run to its thirtieth iteration and continue, printing "OAG is
+# deployed" over a gateway that never became ready — or never started, in which
+# case `$IP` was empty and the health check below curled `http://:8080`. A
+# deploy script whose last line says it worked is the line people read, and this
+# one said it for a container that was not there.
+if [ "$READY" != "1" ]; then
+  echo
+  echo "FAILED: the gateway did not answer /health/ready within 60s."
+  if [ -z "$IP" ]; then
+    echo "  No container matching 'floci-gcp-cloudrun-open-ai-gateway' is running."
+    echo "  \`docker ps -a\` will say whether it exited; its logs will say why."
+  else
+    echo "  The container is at $IP. Its logs are the next thing to read:"
+    echo "    docker logs \$(docker ps -aq --filter name=floci-gcp-cloudrun-open-ai-gateway | head -1)"
+  fi
+  exit 1
+fi
+
 docker run --rm --network "$NETWORK" curlimages/curl:latest -s "http://$IP:8080/health/ready"; echo
 cat <<EOF
 

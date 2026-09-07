@@ -10,7 +10,7 @@
 
 terraform {
   required_providers {
-    aws = { source = "hashicorp/aws", version = ">= 5.0" }
+    aws = { source = "hashicorp/aws", version = "~> 6.0" }
   }
 }
 
@@ -31,8 +31,15 @@ resource "aws_lb" "this" {
   name               = var.name
   load_balancer_type = "application"
   internal           = var.internal
-  subnets            = var.public_subnet_ids
-  security_groups    = [var.lb_security_group_id]
+  # An internal load balancer belongs in the private subnets.
+  #
+  # This always used `public_subnet_ids`, so `internal = true` produced a
+  # load balancer with no public IPs sitting in subnets that route to an
+  # internet gateway — which applies cleanly and defeats the point of asking for
+  # an internal one. The variable's own description said it was ignored when
+  # internal; nothing ignored it.
+  subnets         = var.internal ? var.private_subnet_ids : var.public_subnet_ids
+  security_groups = [var.lb_security_group_id]
 
   # Inactivity, not total duration. Must exceed the gateway's keepalive
   # interval by a wide margin; it comfortably does at the default of 10s.
@@ -60,9 +67,23 @@ resource "aws_lb_target_group" "this" {
   deregistration_delay = var.deregistration_delay_seconds
 
   health_check {
-    # Liveness on the public port. Readiness lives on 8081 and the ALB does not
-    # route there, so the deep check belongs to the container's own probe.
-    path                = "/health/live"
+    # Readiness, on the admin port. The ALB routes traffic to 8080 and health-
+    # checks 8081, which is what `port` below is for.
+    #
+    # These two probes were the wrong way round, and the consequence is not
+    # symmetric. A failing CONTAINER health check makes ECS kill and replace the
+    # task; a failing ALB check only stops routing to it. With the deep check on
+    # the container, an RDS failover made every task's `/health/ready` fail at
+    # once and ECS recycled the entire fleet — while the ALB, checking only
+    # `/health/live`, kept routing to tasks that could not serve.
+    #
+    # So: the load balancer takes the deep check, because "stop sending this
+    # replica work" is the proportionate response to a dependency being down,
+    # and the container takes liveness, because "replace this task" is only ever
+    # right for a process that is actually dead. Every other platform in this
+    # repository is arranged that way.
+    port                = "8081"
+    path                = "/health/ready"
     interval            = 15
     timeout             = 5
     healthy_threshold   = 2
@@ -102,7 +123,36 @@ resource "aws_lb_listener" "this" {
 }
 
 locals {
-  container_env = [for k, v in var.env : { name = k, value = v }]
+  # The admin listener has to be reachable from the ALB, because the ALB is what
+  # health-checks it.
+  #
+  # `server.admin_addr` defaults to `127.0.0.1:8081` — deliberately loopback, so
+  # the admin API is not exposed off the host by an oversight. The container's
+  # own health check curls `127.0.0.1:8080` and never noticed. But the target
+  # group checks `/health/ready` on 8081, and that request arrives on the task's
+  # ENI: a loopback bind refuses it, every target goes unhealthy, and the ALB
+  # serves 503 on an apply that reported success.
+  #
+  # Helm sets this on the Deployment and `compose/stack.yml` sets it on `oag-1`;
+  # this module health-checks the port and did not, which is the same shape as
+  # the Envoy defect fixed two commits ago. The module's own requirement wins
+  # over `var.env`, because the health check it configures depends on it.
+  #
+  # Not an exposure: 8081 is reachable only from the load balancer's security
+  # group, which is what the ingress rule beside the health check is for.
+  #
+  # `LOG_JSON` rides along for the reason Cloud Run has always set it: CloudWatch
+  # turns a JSON line into queryable fields and leaves prose as prose. The review
+  # named Azure; the check that enforces this found two platforms shipping
+  # unstructured logs, and fixing one would have left the other doing it under a
+  # check that says otherwise.
+  container_env = [
+    for k, v in merge(var.env, {
+      OAG_SERVER__ADMIN_ADDR  = "0.0.0.0:8081"
+      OAG_TELEMETRY__LOG_JSON = "true"
+    }) :
+    { name = k, value = v }
+  ]
   # Never plain environment: these come from Secrets Manager or SSM, so they are
   # absent from the task definition and from state.
   container_secrets = [for k, v in var.secret_env : { name = k, valueFrom = v }]
@@ -162,7 +212,11 @@ locals {
       secrets     = local.container_secrets
 
       healthCheck = {
-        command     = ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/health/ready || exit 1"]
+        # Liveness, not readiness — see the target group's health check above.
+        # ECS replaces a task whose check fails, and a task whose database is
+        # unreachable is not a task worth replacing: every replacement finds the
+        # same database.
+        command     = ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health/live || exit 1"]
         interval    = 15
         timeout     = 5
         retries     = 3
@@ -215,8 +269,13 @@ resource "aws_ecs_service" "this" {
   deployment_maximum_percent         = 200
 
   # Long enough that a task finishes draining before ECS kills it.
-  # ECS caps this at 120s for Fargate, so the gateway's drain budget should be
-  # set to match rather than the other way round on this platform.
+  #
+  # There is no 120s cap. This comment used to assert one, and told the reader
+  # to size the gateway's drain budget around it — advice derived from a limit
+  # that does not exist. ECS accepts a grace period up to 2,147,483,647 seconds;
+  # what actually bounds a drain here is the target group's
+  # `deregistration_delay`, which this module sets from
+  # `deregistration_delay_seconds` and which AWS does cap, at 3,600.
   health_check_grace_period_seconds = var.health_check_grace_period_seconds
 
   # Without this the apply returns the moment ECS accepts the deployment, which

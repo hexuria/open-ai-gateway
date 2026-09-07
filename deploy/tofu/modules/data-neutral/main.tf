@@ -21,8 +21,12 @@ locals {
 
   # Upstash and Neon both require TLS. A URL without it either fails to connect
   # or, worse, silently downgrades.
-  db_insecure    = !can(regex("sslmode=(require|verify-full|verify-ca)", var.database_url))
-  redis_insecure = can(regex("upstash\\.io", var.redis_url)) && !startswith(var.redis_url, "rediss://")
+  db_insecure = !can(regex("sslmode=(require|verify-full|verify-ca)", var.database_url))
+  # Every Redis, not only Upstash. The hostname check meant a self-hosted or
+  # third-party cache reached over plaintext `redis://` passed silently — and
+  # the auth cache and session pins travelling over it describe who is talking
+  # to what. TLS is a property of the connection, not of the vendor.
+  redis_insecure = !startswith(var.redis_url, "rediss://")
 }
 
 resource "terraform_data" "preflight" {

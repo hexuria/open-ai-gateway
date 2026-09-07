@@ -33,7 +33,7 @@ render() {
     "$@"
 }
 
-say "1/4  default mode (external, not set explicitly)"
+say "1/5  default mode (external, not set explicitly)"
 out="$(render \
   --set data.external.databaseUrl="postgres://oag:oag@db.example.invalid:5432/oag" \
   --set data.external.redisUrl="redis://cache.example.invalid:6379")"
@@ -42,19 +42,19 @@ grep -q 'PGHOST' <<<"$out" && fail "default mode rendered a PGHOST it cannot kno
 grep -q 'name: migrate' <<<"$out" || fail "default mode did not render the migrate container at all"
 pass "no init container, migrate container present"
 
-say "2/4  external via existingSecret"
+say "2/5  external via existingSecret"
 out="$(render --set data.external.existingSecret=my-data)"
 grep -q 'initContainers' <<<"$out" && fail "existingSecret mode must not wait for an in-cluster Postgres"
 pass "no init container"
 
-say "3/4  inCluster"
+say "3/5  inCluster"
 out="$(render --set data.mode=inCluster)"
 grep -q 'initContainers' <<<"$out" || fail "inCluster mode must wait for the StatefulSet it starts"
 grep -q 'value: t-open-ai-gateway-postgres' <<<"$out" \
   || fail "inCluster PGHOST must name the chart's own Postgres; got: $(grep -A1 'name: PGHOST' <<<"$out" | tail -1)"
 pass "init container waits on t-open-ai-gateway-postgres"
 
-say "4/4  every tunable the runbooks name is settable from the chart"
+say "4/5  every tunable the runbooks name is settable from the chart"
 # `OagReplicaShedding` says to raise server.max_in_flight. A knob an alert
 # points at and the chart cannot set is a runbook step that cannot be done.
 out="$(helm template t "$CHART" -s templates/configmap.yaml \
@@ -74,5 +74,43 @@ for pair in 'OAG_SERVER__MAX_IN_FLIGHT: "128"' \
   grep -qF "$pair" <<<"$out" || fail "configmap did not render $pair"
 done
 pass "max_in_flight, statement_timeout, upstream_response_timeout, client_write_timeout, spend_reconcile_interval"
+
+say "5/5  a secret change rolls the pods"
+# H12. The pod template carried `checksum/config` and no `checksum/secret`, so
+# `helm upgrade` with a new `credentialKek` updated the Secret and left the pod
+# template byte-identical: a successful upgrade with nothing to roll. The
+# rotation then landed pod by pod at arbitrary times, through HPA scale-ups and
+# node drains, giving a fleet where some pods could decrypt sealed credentials
+# and some could not — with no deploy to correlate against.
+#
+# Two renders differing only in the KEK. If the annotation is missing the pod
+# templates are identical, which is the bug stated as a diff.
+deployment() {
+  helm template t "$CHART" -s templates/deployment.yaml \
+    --set security.signingSecret="ci-only-signing-secret-0123456789abcdefghij" \
+    --set security.credentialKek="$1" \
+    --set data.external.databaseUrl="postgres://oag:oag@db.example.invalid:5432/oag" \
+    --set data.external.redisUrl="redis://cache.example.invalid:6379"
+}
+before="$(deployment "Y2ktb25seS1rZWstMzItYnl0ZXMtMDEyMzQ1Njc4OTA=")" \
+  || fail "chart did not render"
+after="$(deployment "YW5vdGhlci1rZWstMzItYnl0ZXMtMDEyMzQ1Njc4OTA=")" \
+  || fail "chart did not render with the second KEK"
+
+grep -q "checksum/secret:" <<<"$before" || fail "no checksum/secret annotation"
+[ "$before" != "$after" ] \
+  || fail "rotating the KEK left the pod template byte-identical; nothing would roll"
+pass "a new KEK changes the pod template"
+
+# And skipped when the chart renders no Secret of its own: an annotation that
+# can never change is noise on every pod, and would imply a guarantee the chart
+# cannot make about someone else's Secret.
+supplied="$(helm template t "$CHART" -s templates/deployment.yaml \
+  --set security.existingSecret=my-security \
+  --set data.mode=external \
+  --set data.external.existingSecret=my-data)" || fail "chart did not render"
+grep -q "checksum/secret:" <<<"$supplied" \
+  && fail "checksum/secret rendered for a chart that owns no Secret"
+pass "no checksum/secret when both secrets are supplied"
 
 printf '\n\033[32mPASS: the chart renders in all three data modes\033[0m\n'

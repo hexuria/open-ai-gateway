@@ -40,7 +40,7 @@ buffering hazard, and duplicated auth.
   ┌──────────────────────────────────────────────────────────┐
   │  L7 LOAD BALANCER — Envoy                                │
   │  LEAST_REQUEST · outlier ejection · no stream timeouts    │
-  │  health check /health/ready · long drain                  │
+  │  health check /health/ready on :8081 · long drain         │
   └──────────────────────────────────────────────────────────┘
               ┌─────────────┼─────────────┐
               ▼             ▼             ▼

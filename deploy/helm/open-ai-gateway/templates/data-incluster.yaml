@@ -1,10 +1,53 @@
 {{- if eq .Values.data.mode "inCluster" }}
+{{- /*
+The in-cluster data tier: Postgres and Redis, for a demo or a single-node
+install.
+
+These are hooks, at weight -10, and the weight is load-bearing. `migrate-job`
+is itself a `pre-install,pre-upgrade` hook at weight -5, and its init container
+waits for Postgres to accept connections. Helm runs the whole pre-install hook
+phase before it applies any ordinary manifest, so an unannotated Postgres here
+is a Postgres that cannot be created until the migrate hook exits — and the
+migrate hook will not exit, because it is waiting for that Postgres. The install
+deadlocks and `helm install --wait` fails on its timeout, twenty minutes later,
+with `Init:0/1` and no explanation attached to it.
+
+That is not hypothetical: dropping the hooks is what the review's D8 asked for,
+it was done, and `kind-verify.sh` in CI failed exactly this way. The finding's
+premise is right and its remedy is not available on its own.
+
+Because the premise IS right, it is written down here rather than lost. Helm's
+default hook deletion policy is `before-hook-creation`, so every `helm upgrade`
+deletes and recreates both StatefulSets and their Services before the new
+gateway pods exist. The fleet loses its database and its cache for the twenty to
+forty seconds that takes, failing in-flight ledger writes, on an upgrade that
+reports success.
+
+Three things follow, and the third is the one that matters.
+
+`helm.sh/resource-policy: keep` is not the escape. Helm documents it as skipping
+a deletion that `uninstall`, `upgrade` or `rollback` would perform — which is
+the same deletion `before-hook-creation` depends on to recreate the hook, so the
+next upgrade would fail with AlreadyExists instead. Untested against a cluster,
+it would be trading a known cost for an unknown one.
+
+Making `migrate-job` an ordinary manifest, or a post-install hook, would free
+this tier to be ordinary too. Both change when migrations run relative to the
+pods that need them, which is the one ordering in this chart that must not be
+guessed at; it wants its own change, with a cluster to test it on.
+
+Until then: `data.mode: inCluster` is for a demo or a single-node install, and
+this comment is the reason that is not false modesty. A deployment whose
+database matters should use `data.mode: external`, where the database is not
+Helm's to delete on any policy.
+*/ -}}
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "oag.fullname" . }}-postgres
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
+    # Weight -10, ahead of migrate-job's -5. See the note at the top of this file.
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-10"
 spec:
@@ -20,6 +63,7 @@ metadata:
   name: {{ include "oag.fullname" . }}-postgres
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
+    # Weight -10, ahead of migrate-job's -5. See the note at the top of this file.
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-10"
 spec:
@@ -79,6 +123,7 @@ metadata:
   name: {{ include "oag.fullname" . }}-redis
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
+    # Weight -10, ahead of migrate-job's -5. See the note at the top of this file.
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-10"
 spec:
@@ -94,6 +139,7 @@ metadata:
   name: {{ include "oag.fullname" . }}-redis
   labels: {{- include "oag.labels" . | nindent 4 }}
   annotations:
+    # Weight -10, ahead of migrate-job's -5. See the note at the top of this file.
     "helm.sh/hook": pre-install,pre-upgrade
     "helm.sh/hook-weight": "-10"
 spec:

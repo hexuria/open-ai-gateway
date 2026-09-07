@@ -1,6 +1,6 @@
 terraform {
   required_providers {
-    aws    = { source = "hashicorp/aws", version = ">= 5.0" }
+    aws    = { source = "hashicorp/aws", version = "~> 6.0" }
     random = { source = "hashicorp/random", version = ">= 3.5" }
   }
 }
@@ -91,4 +91,29 @@ resource "aws_elasticache_replication_group" "this" {
 
   at_rest_encryption_enabled = true
   transit_encryption_enabled = var.tls
+
+  # An AUTH token, so reaching the cache is not enough to read it.
+  #
+  # The GCP module sets an auth string; this one set nothing, so anything that
+  # could open a TCP connection to the node could read every session pin and
+  # cached identity in it. The security group is the only thing that was
+  # stopping that, and a security group is one misconfigured rule from not
+  # stopping it.
+  #
+  # Gated on `tls` because ElastiCache refuses an auth token without transit
+  # encryption — sending it in clear would be worse than not setting one — and
+  # generated rather than taken as a variable, so it never passes through a
+  # tfvars file or a shell history.
+  auth_token                 = var.tls ? random_password.redis_auth[0].result : null
+  auth_token_update_strategy = "ROTATE"
+}
+
+resource "random_password" "redis_auth" {
+  count = var.tls ? 1 : 0
+
+  # ElastiCache requires 16-128 printable characters and rejects several
+  # punctuation marks outright, so this keeps to the alphanumeric set rather
+  # than discovering the exclusions during an apply.
+  length  = 64
+  special = false
 }

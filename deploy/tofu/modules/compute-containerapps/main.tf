@@ -14,7 +14,7 @@ terraform {
     # Floor raised to 5.0: `init_container` — which is how migrations run here —
     # is not present in 3.x, and a loose floor would let an older provider
     # silently drop the migration rather than fail.
-    azurerm = { source = "hashicorp/azurerm", version = ">= 5.0" }
+    azurerm = { source = "hashicorp/azurerm", version = "~> 5.0" }
   }
 }
 
@@ -43,6 +43,16 @@ resource "azurerm_container_app" "this" {
   resource_group_name          = var.resource_group_name
   container_app_environment_id = azurerm_container_app_environment.this.id
   revision_mode                = "Single"
+
+  # Run ON the dedicated profile, not merely beside it.
+  #
+  # The environment above creates a `Dedicated-D4` profile when
+  # `premium_ingress` is set, and the app never named it — so it ran on
+  # Consumption, which is what the profile was bought to escape. The bill
+  # arrived, the 240s ingress cap stayed, every stream longer than four minutes
+  # still died, and the guard that checks `premium_ingress` passed throughout
+  # because the profile does exist. It was simply not being used.
+  workload_profile_name = var.premium_ingress ? "Dedicated-D4" : null
 
   template {
     min_replicas = var.min_replicas
@@ -91,6 +101,14 @@ resource "azurerm_container_app" "this" {
         env {
           name  = "OAG_GATEWAY__MAX_STREAM_DURATION"
           value = tostring(var.max_stream_duration_seconds)
+        }
+        # Structured logs, as Cloud Run has always set. The environment is bound
+        # to a Log Analytics workspace, which is how these lines are collected —
+        # and without this they arrive as prose, so nothing can be queried by
+        # field and the workspace holds text nobody can ask a question of.
+        env {
+          name  = "OAG_TELEMETRY__LOG_JSON"
+          value = "true"
         }
 
         dynamic "env" {

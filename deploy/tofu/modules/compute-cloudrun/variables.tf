@@ -58,8 +58,15 @@ variable "cpu" {
   default = "1"
 }
 variable "memory" {
-  type    = string
-  default = "512Mi"
+  type = string
+  # 1Gi, not 512Mi.
+  #
+  # The in-flight ceiling defaults to 64 and `oag-core`'s own comment sizes that
+  # against a 1Gi replica — the two numbers are chosen together, and 512Mi here
+  # meant a Cloud Run revision would OOM under exactly the load its concurrency
+  # limit was picked to allow. A container killed for memory takes its in-flight
+  # streams with it and looks like an upstream problem.
+  default = "1Gi"
 }
 
 variable "ingress" {
@@ -83,5 +90,20 @@ variable "run_migrations" {
     skip the step during an incident. Rolling back does NOT require it: the
     migrator runs with ignore_missing(true), so an older binary migrates
     happily against a schema a newer release already applied.
+  EOT
+}
+
+variable "deletion_protection" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Refuse to delete the Cloud Run service.
+
+    `false`, matching the migrate job, because the service holds no state and is
+    reproducible from this configuration — and because the provider's default of
+    `true` makes `terraform destroy` fail, which is a surprise at exactly the
+    moment someone is tearing down an environment they meant to tear down.
+
+    Set it true for a service you would rather not lose to a misapplied plan.
   EOT
 }

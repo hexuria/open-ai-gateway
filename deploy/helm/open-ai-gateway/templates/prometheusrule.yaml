@@ -1,0 +1,121 @@
+{{- if .Values.prometheusRule.enabled }}
+{{- /*
+The alert rules, as a PrometheusRule the operator can actually install.
+
+`deploy/prometheus/alerts.yml` holds the same rules for a standalone Prometheus,
+and on Kubernetes there was no way to get them: the chart shipped a
+ServiceMonitor, so metrics were scraped and nothing was ever paged on. An
+operator following the runbooks found the alerts they name do not exist.
+
+Two things differ from the standalone file and both are Kubernetes facts rather
+than preferences.
+
+`up{job="oag"}` cannot work here. The Prometheus Operator generates the job
+label from the ServiceMonitor, so it is the Service's name and not "oag" — the
+rule would be permanently inert, which is the worst kind of alert because its
+silence reads as health. The selector below matches the same Service the
+ServiceMonitor does, through the chart's own labels.
+
+And the target label is `pod`, not `instance`. `instance` on Kubernetes is an
+IP and port that changes on every reschedule, so an alert grouped by it fires
+afresh for what is one continuing problem and its history is unfollowable. `pod`
+is the thing an operator can actually `kubectl logs`.
+*/ -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "oag.fullname" . }}
+  labels:
+    {{- include "oag.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}{{- toYaml . | nindent 4 }}{{- end }}
+spec:
+  groups:
+    - name: {{ include "oag.fullname" . }}-money
+      rules:
+        # A ledger row failed to write. The response was already delivered and
+        # the provider has already billed us, so this is spend that exists and
+        # is not recorded — the ledger is the only record there is.
+        - alert: OagUsageWriteFailing
+          expr: increase(oag_usage_write_failures_total{namespace="{{ .Release.Namespace }}"}[10m]) > 0
+          for: 0m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Spend is being served and not recorded ({{`{{ $labels.pod }}`}})"
+            description: >-
+              oag_usage_write_failures_total rose. Every failure is a request that
+              was answered and billed by a provider with no ledger row, so the
+              month's figures are already wrong and get wronger. Look at the
+              database before anything else: this counter only moves when a write
+              failed, never when routing did.
+
+    - name: {{ include "oag.fullname" . }}-availability
+      rules:
+        # Scraping stopped. Not "the gateway is down" — Prometheus cannot tell
+        # those apart — but it is the one condition that hides every other rule
+        # here, so it pages first.
+        - alert: OagDown
+          expr: up{namespace="{{ .Release.Namespace }}", service="{{ include "oag.fullname" . }}"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "A gateway replica is not being scraped ({{`{{ $labels.pod }}`}})"
+            description: >-
+              Either the pod is gone or /metrics on the admin port is not
+              answering. Every other alert in this file is silent while this one
+              is firing, so treat that silence as unknown rather than healthy.
+
+        # Shedding is working as designed and is still worth knowing about: the
+        # replica is refusing work it was sized to accept.
+        - alert: OagReplicaShedding
+          # `oag_requests_total{outcome="overloaded"}`, the same expression the
+          # standalone rules use. There is no `oag_requests_shed_total`; a rule
+          # naming a metric that does not exist is permanently inert, and its
+          # silence reads as health.
+          expr: sum by (pod) (rate(oag_requests_total{namespace="{{ .Release.Namespace }}", outcome="overloaded"}[5m])) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Requests are being shed ({{`{{ $labels.pod }}`}})"
+            description: >-
+              The in-flight ceiling is being reached. Raise `server.maxInFlight`
+              if the replica has memory to spare — it is sized against
+              `resources.limits.memory` and `server.maxBodyBytes`, so raise those
+              together — or add replicas. A 503 with Retry-After is the intended
+              behaviour here; sustained shedding is not.
+
+        # A panic reached the catch layer. It was answered as a 500 rather than
+        # severing the connection, which is what that layer is for — and it
+        # still names a bug.
+        - alert: OagPanics
+          expr: increase(oag_panics_total{namespace="{{ .Release.Namespace }}"}[1h]) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A handler panicked ({{`{{ $labels.pod }}`}})"
+            description: >-
+              Should be zero. The catch_panic layer turned it into a 500 instead
+              of a severed connection, so clients saw an error rather than a
+              reset — but a panic on the request path is a defect, not a
+              condition. The panic message is in the pod's logs.
+
+    - name: {{ include "oag.fullname" . }}-credentials
+      rules:
+        # Refreshes are failing, which is visible some minutes before seats
+        # start 401ing. That gap is the whole value of this alert.
+        - alert: OagTokenRefreshFailing
+          expr: increase(oag_token_refreshes_total{namespace="{{ .Release.Namespace }}", outcome="failed"}[15m]) > 2
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "OAuth refreshes are failing ({{`{{ $labels.pod }}`}})"
+            description: >-
+              A seat whose refresh keeps failing will start returning 401 when its
+              current token expires, and the breaker will then cool it down —
+              which presents as a provider outage. Check the credential before it
+              gets there.
+{{- end }}

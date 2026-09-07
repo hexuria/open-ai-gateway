@@ -14,7 +14,7 @@
 terraform {
   required_version = ">= 1.5"
   required_providers {
-    aws = { source = "hashicorp/aws", version = ">= 5.0" }
+    aws = { source = "hashicorp/aws", version = "~> 6.0" }
     # Pinned to v4: v5 turned `rules` from a block into an attribute, so the
     # ruleset resources in the edge module do not parse against it.
     cloudflare = { source = "cloudflare/cloudflare", version = "~> 4.0" }
@@ -57,6 +57,20 @@ resource "aws_vpc_security_group_egress_rule" "lb_to_tasks" {
   ip_protocol                  = "tcp"
 }
 
+# The admin port, for the target group's health check only.
+#
+# The ALB health-checks `/health/ready`, which is registered on 8081, and
+# without this rule every check times out and every target is unhealthy. It is
+# still only the load balancer's security group that can reach it — nothing
+# routes client traffic there, and the admin API keeps its own key.
+resource "aws_vpc_security_group_egress_rule" "lb_to_tasks_health" {
+  security_group_id            = aws_security_group.lb.id
+  referenced_security_group_id = aws_security_group.task.id
+  from_port                    = 8081
+  to_port                      = 8081
+  ip_protocol                  = "tcp"
+}
+
 resource "aws_security_group" "task" {
   name        = "${var.name}-task"
   description = "The ${var.name} tasks"
@@ -68,6 +82,15 @@ resource "aws_vpc_security_group_ingress_rule" "task_from_lb" {
   referenced_security_group_id = aws_security_group.lb.id
   from_port                    = 8080
   to_port                      = 8080
+  ip_protocol                  = "tcp"
+}
+
+# The other half of the health-check path. See `lb_to_tasks_health`.
+resource "aws_vpc_security_group_ingress_rule" "task_from_lb_health" {
+  security_group_id            = aws_security_group.task.id
+  referenced_security_group_id = aws_security_group.lb.id
+  from_port                    = 8081
+  to_port                      = 8081
   ip_protocol                  = "tcp"
 }
 
@@ -184,14 +207,46 @@ module "gateway" {
   execution_role_arn     = aws_iam_role.execution.arn
   task_role_arn          = aws_iam_role.task.arn
 
+  # `arn:::version_id`, not the bare ARN.
+  #
+  # ECS resolves a bare ARN to AWSCURRENT at task start, so rotating a secret
+  # left this task definition byte-identical: no new revision, no deployment,
+  # and every running task keeping the old value. `terraform apply
+  # -var credential_kek=<new>` reported one changed secret version and no ECS
+  # change at all.
+  #
+  # The failure arrives weeks later. An unrelated image bump finally rolls the
+  # tasks, the new ones cannot decrypt credentials sealed under the old KEK, and
+  # every upstream call fails — with nothing in the change log between then and
+  # now that touched credentials.
+  #
+  # The `:::` is the ARN's own separator syntax for "no label, this version id".
+  # The Cloud Run module pins by version number for exactly this reason and says
+  # so in `compute-cloudrun/main.tf`.
   secret_env = {
-    OAG_DATABASE__URL            = aws_secretsmanager_secret.this["database-url"].arn
-    OAG_REDIS__URL               = aws_secretsmanager_secret.this["redis-url"].arn
-    OAG_SECURITY__SIGNING_SECRET = aws_secretsmanager_secret.this["signing-secret"].arn
-    OAG_SECURITY__CREDENTIAL_KEK = aws_secretsmanager_secret.this["credential-kek"].arn
+    OAG_DATABASE__URL            = "${aws_secretsmanager_secret.this["database-url"].arn}:::${aws_secretsmanager_secret_version.this["database-url"].version_id}"
+    OAG_REDIS__URL               = "${aws_secretsmanager_secret.this["redis-url"].arn}:::${aws_secretsmanager_secret_version.this["redis-url"].version_id}"
+    OAG_SECURITY__SIGNING_SECRET = "${aws_secretsmanager_secret.this["signing-secret"].arn}:::${aws_secretsmanager_secret_version.this["signing-secret"].version_id}"
+    OAG_SECURITY__CREDENTIAL_KEK = "${aws_secretsmanager_secret.this["credential-kek"].arn}:::${aws_secretsmanager_secret_version.this["credential-kek"].version_id}"
   }
 
-  env = var.gateway_env
+  # The guarded number and the deployed number, merged into one.
+  #
+  # `stream_keepalive_interval_seconds` was passed to the Cloudflare module,
+  # which preconditions on it staying under Cloudflare's ~100s Proxy Read
+  # Timeout — and to nothing else. The gateway read its own
+  # `OAG_GATEWAY__STREAM_KEEPALIVE_INTERVAL` from `gateway_env` or from its
+  # default, so the two were independent: an operator who raised the real one
+  # got the 524s the guard promised to prevent, with the guard still green.
+  #
+  # Merged rather than appended, so an explicit `gateway_env` entry still wins —
+  # someone setting it by hand has said something more specific than the
+  # variable's default, and the precondition still sees the variable, which is
+  # the honest limit of what this can promise.
+  env = merge(
+    { OAG_GATEWAY__STREAM_KEEPALIVE_INTERVAL = tostring(var.stream_keepalive_interval_seconds) },
+    var.gateway_env,
+  )
 
   max_stream_duration_seconds = var.max_stream_duration_seconds
   desired_count               = var.desired_count
@@ -216,4 +271,9 @@ module "edge" {
   hostname                   = var.hostname
   origin                     = module.gateway.lb_dns_name
   keepalive_interval_seconds = var.stream_keepalive_interval_seconds
+
+  # Passed through, because the module's ruleset is gated on it being non-zero
+  # and no stack was passing it — so the rate limit could not be turned on from
+  # anywhere. A variable no caller can set is not a default, it is dead code.
+  rate_limit_requests_per_minute = var.cloudflare_rate_limit_requests_per_minute
 }

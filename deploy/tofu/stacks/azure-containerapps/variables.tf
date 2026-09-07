@@ -9,7 +9,17 @@ variable "location" {
 
 variable "image" {
   type        = string
-  description = "e.g. ghcr.io/hexuria/open-ai-gateway:0.1.0"
+  description = <<-EOT
+    The gateway image to run, including a tag.
+
+    `ghcr.io/hexuria/open-ai-gateway:main` is published on every push to the
+    default branch, and `:sha-<full sha>` on the same pushes — either is a real
+    tag today. A semver tag such as `:0.1.0` exists only once a `v0.1.0` git tag
+    has been pushed; the release workflow publishes semver on `v*` and nothing
+    else does, so naming one before it is cut lands on ImagePullBackOff.
+
+    Pin a sha for anything you intend to keep: `:main` moves under you.
+  EOT
 }
 
 variable "data_mode" {
@@ -125,5 +135,41 @@ variable "run_migrations" {
     skip the step during an incident. Rolling back does NOT require it: the
     migrator runs with ignore_missing(true), so an older binary migrates
     happily against a schema a newer release already applied.
+  EOT
+}
+
+variable "redis_private" {
+  type        = bool
+  default     = false
+  description = <<-EOT
+    Reach Azure Cache for Redis over a private endpoint instead of the internet.
+
+    `false` is the shape every existing deployment has, so an upgrade changes
+    nothing — and it means anyone holding the access key reads the auth cache
+    from anywhere. The session pins and cached identities in there describe who
+    is talking to what.
+
+    `true` turns public access off, creates a private endpoint in the
+    infrastructure subnet, and forces the Premium family, because Basic and
+    Standard have no VNet integration. That is a cost decision, which is why
+    this is a variable rather than simply the right answer.
+
+    Postgres is private either way.
+  EOT
+}
+
+variable "cloudflare_rate_limit_requests_per_minute" {
+  type        = number
+  default     = 0
+  description = <<-EOT
+    Per-IP requests per minute blocked at the Cloudflare edge, or 0 for no limit.
+
+    0 by default because the right ceiling depends on the traffic, and a limit
+    guessed here would cut off long-lived streams — which is why the module
+    calls its own limit "deliberately generous". Ahead of the gateway's own
+    per-key limits, this stops obvious abuse before it reaches the database.
+
+    Only takes effect when `cloudflare_zone_id` is set and the record is
+    proxied; an unproxied record never sees the traffic.
   EOT
 }
