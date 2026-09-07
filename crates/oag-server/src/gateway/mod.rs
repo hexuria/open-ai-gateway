@@ -423,9 +423,25 @@ async fn run_with_escalation(
                 // must not be quietly moved onto another provider's, however
                 // unavailable theirs is — that is the same rule that stops a
                 // quality gate doing it.
+                //
+                // And so does the budget, by `escalation_allowed`, which is the
+                // same call `should_climb` makes sixty lines below. This branch
+                // checked the escalation count alone, so a principal the router
+                // had just downgraded for being near their cap — reason
+                // `BudgetDowngraded`, which `climb_allowed` permits — was
+                // promoted to a rung fifteen times dearer the moment their
+                // cheap rung had no credential, and debited against the very
+                // budget the downgrade was protecting.
+                //
+                // The two paths ask the same question and gave opposite
+                // answers, which is the defect whichever answer is right. This
+                // is the documented one: the refusal is a 503 naming the rung
+                // that could not be dispatched to, which is a truthful answer an
+                // operator can act on, and `hard_stop_multiple` remains the
+                // wall rather than this.
                 if matches!(e.disposition(), oag_core::Disposition::EscalateTier)
                     && oag_router::climb_allowed(&decision.reason)
-                    && escalations < MAX_ESCALATIONS
+                    && oag_router::escalation_allowed(pressure, escalations, MAX_ESCALATIONS)
                     && let Some(from) = decision.tier.as_ref()
                     && let Some(next) = policy.escalate_past_provider(
                         from,
@@ -2298,6 +2314,32 @@ mod tests {
             path.contains("oag_router::climb_allowed(&decision.reason)"),
             "a caller who named a model must not be moved onto another \
              provider's, however unavailable theirs is"
+        );
+
+        // Both guards, and the same call the quality-gate path makes.
+        //
+        // This branch checked the escalation count alone, so a principal the
+        // router had just downgraded for being near their cap — whose reason
+        // `climb_allowed` permits — was promoted to a rung fifteen times
+        // dearer the moment their cheap rung had no credential, and debited
+        // against the budget the downgrade was protecting. Two paths asking one
+        // question and answering it differently is the defect; the assertion is
+        // that they now make the same call.
+        let guard = "oag_router::escalation_allowed(pressure, escalations, MAX_ESCALATIONS)";
+        assert!(
+            path.contains(guard),
+            "the selection-failure climb must ask the budget what the quality-gate \
+             climb asks it"
+        );
+        // The module's code, not its tests — this assertion's own string
+        // literal is a match otherwise, and a count that includes the thing
+        // doing the counting is not a count.
+        let code = src.split_once("\n#[cfg(test)]\n").map_or(src, |(code, _)| code);
+        assert_eq!(
+            code.matches(guard).count(),
+            2,
+            "once on each climb; a third call site means somewhere else is \
+             deciding this and is not covered here"
         );
     }
 
