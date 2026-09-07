@@ -3899,23 +3899,6 @@ mod tests {
         );
     }
 
-    /// S1. The usage panels read a window, not a key's whole history.
-    ///
-    /// Both queries state their windows inside `FILTER` clauses, which decide
-    /// what each aggregate counts and nothing about what the join reads. With
-    /// no bound in the `ON`, the join walked every row the key or principal had
-    /// ever written in order to report a rolling five hours — and `key_usage`
-    /// is the query a partner service calls before each model call, per member.
-    /// The ledger-partitioning design doc classifies both as range-bounded;
-    /// that premise was wrong, which is why this asserts the plan and not the
-    /// numbers. The numbers were always right. They just cost a scan.
-    ///
-    /// What is asserted is that the window bound reaches the *index condition*
-    /// rather than being applied after rows are read. That is the difference
-    /// between a range scan and a full walk, and it is a property of the query
-    /// rather than of how much data happens to be in the table — so the test
-    /// says nothing about which plan the planner prefers today, and turning
-    /// sequential scans off is how it asks the question it actually means.
     /// C4: the reason 0016 gives for dropping `account_schedulable_idx`.
     ///
     /// Its first draft said the seat poller was the only query filtering
@@ -4037,6 +4020,23 @@ mod tests {
     }
 
     #[tokio::test]
+    /// S1. The usage panels read a window, not a key's whole history.
+    ///
+    /// Both queries state their windows inside `FILTER` clauses, which decide
+    /// what each aggregate counts and nothing about what the join reads. With
+    /// no bound in the `ON`, the join walked every row the key or principal had
+    /// ever written in order to report a rolling five hours — and `key_usage`
+    /// is the query a partner service calls before each model call, per member.
+    /// The ledger-partitioning design doc classifies both as range-bounded;
+    /// that premise was wrong, which is why this asserts the plan and not the
+    /// numbers. The numbers were always right. They just cost a scan.
+    ///
+    /// What is asserted is that the window bound reaches the *index condition*
+    /// rather than being applied after rows are read. That is the difference
+    /// between a range scan and a full walk, and it is a property of the query
+    /// rather than of how much data happens to be in the table — so the test
+    /// says nothing about which plan the planner prefers today, and turning
+    /// sequential scans off is how it asks the question it actually means.
     async fn the_usage_panels_bound_the_ledger_side_of_their_joins() {
         let Some(db) = test_db() else {
             eprintln!("skipped: OAG_TEST_DATABASE_URL unset");

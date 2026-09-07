@@ -359,15 +359,23 @@ impl CanonicalRequest {
     /// and a level, or `None` when it asked for none.
     ///
     /// The two spellings are one request. A client that names a level is asking
-    /// for reasoning as plainly as one that names a number, and every dialect
-    /// that speaks either can be served from this pair — so the conversion
-    /// lives here rather than being re-derived, differently, in each renderer.
+    /// for reasoning as plainly as one that names a number, so the conversion
+    /// between them is written once here instead of in each renderer that needs
+    /// it.
     ///
     /// `Off` and a zero budget both answer `None`. Off is a request for *no*
     /// thinking, not a request for zero tokens of it, and the difference
     /// matters on the wire: Anthropic's floor is 1024, so a renderer that
     /// passed the zero through was refused. `signal()` above reads it the same
     /// way, and the two must not disagree about what "off" means.
+    ///
+    /// **Anthropic uses this. Gemini deliberately does not**, and an earlier
+    /// version of this comment claimed otherwise. For Gemini,
+    /// `thinkingBudget: 0` is the documented way to *disable* thinking, which
+    /// is exactly what `Off` asks for — so answering `None` there would drop
+    /// the instruction and leave the model on its own default. The two
+    /// renderers differ because the wire formats mean different things by zero,
+    /// not because one of them was overlooked.
     #[must_use]
     pub fn thinking_request(&self) -> Option<(u32, Effort)> {
         if let Some(budget) = self.thinking_budget.filter(|b| *b > 0) {

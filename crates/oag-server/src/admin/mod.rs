@@ -421,14 +421,6 @@ async fn seat_summaries(
 /// is "what ran, and did this gateway see it", and excluding a subscription's
 /// traffic would answer a different one. The `LEFT JOIN` is what lets a row keep
 /// its seat's name; rows attributed to nothing group together under a null,
-/// which is the honest rendering of an import nobody said the owner of.
-///
-/// Returns nothing while every row came from the gateway, so a deployment that
-/// has never imported sees no section it would have to learn to ignore. The test
-/// is on the origins and not on the row count, because grouping by credential
-/// splits even a purely proxied deployment into a line per seat — which is
-/// interesting only once there is something outside the gateway to compare it
-/// against.
 /// The statement [`origin_breakdown`] runs.
 ///
 /// A constant so its shape can be asserted without a database. Two things in it
@@ -469,6 +461,14 @@ const ORIGIN_BREAKDOWN_SQL: &str = r"
             ORDER BY u.origin, COALESCE(SUM(u.counterfactual_api_usd), 0) DESC, a.name
             ";
 
+/// which is the honest rendering of an import nobody said the owner of.
+///
+/// Returns nothing while every row came from the gateway, so a deployment that
+/// has never imported sees no section it would have to learn to ignore. The test
+/// is on the origins and not on the row count, because grouping by credential
+/// splits even a purely proxied deployment into a line per seat — which is
+/// interesting only once there is something outside the gateway to compare it
+/// against.
 async fn origin_breakdown(
     db: &oag_store::Db,
     window: &period::Resolved,

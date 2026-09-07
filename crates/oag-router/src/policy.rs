@@ -1324,13 +1324,6 @@ mod tests {
         ));
     }
 
-    /// R1. A rung nothing can be dispatched to is a reason to climb.
-    ///
-    /// `NoCredential`, `ReserveHeld` and `NoViableModel` all classify as
-    /// `EscalateTier`, and nothing read that: the selection error went straight
-    /// back to the caller as a 503 while a rung naming a different provider sat
-    /// there able to serve. This pins the classification the gateway now acts
-    /// on; `escalate` accepting the gate is what makes acting on it possible.
     /// R10. A hard-stop multiple below 1 would invert degrade-before-deny.
     ///
     /// The multiple exists to let spend run PAST the limit before refusing:
@@ -1376,6 +1369,13 @@ mod tests {
     }
 
     #[test]
+    /// R1. A rung nothing can be dispatched to is a reason to climb.
+    ///
+    /// `NoCredential`, `ReserveHeld` and `NoViableModel` all classify as
+    /// `EscalateTier`, and nothing read that: the selection error went straight
+    /// back to the caller as a 503 while a rung naming a different provider sat
+    /// there able to serve. This pins the classification the gateway now acts
+    /// on; `escalate` accepting the gate is what makes acting on it possible.
     fn a_rung_with_no_usable_credential_escalates_rather_than_failing() {
         use oag_core::{Disposition, Error, Provider};
 

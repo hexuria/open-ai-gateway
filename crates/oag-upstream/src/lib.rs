@@ -113,14 +113,6 @@ mod side_channel_tests {
     use super::side_channel_client;
     use std::time::Duration;
 
-    /// U12. A credential's proxy applies to every call made with it.
-    ///
-    /// `proxy_url` is set per credential and was applied only by `transport`,
-    /// so a deployment whose egress must go through a proxy had its refresh,
-    /// quota and price traffic leave by a different route — sometimes failing,
-    /// sometimes succeeding and quietly bypassing the control the proxy existed
-    /// to enforce. A credential's proxy is a property of the credential, not of
-    /// one kind of request made with it.
     /// C5: `builder_client` reports a failure instead of unwinding.
     ///
     /// It ended in `unwrap_or_default()` under a comment calling that an
@@ -144,6 +136,14 @@ mod side_channel_tests {
     }
 
     #[test]
+    /// U12. A credential's proxy applies to every call made with it.
+    ///
+    /// `proxy_url` is set per credential and was applied only by `transport`,
+    /// so a deployment whose egress must go through a proxy had its refresh,
+    /// quota and price traffic leave by a different route — sometimes failing,
+    /// sometimes succeeding and quietly bypassing the control the proxy existed
+    /// to enforce. A credential's proxy is a property of the credential, not of
+    /// one kind of request made with it.
     fn a_side_channel_client_accepts_a_proxy_and_refuses_a_broken_one() {
         side_channel_client(None, Duration::from_secs(20)).expect("no proxy is fine");
         side_channel_client(Some("http://127.0.0.1:3128"), Duration::from_secs(20))

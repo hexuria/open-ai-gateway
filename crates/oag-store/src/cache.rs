@@ -591,12 +591,6 @@ fn slot_key(account: AccountId) -> String {
 // did, a leaked slot stood in the count until the key's own EXPIRE at twice
 // the TTL, and nothing acquiring on a "full" credential ever ran the trim.
 
-/// Requests-per-minute expressed as a continuous refill rate and a bucket size.
-///
-/// Burst is the full minute's allowance: "60 requests per minute" plainly reads
-/// as permission to make 60 requests, and a caller who makes them in the first
-/// second has not broken the promise — they have simply spent it. What the
-/// bucket prevents is spending it twice inside one minute.
 /// The wait a rate-limit script asked for, or `None` for no wait.
 ///
 /// `try_from_secs_f64`, not `from_secs_f64`, which panics on a non-finite or
@@ -616,6 +610,12 @@ fn wait_from_redis(raw: &str) -> Option<Duration> {
         .flatten()
 }
 
+/// Requests-per-minute expressed as a continuous refill rate and a bucket size.
+///
+/// Burst is the full minute's allowance: "60 requests per minute" plainly reads
+/// as permission to make 60 requests, and a caller who makes them in the first
+/// second has not broken the promise — they have simply spent it. What the
+/// bucket prevents is spending it twice inside one minute.
 fn rate_and_burst(rpm: u32) -> (f64, f64) {
     let burst = f64::from(rpm.max(1));
     (burst / 60.0, burst)

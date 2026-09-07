@@ -272,12 +272,6 @@ async fn handle(
     .await
 }
 
-/// Whether this attempt may be retried one rung up.
-///
-/// Failover (same model, another credential) is a different path. Climbing
-/// changes the model. A named passthrough request must not walk onto the
-/// next ladder provider; hitting the caller's own `max_tokens` is not a
-/// weaker-model failure; budget pressure must not undo a downgrade.
 /// Whether the budget, and nothing else, is what stopped this climb.
 ///
 /// G4. `oag_escalations_suppressed_total` answers one question — how much
@@ -331,6 +325,12 @@ fn budget_alone_prevented_the_climb(
         .is_some()
 }
 
+/// Whether this attempt may be retried one rung up.
+///
+/// Failover (same model, another credential) is a different path. Climbing
+/// changes the model. A named passthrough request must not walk onto the
+/// next ladder provider; hitting the caller's own `max_tokens` is not a
+/// weaker-model failure; budget pressure must not undo a downgrade.
 fn should_climb(
     reason: &oag_router::SelectionReason,
     gate: oag_router::QualityGate,
@@ -2233,14 +2233,6 @@ mod tests {
         );
     }
 
-    /// R1, the wiring. The selection error path consults `disposition`.
-    ///
-    /// Reads this file's own source, because reaching that branch needs a
-    /// gateway with a real route, a real ladder, and a credential pool that is
-    /// empty in the specific way the finding is about — a fixture larger and
-    /// less reliable than the thing it would prove. `oag-router` pins the
-    /// classification and the escalation this depends on; what is left is that
-    /// anything asks, and this is that.
     /// G3's wiring: the streamed path hands the ledger the gate that caused
     /// the climb.
     ///
@@ -2273,6 +2265,14 @@ mod tests {
     }
 
     #[test]
+    /// R1, the wiring. The selection error path consults `disposition`.
+    ///
+    /// Reads this file's own source, because reaching that branch needs a
+    /// gateway with a real route, a real ladder, and a credential pool that is
+    /// empty in the specific way the finding is about — a fixture larger and
+    /// less reliable than the thing it would prove. `oag-router` pins the
+    /// classification and the escalation this depends on; what is left is that
+    /// anything asks, and this is that.
     fn the_selection_error_path_asks_the_disposition() {
         let src = include_str!("mod.rs");
         let body = src
