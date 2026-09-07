@@ -624,25 +624,24 @@ impl Config {
                     .to_owned(),
             ));
         }
+        // `usage_poll_interval: 0` is NOT refused here, deliberately.
+        //
         // Zero disables the usage poller, and the poller is what keeps
         // `usage_remaining_pct` current — the number every seat's reserve is
-        // evaluated against. With it stale at whatever the last poll saw, or
-        // never set at all on a fresh replica, `usage_reserve_pct` holds nothing
-        // back and a seat runs to the provider's own refusal. So "disabled"
-        // here silently disables a different feature the operator did not
-        // mention, which is why it is refused rather than assumed.
+        // evaluated against. With it stale, or never set at all on a fresh
+        // replica, `usage_reserve_pct` holds nothing back and a seat runs to
+        // the provider's own refusal. So zero quietly disables a second feature
+        // the operator did not mention, and that is worth saying out loud.
         //
-        // Refused unconditionally, and the refusal cannot be narrowed to
-        // deployments that use reserves: `usage_reserve_pct` lives in the
-        // database, and this runs before anything has read a row.
-        if self.gateway.usage_poll_interval.is_zero() {
-            return Err(crate::Error::Config(
-                "gateway.usage_poll_interval of 0 disables the usage poller, and with it \
-                 every seat's reserve — usage_reserve_pct is evaluated against a figure \
-                 only the poller refreshes. Set a positive interval."
-                    .to_owned(),
-            ));
-        }
+        // Saying it is not the same as refusing it. This was briefly a hard
+        // error, which turned a comment correction into a breaking change: a
+        // deployment that had deliberately set zero — one with no subscription
+        // seats, where there is no reserve to protect — could no longer start.
+        // The consequence is real and the choice is still the operator's.
+        //
+        // The warning lives in `oag::settings::load`, not here: this crate does
+        // no I/O and has no logger, and `validate` is a predicate rather than a
+        // reporter. `settings::load` is the one path a running gateway takes.
         // Zero here means "try exactly one credential", which is not what zero
         // means anywhere else in this section: for every neighbouring duration
         // it means "no deadline". So an operator disabling a budget got silent
@@ -1152,14 +1151,14 @@ security:
     /// refusal. "Disabled" silently disabled a different feature the operator
     /// had not mentioned.
     #[test]
-    fn a_usage_poll_interval_of_zero_is_refused_because_reserves_depend_on_it() {
+    fn a_usage_poll_interval_of_zero_is_accepted_rather_than_refused() {
+        // It was refused for one commit, which made a comment correction into a
+        // breaking change: a deployment with no subscription seats — nothing to
+        // hold back, so nothing the poller protects — could no longer start.
+        // The consequence is named in a warning at startup instead.
         let zero = format!("{MINIMAL}\ngateway:\n  usage_poll_interval: 0\n");
-        let err = Config::from_yaml(&zero).expect_err("refused");
-        assert!(err.to_string().contains("usage_poll_interval"), "{err}");
-        assert!(
-            err.to_string().contains("reserve"),
-            "the message has to name what else stops working: {err}"
-        );
+        let cfg = Config::from_yaml(&zero).expect("zero is the operator's to choose");
+        assert!(cfg.gateway.usage_poll_interval.is_zero());
 
         let set = format!("{MINIMAL}\ngateway:\n  usage_poll_interval: 60\n");
         Config::from_yaml(&set).expect("an interval is an interval");

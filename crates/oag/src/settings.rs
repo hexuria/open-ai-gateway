@@ -32,6 +32,24 @@ pub fn load(path: Option<&str>) -> Result<Config> {
     let cfg: Config = serde_yaml_ng::from_value(doc)
         .map_err(|e| Error::Config(format!("building config: {e}")))?;
     cfg.validate()?;
+
+    // Said once, at the only point a running gateway loads its configuration.
+    //
+    // Zero is a legitimate choice — a deployment with no subscription seats has
+    // no reserve for the poller to protect — but it also silently disables
+    // every seat's `usage_reserve_pct`, which is a different feature from the
+    // one the operator turned off. Refusing it was tried and was wrong: it
+    // stopped deployments that had chosen zero on purpose. Naming the
+    // consequence is the part that was actually missing.
+    if cfg.gateway.usage_poll_interval.is_zero() {
+        tracing::warn!(
+            "gateway.usage_poll_interval is 0, so the usage poller will not run — and \
+             with it every seat's usage_reserve_pct stops being enforced, because the \
+             figure it is evaluated against is only refreshed by that poller. Set a \
+             positive interval if any credential relies on a reserve."
+        );
+    }
+
     Ok(cfg)
 }
 
