@@ -532,25 +532,13 @@ fn tier_row(
         saved_usd: format!("{:.4}", cf - spent),
     }
 }
-
-pub async fn summary(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<period::Window>,
-) -> Response {
-    let window = match period::resolve(&query, time::OffsetDateTime::now_utc()) {
-        Ok(w) => w,
-        // A window nobody can name is not a window to guess at: an operator who
-        // typed `period=quarter` and silently got a rolling 30 days would trust
-        // the answer to a question they did not ask.
-        Err(message) => return invalid(&message),
-    };
-
-    // The headline is per-token traffic only. A seat row (cost 0, real
-    // API-equivalent price) is flat-rate, so folding it in here would let its
-    // zero marginal cost inflate the frontier saving — the subscription's worth
-    // is a separate question, answered per seat below.
-    let totals: Result<SummaryTotals, _> = sqlx::query_as(
-        r"
+/// The statement the headline runs.
+///
+/// A constant for the same reason `SEAT_SUMMARIES_SQL` and
+/// `ORIGIN_BREAKDOWN_SQL` are: what it excludes is invisible in the output — a
+/// wrong number looks exactly like a right one — so a test has to be able to
+/// run the statement itself rather than a retyped copy of its predicates.
+const SUMMARY_TOTALS_SQL: &str = r"
             -- The count filters out abandoned and lost attempts and the sums
             -- do not. Since 0014 contracted the ledger key onto
             -- `(request_id, attempt)`, one request can leave several rows —
@@ -572,13 +560,50 @@ pub async fn summary(
             FROM usage_event
             WHERE ($1::timestamptz IS NULL OR occurred_at >= $1)
               AND ($2::timestamptz IS NULL OR occurred_at <  $2)
-              AND NOT (cost_usd = 0 AND counterfactual_api_usd > 0)
-            ",
-    )
-    .bind(window.start)
-    .bind(window.end)
-    .fetch_one(state.db.pool())
-    .await;
+              -- The seat-row predicate, and the reason it needs its second
+              -- clause. `cost_usd = 0 AND counterfactual_api_usd > 0` was the
+              -- whole of it, and it worked because a seat row's displaced API
+              -- bill was always positive. Zeroing `counterfactual_api_usd` on
+              -- unserved rows took that away: an abandoned or lost attempt on a
+              -- flat-rate seat is now 0 and 0, so it passes a test written to
+              -- catch seats and lands in this per-token headline. Its count is
+              -- filtered and its money is zero, so the visible effect is the
+              -- token sums below — a seat's tokens in the denominator of a
+              -- cache-hit rate that is supposed to describe metered traffic.
+              --
+              -- An unserved row on a METERED credential is not caught: its
+              -- `cost_usd` is what those tokens cost and stays positive, which
+              -- is the distinction this whole column exists to make.
+              AND NOT (
+                  cost_usd = 0
+                  AND (
+                      counterfactual_api_usd > 0
+                      OR selection_reason IN ('abandoned', 'lost')
+                  )
+              )
+            ";
+
+pub async fn summary(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<period::Window>,
+) -> Response {
+    let window = match period::resolve(&query, time::OffsetDateTime::now_utc()) {
+        Ok(w) => w,
+        // A window nobody can name is not a window to guess at: an operator who
+        // typed `period=quarter` and silently got a rolling 30 days would trust
+        // the answer to a question they did not ask.
+        Err(message) => return invalid(&message),
+    };
+
+    // The headline is per-token traffic only. A seat row (cost 0, real
+    // API-equivalent price) is flat-rate, so folding it in here would let its
+    // zero marginal cost inflate the frontier saving — the subscription's worth
+    // is a separate question, answered per seat below.
+    let totals: Result<SummaryTotals, _> = sqlx::query_as(SUMMARY_TOTALS_SQL)
+        .bind(window.start)
+        .bind(window.end)
+        .fetch_one(state.db.pool())
+        .await;
 
     let (requests, spent, counterfactual, cached, prompt) = match totals {
         Ok(t) => t,
@@ -1019,7 +1044,10 @@ pub async fn usage(State(state): State<Arc<AppState>>, Query(page): Query<Page>)
 
 #[cfg(test)]
 mod tests {
-    use super::{ORIGIN_BREAKDOWN_SQL, OriginTuple, SEAT_SUMMARIES_SQL, SeatTuple, Summary};
+    use super::{
+        ORIGIN_BREAKDOWN_SQL, OriginTuple, SEAT_SUMMARIES_SQL, SUMMARY_TOTALS_SQL, SeatTuple,
+        Summary, SummaryTotals,
+    };
 
     /// A3, end to end: a section whose query fails names itself.
     ///
@@ -1062,6 +1090,93 @@ mod tests {
         let origins = super::origin_breakdown(&db, &window, &mut degraded).await;
         assert!(origins.is_empty());
         assert_eq!(degraded, vec!["subscriptions", "origins"]);
+    }
+
+    /// B7's other edge: an unserved seat row still reads as a seat row.
+    ///
+    /// The headline is per-token traffic only, and it recognises a flat-rate row
+    /// by `cost_usd = 0 AND counterfactual_api_usd > 0` — a proxy that held
+    /// because a seat's displaced API bill was always positive. Zeroing
+    /// `counterfactual_api_usd` on unserved rows took that away: an abandoned or
+    /// lost attempt on a seat is now 0 and 0, and passes a test written to
+    /// exclude seats.
+    ///
+    /// Money and counts survive it — both are zero or filtered — so what showed
+    /// was the token sums, which are neither: a seat's tokens in the denominator
+    /// of a cache-hit rate describing metered traffic. The statement is run
+    /// directly, because that rate is computed in Rust from these two sums and
+    /// asserting on the percentage would test the division.
+    #[tokio::test]
+    async fn an_unserved_seat_row_stays_out_of_the_per_token_headline() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = oag_store::Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let window = super::period::resolve(
+            &super::period::Window::default(),
+            time::OffsetDateTime::now_utc(),
+        )
+        .expect("window");
+
+        // One repeatable-read transaction, rolled back: this aggregates the
+        // whole window with nothing to key on.
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await
+            .expect("a stable snapshot");
+        let before: SummaryTotals = sqlx::query_as(SUMMARY_TOTALS_SQL)
+            .bind(window.start)
+            .bind(window.end)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("headline");
+
+        // Three rows for one request on a flat-rate seat: two attempts nobody
+        // was served, and the answer that was. Only the served one is a seat
+        // row the headline should recognise, and none of the three is
+        // per-token traffic.
+        let request_id = uuid::Uuid::new_v4();
+        for (attempt, reason, api) in [
+            (0i16, "abandoned", "0"),
+            (1, "lost", "0"),
+            (2, "classified", "40.00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO usage_event (request_id, attempt, model_id, tier, \
+                 selection_reason, input_tokens, output_tokens, cache_read_tokens, \
+                 cost_usd, counterfactual_usd, counterfactual_api_usd, status) \
+                 VALUES ($1, $2, 'anthropic/claude-opus-5', 'frontier', $3, \
+                         1000, 20, 500, 0, 0, $4::numeric, 200)",
+            )
+            .bind(request_id)
+            .bind(attempt)
+            .bind(reason)
+            .bind(api)
+            .execute(&mut *tx)
+            .await
+            .expect("seed");
+        }
+
+        let after: SummaryTotals = sqlx::query_as(SUMMARY_TOTALS_SQL)
+            .bind(window.start)
+            .bind(window.end)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("headline");
+        tx.rollback().await.expect("rollback");
+
+        assert_eq!(
+            (after.3 - before.3, after.4 - before.4),
+            (0, 0),
+            "no flat-rate row belongs in a per-token headline, served or not — \
+             and the two unserved ones are the pair that used to slip through, \
+             carrying 1000 cache-read tokens into a cache-hit denominator that \
+             is supposed to describe metered traffic"
+        );
+        assert_eq!(after.0 - before.0, 0, "and none of them is a request here");
     }
 
     /// The `64fc95b` filter, on the admin surface: attempts are not requests.
