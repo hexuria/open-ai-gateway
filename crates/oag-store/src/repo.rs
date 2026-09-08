@@ -18,6 +18,22 @@ use uuid::Uuid;
 /// What every key this gateway has ever issued looks like: the prefix, then
 /// 32 bytes of entropy as lowercase hex. See `mint_key`.
 pub const KEY_PREFIX: &str = "oag_live_";
+/// The stored, loggable prefix of an issued key: `KEY_PREFIX` plus seven hex.
+///
+/// Sixteen characters, the same slice `mint_key` records in `api_key.key_prefix`,
+/// so a prefix in a log lines up with a prefix in the database and an operator
+/// can join the two without ever handling a value.
+///
+/// **Only ever call this on a string that has passed [`is_issued_key_shape`].**
+/// The point of the prefix is that it identifies one of *our* keys; the first
+/// sixteen characters of an arbitrary bearer token are the first sixteen
+/// characters of somebody else's secret, and a caller who pastes an Anthropic
+/// key into the wrong client must not have a third of it written to a log.
+#[must_use]
+pub fn loggable_key_prefix(raw: &str) -> String {
+    raw.chars().take(16).collect()
+}
+
 /// `KEY_PREFIX` plus 64 hex digits.
 pub const KEY_LEN: usize = 9 + 64;
 
@@ -590,7 +606,7 @@ pub async fn mint_key(
         })
     );
     let hash = hash_key(&key);
-    let prefix: String = key.chars().take(16).collect();
+    let prefix = loggable_key_prefix(&key);
 
     // Never `admin`: a key minted over HTTP must not be able to mint more keys.
     // Admin authority is the CLI's to grant (`oag admin key create --admin`).
@@ -1883,6 +1899,28 @@ mod tests {
         )));
         assert!(!is_issued_key_shape("oag_live_definitely_not_a_real_key"));
         assert!(!is_issued_key_shape(""));
+    }
+
+    #[test]
+    fn a_loggable_prefix_stops_before_the_entropy() {
+        // The whole safety of writing this to a log is where it stops. A key
+        // is `oag_live_` plus 64 hex; the prefix is the marker plus seven of
+        // those characters — 28 bits of the 256, enough to name one key among
+        // an operator's few and useless to anyone who wants to present one.
+        // Widening it later would be silent, so the count is pinned here and
+        // not left to a `take(n)` nobody reads twice.
+        let minted = format!("{KEY_PREFIX}{}", "0123456789abcdef".repeat(4));
+        let prefix = loggable_key_prefix(&minted);
+
+        assert_eq!(prefix, "oag_live_0123456");
+        assert_eq!(prefix.len(), 16);
+        assert_eq!(&prefix[..KEY_PREFIX.len()], KEY_PREFIX);
+        assert_eq!(prefix.len() - KEY_PREFIX.len(), 7, "seven hex, no more");
+        assert!(minted.starts_with(&prefix));
+        assert!(
+            prefix.len() < minted.len(),
+            "a prefix that is the whole key is the key"
+        );
     }
 
     #[test]
