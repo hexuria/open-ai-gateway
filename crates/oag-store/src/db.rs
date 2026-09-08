@@ -18,7 +18,15 @@ pub struct Db {
 /// An arbitrary but fixed 64-bit constant. Postgres advisory locks are keyed by
 /// value, so every replica must use the same one; changing it would let two
 /// versions of the binary migrate simultaneously.
-const MIGRATION_LOCK_ID: i64 = 0x0A6_1247_0001;
+/// The advisory lock [`Db::migrate`] holds while it applies migrations.
+///
+/// Public because migrating is not the only thing that touches
+/// `_sqlx_migrations`: a test that deliberately corrupts that table — to prove
+/// a gap or a `success = false` row is caught — opens a window in which the
+/// table does not describe the schema, and a concurrent `migrate()` walking
+/// into that window re-applies a migration and collides on the primary key.
+/// Anything mutating that table must hold this for the width of its window.
+pub const MIGRATION_LOCK_ID: i64 = 0x0A6_1247_0001;
 
 /// How long one statement may run before Postgres cancels it, when the caller
 /// does not say. Generous for a request-path query, which is a primary-key
