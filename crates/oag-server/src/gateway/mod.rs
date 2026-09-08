@@ -1255,6 +1255,13 @@ fn json_response(
 
 /// Routing identity on the way out. `x-oag-tier` is omitted when the model
 /// sat on no rung — a named off-ladder pin is not `cheap`.
+/// This build, as `<version>+<commit>` — the value of `x-oag-build`.
+///
+/// Built once rather than per response: it cannot change while the process
+/// lives, and this sits on every inference reply.
+static BUILD_ID: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("OAG_BUILD_SHA")));
+
 fn oag_headers(
     builder: axum::http::response::Builder,
     decision: &RoutingDecision,
@@ -1262,7 +1269,18 @@ fn oag_headers(
 ) -> axum::http::response::Builder {
     let builder = builder
         .header("x-oag-model", decision.model.id.as_str())
-        .header("x-oag-request-id", request_id.to_string());
+        .header("x-oag-request-id", request_id.to_string())
+        // Which build answered, on the response the caller is already reading.
+        //
+        // `/health/ready` carries the same identity but lives on the **admin**
+        // listener, and a consumer holds an inference key by definition — so
+        // the one party that most needs to know which build produced a payload
+        // could not ask. Answering it here rather than opening `/health/ready`
+        // on the public listener keeps it behind authentication: nothing new
+        // is readable without a key, and the answer arrives on the very
+        // request whose shape is in question rather than on a second probe
+        // that could hit a different replica.
+        .header("x-oag-build", BUILD_ID.as_str());
     match decision.rung_name() {
         Some(tier) => builder.header("x-oag-tier", tier),
         None => builder,

@@ -106,7 +106,26 @@ case "$OAG_MODEL" in
   */*) : ;;
   *) fail "x-oag-model is '$OAG_MODEL', which is not a provider-qualified id" ;;
 esac
+# Which build answered, on the response the caller already has. `/health/ready`
+# carries the same identity but lives on the admin listener, and a consumer
+# holds an inference key by definition — so without this header the one party
+# that most needs to know which build produced a payload cannot ask. Three
+# incidents in a week came from someone inferring a build from a process start
+# time or a merge state; this is the fact that ends that guessing.
+OAG_BUILD="$(sed -n 's/^[Xx]-[Oo][Aa][Gg]-[Bb]uild: *//p' "$WORK/stream.headers" | tr -d '\r')"
+[ -n "$OAG_BUILD" ] \
+  || fail "no x-oag-build on the response; a consumer cannot tell which build
+  answered, and /health/ready is admin-only so it cannot ask there either"
+case "$OAG_BUILD" in
+  # `<version>+<commit>`. An empty half is worse than "unknown": it reads as a
+  # present answer while carrying none.
+  *+) fail "x-oag-build is '$OAG_BUILD' — a version with no commit" ;;
+  +*) fail "x-oag-build is '$OAG_BUILD' — a commit with no version" ;;
+  *+*) : ;;
+  *) fail "x-oag-build is '$OAG_BUILD', not <version>+<commit>" ;;
+esac
 pass "x-oag-model $OAG_MODEL, x-oag-tier ${OAG_TIER:-<off-ladder>}, x-oag-request-id present"
+pass "x-oag-build $OAG_BUILD"
 
 # A stream that hangs until the 180s idle watchdog looks identical to a healthy
 # one if you only check the events.
