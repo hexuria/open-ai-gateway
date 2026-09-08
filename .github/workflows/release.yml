@@ -47,6 +47,12 @@ jobs:
         with:
           context: .
           file: deploy/Dockerfile
+          # `.git` is not in the build context, so build.rs cannot read the sha
+          # itself; without this every published image reports "unknown" and
+          # the readiness stamp is useless on exactly the deployments that need
+          # it most.
+          build-args: |
+            OAG_BUILD_SHA=${{ github.sha }}
           platforms: linux/${{ matrix.arch }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}

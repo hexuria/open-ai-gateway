@@ -20,6 +20,13 @@ COPY migrations ./migrations
 # The dashboard is embedded with include_str!, so it is a build-time input for
 # the same reason the migrations are.
 COPY web ./web
+# The commit this image was built from, surfaced on /health/ready so a running
+# replica can say what it is. Nothing above copies `.git` — deliberately, it is
+# large and changes every commit — so `build.rs` cannot read it here and the
+# value has to be passed in. Unset builds stamp "unknown", which is honest;
+# release.yml passes the real sha.
+ARG OAG_BUILD_SHA
+ENV OAG_BUILD_SHA=${OAG_BUILD_SHA}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --bin oag && \
