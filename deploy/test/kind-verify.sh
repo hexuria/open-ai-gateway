@@ -315,14 +315,31 @@ pass "every stream survived a full rolling restart"
 # Rows this run wrote, not rows the table holds. And served rows only: a severed
 # stream writes a `lost` row, so counting those would let the exact failure this
 # check exists to catch supply its own evidence.
-requests="$($KC exec "$PG" -- psql -U oag -d oag -At -c \
-  "SELECT count(*) FROM usage_event WHERE occurred_at > '$SINCE' \
-     AND selection_reason NOT IN ('abandoned', 'lost')" 2>/dev/null | tr -d '[:space:]')"
-requests="${requests:-0}"
+#
+# Polled, not read once. `message_stop` reaches the client from `sse::pump`,
+# and `meter::record` runs *after* pump returns — so the instant curl exits
+# there is a window in which the row legitimately does not exist yet. Reading
+# once inside that window failed a run at 3 of 8 with nothing wrong: the writes
+# were in flight, and a re-run of the identical commit passed.
+#
+# This cannot mask the failure it exists to catch. A metering task killed with
+# its pod never writes at all, so its row does not arrive late — it never
+# arrives, and this still fails, just after the wait instead of instantly.
+LEDGER_WAIT=60
+requests=0
+for _ in $(seq 1 "$LEDGER_WAIT"); do
+  requests="$($KC exec "$PG" -- psql -U oag -d oag -At -c \
+    "SELECT count(*) FROM usage_event WHERE occurred_at > '$SINCE' \
+       AND selection_reason NOT IN ('abandoned', 'lost')" 2>/dev/null | tr -d '[:space:]')"
+  requests="${requests:-0}"
+  [ "$requests" -ge "$STREAMS" ] && break
+  sleep 1
+done
 echo "  ledger rows written by this run: $requests (expected >= $STREAMS)"
 [ "$requests" -ge "$STREAMS" ] \
-  || fail "only $requests of $STREAMS completed streams reached the ledger — metering
-  was cut off with the pod, so spend on a drained stream is invisible"
+  || fail "only $requests of $STREAMS completed streams reached the ledger after
+  ${LEDGER_WAIT}s — metering was cut off with the pod, so spend on a drained
+  stream is invisible"
 pass "every completed stream was metered"
 
 OK=1
