@@ -19,10 +19,22 @@ services:
     # /var/lib/postgresql and places the cluster in a version subdirectory.
     # Mounting /var/lib/postgresql/data (correct for 17 and earlier) makes the
     # container refuse to start.
-    tmpfs: ["/var/lib/postgresql"]
+    # A named volume, not tmpfs. Docker Desktop's engine restarting on
+    # 2026-09-07 remounted this empty and took the schema, every credential and
+    # both API keys with it — with nobody running `dev-reset`, because tmpfs is
+    # memory-backed and dies with the container on any recreate.
+    #
+    # `dev-reset` is `down -v`, which removes named volumes, so the deliberate
+    # wipe still works exactly as before. What changes is that the wipe stops
+    # being incidental. `stack.yml` has always done it this way.
+    volumes: ["pgdata:/var/lib/postgresql"]
 
   redis:
     image: redis:8-alpine
+    # Deliberately not persisted, unlike postgres above. Everything here is
+    # derived or advisory — the L2 auth cache refills from Postgres, sticky
+    # pins are affinity hints, concurrency slots carry their own TTLs — so a
+    # cold start costs a cold cache and nothing else.
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     ports: ["127.0.0.1:6399:6379"]
     healthcheck:
@@ -30,3 +42,6 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+
+volumes:
+  pgdata:

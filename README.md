@@ -124,6 +124,7 @@ Ordered by what you are likely to need, not by number.
 |---|---|
 | [08-clients.md](docs/08-clients.md) | **Start here.** How do I point Claude Code, an OpenAI SDK, or curl at this — and why did I get a model I did not ask for? |
 | [07-running-locally.md](docs/07-running-locally.md) | How do I run it on my own machine, and which key goes where? |
+| [09-keeping-it-running.md](docs/09-keeping-it-running.md) | It works — now what breaks? **Why a credential can be invisible**, what a "no credential" error is really telling you, and what survives a container restart |
 | [00-architecture.md](docs/00-architecture.md) | What happens to a request, end to end, and why the workspace splits the way it does |
 | [02-cost-routing.md](docs/02-cost-routing.md) | How does the gateway decide which model serves a request, and what stops it escalating your budget away? |
 | [03-providers.md](docs/03-providers.md) | **Which provider takes a key, a subscription, or both** — and what it costs to add another |
