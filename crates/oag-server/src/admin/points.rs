@@ -150,9 +150,14 @@ fn window_of(raw: Option<&str>) -> std::result::Result<UsageWindow, String> {
         .ok_or_else(|| format!("'{raw}' is not a window; one of 5h, 24h, 7d, month"))
 }
 
-/// `GET /admin/api/keys/{id}/usage/models?window=5h|24h|7d|month` → one row per model the key
-/// used inside the window: requests, tokens by class, cost, list price, points. A key that
-/// exists and used nothing is `[]`; an unknown id is 404.
+/// `GET /admin/api/keys/{id}/usage/models?window=5h|24h|7d|month` → one row per
+/// `(model, ladder rung)` the key used inside the window: attempts, requests, tokens by
+/// class, cost, list price, points. A key that exists and used nothing is `[]`; an unknown
+/// id is 404.
+///
+/// **One row per model *and rung*, not per model.** A model reached both through a rung and
+/// by a direct pin is two rows, because a rung is a property of the request; `tier` is null
+/// on the pinned one. A consumer keying a map by `model_id` alone will collide.
 pub async fn key_usage_models(
     State(state): State<Arc<AppState>>,
     Path(id): Path<uuid::Uuid>,
@@ -179,6 +184,8 @@ pub async fn key_usage_models(
                 .map(|row| {
                     json!({
                         "model_id": row.model_id,
+                        "tier": row.tier,
+                        "attempts": row.attempts,
                         "requests": row.requests,
                         "input_tokens": row.input_tokens,
                         "output_tokens": row.output_tokens,

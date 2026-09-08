@@ -900,6 +900,22 @@ fn first_of_next_month(now: OffsetDateTime) -> OffsetDateTime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelUsage {
     pub model_id: String,
+    /// The ladder rung this row's requests were routed through, or `None` when
+    /// the caller pinned the model directly and no rung was involved.
+    ///
+    /// A rung is a property of a *request*, not of a model: the same model
+    /// reached as `cheap` and hard-pinned by name are the same `model_id` and
+    /// genuinely different things. So this is part of the grouping key, and a
+    /// model used both ways is two rows rather than one row that averages them.
+    pub tier: Option<String>,
+    /// Every attempt, served or not — always `>= requests`.
+    ///
+    /// `requests` excludes `abandoned` and `lost`, so the difference is what
+    /// was tried and not served. It cannot be recovered from the money: over a
+    /// window with failures `list_usd` can sit *below* `cost_usd`, because the
+    /// gateway paid for tokens that displaced no API bill. Two questions, two
+    /// fields.
+    pub attempts: i64,
     pub requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -915,6 +931,11 @@ pub struct ModelUsage {
 #[derive(sqlx::FromRow)]
 struct ModelUsageRow {
     model_id: String,
+    /// `NOT NULL` in the schema: a direct pin stores the empty string, which
+    /// [`key_usage_by_model`] maps to `None` rather than passing on a rung
+    /// whose name is "".
+    tier: String,
+    attempts: i64,
     requests: i64,
     input_tokens: i64,
     output_tokens: i64,
@@ -946,6 +967,8 @@ pub async fn key_usage_by_model(
     sqlx::query_as::<_, ModelUsageRow>(
         r"
         SELECT model_id,
+               tier,
+               COUNT(*) AS attempts,
                COUNT(*) FILTER (
                    WHERE selection_reason NOT IN ('abandoned', 'lost')
                ) AS requests,
@@ -966,8 +989,8 @@ pub async fn key_usage_by_model(
                END AS points
         FROM usage_event
         WHERE api_key_id = $1 AND occurred_at >= $2
-        GROUP BY model_id
-        ORDER BY list_usd DESC, model_id
+        GROUP BY model_id, tier
+        ORDER BY list_usd DESC, model_id, tier
         ",
     )
     .bind(id)
@@ -979,6 +1002,10 @@ pub async fn key_usage_by_model(
         rows.into_iter()
             .map(|row| ModelUsage {
                 model_id: row.model_id,
+                // The empty string is how "no rung" is spelled in a NOT NULL
+                // column; JSON has a null for exactly this and should use it.
+                tier: (!row.tier.is_empty()).then_some(row.tier),
+                attempts: row.attempts,
                 requests: row.requests,
                 input_tokens: row.input_tokens,
                 output_tokens: row.output_tokens,
@@ -2786,6 +2813,128 @@ mod tests {
     fn test_db() -> Option<Db> {
         let url = std::env::var("OAG_TEST_DATABASE_URL").ok()?;
         Some(Db::connect(&url, 2).expect("connect"))
+    }
+
+    /// A rung is a property of a request, so one model used two ways is two
+    /// rows — and every attempt is counted beside the served ones.
+    ///
+    /// Three things at once because they share a fixture and each would be
+    /// vacuous without the others: grouping by `(model_id, tier)` means nothing
+    /// unless a model actually spans two rungs, `attempts` means nothing unless
+    /// something went unserved, and the `'' -> None` mapping means nothing
+    /// unless a row was pinned directly.
+    #[tokio::test]
+    async fn one_model_reached_two_ways_is_two_rows_and_counts_what_it_did_not_serve() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+        // Unique per run: `capped_key` hashes the name into `key_hash`, which is
+        // unique, and `oag_g0` keeps every row a previous run left behind. A
+        // fixed name here passes once and collides on the second run.
+        let key = capped_key(
+            &db,
+            principal,
+            route,
+            format!("tier-split-{}", Uuid::new_v4()),
+        )
+        .await;
+
+        let write = |tier: &str, reason: &str, api: &str| UsageWrite {
+            request_id: Uuid::new_v4(),
+            attempt: 0,
+            principal_id: Some(principal),
+            api_key_id: Some(key),
+            route_id: Some(route),
+            account_id: Some(account.as_uuid()),
+            model_id: "kimi-k2".to_owned(),
+            tier: tier.to_owned(),
+            selection_reason: reason.to_owned(),
+            escalated_from_tier: None,
+            escalation_gate: None,
+            usage: oag_router::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            cost_usd: dec!(0.10),
+            counterfactual_usd: Decimal::ZERO,
+            counterfactual_model_id: None,
+            counterfactual_api_usd: api.parse().expect("decimal"),
+            status: 200,
+            latency_ms: Some(10),
+            ttft_ms: None,
+            streamed: false,
+        };
+
+        // Two served through the `cheap` rung, one abandoned on the same rung,
+        // and two the caller pinned by name. An abandoned attempt records a
+        // real `cost_usd` and a zero `counterfactual_api_usd` — the gateway
+        // paid, the member is charged no points — which is exactly why the
+        // count cannot be recovered from the money.
+        for api in ["2.00", "1.00"] {
+            record_usage(&db, &write("cheap", "default", api))
+                .await
+                .expect("record");
+        }
+        record_usage(&db, &write("cheap", "abandoned", "0"))
+            .await
+            .expect("record");
+        for api in ["4.00", "1.00"] {
+            record_usage(&db, &write("", "pinned", api))
+                .await
+                .expect("record");
+        }
+
+        let rows = key_usage_by_model(
+            &db,
+            key,
+            UsageWindow::Month,
+            Some(dec!(0.20)),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("by model");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "one model, two rungs, two rows — grouping by model_id alone gives one: {rows:?}"
+        );
+
+        let pinned = rows
+            .iter()
+            .find(|r| r.tier.is_none())
+            .expect("the directly-pinned row, whose tier is null and not \"\"");
+        let cheap = rows
+            .iter()
+            .find(|r| r.tier.as_deref() == Some("cheap"))
+            .expect("the rung row");
+
+        assert_eq!(cheap.model_id, pinned.model_id, "the same model, both ways");
+
+        // The rung row: three tried, two served.
+        assert_eq!(cheap.attempts, 3);
+        assert_eq!(cheap.requests, 2);
+        assert!(
+            cheap.attempts > cheap.requests,
+            "the abandoned one is counted"
+        );
+        // And the difference is invisible in the money: the abandoned attempt
+        // added to `cost_usd` and nothing to `list_usd`.
+        assert_eq!(cheap.list_usd, dec!(3.000000));
+        assert_eq!(cheap.cost_usd, dec!(0.300000));
+
+        // The pinned row: nothing unserved, so the two agree.
+        assert_eq!((pinned.attempts, pinned.requests), (2, 2));
+        assert_eq!(pinned.list_usd, dec!(5.000000));
+
+        // Points follow list price, per row, so the rows do not share a total.
+        assert_eq!(cheap.points, Some(15_000_000));
+        assert_eq!(pinned.points, Some(25_000_000));
     }
 
     /// A key's usage is its OWN ledger rows: another key on the same principal
