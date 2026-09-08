@@ -149,6 +149,61 @@ fn leased(state: &AppState, account: AccountRow, request_id: &str, via_sticky: b
     }
 }
 
+/// What the search was, when it found nothing this caller can use.
+///
+/// A struct rather than six arguments because they travel together and only
+/// here — the clump is the report, not a parameter list anybody else assembles.
+struct NothingUsable {
+    provider: Provider,
+    principal_id: uuid::Uuid,
+    route_id: uuid::Uuid,
+    candidates: usize,
+    reserved: Option<i16>,
+    channel: Option<CredentialKind>,
+}
+
+/// The error for "nothing to dispatch to", and the line that says who asked.
+///
+/// `repo::candidates` filters `owner_principal_id IS NULL OR = $3`, so a
+/// credential bound to one principal is *invisible* to another rather than
+/// refused — and the error a caller sees says only "no credential for
+/// <provider>". On 2026-09-08 that cost four hypotheses and an hour: two seats
+/// were owner-bound while the caller authenticated as a second principal, and
+/// the one fault reported `anthropic`, then `openai`, then `xai` as the ladder
+/// changed underneath it, because the message names the last rung *tried*
+/// rather than the thing that is missing.
+///
+/// The principal is not a secret — the caller authenticated as it — and it is
+/// the one field that turns that hour into a glance. It goes in the log rather
+/// than the response: a client has no use for it, and an error body is the
+/// wrong place to describe another tenant's configuration.
+fn nothing_usable(search: &NothingUsable) -> Error {
+    let &NothingUsable {
+        provider,
+        principal_id,
+        route_id,
+        candidates,
+        reserved,
+        channel,
+    } = search;
+    tracing::info!(
+        %provider,
+        %principal_id,
+        %route_id,
+        candidates,
+        reserve_holding_back = reserved.is_some(),
+        "no credential this caller can use on this route"
+    );
+    match (reserved, channel) {
+        (Some(reserve_pct), _) => Error::ReserveHeld {
+            provider,
+            reserve_pct,
+        },
+        (None, Some(kind)) => Error::NoCredentialOfKind { provider, kind },
+        (None, None) => Error::NoCredential { provider },
+    }
+}
+
 /// Choose a credential for this request.
 ///
 /// Order:
@@ -200,13 +255,15 @@ pub async fn lease(
     // there is nothing to select the candidates are gone — and this is the one
     // moment the reason matters.
     let reserved = reserve_holding_back(&rows);
-    let none_left = || match (reserved, channel) {
-        (Some(reserve_pct), _) => Error::ReserveHeld {
+    let none_left = || {
+        nothing_usable(&NothingUsable {
             provider,
-            reserve_pct,
-        },
-        (None, Some(kind)) => Error::NoCredentialOfKind { provider, kind },
-        (None, None) => Error::NoCredential { provider },
+            principal_id,
+            route_id,
+            candidates: rows.len(),
+            reserved,
+            channel,
+        })
     };
 
     if rows.is_empty() {
@@ -712,6 +769,56 @@ mod tests {
             .await
             .expect_err("a dead Redis is an error, not a lost race");
         assert!(err.to_string().contains("redis"), "{err}");
+    }
+
+    #[test]
+    fn a_search_that_found_nothing_still_says_which_nothing_it_was() {
+        // Three refusals wear the same shape at the call site and mean three
+        // different things to whoever is paged: the reserve is holding a seat
+        // back on purpose, the route wanted a channel nobody offers, or there
+        // is simply nothing here. The mapping used to sit inline in `lease`;
+        // moving it out is only safe if it still discriminates, and the
+        // reserve arm must keep winning over the channel arm — a held seat is
+        // a credential that exists, and telling the operator its kind is
+        // missing would send them to buy one they already have.
+        let search = |reserved, channel| {
+            nothing_usable(&NothingUsable {
+                provider: Provider::XAI,
+                principal_id: uuid::Uuid::nil(),
+                route_id: uuid::Uuid::nil(),
+                candidates: 0,
+                reserved,
+                channel,
+            })
+        };
+
+        assert!(matches!(
+            search(None, None),
+            Error::NoCredential {
+                provider: Provider::XAI
+            }
+        ));
+        assert!(matches!(
+            search(None, Some(CredentialKind::OAuth)),
+            Error::NoCredentialOfKind {
+                provider: Provider::XAI,
+                kind: CredentialKind::OAuth
+            }
+        ));
+        assert!(matches!(
+            search(Some(10), None),
+            Error::ReserveHeld {
+                provider: Provider::XAI,
+                reserve_pct: 10
+            }
+        ));
+        assert!(
+            matches!(
+                search(Some(10), Some(CredentialKind::OAuth)),
+                Error::ReserveHeld { .. }
+            ),
+            "a held seat is a credential that exists; the reserve arm wins"
+        );
     }
 
     #[tokio::test]
