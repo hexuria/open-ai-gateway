@@ -898,41 +898,64 @@ mod tests {
 
         // Five per minute: a burst of five, then a refusal.
         //
-        // Take until refused rather than asserting the sixth specifically. One
-        // token accrues every twelve seconds at 5/min, so a run slow enough to
-        // spend twelve seconds on five Redis round trips has legitimately
-        // earned a sixth — and CI is sometimes exactly that slow. This failed
-        // on `main` for that reason, with the bucket working perfectly: the
-        // loop took twenty-one seconds. The invariant worth pinning is "a
-        // burst, then a refusal, and the wait it names is sane", not "the
-        // sixth call, specifically, at wall-clock speed".
+        // Counted against what **Redis** recorded, not against what the API
+        // returned. `take_rate_token` answers `Ok(None)` for two different
+        // things — "here is your token" and "Redis is unreachable, so I am
+        // failing open" — and that conflation is deliberate and right in
+        // production: refusing traffic because the coordination store blinked
+        // trades a real outage for a theoretical one. It is fatal to a test
+        // that counts `None`s, though. On CI this handed out **seven tokens in
+        // 7.7 milliseconds** — not a slow runner earning extras, which was my
+        // first and wrong reading of it, but five real grants and two
+        // fail-opens wearing the same return value.
+        //
+        // The bucket's own `tokens` field cannot be faked that way: it moves
+        // only when the script actually ran.
         let started = std::time::Instant::now();
-        let mut free = 0_u64;
+        let mut granted = 0_u64;
         let wait = loop {
             match cache.take_rate_token(route, 5).await.expect("take") {
                 None => {
-                    free += 1;
+                    granted += 1;
                     assert!(
-                        free <= 60,
-                        "a 5/min bucket handed out {free} tokens without ever refusing"
+                        granted <= 60,
+                        "a 5/min bucket never refused in {granted} calls"
                     );
                 }
                 Some(wait) => break wait,
             }
         };
-        let elapsed = started.elapsed();
 
-        assert!(free >= 5, "the burst is five; only {free} were free");
-        // Everything past the burst has to be explained by accrual, or the
-        // bucket is simply not refusing. This is the half that would catch a
-        // rate limiter that had stopped limiting, which a "slow CI" allowance
-        // must not quietly excuse.
-        let accrued = elapsed.as_secs() / 12;
+        // Ground truth, read straight from the bucket.
+        let mut raw = redis::Client::open(url.as_str())
+            .expect("client")
+            .get_multiplexed_async_connection()
+            .await
+            .expect(
+                "a connection of our own: if Redis is unreachable here, \
+                     every `None` above may have been a fail-open and this \
+                     test proved nothing",
+            );
+        let tokens: Option<String> = redis::cmd("HGET")
+            .arg(format!("oag:rate:{route}"))
+            .arg("tokens")
+            .query_async(&mut raw)
+            .await
+            .expect("read the bucket");
+        let tokens: f64 = tokens
+            .expect("the bucket exists, so the script really ran")
+            .parse()
+            .expect("a number");
+
         assert!(
-            free <= 5 + accrued + 1,
-            "handed out {free} tokens in {elapsed:?}; a 5/min bucket earns one \
-             per twelve seconds, so at most {} were owed",
-            5 + accrued + 1
+            tokens < 1.0,
+            "it refused while holding {tokens} tokens, which is not a refusal \
+             at all — the limiter is not decrementing"
+        );
+        assert!(
+            granted >= 5,
+            "the burst is five; only {granted} were granted in {:?}",
+            started.elapsed()
         );
         assert!(
             wait > Duration::ZERO && wait <= Duration::from_secs(12),
