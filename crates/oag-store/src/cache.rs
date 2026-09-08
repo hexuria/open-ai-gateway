@@ -896,28 +896,48 @@ mod tests {
         let cache = Cache::connect(&url).expect("cache");
         let route = Uuid::new_v4();
 
-        // Five per minute: five immediate, the sixth refused.
-        for i in 0..5 {
-            assert!(
-                cache
-                    .take_rate_token(route, 5)
-                    .await
-                    .expect("take")
-                    .is_none(),
-                "token {i} should have been free"
-            );
-        }
-        let wait = cache
-            .take_rate_token(route, 5)
-            .await
-            .expect("take")
-            .expect("sixth request in a 5/min bucket must be refused");
+        // Five per minute: a burst of five, then a refusal.
+        //
+        // Take until refused rather than asserting the sixth specifically. One
+        // token accrues every twelve seconds at 5/min, so a run slow enough to
+        // spend twelve seconds on five Redis round trips has legitimately
+        // earned a sixth — and CI is sometimes exactly that slow. This failed
+        // on `main` for that reason, with the bucket working perfectly: the
+        // loop took twenty-one seconds. The invariant worth pinning is "a
+        // burst, then a refusal, and the wait it names is sane", not "the
+        // sixth call, specifically, at wall-clock speed".
+        let started = std::time::Instant::now();
+        let mut free = 0_u64;
+        let wait = loop {
+            match cache.take_rate_token(route, 5).await.expect("take") {
+                None => {
+                    free += 1;
+                    assert!(
+                        free <= 60,
+                        "a 5/min bucket handed out {free} tokens without ever refusing"
+                    );
+                }
+                Some(wait) => break wait,
+            }
+        };
+        let elapsed = started.elapsed();
 
-        // One token accrues every twelve seconds at 5/min. Allow slack for the
-        // fractional token earned while the loop above was running.
+        assert!(free >= 5, "the burst is five; only {free} were free");
+        // Everything past the burst has to be explained by accrual, or the
+        // bucket is simply not refusing. This is the half that would catch a
+        // rate limiter that had stopped limiting, which a "slow CI" allowance
+        // must not quietly excuse.
+        let accrued = elapsed.as_secs() / 12;
         assert!(
-            wait > Duration::from_secs(9) && wait <= Duration::from_secs(12),
-            "expected roughly a twelve second wait, got {wait:?}"
+            free <= 5 + accrued + 1,
+            "handed out {free} tokens in {elapsed:?}; a 5/min bucket earns one \
+             per twelve seconds, so at most {} were owed",
+            5 + accrued + 1
+        );
+        assert!(
+            wait > Duration::ZERO && wait <= Duration::from_secs(12),
+            "a refusal must name a wait inside the twelve-second accrual \
+             interval, got {wait:?}"
         );
 
         // A different route has its own bucket.
