@@ -182,11 +182,177 @@ impl Db {
     pub async fn ping(&self) -> bool {
         sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
     }
+
+    /// Whether the schema this binary was built against is actually applied.
+    ///
+    /// `ping` answers a different question — "is the connection alive" — and
+    /// answering only that is how a replica came to report itself ready while
+    /// every request 500'd. `SELECT 1` succeeds against a database with no
+    /// tables at all, so after the dev Postgres (whose data directory is
+    /// tmpfs) restarted empty, `/health/ready` returned
+    /// `{"ready":true,"database":true}` while `/v1/models` returned 500. A
+    /// readiness endpoint vouching for a process that cannot serve is worse
+    /// than none: in Kubernetes that pod takes the whole rotation.
+    ///
+    /// So this asks whether every migration the binary carries has been
+    /// applied. `>=` and not `==`, deliberately: a schema *ahead* of this
+    /// binary is the normal middle of a rolling deploy — every migration here
+    /// is expand-then-contract for exactly that reason — and refusing traffic
+    /// for it would make every old replica unready during a routine upgrade.
+    /// A schema *behind* is the case that cannot serve, and is the one this
+    /// refuses.
+    ///
+    /// Three states it distinguishes that `ping` cannot: the schema is gone
+    /// (`_sqlx_migrations` missing, the query errors), the schema is behind
+    /// this binary (fewer applied than embedded — a binary deployed ahead of
+    /// its migration), and a migration that ran and failed (`success` is
+    /// false, so it does not count).
+    ///
+    /// One extra query per probe, and `health::cached_readiness` memoises the
+    /// whole answer for a second, so a burst of probes still costs one.
+    pub async fn schema_ready(&self) -> bool {
+        let applied: std::result::Result<i64, _> =
+            sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE success")
+                .fetch_one(&self.pool)
+                .await;
+        let Ok(applied) = applied else { return false };
+        schema_is_ready(applied, sqlx::migrate!("../../migrations").migrations.len())
+    }
+}
+
+/// Whether `applied` successful migrations satisfy a binary carrying `embedded`.
+///
+/// Separated from the query so the comparison can be tested over the cases a
+/// live database cannot cheaply be put into. The wiring is covered by
+/// `a_reachable_database_with_no_schema_is_not_ready`, which drives the query.
+fn schema_is_ready(applied: i64, embedded: usize) -> bool {
+    usize::try_from(applied).is_ok_and(|applied| applied >= embedded)
 }
 
 #[cfg(test)]
 mod tests {
     use super::Db;
+
+    /// A reachable database with no schema is not a ready one.
+    ///
+    /// This is the case `ping` cannot see and the one that produced a replica
+    /// answering `/health/ready` with `{"ready":true,"database":true}` while
+    /// every request returned 500. Driven against a real database rather than
+    /// asserted about the query, because what has to be true is a property of
+    /// the rows in `_sqlx_migrations`.
+    #[tokio::test]
+    async fn a_reachable_database_with_no_schema_is_not_ready() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        assert!(db.ping().await, "the connection is alive");
+        assert!(
+            db.schema_ready().await,
+            "and a migrated database is ready to serve"
+        );
+
+        // A database that answers and has nothing in it. `postgres` exists on
+        // every cluster and carries no `_sqlx_migrations`, so it is the empty
+        // schema without creating or dropping anything.
+        let Some((prefix, _)) = url.rsplit_once('/') else {
+            eprintln!("skipped: no database name in OAG_TEST_DATABASE_URL");
+            return;
+        };
+        let bare = Db::connect(&format!("{prefix}/postgres"), 2).expect("connect");
+        assert!(
+            bare.ping().await,
+            "SELECT 1 succeeds — which is exactly the problem, and why `ping` \
+             alone could vouch for a replica that cannot serve"
+        );
+        assert!(
+            !bare.schema_ready().await,
+            "but there is no schema, so nothing this gateway queries exists"
+        );
+
+        // And a database that is merely unreachable fails both.
+        let dead = Db::connect("postgres://oag:oag@127.0.0.1:1/oag", 1).expect("lazy pool");
+        assert!(!dead.ping().await);
+        assert!(!dead.schema_ready().await);
+    }
+
+    /// A schema BEHIND this binary is refused; one AHEAD is not.
+    ///
+    /// Behind is a binary deployed before its migration ran: it queries columns
+    /// that do not exist yet, so it cannot serve and must not be handed
+    /// traffic. Ahead is the ordinary middle of a rolling deploy — the new
+    /// replica migrated, the old ones have not been replaced — and every
+    /// migration here is expand-then-contract precisely so those old replicas
+    /// keep serving. Refusing traffic for it would take a fleet down during a
+    /// routine upgrade, so the comparison is `>=` and this pins that.
+    #[tokio::test]
+    async fn a_schema_behind_the_binary_is_refused_and_one_ahead_is_not() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+
+        // Ahead: one more applied row than the binary embeds. Rolled back, so
+        // the real migration state is untouched either way.
+        let mut tx = db.pool().begin().await.expect("begin");
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, installed_on, success, checksum, execution_time) \
+             VALUES (99999, 'from a newer binary', now(), true, '\\x00', 0)",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("plant a migration this binary does not carry");
+        let applied: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE success")
+                .fetch_one(&mut *tx)
+                .await
+                .expect("count");
+        tx.rollback().await.expect("rollback");
+
+        let embedded = sqlx::migrate!("../../migrations").migrations.len();
+        assert!(
+            applied > i64::try_from(embedded).expect("a small number"),
+            "the fixture has to actually be ahead, or it tests nothing: \
+             {applied} applied vs {embedded} embedded"
+        );
+        assert!(
+            super::schema_is_ready(applied, embedded),
+            "a schema ahead of this binary is the ordinary middle of a rolling \
+             deploy, and refusing traffic for it would take a fleet down on a \
+             routine upgrade"
+        );
+    }
+
+    /// The rule the query feeds, over the cases a live database cannot cheaply
+    /// be put into.
+    #[test]
+    fn a_schema_short_of_what_the_binary_carries_is_not_ready() {
+        use super::schema_is_ready;
+
+        assert!(schema_is_ready(17, 17), "exactly what it carries");
+        assert!(schema_is_ready(18, 17), "ahead — a newer replica migrated");
+        assert!(
+            !schema_is_ready(16, 17),
+            "one behind: this binary queries something the schema has not got yet"
+        );
+        assert!(!schema_is_ready(0, 17), "an empty schema is the wipe case");
+        assert!(
+            schema_is_ready(0, 0),
+            "a binary carrying no migrations is satisfied by anything, which is \
+             only reachable if the migrations directory is empty"
+        );
+        assert!(
+            !schema_is_ready(-1, 1),
+            "count() cannot go negative, but the conversion must refuse rather \
+             than wrap into a large usize and read as ready"
+        );
+    }
 
     /// The session's timezone is UTC, and it is the client that says so.
     ///

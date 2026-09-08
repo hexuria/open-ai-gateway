@@ -87,6 +87,7 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serd
             "ready": r.ready,
             "database": r.database,
             "redis": r.redis,
+            "schema": r.schema,
         })),
     )
 }
