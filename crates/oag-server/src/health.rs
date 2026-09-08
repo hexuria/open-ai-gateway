@@ -59,7 +59,12 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serd
     if state.lifecycle.is_draining() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "ready": false, "reason": "draining" })),
+            Json(json!({
+                "ready": false,
+                "reason": "draining",
+                "version": env!("CARGO_PKG_VERSION"),
+                "commit": env!("OAG_BUILD_SHA"),
+            })),
         );
     }
 
@@ -88,6 +93,13 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> (StatusCode, Json<serd
             "database": r.database,
             "redis": r.redis,
             "schema": r.schema,
+            "version": env!("CARGO_PKG_VERSION"),
+            // Deliberately outside `cached_readiness`, which memoises what the
+            // *probes* found. This is not a probe result; it is who is
+            // answering, it cannot change while the process lives, and it must
+            // be readable when every probe is failing — an unhealthy replica is
+            // exactly when "which build is this?" gets asked.
+            "commit": env!("OAG_BUILD_SHA"),
         })),
     )
 }
@@ -136,6 +148,59 @@ mod tests {
         assert!(
             b.readiness.lock().await.is_some(),
             "and it memoises its own once it is asked"
+        );
+    }
+
+    /// The build stamp is readable when every probe is failing.
+    ///
+    /// That is the whole point of it. The question "which build is this?" gets
+    /// asked during an incident, and an incident is when readiness is 503 —
+    /// a replica answered `{"ready":true,"schema":true}` on a stale binary and
+    /// the health check read as an alibi for the failure it looked like it
+    /// covered. Putting the stamp behind `ready == true`, or inside the
+    /// memoised probe result, would make it absent exactly when it is needed.
+    #[tokio::test]
+    async fn an_unhealthy_replica_still_says_which_build_it_is() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt as _;
+
+        // Backends on closed ports: every probe fails, so this is the 503 path.
+        let app = crate::admin_router(crate::testing::state(""));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/ready")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            res.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the fixture's backends are closed ports; if this is 200 the test is not on the path it claims"
+        );
+
+        let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+        assert_eq!(body["ready"], false, "this is the unhealthy path");
+        assert_eq!(
+            body["version"],
+            env!("CARGO_PKG_VERSION"),
+            "no version on a failing probe is the gap this closed"
+        );
+        let commit = body["commit"].as_str().expect("a commit string");
+        assert!(
+            !commit.is_empty(),
+            "an empty stamp is worse than \"unknown\""
+        );
+        assert_ne!(
+            commit, "",
+            "build.rs falls back to \"unknown\", never to nothing"
         );
     }
 }

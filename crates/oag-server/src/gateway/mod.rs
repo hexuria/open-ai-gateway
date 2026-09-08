@@ -1262,7 +1262,18 @@ fn oag_headers(
 ) -> axum::http::response::Builder {
     let builder = builder
         .header("x-oag-model", decision.model.id.as_str())
-        .header("x-oag-request-id", request_id.to_string());
+        .header("x-oag-request-id", request_id.to_string())
+        // Which build answered, on the response the caller is already reading.
+        //
+        // `/health/ready` carries the same identity but lives on the **admin**
+        // listener, and a consumer holds an inference key by definition — so
+        // the one party that most needs to know which build produced a payload
+        // could not ask. Answering it here rather than opening `/health/ready`
+        // on the public listener keeps it behind authentication: nothing new
+        // is readable without a key, and the answer arrives on the very
+        // request whose shape is in question rather than on a second probe
+        // that could hit a different replica.
+        .header(crate::BUILD_HEADER, crate::build_id());
     match decision.rung_name() {
         Some(tier) => builder.header("x-oag-tier", tier),
         None => builder,
