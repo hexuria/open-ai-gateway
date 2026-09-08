@@ -1255,13 +1255,6 @@ fn json_response(
 
 /// Routing identity on the way out. `x-oag-tier` is omitted when the model
 /// sat on no rung — a named off-ladder pin is not `cheap`.
-/// This build, as `<version>+<commit>` — the value of `x-oag-build`.
-///
-/// Built once rather than per response: it cannot change while the process
-/// lives, and this sits on every inference reply.
-static BUILD_ID: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("OAG_BUILD_SHA")));
-
 fn oag_headers(
     builder: axum::http::response::Builder,
     decision: &RoutingDecision,
@@ -1280,7 +1273,7 @@ fn oag_headers(
         // is readable without a key, and the answer arrives on the very
         // request whose shape is in question rather than on a second probe
         // that could hit a different replica.
-        .header("x-oag-build", BUILD_ID.as_str());
+        .header(crate::BUILD_HEADER, crate::build_id());
     match decision.rung_name() {
         Some(tier) => builder.header("x-oag-tier", tier),
         None => builder,

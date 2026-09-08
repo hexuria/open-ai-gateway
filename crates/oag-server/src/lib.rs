@@ -287,10 +287,59 @@ pub fn public_router(state: Arc<AppState>) -> Router {
 }
 
 /// Admin API, metrics, readiness. Internal network only.
+/// The header naming which build produced a response.
+pub(crate) const BUILD_HEADER: &str = "x-oag-build";
+
+/// This build, as `<version>+<commit>`.
+///
+/// A `HeaderValue` rather than a `String`, built once: it cannot change while
+/// the process lives and it now rides every inference *and* admin response, so
+/// formatting or parsing it per response would be pure waste. Cloning one is a
+/// refcount bump.
+pub(crate) fn build_id() -> axum::http::HeaderValue {
+    static ID: std::sync::LazyLock<axum::http::HeaderValue> = std::sync::LazyLock::new(|| {
+        let raw = format!("{}+{}", env!("CARGO_PKG_VERSION"), env!("OAG_BUILD_SHA"));
+        // A sha is hex and a version is dotted digits, so this cannot fail —
+        // but `build.rs` takes `OAG_BUILD_SHA` from the environment, and an
+        // unprintable byte injected there must not take the process down over
+        // a diagnostic header.
+        axum::http::HeaderValue::from_str(&raw)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("unknown"))
+    });
+    ID.clone()
+}
+
+/// Stamp every admin response with the build that produced it.
+///
+/// The inference path sets this in `oag_headers`, on the response itself. The
+/// admin API needs it for the same reason and more sharply: the payload a
+/// consumer parses for *shape* is an admin one, and telling it which build
+/// served some other response is telling it about the wrong response. Asking
+/// `/health/ready` instead is the second-probe problem — mid-rollout that can
+/// answer for a different replica than the one whose body is in hand.
+///
+/// Applied outermost, so a 500 from `catch_panic` and a 4xx from the auth
+/// layer carry it too. A build identity absent exactly when something is wrong
+/// is absent when it is wanted, which is the failure this whole line of work
+/// exists to end.
+///
+/// The order relative to `catch_panic` is load-bearing and is not free: layers
+/// wrap in application order, so a panic caught *inside* this one becomes a 500
+/// that flows back out through it and gets stamped, while the reverse order
+/// lets the panic pass this layer un-stamped on its way to being caught. See
+/// `the_build_stamp_wraps_the_panic_catcher_and_not_the_reverse`, which is a
+/// source scan because a panicking route cannot be injected into
+/// `admin_router` from a test.
+async fn stamp_build(mut response: axum::response::Response) -> axum::response::Response {
+    response.headers_mut().insert(BUILD_HEADER, build_id());
+    response
+}
+
 pub fn admin_router(state: Arc<AppState>) -> Router {
     admin_routes(&state)
         .route("/health/live", get(health::live))
         .layer(catch_panic())
+        .layer(axum::middleware::map_response(stamp_build))
         .with_state(state)
 }
 
@@ -640,6 +689,108 @@ mod router_tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt as _;
+
+    /// Every admin response says which build produced it — including the ones
+    /// that failed.
+    ///
+    /// The payload a consumer parses for *shape* is an admin one, so telling
+    /// it which build served some other response is telling it about the wrong
+    /// response, and sending it to `/health/ready` instead is the second-probe
+    /// problem: mid-rollout that can answer for a different replica than the
+    /// one whose body is in hand. The layer is outermost for the same reason
+    /// the readiness stamp is outside the `ready` gate — a build identity
+    /// absent when something is wrong is absent when it is wanted.
+    #[tokio::test]
+    async fn every_admin_response_names_the_build_that_made_it() {
+        // No key: a 401 from the auth layer, which is *inside* the stamping
+        // layer. If this only worked on 200s the test would pass on a handler
+        // that set the header itself, and prove nothing about the layer.
+        let res = admin_router(state(false))
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/summary")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "this must be the refused path, or it is not testing the layer"
+        );
+        let build = res
+            .headers()
+            .get("x-oag-build")
+            .expect("a refused admin response still names its build")
+            .to_str()
+            .expect("printable");
+        assert!(
+            build.starts_with(env!("CARGO_PKG_VERSION")),
+            "expected <version>+<commit>, got {build:?}"
+        );
+        let (_, commit) = build.split_once('+').expect("<version>+<commit>");
+        assert!(
+            !commit.is_empty(),
+            "an empty commit half is worse than none"
+        );
+
+        // And a route no handler serves at all. A 404 is produced by the
+        // router itself, so this is the proof the layer is genuinely outermost
+        // rather than something a handler happens to set on its way out.
+        let missing = admin_router(state(false))
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/api/no-such-route")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing
+                .headers()
+                .get("x-oag-build")
+                .map(|v| v.to_str().ok()),
+            Some(Some(build)),
+            "a 404 names the same build as a 401; the stamp is the process, not the route"
+        );
+    }
+
+    /// The stamp layer wraps `catch_panic`, not the other way round.
+    ///
+    /// A source scan, and it says so: layers wrap in application order, so the
+    /// property is "a panic becomes a 500 *inside* the stamp and is stamped on
+    /// its way out". Proving that behaviourally needs a route that panics, and
+    /// `admin_router` builds its own routes with no way to inject one — a test
+    /// that assembled its own two-layer stack would assert about that stack and
+    /// not about this function, and would stay green if this function's order
+    /// were swapped. Swapping the two here is invisible to
+    /// `every_admin_response_names_the_build_that_made_it`, which is why this
+    /// exists beside it rather than instead of it.
+    #[test]
+    fn the_build_stamp_wraps_the_panic_catcher_and_not_the_reverse() {
+        let source = include_str!("lib.rs");
+        // Cut at the test module so the scan cannot match its own strings.
+        let (production, _) = source
+            .split_once("#[cfg(test)]")
+            .expect("this module is the cut point");
+        let (_, body) = production
+            .split_once("pub fn admin_router")
+            .expect("the function this is about");
+        let body = body.split_once("\n}").map_or(body, |(before, _)| before);
+
+        let panic_at = body.find("catch_panic()").expect("the panic catcher");
+        let stamp_at = body
+            .find("map_response(stamp_build)")
+            .expect("the stamp layer");
+        assert!(
+            panic_at < stamp_at,
+            "catch_panic must be applied first so the stamp wraps it; a panic \
+             caught outside the stamp is a 500 with no build on it"
+        );
+    }
 
     /// See `crate::testing::state`: every assertion below is about routing and
     /// the auth layer, which run before any backend does.
