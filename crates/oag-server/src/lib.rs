@@ -175,6 +175,10 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
             patch(admin::set_principal_budget),
         )
         .route("/principals/{email}/usage", get(admin::principal_usage))
+        .route(
+            "/principals/{email}/usage/points",
+            get(admin::principal_points),
+        )
         .route("/keys/{id}/quota", patch(admin::set_key_quota))
         .route("/keys/{id}/usage", get(admin::key_usage))
         // Points: the reference price (one row) and every model's multipliers over it. The
@@ -895,6 +899,7 @@ mod router_tests {
             "/admin/api/keys/00000000-0000-0000-0000-000000000001/usage/models",
         ),
         ("POST", "/admin/api/usage/points"),
+        ("GET", "/admin/api/principals/{email}/usage/points"),
     ];
 
     async fn status(router: Router, method: &str, path: &str) -> StatusCode {

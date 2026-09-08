@@ -203,6 +203,70 @@ pub async fn key_usage_models(
     }
 }
 
+/// `GET /admin/api/principals/{email}/usage/points?window=5h|24h|7d|month`
+///
+/// One organisation's points in one indexed aggregate. Every coworker key an
+/// organisation mints sits on one principal, so this is the org's spend without
+/// enumerating keys — and `points_for_keys`' `MAX_POOL_KEYS` ceiling therefore
+/// does not apply to it, which is the whole reason this exists beside that.
+///
+/// Also carries the **unbilled** spend: what we paid for attempts nobody was
+/// served. Zero on a subscription seat by construction, real money on a metered
+/// credential.
+///
+/// A principal that exists and spent nothing is `0`, not 404 — a real zero is
+/// not a missing row. 404 while no reference price is set, **with the body
+/// `points_for_keys` uses verbatim**: a consumer distinguishes "no reference
+/// set" (recoverable, and it says so) from "this gateway does not serve this
+/// route" (an upgrade) by matching that text, so rewording it turns a
+/// recoverable state into a hard failure. Pinned by a test for that reason.
+pub async fn principal_points(
+    State(state): State<Arc<AppState>>,
+    Path(email): Path<String>,
+    Query(query): Query<WindowQuery>,
+) -> Response {
+    let window = match window_of(query.window.as_deref()) {
+        Ok(window) => window,
+        Err(message) => return invalid(&message),
+    };
+    // Before the principal lookup on purpose. Both are 404s and a consumer
+    // tells them apart by body, so the recoverable one should win when both
+    // are true: an unconfigured gateway is a thing the caller can fix.
+    let reference = match repo::points_reference(&state.db).await {
+        Ok(Some(reference)) => reference,
+        Ok(None) => {
+            return not_found("no reference price set; PUT /admin/api/points/reference first");
+        }
+        Err(e) => return failed(&e),
+    };
+    let principal_id = match repo::principal_id_for_email(&state.db, &email).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return not_found("no principal with that email"),
+        Err(e) => return failed(&e),
+    };
+    match repo::points_for_principal(
+        &state.db,
+        principal_id,
+        window,
+        Some(reference),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    {
+        Ok(spent) => Json(json!({
+            "principal": email,
+            "window": window.as_str(),
+            "points": spent.points,
+            // Money as a string, like every other figure this API reports.
+            "unbilled_cost_usd": format!("{:.6}", spent.unbilled_cost_usd),
+            "total_cost_usd": format!("{:.6}", spent.total_cost_usd),
+            "unserved_attempts": spent.unserved_attempts,
+        }))
+        .into_response(),
+        Err(e) => failed(&e),
+    }
+}
+
 /// How many keys one pool read may name. A member with fifty coworkers is fifty; five hundred
 /// is a bug or an attack.
 const MAX_POOL_KEYS: usize = 500;
@@ -282,6 +346,41 @@ fn audit(actor: &AdminActor, action: &str, subject: &str, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The no-reference 404 body is a wire contract, not prose.
+    ///
+    /// A consumer substring-matches `"no reference price"` to tell "this
+    /// gateway has no R set" — recoverable, and it can say so — from "this
+    /// gateway does not serve this route", which is an upgrade and must hold
+    /// rather than guess. Rewording this turns the first into the second, and
+    /// nothing else in the build would notice. Both handlers that can return
+    /// it must return the same text, or the two routes disagree about a state
+    /// that is a property of the gateway.
+    #[test]
+    fn the_no_reference_404_says_the_words_a_consumer_matches_on() {
+        let source = include_str!("points.rs");
+        // Cut at the test module: this test's own strings would otherwise
+        // satisfy the count with every call site deleted.
+        let (production, _) = source
+            .split_once("#[cfg(test)]")
+            .expect("this module is the cut point");
+        assert!(
+            production.contains("pub async fn principal_points"),
+            "the scan lost its haystack"
+        );
+        assert_eq!(
+            production
+                .matches(
+                    r#"not_found("no reference price set; PUT /admin/api/points/reference first")"#
+                )
+                .count(),
+            3,
+            "every handler that can answer 'no R is set' must say it in the \
+             one form a consumer matches: points_models, points_for_keys and \
+             principal_points"
+        );
+    }
+
     fn dec(text: &str) -> Decimal {
         text.parse().expect("a decimal literal")
     }
