@@ -700,6 +700,30 @@ mod tests {
         // The healthy case, which is what the test database is in.
         assert_eq!(check_migrations(&db).await.expect("check"), 0);
 
+        // Everything below leaves `_sqlx_migrations` describing a schema that
+        // is not the one present. `cargo test --workspace` runs several
+        // crates' gated tests against ONE database, and every one of them
+        // calls `db.migrate()`; a migrate landing inside this window sees the
+        // newest version as unapplied, re-applies it, and then this test's
+        // restore collides on the primary key — or sees `success = false` and
+        // aborts with "partially applied". Both were observed on CI, on `main`,
+        // as two different-looking failures with this single cause.
+        //
+        // So hold the lock `Db::migrate` holds, for the width of the window.
+        // A dedicated connection rather than a pooled one: an advisory lock
+        // lives on its session, and a pooled connection handed back to the
+        // pool while still holding it would leak the lock into whatever query
+        // ran next. Dropping this closes the session, so a panic mid-window
+        // releases it too.
+        let mut guard = <sqlx::PgConnection as sqlx::Connection>::connect(&url)
+            .await
+            .expect("a connection of our own to hold the migration lock on");
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(oag_store::MIGRATION_LOCK_ID)
+            .execute(&mut guard)
+            .await
+            .expect("take the migration lock");
+
         // A gap: hide the newest version, then put it back. The count is
         // restored to `EXPECTED_MIGRATIONS` by adding a version that does not
         // belong, which is what makes counting insufficient.
@@ -773,6 +797,11 @@ mod tests {
             .execute(db.pool())
             .await
             .expect("restore");
+
+        // Window closed: the table describes the schema again, so a
+        // concurrent migrate is safe. Released before the assertions, so a
+        // failure here cannot hold the lock while the rest of the suite waits.
+        drop(guard);
 
         assert_eq!(
             with_failure, 1,

@@ -896,28 +896,71 @@ mod tests {
         let cache = Cache::connect(&url).expect("cache");
         let route = Uuid::new_v4();
 
-        // Five per minute: five immediate, the sixth refused.
-        for i in 0..5 {
-            assert!(
-                cache
-                    .take_rate_token(route, 5)
-                    .await
-                    .expect("take")
-                    .is_none(),
-                "token {i} should have been free"
-            );
-        }
-        let wait = cache
-            .take_rate_token(route, 5)
-            .await
-            .expect("take")
-            .expect("sixth request in a 5/min bucket must be refused");
+        // Five per minute: a burst of five, then a refusal.
+        //
+        // Counted against what **Redis** recorded, not against what the API
+        // returned. `take_rate_token` answers `Ok(None)` for two different
+        // things — "here is your token" and "Redis is unreachable, so I am
+        // failing open" — and that conflation is deliberate and right in
+        // production: refusing traffic because the coordination store blinked
+        // trades a real outage for a theoretical one. It is fatal to a test
+        // that counts `None`s, though. On CI this handed out **seven tokens in
+        // 7.7 milliseconds** — not a slow runner earning extras, which was my
+        // first and wrong reading of it, but five real grants and two
+        // fail-opens wearing the same return value.
+        //
+        // The bucket's own `tokens` field cannot be faked that way: it moves
+        // only when the script actually ran.
+        let started = std::time::Instant::now();
+        let mut granted = 0_u64;
+        let wait = loop {
+            match cache.take_rate_token(route, 5).await.expect("take") {
+                None => {
+                    granted += 1;
+                    assert!(
+                        granted <= 60,
+                        "a 5/min bucket never refused in {granted} calls"
+                    );
+                }
+                Some(wait) => break wait,
+            }
+        };
 
-        // One token accrues every twelve seconds at 5/min. Allow slack for the
-        // fractional token earned while the loop above was running.
+        // Ground truth, read straight from the bucket.
+        let mut raw = redis::Client::open(url.as_str())
+            .expect("client")
+            .get_multiplexed_async_connection()
+            .await
+            .expect(
+                "a connection of our own: if Redis is unreachable here, \
+                     every `None` above may have been a fail-open and this \
+                     test proved nothing",
+            );
+        let tokens: Option<String> = redis::cmd("HGET")
+            .arg(format!("oag:rate:{route}"))
+            .arg("tokens")
+            .query_async(&mut raw)
+            .await
+            .expect("read the bucket");
+        let tokens: f64 = tokens
+            .expect("the bucket exists, so the script really ran")
+            .parse()
+            .expect("a number");
+
         assert!(
-            wait > Duration::from_secs(9) && wait <= Duration::from_secs(12),
-            "expected roughly a twelve second wait, got {wait:?}"
+            tokens < 1.0,
+            "it refused while holding {tokens} tokens, which is not a refusal \
+             at all — the limiter is not decrementing"
+        );
+        assert!(
+            granted >= 5,
+            "the burst is five; only {granted} were granted in {:?}",
+            started.elapsed()
+        );
+        assert!(
+            wait > Duration::ZERO && wait <= Duration::from_secs(12),
+            "a refusal must name a wait inside the twelve-second accrual \
+             interval, got {wait:?}"
         );
 
         // A different route has its own bucket.
