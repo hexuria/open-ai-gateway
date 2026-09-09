@@ -1023,6 +1023,88 @@ pub async fn key_usage_by_model(
 /// Points spent inside a window by each of several keys — one query, the partner service's
 /// pool read (a member's pool is the sum over that member's coworker keys). Keys with no rows
 /// are absent; the caller says 0 for them.
+/// A principal's id from its email, for the routes that address it that way.
+///
+/// `None` means no such principal — distinct from a principal with no ledger
+/// rows, which is a real zero and must not be reported as a missing one.
+pub async fn principal_id_for_email(db: &Db, email: &str) -> Result<Option<Uuid>> {
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM principal WHERE email = $1")
+        .bind(email)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("looking up a principal: {e}")))
+}
+
+/// One principal's points and its unbilled spend inside a window.
+///
+/// Every coworker key an organisation mints sits on one principal, so the
+/// organisation's spend is this — **one indexed aggregate**, not a sum over an
+/// enumerated key list. `usage_event_principal_idx (principal_id,
+/// occurred_at DESC)` serves it exactly, and none of `points_for_keys`'
+/// per-key ceiling applies, because there is no list to cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrincipalPoints {
+    /// `None` while no reference price is set — never zero, which is a spend.
+    pub points: Option<i64>,
+    /// What we paid for attempts nobody was served: the leak.
+    ///
+    /// Real money on a metered credential and **zero on a subscription seat by
+    /// construction**, since `cost_usd` is zero there whatever the fate. That
+    /// is correct rather than a gap: the leak is only a bill where there is a
+    /// bill.
+    pub unbilled_cost_usd: Decimal,
+    /// Everything we paid in the window, served or not, for the ratio.
+    pub total_cost_usd: Decimal,
+    /// How many attempts went unserved, so a leak of zero can be told from no
+    /// attempts at all.
+    pub unserved_attempts: i64,
+}
+
+/// A principal's points and leak inside a window, in one pass over the ledger.
+///
+/// `selection_reason`, never `counterfactual_api_usd = 0`, is the
+/// discriminator for "unserved": a *served* row can be zero too, when the
+/// request spent no tokens or the model carries no price, and counting those
+/// as leaks would inflate the figure with successes.
+pub async fn points_for_principal(
+    db: &Db,
+    principal_id: Uuid,
+    window: UsageWindow,
+    reference: Option<Decimal>,
+    now: OffsetDateTime,
+) -> Result<PrincipalPoints> {
+    sqlx::query_as::<_, (Option<i64>, Decimal, Decimal, i64)>(
+        r"
+        SELECT CASE WHEN $3::numeric IS NULL THEN NULL
+                    ELSE COALESCE(
+                        SUM(ROUND(counterfactual_api_usd * 1000000 / $3::numeric)), 0
+                    )::bigint
+               END,
+               COALESCE(SUM(cost_usd) FILTER (
+                   WHERE selection_reason IN ('abandoned', 'lost')
+               ), 0)::numeric(16,8),
+               COALESCE(SUM(cost_usd), 0)::numeric(16,8),
+               COUNT(*) FILTER (
+                   WHERE selection_reason IN ('abandoned', 'lost')
+               )::bigint
+        FROM usage_event
+        WHERE principal_id = $1 AND occurred_at >= $2
+        ",
+    )
+    .bind(principal_id)
+    .bind(window.since(now))
+    .bind(reference)
+    .fetch_one(db.pool())
+    .await
+    .map(|row| PrincipalPoints {
+        points: row.0,
+        unbilled_cost_usd: row.1,
+        total_cost_usd: row.2,
+        unserved_attempts: row.3,
+    })
+    .map_err(|e| Error::Internal(format!("reading a principal's points: {e}")))
+}
+
 pub async fn points_for_keys(
     db: &Db,
     keys: &[Uuid],
@@ -2813,6 +2895,137 @@ mod tests {
     fn test_db() -> Option<Db> {
         let url = std::env::var("OAG_TEST_DATABASE_URL").ok()?;
         Some(Db::connect(&url, 2).expect("connect"))
+    }
+
+    /// An organisation's points and its leak, in one pass, without naming a key.
+    ///
+    /// The whole point of the principal scope: every coworker key an org mints
+    /// sits on one principal, so this answers "the org's spend" with no key
+    /// list and therefore no ceiling on how many coworkers an org may have.
+    ///
+    /// The leak half uses `selection_reason`, never `counterfactual_api_usd =
+    /// 0`. A *served* row can be zero too — no tokens, or a model with no
+    /// price — so the fixture seeds one of those deliberately: if the
+    /// discriminator ever becomes the money, that row joins the leak and the
+    /// count goes up.
+    #[tokio::test]
+    async fn an_orgs_points_and_its_leak_come_from_one_pass_over_the_ledger() {
+        let Some(db) = test_db() else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        db.migrate().await.expect("migrate");
+        let (principal, route, account) = seed(&db).await;
+        // Two keys on ONE principal: the shape an org has, and the thing a
+        // key-list sum would have to enumerate.
+        let a = capped_key(&db, principal, route, format!("org-a-{}", Uuid::new_v4())).await;
+        let b = capped_key(&db, principal, route, format!("org-b-{}", Uuid::new_v4())).await;
+
+        let write = |key: Uuid, reason: &str, cost: &str, api: &str| UsageWrite {
+            request_id: Uuid::new_v4(),
+            attempt: 0,
+            principal_id: Some(principal),
+            api_key_id: Some(key),
+            route_id: Some(route),
+            account_id: Some(account.as_uuid()),
+            model_id: "kimi-k2".to_owned(),
+            tier: "cheap".to_owned(),
+            selection_reason: reason.to_owned(),
+            escalated_from_tier: None,
+            escalation_gate: None,
+            usage: oag_router::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+            cost_usd: cost.parse().expect("decimal"),
+            counterfactual_usd: Decimal::ZERO,
+            counterfactual_model_id: None,
+            counterfactual_api_usd: api.parse().expect("decimal"),
+            status: 200,
+            latency_ms: Some(10),
+            ttft_ms: None,
+            streamed: false,
+        };
+
+        // Served, on both keys, so the aggregate has to span them.
+        record_usage(&db, &write(a, "default", "1.00", "2.00"))
+            .await
+            .expect("record");
+        record_usage(&db, &write(b, "default", "0.50", "1.00"))
+            .await
+            .expect("record");
+        // A served row worth nothing: zero list price, real cost. This is the
+        // trap — it looks exactly like a leak if you discriminate on money.
+        record_usage(&db, &write(a, "default", "0.25", "0"))
+            .await
+            .expect("record");
+        // The actual leak: paid for, served to nobody.
+        record_usage(&db, &write(b, "abandoned", "0.20", "0"))
+            .await
+            .expect("record");
+        record_usage(&db, &write(a, "lost", "0.05", "0"))
+            .await
+            .expect("record");
+
+        let got = points_for_principal(
+            &db,
+            principal,
+            UsageWindow::Month,
+            Some(dec!(0.20)),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("principal points");
+
+        // 3.00 of list price over R=0.20. The two unserved rows and the
+        // zero-priced served row contribute nothing, for different reasons.
+        assert_eq!(got.points, Some(15_000_000));
+        // 0.20 + 0.05, and NOT the 0.25 served row that also priced at zero.
+        assert_eq!(
+            got.unbilled_cost_usd,
+            dec!(0.250000),
+            "the zero-priced SERVED row must not count as a leak"
+        );
+        assert_eq!(got.total_cost_usd, dec!(2.000000));
+        assert_eq!(got.unserved_attempts, 2);
+
+        // And it agrees with the per-key sum it exists to replace, which is
+        // what makes it a scope change rather than a different number.
+        let by_key = points_for_keys(
+            &db,
+            &[a, b],
+            UsageWindow::Month,
+            dec!(0.20),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("by key");
+        let summed: i64 = by_key.iter().map(|(_, points)| *points).sum();
+        assert_eq!(
+            got.points,
+            Some(summed),
+            "the principal scope must be the same money as the key list, only \
+             without the list"
+        );
+
+        // No reference is None, never zero: zero is a spend.
+        let unpriced = points_for_principal(
+            &db,
+            principal,
+            UsageWindow::Month,
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .expect("no reference");
+        assert_eq!(unpriced.points, None);
+        assert_eq!(
+            unpriced.unbilled_cost_usd,
+            dec!(0.250000),
+            "the leak is money and does not need a reference price"
+        );
     }
 
     /// A rung is a property of a request, so one model used two ways is two
