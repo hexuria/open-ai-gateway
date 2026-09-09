@@ -24,3 +24,7 @@ deploy/tofu/gcp-deploy.local.env
 # Dev API keys minted by `just api-keys`, for the hurl files in
 # deploy/test/api. Shown once at creation; this file holds the only copy.
 .dev-hurl-vars
+
+# Resumable session state. Deliberately not tracked: disposable, rebuildable, and
+# never a record. See .handoff/STATE.md.
+.handoff/
