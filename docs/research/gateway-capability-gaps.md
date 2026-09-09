@@ -4,6 +4,14 @@
 comparing OAG against Aperture by Tailscale. It exists to be argued with, and to
 be picked up later without re-deriving the reasoning.
 
+**A gap document decays silently**, because nothing fails when it goes stale —
+it simply starts describing a system that no longer exists, and the next reader
+plans against it. Every "what we have" claim below was re-checked against the
+code on **2026-09-09**: §3.1 had shipped in part and is corrected; §3.2 (OIDC),
+§3.3 (guardrails), §3.4 (MCP), §3.5 (log export) and §3.7 (tool-call tracking)
+were each verified still accurate. Re-check before trusting, and date what you
+find.
+
 ---
 
 ## 1. The shape of the answer
@@ -78,9 +86,38 @@ its marginal cost is zero) and the new quota reserve (which only engages once th
 provider's own pool is nearly spent). A looping agent on a subscription seat can
 therefore exhaust a shared weekly pool in minutes and nothing refuses it.
 
-**What we have.** Verified: nothing. Every `rate_limit` path in the codebase is
-*upstream* 429 handling — `select.rs`, `schedule.rs`, `usage_poll.rs`. There is
-no inbound limiter.
+**What we have.** *(Corrected 2026-09-09. This said "Verified: nothing", which
+was true when written and is no longer.)* **Half of this shipped, per-route.**
+
+- `route.rpm_limit` (`0001_baseline.sql:58`), a typed column on the route — not a
+  settings table, as this section asked for.
+- `Cache::take_rate_token` — a token bucket in Redis, applied by a **Lua script**,
+  so it is the atomic operation the "second trap" below calls for rather than a
+  read-modify-write that races across replicas.
+- Applied in `gateway/mod.rs` and `count_tokens.rs` **before** classification and
+  credential selection, so a refused request costs one Redis round trip. That is
+  the "refuse cheaply" placement below.
+- Refusal is `Error::RateLimited { retry_after }` → **429 with `Retry-After`**,
+  and a test refuses `Retry-After: 0` outright as an invitation to hot-loop.
+
+**What is still missing**, and it is the half this section actually asked for:
+
+- **Per-key and per-principal limits.** `rpm_limit` exists only on `route`, and
+  this section says per-key is the *minimum*. A route shared by fifty keys
+  throttles them collectively; one looping agent still starves the other
+  forty-nine, which is close to the incident described above.
+- **Windows longer than a minute.** The bucket is rpm only, so "5,000 per day"
+  and the "5-hour window" named at the top of this section cannot be expressed.
+- **A concurrency cap per caller** — the streaming trap below. `account`
+  carries `max_concurrency` for *credential* scheduling, but nothing bounds how
+  many streams one key may hold open.
+
+One caveat worth carrying, learned 2026-09-09: `take_rate_token` returns
+`Ok(None)` for **both** "token granted" and "Redis unreachable, so failing open".
+That is deliberate and right — refusing traffic because the coordination store
+blinked trades a real outage for a theoretical one — but it means the limiter is
+advisory under a Redis partition, and anything reasoning about it must not read
+`None` as proof a token was spent.
 
 **Low level.**
 
@@ -102,8 +139,9 @@ no inbound limiter.
   replicas. Use an atomic Redis operation (`INCR` with expiry, or a Lua script),
   not read-modify-write.
 
-**Effort:** small. This is the cheapest item here and the one whose absence is
-most likely to cause an incident.
+**Effort:** small, and now smaller — the Redis machinery, the error, the 429 and
+the `Retry-After` all exist. What remains is a second typed column on `api_key`
+(and `principal`), a second bucket key, and a window longer than a minute.
 
 ---
 
@@ -469,8 +507,11 @@ tokens to it and then get out of the way.
 
 ## 5. Suggested order, and why
 
-1. **Inbound rate limiting** — smallest, and its absence is the most likely cause
-   of a live incident (a looping agent draining a shared seat).
+1. **Inbound rate limiting — per key.** The per-*route* half shipped (see §3.1),
+   which removes the crudest version of the incident but not the one described:
+   a route shared by many keys still lets one looping agent starve the rest.
+   Now the smallest item here by some margin, because the Redis bucket, the
+   error and the 429 already exist.
 2. **Tool-call tracking** — small, the signal already flows through us, and it
    materially improves the audit story.
 3. **Guardrails hook + one deterministic guard** — the item that makes the system
