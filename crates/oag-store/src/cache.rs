@@ -14,7 +14,7 @@
 use hmac::{Hmac, Mac};
 use oag_core::{AccountId, Error, Result};
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use sha2::Sha256;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,17 +50,43 @@ return 1";
 /// Count the live slots on a credential: the members `ACQUIRE_SLOT` would
 /// keep, by the same clock and the same expiry.
 ///
-/// A read, deliberately — it trims nothing. Writes stay in the acquire path
-/// so a count can never race an acquire over who removes what; this simply
-/// declines to count what the next acquire will remove anyway.
+/// This used to be a read (`ZCOUNT` of scores inside the window) so a count
+/// could never race an acquire over who removes what. The race was imaginary
+/// for members both sides already treat as dead — they only trim scores at or
+/// before `now - ttl`, which acquire would drop on the next take anyway — and
+/// the read left expired members sitting in the key until something acquired.
+/// A full credential never acquired, so nothing swept it; operators staring
+/// at `ZCARD` saw ghosts the scheduler had already stopped counting.
+///
+/// Trim first, then `ZCARD`. The acquire's trim is inclusive at `now - ttl`,
+/// so this uses the same command rather than an exclusive `ZCOUNT` that had
+/// to explain a boundary the two sides already agree on.
 const SLOTS_IN_USE: &str = r"
 local key = KEYS[1]
 local ttl = tonumber(ARGV[1])
 
 local now = redis.call('TIME')[1]
--- Exclusive at the boundary, because the acquire's trim is inclusive there:
--- a member scored exactly now - ttl is one the next acquire removes.
-return redis.call('ZCOUNT', key, '(' .. (now - ttl), '+inf')
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - ttl)
+return redis.call('ZCARD', key)
+";
+
+/// Refresh a live slot's score so a short TTL can outlive a long stream.
+///
+/// No-ops if the member is gone: an admin clear, a release, or a trim must
+/// not be undone by a heartbeat that lost the race.
+const REFRESH_SLOT: &str = r"
+local key    = KEYS[1]
+local member = ARGV[1]
+local ttl    = tonumber(ARGV[2])
+
+if redis.call('ZSCORE', key, member) == false then
+  return 0
+end
+
+local now = redis.call('TIME')[1]
+redis.call('ZADD', key, now, member)
+redis.call('EXPIRE', key, ttl * 2)
+return 1
 ";
 
 /// Take one token from a route's bucket, returning the seconds to wait.
@@ -117,8 +143,20 @@ static ACQUIRE_SLOT_SCRIPT: std::sync::LazyLock<redis::Script> =
     std::sync::LazyLock::new(|| redis::Script::new(ACQUIRE_SLOT));
 static SLOTS_IN_USE_SCRIPT: std::sync::LazyLock<redis::Script> =
     std::sync::LazyLock::new(|| redis::Script::new(SLOTS_IN_USE));
+static REFRESH_SLOT_SCRIPT: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(REFRESH_SLOT));
 static TAKE_TOKEN_SCRIPT: std::sync::LazyLock<redis::Script> =
     std::sync::LazyLock::new(|| redis::Script::new(TAKE_TOKEN));
+
+/// How long a slot Redis round trip may take before we drop the cached
+/// connection and surface an error.
+///
+/// Completions that hang inside `ConnectionManager` look like an empty reply
+/// to the client (`RemoteDisconnected`) while `/v1/models` and liveness still
+/// answer. Two seconds is well above a healthy RTT and well below a client
+/// timeout; the caller fail-opens, which is the same answer an unreachable
+/// Redis already gets.
+const SLOT_OP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Redis, for cross-replica coordination.
 ///
@@ -163,11 +201,59 @@ impl Cache {
         if let Some(c) = guard.clone() {
             return Ok(c);
         }
-        let c = ConnectionManager::new(self.client.clone())
+        // Bounded reconnects: the crate default is six exponential retries,
+        // and every in-flight command waits on that future. Completions that
+        // share this manager then look empty/`RemoteDisconnected` while
+        // `/v1/models` still answers. Two tries, two-second caps; the caller
+        // fail-opens.
+        let cfg = ConnectionManagerConfig::new()
+            .set_response_timeout(Some(SLOT_OP_TIMEOUT))
+            .set_connection_timeout(Some(SLOT_OP_TIMEOUT))
+            .set_number_of_retries(2);
+        let c = ConnectionManager::new_with_config(self.client.clone(), cfg)
             .await
             .map_err(|e| Error::Internal(format!("connecting to redis: {e}")))?;
         *guard = Some(c.clone());
         Ok(c)
+    }
+
+    /// Forget the cached connection so the next call redials.
+    ///
+    /// A timed-out command can leave `ConnectionManager` holding a socket that
+    /// will never answer; keeping it would hang every subsequent slot op on
+    /// this replica, which is the completions wedge.
+    async fn drop_conn(&self) {
+        *self.conn.write().await = None;
+    }
+
+    /// Run a slot Redis op with a deadline. Timeout drops the connection.
+    async fn slot_timed<T>(
+        &self,
+        op: &'static str,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        match tokio::time::timeout(SLOT_OP_TIMEOUT, fut).await {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => {
+                if e.to_string().to_ascii_lowercase().contains("timeout") {
+                    tracing::warn!(
+                        op,
+                        error = %e,
+                        "redis slot op timed out; dropping the cached connection"
+                    );
+                    self.drop_conn().await;
+                }
+                Err(e)
+            }
+            Err(_) => {
+                tracing::warn!(
+                    op,
+                    "redis slot op timed out; dropping the cached connection"
+                );
+                self.drop_conn().await;
+                Err(Error::Internal(format!("{op}: redis timed out")))
+            }
+        }
     }
 
     pub async fn ping(&self) -> bool {
@@ -188,16 +274,14 @@ impl Cache {
         limit: u32,
         ttl: Duration,
     ) -> Result<bool> {
-        let mut conn = self.conn().await?;
-        let taken: i64 = ACQUIRE_SLOT_SCRIPT
-            .key(slot_key(account))
-            .arg(request)
-            .arg(limit)
-            .arg(ttl.as_secs())
-            .invoke_async(&mut conn)
-            .await
-            .map_err(|e| Error::Internal(format!("acquiring slot: {e}")))?;
-        Ok(taken == 1)
+        self.slot_timed("acquiring slot", async {
+            let mut conn = self.conn().await?;
+            let mut inv = ACQUIRE_SLOT_SCRIPT.key(slot_key(account));
+            inv.arg(request).arg(limit).arg(ttl.as_secs());
+            let taken: i64 = eval_slot_script(&mut conn, "acquiring slot", &inv).await?;
+            Ok(taken == 1)
+        })
+        .await
     }
 
     /// Take one request's worth of rate-limit allowance for a route.
@@ -217,59 +301,99 @@ impl Cache {
         }
         let (rate, burst) = rate_and_burst(rpm);
 
-        let mut conn = match self.conn().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, %route, "rate limiting unavailable; allowing");
-                return Ok(None);
-            }
-        };
-        let wait: String = match TAKE_TOKEN_SCRIPT
-            .key(format!("oag:rate:{route}"))
-            .arg(rate)
-            .arg(burst)
-            .invoke_async(&mut conn)
+        match self
+            .slot_timed("taking rate token", async {
+                let mut conn = self.conn().await?;
+                let mut inv = TAKE_TOKEN_SCRIPT.key(format!("oag:rate:{route}"));
+                inv.arg(rate).arg(burst);
+                let wait: String = eval_slot_script(&mut conn, "taking rate token", &inv).await?;
+                Ok(wait_from_redis(&wait))
+            })
             .await
         {
-            Ok(w) => w,
+            Ok(v) => Ok(v),
             Err(e) => {
                 tracing::warn!(error = %e, %route, "rate limiting unavailable; allowing");
-                return Ok(None);
+                Ok(None)
             }
-        };
-
-        Ok(wait_from_redis(&wait))
+        }
     }
 
     /// Give a slot back.
     pub async fn release_slot(&self, account: AccountId, request: &str) -> Result<()> {
-        let mut conn = self.conn().await?;
-        let _: i64 = conn
-            .zrem(slot_key(account), request)
-            .await
-            .map_err(|e| Error::Internal(format!("releasing slot: {e}")))?;
-        Ok(())
+        self.slot_timed("releasing slot", async {
+            let mut conn = self.conn().await?;
+            let _: i64 = conn
+                .zrem(slot_key(account), request)
+                .await
+                .map_err(|e| Error::Internal(format!("releasing slot: {e}")))?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Keep a held slot from ageing out of the TTL window.
+    ///
+    /// `Ok(true)` if the member was still there and its score moved. `Ok(false)`
+    /// if it was already gone — release, trim, or an admin clear won.
+    pub async fn refresh_slot(
+        &self,
+        account: AccountId,
+        request: &str,
+        ttl: Duration,
+    ) -> Result<bool> {
+        self.slot_timed("refreshing slot", async {
+            let mut conn = self.conn().await?;
+            let mut inv = REFRESH_SLOT_SCRIPT.key(slot_key(account));
+            inv.arg(request).arg(ttl.as_secs());
+            let kept: i64 = eval_slot_script(&mut conn, "refreshing slot", &inv).await?;
+            Ok(kept == 1)
+        })
+        .await
+    }
+
+    /// Drop every slot member for a credential. Returns how many were there,
+    /// expired included — the operator asked to clear the key, not to apply
+    /// the scheduler's window to it.
+    pub async fn clear_slots(&self, account: AccountId) -> Result<u32> {
+        self.slot_timed("clearing slots", async {
+            let mut conn = self.conn().await?;
+            let key = slot_key(account);
+            let n: i64 = conn
+                .zcard(&key)
+                .await
+                .map_err(|e| Error::Internal(format!("counting slots to clear: {e}")))?;
+            let _: i64 = conn
+                .del(&key)
+                .await
+                .map_err(|e| Error::Internal(format!("clearing slots: {e}")))?;
+            Ok(u32::try_from(n.max(0)).unwrap_or(u32::MAX))
+        })
+        .await
     }
 
     /// How many slots a credential is currently holding.
     ///
-    /// Counts only members younger than `ttl` — the same expiry `acquire_slot`
-    /// trims by — read against Redis's clock so replicas agree on it. A plain
-    /// `ZCARD` counted expired members too, and only an *acquire* ever swept
-    /// them: a credential that leaked `max_concurrency` slots (a replica that
-    /// died holding them, a pump that never returned) read as full to every
-    /// candidate pass, nothing tried to acquire on a full credential, and so
-    /// nothing swept it — a lockout lasting until the key's own expiry, twice
-    /// the TTL. Seventy minutes of a healthy credential reporting itself busy.
+    /// Trims members older than `ttl` — the same expiry `acquire_slot` trims
+    /// by — then `ZCARD`s what remains, against Redis's clock so replicas
+    /// agree. A plain `ZCARD` counted expired members too, and only an
+    /// *acquire* ever swept them: a credential that leaked `max_concurrency`
+    /// slots (a replica that died holding them, a pump that never returned)
+    /// read as full to every candidate pass, nothing tried to acquire on a
+    /// full credential, and so nothing swept it — a lockout lasting until the
+    /// key's own expiry, twice the TTL.
+    ///
+    /// The count itself now does the trim, so a background sweep (or a
+    /// candidate pass that finds the credential idle) can clear ghosts
+    /// without waiting for a successful acquire.
     pub async fn slots_in_use(&self, account: AccountId, ttl: Duration) -> Result<u32> {
-        let mut conn = self.conn().await?;
-        let n: u32 = SLOTS_IN_USE_SCRIPT
-            .key(slot_key(account))
-            .arg(ttl.as_secs())
-            .invoke_async(&mut conn)
-            .await
-            .map_err(|e| Error::Internal(format!("counting slots: {e}")))?;
-        Ok(n)
+        self.slot_timed("counting slots", async {
+            let mut conn = self.conn().await?;
+            let mut inv = SLOTS_IN_USE_SCRIPT.key(slot_key(account));
+            inv.arg(ttl.as_secs());
+            eval_slot_script(&mut conn, "counting slots", &inv).await
+        })
+        .await
     }
 
     /// `slots_in_use` for several credentials in one round trip, in order.
@@ -287,58 +411,114 @@ impl Cache {
         if accounts.is_empty() {
             return Ok(Vec::new());
         }
-        let mut conn = self.conn().await?;
-        let mut pipe = redis::pipe();
-        for account in accounts {
-            pipe.invoke_script(
-                SLOTS_IN_USE_SCRIPT
-                    .key(slot_key(*account))
-                    .arg(ttl.as_secs()),
-            );
-        }
-        match pipe.query_async::<Vec<u32>>(&mut conn).await {
-            Ok(counts) => Ok(counts),
-            // A single invocation loads the script on NOSCRIPT and retries; a
-            // pipeline does not. Straight after a Redis restart, a SCRIPT
-            // FLUSH, or on a node that has never seen this script, every
-            // count would otherwise fail — and selection would run open (see
-            // `slot_accounting_degraded`) until some other path happened to
-            // load it. Load it and go again, once.
-            Err(e) if e.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) => {
-                SLOTS_IN_USE_SCRIPT
-                    .load_async(&mut conn)
-                    .await
-                    .map_err(|e| Error::Internal(format!("loading slot script: {e}")))?;
-                pipe.query_async::<Vec<u32>>(&mut conn)
-                    .await
-                    .map_err(|e| Error::Internal(format!("counting slots: {e}")))
+        self.slot_timed("counting slots", async {
+            let mut conn = self.conn().await?;
+            let mut pipe = redis::pipe();
+            for account in accounts {
+                pipe.invoke_script(
+                    SLOTS_IN_USE_SCRIPT
+                        .key(slot_key(*account))
+                        .arg(ttl.as_secs()),
+                );
             }
-            Err(e) => Err(Error::Internal(format!("counting slots: {e}"))),
-        }
+            let mut last = None;
+            for _ in 0..4 {
+                match pipe.query_async::<Vec<u32>>(&mut conn).await {
+                    Ok(counts) => return Ok(counts),
+                    // A single invocation loads the script on NOSCRIPT and retries; a
+                    // pipeline does not. Straight after a Redis restart, a SCRIPT
+                    // FLUSH, or on a node that has never seen this script, every
+                    // count would otherwise fail — and selection would run open (see
+                    // `slot_accounting_degraded`) until some other path happened to
+                    // load it. Load and go again; a flush between load and eval
+                    // is why this is a loop, not a single retry.
+                    Err(e) if is_noscript(&e) => {
+                        SLOTS_IN_USE_SCRIPT
+                            .load_async(&mut conn)
+                            .await
+                            .map_err(|e| Error::Internal(format!("loading slot script: {e}")))?;
+                        last = Some(e);
+                    }
+                    Err(e) => {
+                        return Err(Error::Internal(format!("counting slots: {e}")));
+                    }
+                }
+            }
+            Err(Error::Internal(format!(
+                "counting slots: {}",
+                last.map(|e| e.to_string())
+                    .unwrap_or_else(|| "NoScript".into())
+            )))
+        })
+        .await
     }
 
     /// Which credential a session is pinned to, refreshing the pin's lifetime.
     pub async fn sticky_get(&self, key: &str, ttl: Duration) -> Result<Option<AccountId>> {
-        let mut conn = self.conn().await?;
-        // Refresh on read: an active conversation should keep its pin, and an
-        // abandoned one should let go of it. `GETEX` does both in one round
-        // trip; this was a GET and an EXPIRE, on every request with a pin.
-        let raw: Option<String> = conn
-            .get_ex(key, redis::Expiry::EX(ttl.as_secs()))
-            .await
-            .map_err(|e| Error::Internal(format!("reading sticky pin: {e}")))?;
-        let Some(raw) = raw else { return Ok(None) };
-        Ok(uuid::Uuid::parse_str(&raw).ok().map(AccountId::from_uuid))
+        self.slot_timed("reading sticky pin", async {
+            let mut conn = self.conn().await?;
+            // Refresh on read: an active conversation should keep its pin, and an
+            // abandoned one should let go of it. `GETEX` does both in one round
+            // trip; this was a GET and an EXPIRE, on every request with a pin.
+            let raw: Option<String> = conn
+                .get_ex(key, redis::Expiry::EX(ttl.as_secs()))
+                .await
+                .map_err(|e| Error::Internal(format!("reading sticky pin: {e}")))?;
+            let Some(raw) = raw else { return Ok(None) };
+            Ok(uuid::Uuid::parse_str(&raw).ok().map(AccountId::from_uuid))
+        })
+        .await
     }
 
     pub async fn sticky_set(&self, key: &str, account: AccountId, ttl: Duration) -> Result<()> {
-        let mut conn = self.conn().await?;
-        let _: () = conn
-            .set_ex(key, account.to_string(), ttl.as_secs())
-            .await
-            .map_err(|e| Error::Internal(format!("writing sticky pin: {e}")))?;
-        Ok(())
+        self.slot_timed("writing sticky pin", async {
+            let mut conn = self.conn().await?;
+            let _: () = conn
+                .set_ex(key, account.to_string(), ttl.as_secs())
+                .await
+                .map_err(|e| Error::Internal(format!("writing sticky pin: {e}")))?;
+            Ok(())
+        })
+        .await
     }
+}
+
+fn is_noscript(err: &redis::RedisError) -> bool {
+    err.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::NoScript)
+}
+
+/// `EVALSHA`, loading the script if Redis has forgotten it.
+///
+/// `invoke_async` already loads and retries once. A `SCRIPT FLUSH` (restart,
+/// failover, a parallel test) between that load and the retry still returns
+/// `NoScript` to us. A few more attempts are cheaper than treating an empty
+/// script cache as a fatal acquire.
+async fn eval_slot_script<T>(
+    conn: &mut ConnectionManager,
+    op: &'static str,
+    invocation: &redis::ScriptInvocation<'_>,
+) -> Result<T>
+where
+    T: redis::FromRedisValue,
+{
+    let mut last = None;
+    for _ in 0..4 {
+        match invocation.invoke_async(conn).await {
+            Ok(v) => return Ok(v),
+            Err(e) if is_noscript(&e) => {
+                if let Err(load_err) = invocation.load_async(conn).await {
+                    return Err(Error::Internal(format!("{op}: loading script: {load_err}")));
+                }
+                last = Some(e);
+            }
+            Err(e) => return Err(Error::Internal(format!("{op}: {e}"))),
+        }
+    }
+    Err(Error::Internal(format!(
+        "{op}: {}",
+        last.map(|e| e.to_string())
+            .unwrap_or_else(|| "NoScript".into())
+    )))
 }
 
 // ── auth cache (L2) ───────────────────────────────────────────────────────────
@@ -587,9 +767,10 @@ fn slot_key(account: AccountId) -> String {
 // Slots here expire by TTL and nothing else. A replica that dies leaves its
 // slots behind for at most one TTL, which is a bounded and self-healing error;
 // evicting by process identity is neither. "At most one TTL" holds because
-// `slots_in_use` counts by the same expiry the acquire trims by — before it
+// `slots_in_use` trims by the same expiry the acquire trims by — before it
 // did, a leaked slot stood in the count until the key's own EXPIRE at twice
 // the TTL, and nothing acquiring on a "full" credential ever ran the trim.
+// An operator who cannot wait that long has `clear_slots`.
 
 /// The wait a rate-limit script asked for, or `None` for no wait.
 ///
@@ -801,6 +982,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acquire_and_count_survive_repeated_script_flush() {
+        // Production: a failover. Tests: the pipelined NOSCRIPT case running
+        // next to this crate's other Redis tests. Either way EVALSHA can lose
+        // the script between load and retry; acquire used to surface that as
+        // a fatal Internal and a seat stayed empty-and-full at once.
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let cache = Cache::connect(&url).expect("cache");
+        let account = AccountId::new();
+        let ttl = Duration::from_mins(1);
+        let mut conn = cache.conn().await.expect("conn");
+        for i in 0..8 {
+            let _: () = redis::cmd("SCRIPT")
+                .arg("FLUSH")
+                .query_async(&mut conn)
+                .await
+                .expect("flush");
+            assert!(
+                cache
+                    .acquire_slot(account, &format!("m{i}"), 16, ttl)
+                    .await
+                    .unwrap_or_else(|e| panic!("acquire {i}: {e}")),
+                "member {i}"
+            );
+        }
+        let _: () = redis::cmd("SCRIPT")
+            .arg("FLUSH")
+            .query_async(&mut conn)
+            .await
+            .expect("flush before count");
+        assert_eq!(
+            cache.slots_in_use(account, ttl).await.expect("count"),
+            8,
+            "every flushed acquire still left a live member"
+        );
+        assert_eq!(cache.clear_slots(account).await.expect("clear"), 8);
+        assert_eq!(cache.slots_in_use(account, ttl).await.expect("empty"), 0);
+    }
+
+    #[tokio::test]
     async fn expired_slot_members_do_not_count_as_in_use() {
         // The lockout. Eight members older than the TTL — a replica that died
         // holding them — and a `ZCARD` reported eight in flight on a
@@ -881,6 +1104,118 @@ mod tests {
             "two live members and a limit of three leaves room"
         );
         let _: () = conn.del(slot_key(account)).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn an_absent_slot_key_counts_as_zero_in_flight() {
+        // Redis empty is idle, not full. The production pain was a replica
+        // whose gauge still showed max concurrency after the key was gone —
+        // operators chased ghosts, and if selection trusted a stale view the
+        // seat stayed at_capacity until restart. The count is Redis, and an
+        // absent key is zero.
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let cache = Cache::connect(&url).expect("cache");
+        let account = AccountId::new();
+        let ttl = Duration::from_mins(1);
+        let mut conn = cache.conn().await.expect("conn");
+        let _: () = conn.del(slot_key(account)).await.expect("absent");
+        assert_eq!(
+            cache.slots_in_use(account, ttl).await.expect("count"),
+            0,
+            "a missing key is zero in flight"
+        );
+        assert_eq!(
+            cache
+                .slots_in_use_many(&[account], ttl)
+                .await
+                .expect("pipelined"),
+            vec![0]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_slots_drops_the_key_and_counts_as_zero() {
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let cache = Cache::connect(&url).expect("cache");
+        let account = AccountId::new();
+        let ttl = Duration::from_mins(1);
+        assert!(
+            cache
+                .acquire_slot(account, "live-a", 8, ttl)
+                .await
+                .expect("acquire a")
+        );
+        assert!(
+            cache
+                .acquire_slot(account, "live-b", 8, ttl)
+                .await
+                .expect("acquire b")
+        );
+        assert_eq!(cache.slots_in_use(account, ttl).await.expect("count"), 2);
+
+        let dropped = cache.clear_slots(account).await.expect("clear");
+        assert_eq!(dropped, 2, "both live members were in the key");
+        assert_eq!(
+            cache.slots_in_use(account, ttl).await.expect("count after"),
+            0,
+            "Redis empty ⇒ in_flight 0"
+        );
+
+        // A heartbeat after a clear must not recreate the member: the operator
+        // asked the seat to be empty, including under a still-running request.
+        assert!(
+            !cache
+                .refresh_slot(account, "live-a", ttl)
+                .await
+                .expect("refresh"),
+            "refresh of a cleared member is a no-op"
+        );
+        assert_eq!(cache.slots_in_use(account, ttl).await.expect("still 0"), 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_a_live_member_and_ignores_a_released_one() {
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let cache = Cache::connect(&url).expect("cache");
+        let account = AccountId::new();
+        let ttl = Duration::from_mins(1);
+        assert!(
+            cache
+                .acquire_slot(account, "held", 2, ttl)
+                .await
+                .expect("acquire")
+        );
+        assert!(
+            cache
+                .refresh_slot(account, "held", ttl)
+                .await
+                .expect("refresh live"),
+            "a held member is refreshed"
+        );
+        cache.release_slot(account, "held").await.expect("release");
+        assert!(
+            !cache
+                .refresh_slot(account, "held", ttl)
+                .await
+                .expect("refresh gone"),
+            "a released member is not revived"
+        );
+        let _: () = cache
+            .conn()
+            .await
+            .expect("conn")
+            .del(slot_key(account))
+            .await
+            .expect("cleanup");
     }
 
     /// Skipped when `OAG_TEST_REDIS_URL` is unset so a plain `cargo test` still

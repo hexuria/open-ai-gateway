@@ -1242,6 +1242,25 @@ fn json_response(
         }
     };
 
+    {
+        let mut acc = oag_proto::StreamAccumulator::new();
+        for event in events {
+            acc.observe(event);
+        }
+        if matches!(
+            acc.quality_gate(),
+            Some(oag_router::QualityGate::EmptyResponse)
+        ) && (always_streams || ingress != upstream_dialect || body.is_empty())
+        {
+            tracing::error!(
+                %request_id,
+                ?ingress,
+                body_len = body.len(),
+                "completion had no content for the client"
+            );
+        }
+    }
+
     oag_headers(
         Response::builder()
             .status(StatusCode::OK)
@@ -1734,7 +1753,20 @@ fn stream_response(
         // is what keeps the credential's slot held for exactly as long as it is
         // really in use.
         let _guard = guard;
-        let outcome = sse::pump(response, adapter, tx, deadlines, egress).await;
+        let (gone_tx, mut gone_rx) = tokio::sync::watch::channel(false);
+        let lease_for_gone = lease.clone();
+        tokio::spawn(async move {
+            let _ = gone_rx.wait_for(|gone| *gone).await;
+            lease_for_gone.release().await;
+        });
+        let outcome =
+            sse::pump_notifying(response, adapter, tx, deadlines, egress, Some(gone_tx)).await;
+        if outcome.client_gone {
+            tracing::warn!(
+                %request_id,
+                "client disconnected; slot released, draining upstream for accounting"
+            );
+        }
         lease.release().await;
         // `triggering_gate` when we escalated to get here, otherwise whatever
         // this attempt tripped — the same rule the collected path applies, so

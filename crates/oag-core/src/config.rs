@@ -563,11 +563,10 @@ impl Default for TelemetryConfig {
 impl Config {
     /// The shipped ceiling on one streamed response.
     ///
-    /// Exposed so `oag-server` can assert its concurrency-slot TTL leaves room
-    /// for it: a slot that expires under a live request oversubscribes the
-    /// credential, silently. The two numbers have to be compared somewhere, and
-    /// the alternative was a test comparing a constant against a copy of this
-    /// one written out by hand.
+    /// A concurrency slot used to have to outlive this: a live request never
+    /// refreshed its Redis score, so a shorter TTL expired the slot under the
+    /// stream. The guard now heartbeats, so this ceiling can be (and is)
+    /// longer than the crash lease.
     #[must_use]
     pub const fn default_gateway_max_stream_duration() -> Duration {
         Duration::from_mins(30)

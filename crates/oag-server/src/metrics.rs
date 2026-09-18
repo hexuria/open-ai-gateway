@@ -60,6 +60,11 @@ pub fn describe() {
          be oversubscribed until Redis returns. Alert on it."
     );
     describe_counter!(
+        "oag_slot_ghost_total",
+        "Times selection saw a full snapshot or a refused acquire while Redis \
+         had room (or none). Non-zero means a ghost lockout was averted."
+    );
+    describe_counter!(
         "oag_tokens_total",
         "Tokens by kind: input, output, cache read, cache write."
     );
@@ -118,6 +123,7 @@ pub fn describe() {
     describe_gauge!(
         "oag_slots_in_use",
         "Concurrency slots held by credential, fleet-wide, as last read by this replica. \
+         Zero is a reading: a missing Redis key publishes 0, not the last full observation. \
          Every replica reports the same shared count: aggregate with max by (account), never sum."
     );
     describe_gauge!(
@@ -176,6 +182,7 @@ mod tests {
             include_str!("listen.rs"),
             include_str!("gateway/mod.rs"),
             include_str!("gateway/select.rs"),
+            include_str!("slots.rs"),
             include_str!("gateway/meter.rs"),
             include_str!("gateway/sse.rs"),
             include_str!("gateway/refresh.rs"),

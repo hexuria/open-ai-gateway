@@ -191,6 +191,17 @@ pub enum AccountCommand {
         #[arg(long)]
         pct: Option<i16>,
     },
+    /// Force-release concurrency slots for a credential.
+    ///
+    /// Drops `oag:slots:{id}` in Redis. Use this when `oag_slots_in_use` is
+    /// stuck at max and Redis has no live members — remasure bursts then 503
+    /// `at_capacity` until something clears the view. The running replica's
+    /// Prometheus gauge zeros on the next sweep (or immediately via the
+    /// admin API).
+    ClearSlots {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -506,7 +517,7 @@ pub async fn run(
         AdminCommand::Status => status(db).await,
         AdminCommand::Doctor { route } => doctor::run(db, config, &route).await,
         AdminCommand::Providers => print_providers(db).await,
-        AdminCommand::Account(cmd) => account_cmd(db, kek, cmd).await,
+        AdminCommand::Account(cmd) => account_cmd(db, kek, cmd, redis_url).await,
         AdminCommand::Key(cli) => key_cmd(db, redis_url, cli).await,
         AdminCommand::Route(cmd) => route_cmd(db, cmd).await,
         AdminCommand::Principal(PrincipalCommand::Promote { email }) => {
@@ -554,7 +565,7 @@ async fn usage_cmd(db: &Db, cmd: UsageCommand) -> Result<()> {
     }
 }
 
-async fn account_cmd(db: &Db, kek: &Kek, cmd: AccountCommand) -> Result<()> {
+async fn account_cmd(db: &Db, kek: &Kek, cmd: AccountCommand, redis_url: &str) -> Result<()> {
     match cmd {
         AccountCommand::Add { args } => add_account_from_args(db, kek, args).await,
         AccountCommand::List => list_accounts(db).await,
@@ -565,6 +576,7 @@ async fn account_cmd(db: &Db, kek: &Kek, cmd: AccountCommand) -> Result<()> {
             set_account_cost(db, &name, monthly_cost).await
         }
         AccountCommand::SetReserve { name, pct } => set_account_reserve(db, &name, pct).await,
+        AccountCommand::ClearSlots { name } => clear_account_slots(db, redis_url, &name).await,
     }
 }
 
@@ -986,6 +998,28 @@ async fn set_account_schedulable(db: &Db, name: &str, value: bool) -> Result<()>
     }
     let verb = if value { "enabled" } else { "disabled" };
     println!("{verb} {name}");
+    Ok(())
+}
+
+async fn clear_account_slots(db: &Db, redis_url: &str, name: &str) -> Result<()> {
+    let rows: Vec<(uuid::Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM account WHERE name = $1")
+            .bind(name)
+            .fetch_all(db.pool())
+            .await
+            .map_err(|e| oag_core::Error::Internal(format!("looking up account: {e}")))?;
+    let Some((id, name)) = rows.into_iter().next() else {
+        return Err(oag_core::Error::Config(format!(
+            "no credential named {name}; see `oag admin account list`"
+        )));
+    };
+    let cache = oag_store::Cache::connect(redis_url)?;
+    let dropped = cache
+        .clear_slots(oag_core::AccountId::from_uuid(id))
+        .await?;
+    println!("cleared {dropped} slot(s) on {name} ({id})");
+    println!("  Redis is empty fleet-wide; each replica zeros oag_slots_in_use on its sweep");
+    println!("  or immediately via POST /admin/api/accounts/{id}/clear-slots");
     Ok(())
 }
 
@@ -3212,6 +3246,16 @@ mod tests {
         match parse(&["account", "set-reserve", "grok"]).unwrap_or_else(|e| panic!("{e}")) {
             AdminCommand::Account(AccountCommand::SetReserve { pct, .. }) => assert_eq!(pct, None),
             other => panic!("expected account set-reserve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_slots_parses_a_credential_name() {
+        match parse(&["account", "clear-slots", "grok-seat"]).unwrap_or_else(|e| panic!("{e}")) {
+            AdminCommand::Account(AccountCommand::ClearSlots { name }) => {
+                assert_eq!(name, "grok-seat");
+            }
+            other => panic!("expected account clear-slots, got {other:?}"),
         }
     }
 

@@ -357,6 +357,22 @@ pub async fn account_by_id(db: &Db, id: AccountId) -> Result<Option<AccountRow>>
     .map_err(|e| Error::Internal(format!("loading account: {e}")))
 }
 
+/// Identity and display name for every credential, for the slot sweep.
+///
+/// The sweep publishes `oag_slots_in_use` from Redis, including zero, so a
+/// gauge that last observed a full seat does not stay full after the key is
+/// gone. Names, not ids, because the gauge is labelled by `account.name`.
+pub async fn account_slot_labels(db: &Db) -> Result<Vec<(AccountId, String)>> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, name FROM account")
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("listing accounts for slot sweep: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name)| (AccountId::from_uuid(id), name))
+        .collect())
+}
+
 /// Providers this route holds usable credentials for, and by which credential
 /// kind, for one principal.
 ///
