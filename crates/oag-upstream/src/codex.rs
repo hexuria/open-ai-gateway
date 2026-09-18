@@ -341,7 +341,7 @@ fn truncate(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oag_proto::{CanonicalRequest, ContentBlock, Message, Role};
+    use oag_proto::{CanonicalRequest, ContentBlock, Message, Role, Tool};
     use oag_router::{Capabilities, ModelId, ModelSpec, Pricing};
     use rust_decimal::dec;
     use serde_json::Value;
@@ -615,5 +615,49 @@ mod tests {
             events.first(),
             Some(StreamEvent::TextDelta { text }) if text == "hello"
         ));
+    }
+
+    #[test]
+    fn luna_never_sees_an_illegal_tool_name_on_the_wire() {
+        // The P0: Codex/Responses posts `tools[i].name` flat, luna rejects
+        // anything outside `^[a-zA-Z0-9_-]{1,64}$`, and a typical agent list
+        // puts an MCP connector with a dot at index 6.
+        let mut c = request();
+        c.tools = [
+            "Shell",
+            "Grep",
+            "Read",
+            "Write",
+            "StrReplace",
+            "Glob",
+            "user-Github.get_file",
+        ]
+        .into_iter()
+        .map(|name| Tool {
+            name: name.to_owned(),
+            description: String::new(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            cache_control: None,
+        })
+        .collect();
+        let req = CodexAdapter::new()
+            .build(&UpstreamRequest {
+                canonical: &c,
+                model: &model(),
+                credential: &seat(),
+            })
+            .expect("builds");
+        let body = body_of(&req);
+        let tools = body["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 7);
+        for (i, t) in tools.iter().enumerate() {
+            let name = t["name"].as_str().expect("name");
+            assert!(
+                oag_proto::is_legal_openai_function_name(name),
+                "tools[{i}].name = {name:?}"
+            );
+        }
+        assert_eq!(tools[6]["name"], "user-Github_get_file");
+        assert_eq!(c.tools[6].name, "user-Github.get_file");
     }
 }

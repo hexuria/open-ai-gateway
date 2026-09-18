@@ -20,7 +20,7 @@
 use futures_util::StreamExt;
 use oag_core::Error;
 use oag_core::provider::Dialect;
-use oag_proto::{StreamAccumulator, StreamEvent};
+use oag_proto::{FunctionNameMap, StreamAccumulator, StreamEvent};
 use oag_upstream::{Framing, ProviderAdapter};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -175,13 +175,37 @@ pub struct Deadlines {
 /// Long, deliberately: this is one state machine over a handful of locals
 /// that every branch reads, and slicing it into helpers would thread those
 /// locals through five signatures to save the lint.
-#[allow(clippy::too_many_lines)]
 pub async fn pump(
     response: reqwest::Response,
     adapter: Arc<dyn ProviderAdapter>,
     tx: mpsc::Sender<Chunk>,
     deadlines: Deadlines,
     egress: Egress,
+) -> StreamOutcome {
+    pump_with(
+        response,
+        adapter,
+        tx,
+        deadlines,
+        egress,
+        FunctionNameMap::identity(),
+    )
+    .await
+}
+
+/// [`pump`] with the original ↔ wire function names for this request.
+///
+/// OpenAI-shaped upstreams sanitise tool names on the way out; this is how
+/// the restored names reach the client on the way back. Identity (the
+/// [`pump`] wrapper) is correct for every other dialect.
+#[allow(clippy::too_many_lines)]
+pub async fn pump_with(
+    response: reqwest::Response,
+    adapter: Arc<dyn ProviderAdapter>,
+    tx: mpsc::Sender<Chunk>,
+    deadlines: Deadlines,
+    egress: Egress,
+    names: FunctionNameMap,
 ) -> StreamOutcome {
     let Deadlines {
         idle: idle_timeout,
@@ -190,7 +214,7 @@ pub async fn pump(
         keepalive: keepalive_interval,
     } = deadlines;
     let started = Instant::now();
-    let mut acc = StreamAccumulator::new();
+    let mut acc = StreamAccumulator::new().with_function_names(names);
     let mut ttft = None;
     let mut client_gone = false;
     let mut error = None;
@@ -606,6 +630,17 @@ pub async fn collect(
     response: reqwest::Response,
     dialect: Dialect,
 ) -> std::result::Result<(bytes::Bytes, Vec<StreamEvent>, StreamAccumulator), Error> {
+    collect_with(response, dialect, &FunctionNameMap::identity()).await
+}
+
+/// [`collect`] with the original ↔ wire function names, so a non-streamed
+/// OpenAI body that echoed sanitised names is restored before the client
+/// dialect renders it.
+pub async fn collect_with(
+    response: reqwest::Response,
+    dialect: Dialect,
+    names: &FunctionNameMap,
+) -> std::result::Result<(bytes::Bytes, Vec<StreamEvent>, StreamAccumulator), Error> {
     let bytes = response
         .bytes()
         .await
@@ -620,7 +655,7 @@ pub async fn collect(
         Error::Internal(format!("a successful upstream response was not JSON: {e}"))
     })?;
 
-    let events = match dialect {
+    let mut events = match dialect {
         Dialect::AnthropicMessages => oag_proto::anthropic::parse_response(&v),
         Dialect::OpenAIChatCompletions => oag_proto::openai::parse_response(&v),
         Dialect::GeminiGenerateContent => oag_proto::gemini::parse_response(&v),
@@ -639,7 +674,9 @@ pub async fn collect(
         }
     };
 
-    let mut acc = StreamAccumulator::new();
+    names.restore_in_events(&mut events);
+
+    let mut acc = StreamAccumulator::new().with_function_names(names.clone());
     for e in &events {
         acc.observe(e);
     }
@@ -666,11 +703,29 @@ pub async fn collect_stream(
     idle_timeout: Duration,
     max_duration: Duration,
 ) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), (Error, StreamAccumulator)> {
+    collect_stream_with(
+        response,
+        adapter,
+        idle_timeout,
+        max_duration,
+        FunctionNameMap::identity(),
+    )
+    .await
+}
+
+/// [`collect_stream`] with the original ↔ wire function names.
+pub async fn collect_stream_with(
+    response: reqwest::Response,
+    adapter: Arc<dyn ProviderAdapter>,
+    idle_timeout: Duration,
+    max_duration: Duration,
+    names: FunctionNameMap,
+) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), (Error, StreamAccumulator)> {
     let started = Instant::now();
     let framing = adapter.framing();
     let mut body = response.bytes_stream();
     let mut pending = Vec::<u8>::new();
-    let mut acc = StreamAccumulator::new();
+    let mut acc = StreamAccumulator::new().with_function_names(names);
     let mut events = Vec::new();
 
     loop {
