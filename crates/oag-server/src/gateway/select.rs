@@ -35,7 +35,7 @@ const SLOT_HEARTBEAT: Duration = Duration::from_secs(30);
 /// Held as a constant rather than configuration because the heartbeat interval
 /// is compiled against it. A deployment that needs a longer crash lease is
 /// waiting too long to notice a dead replica.
-pub(crate) const SLOT_TTL: Duration = Duration::from_secs(120);
+pub(crate) const SLOT_TTL: Duration = Duration::from_mins(2);
 
 const _: () = assert!(
     SLOT_HEARTBEAT.as_secs() * 2 < SLOT_TTL.as_secs(),
@@ -277,7 +277,7 @@ fn nothing_usable(search: &NothingUsable) -> Error {
 /// before anything else looks at it — including the sticky pin, which would
 /// otherwise hand a conversation that started unqualified straight back to an
 /// API key on the turn the caller asked for a seat.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn lease(
     state: &AppState,
     route_id: uuid::Uuid,

@@ -446,8 +446,7 @@ impl Cache {
             }
             Err(Error::Internal(format!(
                 "counting slots: {}",
-                last.map(|e| e.to_string())
-                    .unwrap_or_else(|| "NoScript".into())
+                last.map_or_else(|| "NoScript".into(), |e| e.to_string())
             )))
         })
         .await
@@ -516,8 +515,7 @@ where
     }
     Err(Error::Internal(format!(
         "{op}: {}",
-        last.map(|e| e.to_string())
-            .unwrap_or_else(|| "NoScript".into())
+        last.map_or_else(|| "NoScript".into(), |e| e.to_string())
     )))
 }
 

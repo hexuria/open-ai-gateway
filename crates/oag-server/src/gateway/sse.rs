@@ -170,6 +170,15 @@ pub struct Deadlines {
     pub keepalive: Duration,
 }
 
+fn mark_gone(flag: &mut bool, tx: Option<&tokio::sync::watch::Sender<bool>>) {
+    if !*flag {
+        *flag = true;
+        if let Some(tx) = tx {
+            let _ = tx.send(true);
+        }
+    }
+}
+
 /// Read `response`, forward it to `tx`, and account for usage.
 ///
 /// Long, deliberately: this is one state machine over a handful of locals
@@ -192,6 +201,10 @@ pub async fn pump(
 /// provider will bill those tokens either way, but the seat is no longer
 /// serving this caller. Remasure aborts were holding slots for the rest of
 /// the stream (and then `SLOT_TTL`) while Redis looked empty after a trim.
+///
+/// Long for the same reason [`pump`] is: one state machine over locals every
+/// branch reads.
+#[allow(clippy::too_many_lines)]
 pub async fn pump_notifying(
     response: reqwest::Response,
     adapter: Arc<dyn ProviderAdapter>,
@@ -211,14 +224,6 @@ pub async fn pump_notifying(
     let mut ttft = None;
     let mut client_gone = false;
     let mut error = None;
-    fn mark_gone(flag: &mut bool, tx: &Option<tokio::sync::watch::Sender<bool>>) {
-        if !*flag {
-            *flag = true;
-            if let Some(tx) = tx {
-                let _ = tx.send(true);
-            }
-        }
-    }
     // The provider's own words, if it put an `Error` event inside its 200
     // stream. Held apart from `error` because it decides two things the
     // inferred failures do not: what the ledger records, and whether a second
@@ -277,7 +282,7 @@ pub async fn pump_notifying(
                     let frame = bytes::Bytes::from_static(b": keepalive\n\n");
                     let sent = tokio::time::timeout(client_write_timeout, tx.send(Ok(frame))).await;
                     if !matches!(sent, Ok(Ok(()))) {
-                        mark_gone(&mut client_gone, &on_disconnect);
+                        mark_gone(&mut client_gone, on_disconnect.as_ref());
                         tracing::debug!("client gone during keepalive; draining upstream for accounting");
                     }
                 }
@@ -338,11 +343,11 @@ pub async fn pump_notifying(
             match tokio::time::timeout(client_write_timeout, tx.send(Ok(outbound))).await {
                 Ok(Ok(())) => acc.mark_committed(),
                 Ok(Err(_)) => {
-                    mark_gone(&mut client_gone, &on_disconnect);
+                    mark_gone(&mut client_gone, on_disconnect.as_ref());
                     tracing::debug!("client disconnected; draining upstream for accounting");
                 }
                 Err(_) => {
-                    mark_gone(&mut client_gone, &on_disconnect);
+                    mark_gone(&mut client_gone, on_disconnect.as_ref());
                     tracing::debug!(
                         timeout_s = client_write_timeout.as_secs(),
                         "client stopped reading; draining upstream for accounting"
