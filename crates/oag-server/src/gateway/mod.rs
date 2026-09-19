@@ -1753,18 +1753,18 @@ fn stream_response(
         // is what keeps the credential's slot held for exactly as long as it is
         // really in use.
         let _guard = guard;
-        let (gone_tx, mut gone_rx) = tokio::sync::watch::channel(false);
-        let lease_for_gone = lease.clone();
-        tokio::spawn(async move {
-            let _ = gone_rx.wait_for(|gone| *gone).await;
-            lease_for_gone.release().await;
-        });
+        // The slot is NOT released when the client goes: the seat counts what the
+        // provider is carrying, and the provider is still carrying this stream
+        // until the drain ends. Releasing early made N aborted streams N live
+        // upstream connections nobody counted, which is the ghost this seat
+        // exists to prevent, from the other side.
+        let (gone_tx, _gone_rx) = tokio::sync::watch::channel(false);
         let outcome =
             sse::pump_notifying(response, adapter, tx, deadlines, egress, Some(gone_tx)).await;
         if outcome.client_gone {
             tracing::warn!(
                 %request_id,
-                "client disconnected; slot released, draining upstream for accounting"
+                "client disconnected; slot held while the upstream drains for accounting"
             );
         }
         lease.release().await;
