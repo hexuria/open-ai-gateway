@@ -49,7 +49,12 @@ const _: () = assert!(
 #[async_trait::async_trait]
 pub trait SlotStore: Send + Sync + 'static {
     async fn release(&self, account: AccountId, request_id: &str);
-    async fn refresh(&self, account: AccountId, request_id: &str);
+    /// `true` while the member is still held. `false` means Redis no longer has
+    /// it — expired while Redis was away, or cleared by an admin — and the
+    /// request is now running unseated.
+    async fn refresh(&self, account: AccountId, request_id: &str) -> bool;
+    /// Take a seat back for a request that is already running. Honours `limit`.
+    async fn acquire(&self, account: AccountId, request_id: &str, limit: u32) -> bool;
 }
 
 #[async_trait::async_trait]
@@ -63,9 +68,29 @@ impl SlotStore for oag_store::Cache {
         }
     }
 
-    async fn refresh(&self, account: AccountId, request_id: &str) {
-        if let Err(e) = self.refresh_slot(account, request_id, SLOT_TTL).await {
-            tracing::debug!(error = %e, "could not refresh slot; it may expire");
+    async fn refresh(&self, account: AccountId, request_id: &str) -> bool {
+        match self.refresh_slot(account, request_id, SLOT_TTL).await {
+            Ok(held) => held,
+            Err(e) => {
+                // Unknown, not lost: a refresh that could not reach Redis says
+                // nothing about the member, and re-acquiring on every blip
+                // would churn the key for no reason.
+                tracing::debug!(error = %e, "could not refresh slot; it may expire");
+                true
+            }
+        }
+    }
+
+    async fn acquire(&self, account: AccountId, request_id: &str, limit: u32) -> bool {
+        match self
+            .acquire_slot(account, request_id, limit, SLOT_TTL)
+            .await
+        {
+            Ok(acquired) => acquired,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not re-acquire an expired slot");
+                false
+            }
         }
     }
 }
@@ -88,6 +113,9 @@ pub struct SlotGuard {
     store: Arc<dyn SlotStore>,
     account: AccountId,
     request_id: String,
+    /// The credential's concurrency limit, so the heartbeat can take the seat
+    /// back under the same rule the scheduler granted it.
+    limit: u32,
     released: AtomicBool,
 }
 
@@ -150,7 +178,28 @@ fn spawn_heartbeat(slot: &Arc<SlotGuard>) {
             if slot.released.load(Ordering::SeqCst) {
                 return;
             }
-            slot.store.refresh(slot.account, &slot.request_id).await;
+            if slot.store.refresh(slot.account, &slot.request_id).await {
+                continue;
+            }
+            // The member is gone: Redis was away longer than SLOT_TTL, or an
+            // admin cleared the key. This request is still running, so it still
+            // occupies a seat at the provider whatever Redis forgot. Take it
+            // back; if that is refused, the seat really is over-subscribed now
+            // and the only honest thing left is to say so loudly.
+            metrics::counter!("oag_slot_lost_total", "reason" => "expired").increment(1);
+            if slot
+                .store
+                .acquire(slot.account, &slot.request_id, slot.limit)
+                .await
+            {
+                tracing::warn!(request_id = %slot.request_id, "slot expired mid-stream; re-acquired");
+            } else {
+                tracing::warn!(
+                    request_id = %slot.request_id,
+                    "slot expired mid-stream and could not be re-acquired; the seat is over-subscribed"
+                );
+                metrics::counter!("oag_slot_lost_total", "reason" => "oversubscribed").increment(1);
+            }
         }
     });
 }
@@ -195,6 +244,7 @@ fn leased(state: &AppState, account: AccountRow, request_id: &str, via_sticky: b
         store: Arc::new(state.cache.clone()),
         account: account.account_id(),
         request_id: request_id.to_owned(),
+        limit: u32::try_from(account.max_concurrency).unwrap_or(0),
         released: AtomicBool::new(false),
     });
     spawn_heartbeat(&slot);
@@ -845,7 +895,13 @@ pub(crate) mod testing {
             self.released.fetch_add(1, Ordering::SeqCst);
         }
 
-        async fn refresh(&self, _account: AccountId, _request_id: &str) {}
+        async fn refresh(&self, _account: AccountId, _request_id: &str) -> bool {
+            true
+        }
+
+        async fn acquire(&self, _account: AccountId, _request_id: &str, _limit: u32) -> bool {
+            true
+        }
     }
 
     /// A credential row with nothing but its identity and its kind set.
@@ -904,6 +960,7 @@ pub(crate) mod testing {
                     store: Arc::clone(store) as Arc<dyn SlotStore>,
                     account: account.account_id(),
                     request_id: "req-1".to_owned(),
+                    limit: 8,
                     released: AtomicBool::new(false),
                 });
                 super::spawn_heartbeat(&slot);
