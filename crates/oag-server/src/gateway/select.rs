@@ -368,7 +368,20 @@ pub async fn lease(
         let tie_breaker = fastrand_u64();
         let Some(selection) = oag_pool::select(&candidates, now, tie_breaker) else {
             if let Some(full) = every_candidate_is_full(&candidates, now) {
-                if !ghost_retry && redis_has_room(state, &remaining).await {
+                // Probe only the credentials the snapshot actually considered.
+                // `remaining` still holds rows that are cooling, rate-limited or
+                // reserved; one of those having room in Redis is not a ghost, and
+                // it fired the ERROR and the counter every time.
+                let eligible: Vec<&AccountRow> = remaining
+                    .iter()
+                    .copied()
+                    .filter(|row| {
+                        candidates
+                            .iter()
+                            .any(|c| is_live(c, now) && c.account == row.account_id())
+                    })
+                    .collect();
+                if !ghost_retry && redis_has_room(state, &eligible).await {
                     tracing::error!(
                         %provider,
                         candidates = full,
