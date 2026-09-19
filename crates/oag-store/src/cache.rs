@@ -169,6 +169,11 @@ const SLOT_OP_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Cache {
     client: redis::Client,
     conn: Arc<RwLock<Option<ConnectionManager>>>,
+    /// Bumped every time a connection is established. A caller that timed
+    /// out captures it first and may only drop the connection it timed out
+    /// on; without this, hundreds of callers timing out on one wedged socket
+    /// each destroyed whatever healthy connection had been built since.
+    conn_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for Cache {
@@ -185,6 +190,7 @@ impl Cache {
         Ok(Self {
             client,
             conn: Arc::new(RwLock::new(None)),
+            conn_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -214,6 +220,8 @@ impl Cache {
             .await
             .map_err(|e| Error::Internal(format!("connecting to redis: {e}")))?;
         *guard = Some(c.clone());
+        self.conn_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(c)
     }
 
@@ -222,8 +230,13 @@ impl Cache {
     /// A timed-out command can leave `ConnectionManager` holding a socket that
     /// will never answer; keeping it would hang every subsequent slot op on
     /// this replica, which is the completions wedge.
-    async fn drop_conn(&self) {
-        *self.conn.write().await = None;
+    async fn drop_conn(&self, expected_gen: u64) {
+        let mut guard = self.conn.write().await;
+        if self.conn_gen.load(std::sync::atomic::Ordering::SeqCst) != expected_gen {
+            // Already replaced by a newer connection; the one that timed out is gone.
+            return;
+        }
+        *guard = None;
     }
 
     /// Run a slot Redis op with a deadline. Timeout drops the connection.
@@ -232,16 +245,20 @@ impl Cache {
         op: &'static str,
         fut: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
+        let generation = self.conn_gen.load(std::sync::atomic::Ordering::SeqCst);
         match tokio::time::timeout(SLOT_OP_TIMEOUT, fut).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => {
-                if e.to_string().to_ascii_lowercase().contains("timeout") {
+                // redis-rs spells its own timeout "timed out"; the old check for
+                // "timeout" never matched it, so this branch was dead.
+                let text = e.to_string().to_ascii_lowercase();
+                if text.contains("timeout") || text.contains("timed out") {
                     tracing::warn!(
                         op,
                         error = %e,
                         "redis slot op timed out; dropping the cached connection"
                     );
-                    self.drop_conn().await;
+                    self.drop_conn(generation).await;
                 }
                 Err(e)
             }
@@ -250,7 +267,7 @@ impl Cache {
                     op,
                     "redis slot op timed out; dropping the cached connection"
                 );
-                self.drop_conn().await;
+                self.drop_conn(generation).await;
                 Err(Error::Internal(format!("{op}: redis timed out")))
             }
         }
