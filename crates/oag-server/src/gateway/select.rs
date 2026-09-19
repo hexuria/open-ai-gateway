@@ -550,12 +550,19 @@ async fn claim_slot(
     {
         Ok(true) => true,
         Ok(false) => {
-            tracing::error!(
+            // An atomic refusal is capacity truth. ACQUIRE_SLOT only returns 0
+            // after `ZCARD >= limit`, and it returns before the ZADD -- so this
+            // caller holds no member. The retry exists to tell a stale snapshot
+            // from a full key, and it just answered "full": the key refilled
+            // between the count and this retry. Admitting here admits a request
+            // that nothing counts and nothing releases, which is the ghost this
+            // whole path was written to stop.
+            tracing::warn!(
                 account = %row.name,
                 op,
-                "retry still refused an empty key; admitting"
+                "retry refused: the key refilled between the count and the retry"
             );
-            true
+            false
         }
         Err(e) => {
             slot_accounting_degraded("acquire", &e);
