@@ -528,8 +528,9 @@ async fn claim_slot(
     let live = match state.cache.slots_in_use(row.account_id(), SLOT_TTL).await {
         Ok(n) => n,
         Err(e) => {
+            // Degraded, not empty: acquire just said the seat was full, so
+            // publishing 0 here would wipe a real reading with a guess.
             slot_accounting_degraded("count", &e);
-            publish_slots_in_use(&row.name, 0);
             return true;
         }
     };
