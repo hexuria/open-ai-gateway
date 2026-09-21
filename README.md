@@ -154,14 +154,6 @@ Ordered by what you are likely to need, not by number.
 - **Measures itself.** Every request records what it cost *and* what it would
   have cost on the route's top tier. The difference is the point.
 
-## Prior art
-
-Rebuilt from [sub2api](https://github.com/Wei-Shaw/sub2api), which solved the
-hard plumbing — credential pooling, prompt-cache-aware session affinity,
-streaming usage accounting, two-stage failover — and is worth reading for it.
-This keeps the plumbing, drops the resale SaaS around it, and adds the cost
-engine that was the point.
-
 ## On the name
 
 `open-ai-gateway` reads as "OpenAI gateway" and is trademark-adjacent. The

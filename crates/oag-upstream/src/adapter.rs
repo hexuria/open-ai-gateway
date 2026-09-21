@@ -3,9 +3,8 @@
 //! One implementation per provider, and deliberately narrow: build a request,
 //! interpret a response. Everything a provider does *not* need to know about —
 //! which credential to use, whether to retry, what it cost — is decided before
-//! the adapter is called. sub2api's equivalent is duck-typed across four
-//! concrete services with no interface at all, which is why adding a provider
-//! there means reading four of them to work out the shape.
+//! the adapter is called. The trait is the shape: adding a provider means
+//! implementing it.
 
 use async_trait::async_trait;
 use oag_core::provider::Dialect;

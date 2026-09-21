@@ -1,9 +1,7 @@
 //! Prometheus metrics.
 //!
-//! sub2api ships no metrics endpoint at all — its observability is an admin
-//! dashboard backed by aggregate rows in its own Postgres. That works until you
-//! want to alert on something, or correlate a gateway symptom with anything
-//! else in the fleet.
+//! Scraped by Prometheus, so an alert can fire on a symptom and a gateway
+//! spike can be lined up with the rest of the fleet.
 
 use crate::AppState;
 use axum::extract::State;

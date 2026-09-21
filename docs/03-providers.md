@@ -191,9 +191,7 @@ pub trait ProviderAdapter: Send + Sync + Debug {
 
 Deliberately narrow. Everything an adapter does *not* need to know — which
 credential to use, whether to retry, what it cost — is decided before it is
-called. sub2api's equivalent is duck-typed across four concrete services with no
-interface at all, which is why adding a provider there means reading all four to
-work out the shape.
+called. The trait is the shape: adding a provider means implementing it.
 
 `parse_event` returns a `Vec` because the mapping is not one-to-one: an
 Anthropic `content_block_start` plus its deltas is a single OpenAI chunk, and
@@ -280,10 +278,9 @@ requires SSE framing as well.
 
 `Transport` is a trait with exactly one implementation: `reqwest` over rustls.
 
-The seam exists because sub2api needs to impersonate the official CLI's TLS
-fingerprint — it routes resold subscription traffic that providers actively try
-to detect. This gateway does not, so the default build links no BoringSSL and
-ships no impersonation code. See [compliance.md](compliance.md).
+The seam stays so a different transport can be added later. The default build
+links no BoringSSL and ships no TLS-impersonation code. See
+[compliance.md](compliance.md).
 
 Transports are pooled per `(credential, proxy)`, not per host. Two credentials
 sharing a TCP connection share whatever per-connection state the provider keeps,

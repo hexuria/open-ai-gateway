@@ -1,10 +1,10 @@
 //! The admin mutations: five incident verbs, and the identity-integration set.
 //!
-//! **The five incident verbs.** This project dropped sub2api's admin sprawl — a
-//! 2466-line settings handler over a generic key/value table — and the way back
-//! to that is one reasonable-looking endpoint at a time. Each of these answers a
-//! question an operator has *during an incident*, when reaching for psql is
-//! slower and the CLI may not be to hand:
+//! **The five incident verbs.** The admin surface stays this small on purpose.
+//! A generic settings handler over a key/value table grows without a bound, and
+//! the way back to that is one reasonable-looking endpoint at a time. Each of
+//! these answers a question an operator has *during an incident*, when reaching
+//! for psql is slower and the CLI may not be to hand:
 //!
 //! - a credential is misbehaving          → disable
 //! - it has recovered                     → enable

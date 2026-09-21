@@ -120,8 +120,7 @@ sidesteps it by using `-` in all its own headers.
 
 Completions vary by two orders of magnitude in duration. Round-robin distributes
 *arrivals* evenly, which distributes *load* very unevenly: one replica ends up
-holding every long stream while its neighbours idle. sub2api's bundled Caddyfile
-ships `round_robin`.
+holding every long stream while its neighbours idle.
 
 ### 6. Draining
 
@@ -137,8 +136,7 @@ Step 2 is what makes it work, and only if your orchestrator's grace period
 exceeds the drain budget — `stop_grace_period` in compose,
 `terminationGracePeriodSeconds` on Kubernetes.
 
-sub2api gives in-flight work a hardcoded five seconds, so every deploy drops
-every active stream.
+A drain of a few seconds drops every active stream on every deploy.
 
 ### 7. Health versus readiness
 
@@ -148,9 +146,9 @@ every active stream.
 - `/health/ready` — Postgres and Redis are actually reachable, and we are not
   draining. **This is what the load balancer checks.**
 
-sub2api's `/health` returns a static `{"status":"ok"}` regardless of database
-state, so a replica with a dead pool stays in rotation and spreads the failure
-to every client instead of being routed around.
+A `/health` that returns a static `{"status":"ok"}` regardless of database
+state leaves a replica with a dead pool in rotation and spreads the failure
+to every client instead of routing around it.
 
 ## Running more than one replica
 
@@ -162,8 +160,8 @@ The gateway refuses to boot without `security.signing_secret` and
 `security.credential_kek`. The signing secret is also refused when it looks
 like a placeholder; the KEK is checked for being exactly 32 bytes of base64,
 which is what stops a copied example — no other placeholder check applies to it.
-sub2api generates its equivalents per instance when the environment does not
-supply them, so replica A mints tokens replica B rejects.
+A secret generated per instance, when the environment does not supply one,
+means replica A mints tokens replica B rejects.
 
 `signing_secret` also authenticates the shared auth cache in Redis, so a replica
 holding a different one still authenticates correctly — it just ignores the
@@ -172,10 +170,10 @@ therefore safe and needs no flush: every existing entry stops verifying, and the
 in-process caches age out within 15s. There is no dual-secret window, so plan on
 one cold cache after a rotation.
 
-**Concurrency slots expire by TTL and nothing else.** sub2api runs a cleanup at
-every boot that removes every Redis slot not carrying the current process's
-randomly-regenerated prefix — which, with more than one replica, removes every
-slot held by every *other* live replica. Any restart or scale-up silently voids
+**Concurrency slots expire by TTL and nothing else.** A boot-time cleanup that
+removes every Redis slot not carrying the current process's
+randomly-regenerated prefix removes, with more than one replica, every slot
+held by every *other* live replica. Any restart or scale-up silently voids
 concurrency accounting fleet-wide. A replica that dies here leaves its slots
 behind for at most one TTL: bounded, and self-healing.
 

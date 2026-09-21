@@ -1,7 +1,7 @@
 //! Seeding the model catalog.
 //!
 //! The authoritative source is LiteLLM's `model_prices_and_context_window.json`
-//! — the most complete public pricing table, and the one sub2api uses too.
+//! — the most complete public pricing table.
 //! Point `--from` at a downloaded copy or straight at the published URL.
 //!
 //! The built-in set exists so a fresh install works offline, and is deliberately

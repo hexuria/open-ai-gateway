@@ -7,9 +7,8 @@
 //!
 //! There is no `setting` table. A tunable needs a reader and a write path
 //! either way, so a generic row is not cheaper than a typed column; it is only
-//! less checkable. sub2api put nearly everything in one and grew a 2466-line
-//! handler parsing it. `state.reload_catalog()` shows restart-free mutation
-//! without any of that.
+//! less checkable. A generic row grows a handler that parses untyped strings.
+//! `state.reload_catalog()` is restart-free mutation of a typed catalog.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -35,8 +34,8 @@ pub struct ServerConfig {
     /// Inference traffic. This is the only listener the load balancer fronts.
     pub public_addr: String,
     /// Admin API, the SPA, `/metrics`, `/health/ready`. Bind this to the
-    /// internal network. sub2api served admin and inference on one port, which
-    /// means every admin endpoint inherits the public listener's exposure.
+    /// internal network. Serving admin and inference on one port means every
+    /// admin endpoint inherits the public listener's exposure.
     pub admin_addr: String,
     /// How long a client may take to send its request headers.
     ///
@@ -254,11 +253,11 @@ impl std::fmt::Debug for RedisConfig {
 
 /// Secrets. Every field here is required.
 ///
-/// sub2api generates its signing secret at first boot and writes it to a local
-/// file when the environment does not supply one. With more than one replica
-/// and unshared volumes, replica A mints tokens replica B rejects — an
-/// intermittent auth failure that looks like anything but a config problem.
-/// We refuse to start instead. See [`SecurityConfig::validate`].
+/// None of these is generated at boot. A signing secret written to a local
+/// file on first start differs on every replica with an unshared volume, so
+/// replica A mints tokens replica B rejects — an intermittent auth failure
+/// that looks like anything but a config problem. Startup refuses that.
+/// See [`SecurityConfig::validate`].
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SecurityConfig {

@@ -9,8 +9,8 @@
 //! - **admin** carries the admin API, the SPA, `/metrics`, and `/health/ready`.
 //!   Bound to the internal network.
 //!
-//! sub2api serves both from one port, which means every admin endpoint inherits
-//! whatever exposure the inference endpoint has. Splitting them makes "do not
+//! One port for both means every admin endpoint inherits whatever exposure the
+//! inference endpoint has. Splitting them makes "do not
 //! expose the admin API" a deployment fact rather than a routing rule someone
 //! has to remember to write.
 

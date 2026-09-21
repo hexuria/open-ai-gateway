@@ -76,7 +76,6 @@ static_resources:
       # Completions vary by two orders of magnitude in duration. Round-robin
       # distributes *arrivals* evenly, which distributes *load* very unevenly:
       # one replica ends up holding every long stream while its neighbours idle.
-      # sub2api's bundled config ships round_robin.
       lb_policy: LEAST_REQUEST
       least_request_lb_config:
         # Sample more hosts than the default two before choosing, since the

@@ -13,8 +13,8 @@ use uuid::Uuid;
 /// Hash an inbound key for lookup.
 ///
 /// The key is never stored in the clear, so this is also the only way to find
-/// one. sub2api stores inbound keys plaintext and matches on column equality,
-/// which turns read access to one table into every client's credential.
+/// one. Plaintext keys matched on column equality would turn read access to
+/// one table into every client's credential.
 /// What every key this gateway has ever issued looks like: the prefix, then
 /// 32 bytes of entropy as lowercase hex. See `mint_key`.
 pub const KEY_PREFIX: &str = "oag_live_";

@@ -773,11 +773,11 @@ fn slot_key(account: AccountId) -> String {
 //
 // There is no startup cleanup here, and that is the point.
 //
-// sub2api runs a cleanup at every boot that removes every slot whose id does
-// not carry the *current* process's randomly-regenerated prefix. With more than
-// one replica that removes every slot held by every other live replica, so any
-// restart, rolling deploy, or scale-up silently voids concurrency accounting
-// fleet-wide until the in-flight requests drain.
+// A boot-time cleanup that removes every slot whose id does not carry the
+// *current* process's randomly-regenerated prefix removes, with more than one
+// replica, every slot held by every other live replica. Any restart, rolling
+// deploy, or scale-up then silently voids concurrency accounting fleet-wide
+// until the in-flight requests drain.
 //
 // Slots here expire by TTL and nothing else. A replica that dies leaves its
 // slots behind for at most one TTL, which is a bounded and self-healing error;

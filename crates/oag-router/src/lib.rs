@@ -2,8 +2,8 @@
 
 //! The cost engine: catalog, classification, tier ladders, and escalation.
 //!
-//! This is the crate that justifies the project. sub2api pools credentials and
-//! meters usage but always sends a request to whatever model the client named.
+//! This is the crate that justifies the project. Pooling credentials and
+//! metering usage still sends a request to whatever model the client named.
 //! Most requests do not need a frontier model, and the difference between
 //! `claude-opus` and `kimi-k2` on a routine edit is roughly thirty-fold.
 //!
