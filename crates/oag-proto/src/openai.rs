@@ -19,6 +19,7 @@ use crate::canonical::{
     CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
     ToolResultContent,
 };
+use crate::function_names::FunctionNameMap;
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
 use oag_core::{Error, Result};
@@ -61,6 +62,7 @@ fn reasoning_model(upstream_model: &str) -> bool {
 }
 
 pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Value> {
+    let names = FunctionNameMap::from_request(req);
     let mut messages = Vec::new();
 
     // The system prompt becomes a message, and must come first.
@@ -80,7 +82,7 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     }
 
     for m in &req.messages {
-        messages.extend(render_message(m));
+        messages.extend(render_message(m, &names));
     }
 
     let mut body = json!({
@@ -130,7 +132,7 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
                     json!({
                         "type": "function",
                         "function": {
-                            "name": t.name,
+                            "name": names.wire(&t.name),
                             "description": t.description,
                             "parameters": t.input_schema,
                         }
@@ -154,7 +156,7 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     }
 
     if let Some(choice) = &req.tool_choice {
-        body["tool_choice"] = render_tool_choice(choice);
+        body["tool_choice"] = render_tool_choice(choice, &names);
     }
     if let Some(format) = &req.response_format {
         body["response_format"] = render_response_format(format);
@@ -165,14 +167,16 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     Ok(body)
 }
 
-fn render_tool_choice(choice: &ToolChoice) -> Value {
+fn render_tool_choice(choice: &ToolChoice, names: &FunctionNameMap) -> Value {
     match choice {
         ToolChoice::Auto => json!("auto"),
         ToolChoice::Required => json!("required"),
         ToolChoice::None => json!("none"),
         // The nested `function` wrapper is this dialect's; Responses flattens
         // it and Anthropic spells the whole thing differently.
-        ToolChoice::Tool { name } => json!({ "type": "function", "function": { "name": name } }),
+        ToolChoice::Tool { name } => {
+            json!({ "type": "function", "function": { "name": names.wire(name) } })
+        }
     }
 }
 
@@ -195,7 +199,7 @@ fn render_response_format(format: &ResponseFormat) -> Value {
 ///
 /// One-to-many because a single canonical turn can hold both text and several
 /// tool results, and this dialect needs a separate `tool` message for each.
-fn render_message(m: &Message) -> Vec<Value> {
+fn render_message(m: &Message, names: &FunctionNameMap) -> Vec<Value> {
     let mut out = Vec::new();
 
     // Tool results are their own messages, whatever turn they arrived in.
@@ -235,7 +239,7 @@ fn render_message(m: &Message) -> Vec<Value> {
                 "id": id,
                 "type": "function",
                 "function": {
-                    "name": name,
+                    "name": names.wire(name),
                     // Arguments are a JSON *string* here, not an object.
                     "arguments": input.to_string(),
                 }
@@ -572,10 +576,8 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
             opened.push(id.to_owned());
             events.push(StreamEvent::ToolUseStart {
                 id: id.to_owned(),
-                name: call["function"]["name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
+                name: acc
+                    .restore_function_name(call["function"]["name"].as_str().unwrap_or_default()),
             });
         }
         if let Some(args) = call["function"]["arguments"]
@@ -1307,7 +1309,7 @@ mod tests {
                 is_error: false,
             }],
         };
-        let out = render_message(&m);
+        let out = render_message(&m, &crate::FunctionNameMap::identity());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["role"], "tool");
         assert_eq!(out[0]["content"], "first\nsecond");
@@ -1863,5 +1865,87 @@ mod tests {
         };
         assert!(render_event(&stop, &mut st).is_some());
         assert!(render_event(&stop, &mut st).is_none());
+    }
+
+    // ── OpenAI function names luna (and the spec) refuse ─────────────────────
+
+    fn typical_agent_tools() -> serde_json::Value {
+        // tools[6] is the one luna named in the 400: an MCP/connector name with
+        // a dot, sitting after the six built-ins a NativeChat agent typically
+        // sends.
+        json!([
+            {"type": "function", "function": {"name": "Shell", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "Grep", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "Write", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "StrReplace", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "Glob", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "user-Github.get_file", "parameters": {"type": "object"}}},
+        ])
+    }
+
+    #[test]
+    fn openai_upstream_never_sees_an_illegal_tool_name() {
+        let c = parse_request(&json!({
+            "model": "gpt-5.6-luna",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": typical_agent_tools(),
+            "tool_choice": {"type": "function", "function": {"name": "user-Github.get_file"}},
+        }))
+        .expect("parses");
+        assert_eq!(
+            c.tools[6].name, "user-Github.get_file",
+            "canonical keeps the client's name"
+        );
+
+        let back = render_request(&c, "gpt-5.6-luna").expect("renders");
+        let tools = back["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 7);
+        for (i, t) in tools.iter().enumerate() {
+            let name = t["function"]["name"].as_str().expect("name");
+            assert!(
+                crate::is_legal_openai_function_name(name),
+                "tools[{i}].function.name = {name:?} would 400 on luna"
+            );
+        }
+        assert_eq!(tools[6]["function"]["name"], "user-Github_get_file");
+        assert_eq!(
+            back["tool_choice"]["function"]["name"],
+            "user-Github_get_file"
+        );
+    }
+
+    #[test]
+    fn a_sanitized_tool_call_restores_the_original_name() {
+        let c = parse_request(&json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "user-Github.get_file", "arguments": "{}"}
+                }]},
+            ],
+            "tools": typical_agent_tools(),
+        }))
+        .expect("parses");
+
+        let back = render_request(&c, "m").expect("renders");
+        assert_eq!(
+            back["messages"][1]["tool_calls"][0]["function"]["name"], "user-Github_get_file",
+            "history on the wire uses the sanitised name too"
+        );
+
+        let map = crate::FunctionNameMap::from_request(&c);
+        let mut acc = StreamAccumulator::new().with_function_names(map);
+        let events = parse_event(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_2","type":"function","function":{"name":"user-Github_get_file","arguments":""}}]},"finish_reason":null}]}"#,
+            &mut acc,
+        )
+        .expect("parses");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolUseStart { name, .. } if name == "user-Github.get_file"
+        )));
     }
 }
