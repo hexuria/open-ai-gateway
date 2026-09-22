@@ -21,6 +21,7 @@
 
 pub mod anthropic;
 pub mod canonical;
+pub mod function_names;
 pub mod gemini;
 pub mod openai;
 pub mod responses;
@@ -29,6 +30,10 @@ pub mod stream;
 pub use canonical::{
     CacheControl, CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
     count_input_tokens, extract_cache_blocks,
+};
+pub use function_names::{
+    FunctionNameMap, OPENAI_FUNCTION_NAME_MAX, is_legal_openai_function_name,
+    sanitize_openai_function_name,
 };
 pub use stream::{StopReason, StreamAccumulator, StreamEvent};
 
