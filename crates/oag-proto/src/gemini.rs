@@ -294,7 +294,10 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
                 .filter_map(|d| {
                     Some(Tool {
                         name: field(d, "name").as_str()?.to_owned(),
-                        description: field(d, "description").as_str().unwrap_or_default().to_owned(),
+                        description: field(d, "description")
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
                         input_schema: field(d, "parameters").clone(),
                         cache_control: None,
                     })
@@ -428,12 +431,13 @@ fn parse_content(v: &Value) -> Option<Message> {
                     // long tool-using conversation fed the model its own
                     // punctuation. A `response` this gateway did not render has
                     // no `result` key and is taken whole, as before.
-                    content: ToolResultContent::Text(match field(field(resp, "response"), "result")
-                    {
-                        Value::Null => field(resp, "response").to_string(),
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    }),
+                    content: ToolResultContent::Text(
+                        match field(field(resp, "response"), "result") {
+                            Value::Null => field(resp, "response").to_string(),
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        },
+                    ),
                     is_error: false,
                 });
             }
