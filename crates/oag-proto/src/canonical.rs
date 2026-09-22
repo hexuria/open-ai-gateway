@@ -273,6 +273,24 @@ impl Effort {
     }
 }
 
+/// `maxOutputTokens` → `max_output_tokens`.
+///
+/// proto3 JSON defines both the proto field name and its lowerCamelCase form,
+/// and a dialect built on it is sent in either. One rule rather than a table
+/// of pairs, so a field added later cannot be half supported.
+pub(crate) fn snake_of(camel: &str) -> String {
+    let mut out = String::with_capacity(camel.len() + 4);
+    for c in camel.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('_');
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// A request, dialect-independent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalRequest {

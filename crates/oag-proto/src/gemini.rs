@@ -200,14 +200,33 @@ fn render_message(m: &Message, tool_names: &HashMap<&str, &str>) -> Value {
     })
 }
 
+/// A field, in either of the two spellings this dialect is sent in.
+///
+/// proto3 JSON defines both the proto field name and its lowerCamelCase form,
+/// and Google's own endpoint accepts either — so `inline_data` and
+/// `inlineData` are the same field, and a client is free to send whichever its
+/// SDK emits. Reading only the camelCase one matched no arm for the other
+/// spelling and dropped the part: a request carrying audio came back HTTP 200
+/// having never contained any, which is the worst shape a bug like this has.
+///
+/// Every read in this parser goes through here. The conversion is by rule
+/// rather than by a table of pairs, so a field added later cannot be half
+/// supported.
+fn field<'a>(v: &'a Value, camel: &str) -> &'a Value {
+    static NULL: Value = Value::Null;
+    v.get(camel)
+        .or_else(|| v.get(crate::canonical::snake_of(camel).as_str()))
+        .unwrap_or(&NULL)
+}
+
 /// Gemini wire JSON → canonical.
 pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
-    let system = body["systemInstruction"]["parts"]
+    let system = field(field(body, "systemInstruction"), "parts")
         .as_array()
         .map(|parts| {
             parts
                 .iter()
-                .filter_map(|p| p["text"].as_str())
+                .filter_map(|p| field(p, "text").as_str())
                 .map(|t| ContentBlock::Text {
                     text: t.to_owned(),
                     cache_control: None,
@@ -216,23 +235,23 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         })
         .unwrap_or_default();
 
-    let messages = body["contents"]
+    let messages = field(body, "contents")
         .as_array()
         .map(|arr| arr.iter().filter_map(parse_content).collect())
         .unwrap_or_default();
 
-    let tools = body["tools"]
+    let tools = field(body, "tools")
         .as_array()
         .map(|entries| {
             entries
                 .iter()
-                .filter_map(|e| e["functionDeclarations"].as_array())
+                .filter_map(|e| field(e, "functionDeclarations").as_array())
                 .flatten()
                 .filter_map(|d| {
                     Some(Tool {
-                        name: d["name"].as_str()?.to_owned(),
-                        description: d["description"].as_str().unwrap_or_default().to_owned(),
-                        input_schema: d["parameters"].clone(),
+                        name: field(d, "name").as_str()?.to_owned(),
+                        description: field(d, "description").as_str().unwrap_or_default().to_owned(),
+                        input_schema: field(d, "parameters").clone(),
                         cache_control: None,
                     })
                 })
@@ -240,7 +259,7 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         })
         .unwrap_or_default();
 
-    let cfg = &body["generationConfig"];
+    let cfg = field(body, "generationConfig");
 
     Ok(CanonicalRequest {
         // Carried in the URL, not the body.
@@ -248,26 +267,21 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         system,
         messages,
         tools,
-        max_tokens: cfg["maxOutputTokens"]
+        max_tokens: field(cfg, "maxOutputTokens")
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
             .unwrap_or(4096),
         stream: false,
         #[allow(clippy::cast_possible_truncation)]
-        temperature: cfg["temperature"].as_f64().map(|t| t as f32),
-        thinking_budget: cfg["thinkingConfig"]["thinkingBudget"]
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok()),
+        temperature: field(cfg, "temperature").as_f64().map(|t| t as f32),
+        thinking_budget: thinking_budget(cfg),
         // This dialect speaks budgets. Carry the nearest level too, so a hop to
         // one that speaks levels does not silently drop the request to think.
-        thinking_effort: cfg["thinkingConfig"]["thinkingBudget"]
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .map(Effort::from_budget),
+        thinking_effort: thinking_budget(cfg).map(Effort::from_budget),
         client_session: None,
-        tool_choice: parse_tool_choice(&body["toolConfig"]["functionCallingConfig"]),
+        tool_choice: parse_tool_choice(field(field(body, "toolConfig"), "functionCallingConfig")),
         response_format: parse_response_format(cfg),
-        stop: cfg["stopSequences"]
+        stop: field(cfg, "stopSequences")
             .as_array()
             .map(|arr| {
                 arr.iter()
@@ -280,11 +294,17 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
     })
 }
 
+fn thinking_budget(cfg: &Value) -> Option<u32> {
+    field(field(cfg, "thinkingConfig"), "thinkingBudget")
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+}
+
 fn parse_tool_choice(cfg: &Value) -> Option<ToolChoice> {
-    let mode = cfg["mode"].as_str()?;
+    let mode = field(cfg, "mode").as_str()?;
     // A single allowed name is how this dialect says "call this one", so it
     // parses back to the named form rather than to a bare `Required`.
-    if let Some(name) = cfg["allowedFunctionNames"]
+    if let Some(name) = field(cfg, "allowedFunctionNames")
         .as_array()
         .filter(|names| names.len() == 1)
         .and_then(|names| names[0].as_str())
@@ -303,12 +323,12 @@ fn parse_tool_choice(cfg: &Value) -> Option<ToolChoice> {
 }
 
 fn parse_response_format(cfg: &Value) -> Option<ResponseFormat> {
-    let json = cfg["responseMimeType"].as_str() == Some("application/json");
-    match &cfg["responseSchema"] {
+    let json = field(cfg, "responseMimeType").as_str() == Some("application/json");
+    match field(cfg, "responseSchema") {
         Value::Null => {
             if json {
                 Some(ResponseFormat::JsonObject)
-            } else if cfg["responseMimeType"].is_string() {
+            } else if field(cfg, "responseMimeType").is_string() {
                 Some(ResponseFormat::Text)
             } else {
                 None
@@ -324,33 +344,35 @@ fn parse_response_format(cfg: &Value) -> Option<ResponseFormat> {
 }
 
 fn parse_content(v: &Value) -> Option<Message> {
-    let role = if v["role"].as_str() == Some("model") {
+    let role = if field(v, "role").as_str() == Some("model") {
         Role::Assistant
     } else {
         Role::User
     };
 
-    let content: Vec<ContentBlock> = v["parts"]
+    let content: Vec<ContentBlock> = field(v, "parts")
         .as_array()?
         .iter()
         .filter_map(|p| {
-            if let Some(text) = p["text"].as_str() {
+            if let Some(text) = field(p, "text").as_str() {
                 return Some(ContentBlock::Text {
                     text: text.to_owned(),
                     cache_control: None,
                 });
             }
-            if let Some(call) = p.get("functionCall") {
+            let call = field(p, "functionCall");
+            if !call.is_null() {
                 return Some(ContentBlock::ToolUse {
                     // No call id in this dialect; the name is the identity.
-                    id: call["name"].as_str().unwrap_or_default().to_owned(),
-                    name: call["name"].as_str().unwrap_or_default().to_owned(),
-                    input: call["args"].clone(),
+                    id: field(call, "name").as_str().unwrap_or_default().to_owned(),
+                    name: field(call, "name").as_str().unwrap_or_default().to_owned(),
+                    input: field(call, "args").clone(),
                 });
             }
-            if let Some(resp) = p.get("functionResponse") {
+            let resp = field(p, "functionResponse");
+            if !resp.is_null() {
                 return Some(ContentBlock::ToolResult {
-                    tool_use_id: resp["name"].as_str().unwrap_or_default().to_owned(),
+                    tool_use_id: field(resp, "name").as_str().unwrap_or_default().to_owned(),
                     // Unwrap the envelope `render_message` puts on. It writes
                     // `{"result": <the result>}`, and reading the whole object
                     // back made the result of one turn the *JSON of* the result
@@ -358,18 +380,20 @@ fn parse_content(v: &Value) -> Option<Message> {
                     // long tool-using conversation fed the model its own
                     // punctuation. A `response` this gateway did not render has
                     // no `result` key and is taken whole, as before.
-                    content: ToolResultContent::Text(match &resp["response"]["result"] {
-                        Value::Null => resp["response"].to_string(),
+                    content: ToolResultContent::Text(match field(field(resp, "response"), "result")
+                    {
+                        Value::Null => field(resp, "response").to_string(),
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
                     }),
                     is_error: false,
                 });
             }
-            if let Some(inline) = p.get("inlineData") {
+            let inline = field(p, "inlineData");
+            if !inline.is_null() {
                 return Some(ContentBlock::Image {
-                    media_type: inline["mimeType"].as_str()?.to_owned(),
-                    data: inline["data"].as_str()?.to_owned(),
+                    media_type: field(inline, "mimeType").as_str()?.to_owned(),
+                    data: field(inline, "data").as_str()?.to_owned(),
                 });
             }
             None
@@ -1467,4 +1491,85 @@ mod tests {
         assert_eq!(parts.len(), 1, "only the answer survives");
         assert_eq!(parts[0]["text"], "answer");
     }
+
+    /// The body Allowly sends, with the audio elided. Verbatim in structure:
+    /// `snake_case` part keys, and a vendor block sharing `generationConfig`
+    /// with a field canonical does carry.
+    fn transcription_request() -> Value {
+        json!({
+            "contents": [{
+                "role": "user",
+                "parts": [{"inline_data": {"mime_type": "audio/aac", "data": "QUFB"}}],
+            }],
+            "generationConfig": {
+                "temperature": 0,
+                "audioTranscriptionConfig": {
+                    "wordTimestamp": true,
+                    "diarization": false,
+                    "languageCodes": ["en-US"],
+                    "customVocabulary": ["Ghostty"],
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn a_snake_case_part_is_the_same_part() {
+        // proto3 JSON defines both spellings and Google accepts either, so a
+        // client is free to send whichever its SDK emits. Reading only
+        // `inlineData` matched no arm for `inline_data` and dropped the part:
+        // the request arrived carrying audio and reached the model carrying
+        // nothing, as a 200.
+        let c = parse_request(&transcription_request()).expect("parses");
+
+        assert_eq!(
+            c.messages[0].content,
+            vec![ContentBlock::Image {
+                media_type: "audio/aac".to_owned(),
+                data: "QUFB".to_owned(),
+            }],
+        );
+    }
+
+    #[test]
+    fn both_spellings_parse_to_the_same_request() {
+        let snake = parse_request(&json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"function_call": {"name": "read_file", "args": {"path": "a.rs"}}},
+                    {"function_response": {"name": "read_file", "response": {"result": "ok"}}},
+                ],
+            }],
+            "system_instruction": {"parts": [{"text": "be brief"}]},
+            "generation_config": {
+                "max_output_tokens": 256,
+                "stop_sequences": ["END"],
+                "thinking_config": {"thinking_budget": 8192},
+            },
+            "tool_config": {"function_calling_config": {"mode": "ANY"}},
+        }))
+        .expect("parses");
+
+        let camel = parse_request(&json!({
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"functionCall": {"name": "read_file", "args": {"path": "a.rs"}}},
+                    {"functionResponse": {"name": "read_file", "response": {"result": "ok"}}},
+                ],
+            }],
+            "systemInstruction": {"parts": [{"text": "be brief"}]},
+            "generationConfig": {
+                "maxOutputTokens": 256,
+                "stopSequences": ["END"],
+                "thinkingConfig": {"thinkingBudget": 8192},
+            },
+            "toolConfig": {"functionCallingConfig": {"mode": "ANY"}},
+        }))
+        .expect("parses");
+
+        assert_eq!(snake, camel);
+    }
+
 }
