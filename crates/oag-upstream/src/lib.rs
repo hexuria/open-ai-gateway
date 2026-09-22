@@ -14,6 +14,7 @@ pub mod pricing;
 pub mod sigv4;
 pub mod transport;
 pub mod usage;
+pub mod xai_models;
 pub mod xai_oauth;
 
 pub use adapter::{Framing, ProviderAdapter, UpstreamRequest};

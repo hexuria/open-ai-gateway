@@ -1405,6 +1405,30 @@ pub async fn rate_limit(db: &Db, id: AccountId, until: OffsetDateTime) -> Result
     Ok(())
 }
 
+/// Schedulable credentials of one provider and kind.
+///
+/// The usage poller asks an xAI API key for its model list. That key has no
+/// quota to read, so it is not in [`schedulable_oauth_accounts`], but a new
+/// model still has to land in the catalog or the picker never grows.
+pub async fn schedulable_accounts(db: &Db, provider: &str, kind: &str) -> Result<Vec<AccountRow>> {
+    sqlx::query_as::<_, AccountRow>(
+        r"
+        SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
+               token_version, token_expires_at, owner_principal_id, proxy_url,
+               priority, max_concurrency, schedulable, cooldown_until,
+               rate_limited_until, window_resets_at,
+               usage_remaining_pct, usage_reserve_pct, last_used_at
+        FROM account
+        WHERE provider = $1 AND kind = $2 AND schedulable
+        ",
+    )
+    .bind(provider)
+    .bind(kind)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("loading {provider} {kind} accounts: {e}")))
+}
+
 /// Every OAuth (subscription seat) account, for the usage poller to sweep.
 ///
 /// Not filtered by route or principal like `candidates`: the poller reads a
