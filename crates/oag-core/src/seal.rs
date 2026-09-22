@@ -5,9 +5,9 @@
 //! authenticated encryption is. XChaCha20-Poly1305 under a key-encryption key
 //! supplied by the environment.
 //!
-//! sub2api stores OAuth access and refresh tokens as plaintext JSONB, which
-//! makes a database backup a credential dump and a read-only SQL grant a
-//! credential grant. The cost of not doing that is this file.
+//! Plaintext OAuth access and refresh tokens in JSONB would make a database
+//! backup a credential dump and a read-only SQL grant a credential grant.
+//! Sealing them is this file.
 
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};

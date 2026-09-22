@@ -110,12 +110,16 @@ a client pointed here.
 
 ## Probe. Never trust a list
 
-An advertised model is not a servable one, and the reverse. All three seen in
-one week:
+An advertised model is not a servable one, and the reverse.
 
-- **Servable but unadvertised.** `xai/grok-4.6` dispatches, but xAI's usage
-  endpoint returns quota and no model list, so `served_models` stays empty and
-  `/v1/models` never mentions it.
+- **A model the provider just released.** The usage poller asks each xAI
+  credential which chat models it serves — `api.x.ai` for an API key, the CLI
+  chat proxy for a seat — and inserts any name the catalog has never seen.
+  On a passthrough route `/v1/models` then offers it without a ladder edit.
+  A managed route still only advertises models that sit on a rung. The poller
+  is `gateway.usage_poll_interval` (five minutes unless set otherwise); `0`
+  turns it off. `oag admin catalog sync-prices --provider xai` is the same
+  insert by hand, and it needs an API key.
 - **Advertised but unservable.** A Codex seat listed `gpt-5.5` in
   `served_models`; a request for it returns 404.
 - **`served_models` is not a gate.** It feeds the savings baseline, not

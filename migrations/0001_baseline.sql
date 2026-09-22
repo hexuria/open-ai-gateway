@@ -1,9 +1,7 @@
 -- Baseline schema.
 --
--- One migration, not 268. sub2api's history is worth reading for what it
--- learned and not worth replaying: it contains same-numbered files, several
--- rounds of patch migrations, and four subsystems whose tables were managed
--- outside the ORM entirely. We start from the shape those 268 arrived at.
+-- One migration. The schema is the shape we want, rather than a replay of a
+-- long patch history.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
@@ -31,9 +29,7 @@ CREATE TABLE principal (
 
 -- ── routes ────────────────────────────────────────────────────────────────────
 -- A tier ladder plus its entitlements and budget. This is the single routing
--- concept: sub2api had five overlapping ones (Group, Channel,
--- channel_model_pricing, CompositeModelRoute, and Group.model_routing) with a
--- name collision between two of them.
+-- concept: the ladder, its entitlements, and its prices live in this table.
 CREATE TABLE route (
     id                  uuid PRIMARY KEY,
     name                text        NOT NULL UNIQUE,
@@ -72,8 +68,8 @@ CREATE TABLE account (
                         CHECK (kind IN ('api_key','oauth','bedrock','vertex','service_account')),
 
     -- AEAD-sealed. Never plaintext, never logged, never returned by the admin
-    -- API. sub2api stores OAuth access and refresh tokens as plaintext JSONB,
-    -- which makes a database backup a credential dump.
+    -- API. Plaintext tokens in JSONB would make a database backup a credential
+    -- dump.
     credentials_sealed  bytea       NOT NULL,
     credentials_nonce   bytea       NOT NULL,
     -- Monotonic, guards against a concurrent refresh clobbering a newer token.
@@ -135,9 +131,9 @@ CREATE TABLE api_key (
     -- sha256 of the key, hex. The plaintext is shown once at creation and is
     -- not recoverable.
     --
-    -- sub2api stores inbound keys in plaintext and looks them up by column
-    -- equality, so read access to one table is read access to every client's
-    -- credential. Hashing costs one sha256 per cache miss.
+    -- Hashed, and looked up by the hash. Plaintext keys matched on column
+    -- equality would make read access to one table read access to every
+    -- client's credential. Hashing costs one sha256 per cache miss.
     key_hash        text        NOT NULL UNIQUE,
     -- First few characters, for the operator to recognise a key in a list.
     key_prefix      text        NOT NULL,

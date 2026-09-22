@@ -1,8 +1,7 @@
 //! The filter cascade: given every credential that could serve a request,
 //! pick one.
 //!
-//! Ported from sub2api's scheduler, which arrived at these stages one incident
-//! at a time. Each is a separate, independently justified filter rather than a
+//! Each stage is a separate, independently justified filter rather than a
 //! single scoring function, because a weighted score makes it impossible to
 //! answer "why did this request go there" — and that is the question you have
 //! at 3am.

@@ -1281,6 +1281,25 @@ fn json_response(
         }
     };
 
+    {
+        let mut acc = oag_proto::StreamAccumulator::new();
+        for event in events {
+            acc.observe(event);
+        }
+        if matches!(
+            acc.quality_gate(),
+            Some(oag_router::QualityGate::EmptyResponse)
+        ) && (always_streams || ingress != upstream_dialect || body.is_empty())
+        {
+            tracing::error!(
+                %request_id,
+                ?ingress,
+                body_len = body.len(),
+                "completion had no content for the client"
+            );
+        }
+    }
+
     oag_headers(
         Response::builder()
             .status(StatusCode::OK)
@@ -1785,7 +1804,28 @@ fn stream_response(
         // is what keeps the credential's slot held for exactly as long as it is
         // really in use.
         let _guard = guard;
-        let outcome = sse::pump_with(response, adapter, tx, deadlines, egress, names).await;
+        // The slot is NOT released when the client goes: the seat counts what the
+        // provider is carrying, and the provider is still carrying this stream
+        // until the drain ends. Releasing early made N aborted streams N live
+        // upstream connections nobody counted, which is the ghost this seat
+        // exists to prevent, from the other side.
+        let (gone_tx, _gone_rx) = tokio::sync::watch::channel(false);
+        let outcome = sse::pump_with(
+            response,
+            adapter,
+            tx,
+            deadlines,
+            egress,
+            names,
+            Some(gone_tx),
+        )
+        .await;
+        if outcome.client_gone {
+            tracing::warn!(
+                %request_id,
+                "client disconnected; slot held while the upstream drains for accounting"
+            );
+        }
         lease.release().await;
         // `triggering_gate` when we escalated to get here, otherwise whatever
         // this attempt tripped — the same rule the collected path applies, so

@@ -1,11 +1,10 @@
 //! How bytes reach a provider.
 //!
-//! [`Transport`] exists as a trait for one reason: sub2api needs to impersonate
-//! the TLS fingerprint of the official CLI, because it routes resold
-//! subscription traffic that providers actively try to detect. We do not — an
-//! internal gateway on sanctioned credentials has nothing to hide — so the only
-//! implementation here is plain `reqwest` over rustls, and the build links no
-//! BoringSSL.
+//! [`Transport`] is a trait so the bytes-on-the-wire implementation can change
+//! without the rest of the upstream path knowing. The only implementation here
+//! is plain `reqwest` over rustls, and the build links no BoringSSL: an
+//! internal gateway on sanctioned credentials has nothing to hide, and ships
+//! no TLS-fingerprint impersonation.
 //!
 //! The seam stays because "we never need this" and "this is impossible to add"
 //! are different claims, and only the first one is true.

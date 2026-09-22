@@ -92,23 +92,11 @@ impl AppState {
     pub fn new(config: Config, db: Db, cache: Cache) -> Result<Self> {
         let kek = Kek::from_base64(&config.security.credential_kek)?;
 
-        // A slot must outlive the longest request it guards. `SLOT_TTL` is a
-        // constant and `max_stream_duration` is configuration, so the only
-        // place the two can be compared is here, where both exist.
-        //
-        // Refused rather than clamped: a slot expiring under a live request
-        // oversubscribes the credential silently — nothing observes a slot
-        // vanishing, so the first symptom is a provider's own rate limit on a
-        // deployment that believes it is within its limits.
-        if config.gateway.max_stream_duration >= crate::gateway::select::SLOT_TTL {
-            return Err(oag_core::Error::Config(format!(
-                "gateway.max_stream_duration ({:?}) must be shorter than the concurrency \
-                 slot TTL ({:?}), or a live request's slot expires under it and the \
-                 credential is oversubscribed",
-                config.gateway.max_stream_duration,
-                crate::gateway::select::SLOT_TTL,
-            )));
-        }
+        // Slot TTL used to have to outlive `max_stream_duration`: a live
+        // request never refreshed its Redis score, so a shorter TTL expired
+        // the slot under the stream and oversubscribed the credential. The
+        // guard now heartbeats, so the TTL is a crash lease. A 30-minute
+        // stream on a two-minute lease is the point, not a config error.
 
         // Normalised once, here, rather than trusted at every use site.
         //
@@ -429,42 +417,23 @@ mod tests {
         }
     }
 
-    /// G8. A stream ceiling that outlives a concurrency slot is refused here.
+    /// A stream ceiling may outlive the slot lease: the guard heartbeats.
     ///
-    /// A slot must outlive the longest request it guards. One that expires
-    /// under a live request oversubscribes the credential silently — nothing
-    /// observes a slot vanishing, so the first symptom is the provider's own
-    /// rate limit on a deployment that believes it is inside its limits.
-    ///
-    /// `select.rs` used to assert this by comparing `SLOT_TTL` against the
-    /// shipped default: two constants, which could only disagree if somebody
-    /// edited one of them, and which said nothing about the deployment that
-    /// raises the ceiling in its own YAML. That is precisely the deployment the
-    /// check exists for, so the assertion lives on the call instead — delete the
-    /// refusal in `AppState::new` and this fails, whereas the old one did not.
+    /// G8 used to refuse `max_stream_duration >= SLOT_TTL` at startup because a
+    /// live request never refreshed its Redis score. That forced a 35-minute
+    /// crash lease so a 30-minute stream would not oversubscribe. The lease is
+    /// now two minutes; deleting the heartbeat would oversubscribe, and this
+    /// test only proves the configuration that used to be illegal still boots.
     #[tokio::test]
-    async fn a_stream_ceiling_that_outlives_a_slot_is_refused_at_startup() {
-        let build = |max_stream_duration: u64| {
-            let config = crate::testing::config(&format!(
-                "gateway:\n  max_stream_duration: {max_stream_duration}\n"
-            ));
-            let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
-            let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
-            AppState::new(config, db, cache)
-        };
-
-        let ttl = crate::gateway::select::SLOT_TTL.as_secs();
-        build(oag_core::config::Config::default_gateway_max_stream_duration().as_secs())
-            .expect("the shipped default must leave room, or no deployment starts");
-        build(ttl - 1).expect("a ceiling one second inside the TTL still fits");
-
-        for over in [ttl, ttl + 60] {
-            let err = build(over).expect_err("a ceiling at or past the slot TTL is refused");
-            assert!(
-                err.to_string().contains("max_stream_duration") && err.to_string().contains("slot"),
-                "the refusal names both numbers, because only the operator can \
-                 reconcile them: {err}"
-            );
-        }
+    async fn a_stream_ceiling_may_outlive_the_slot_lease() {
+        let config = crate::testing::config("");
+        assert!(
+            config.gateway.max_stream_duration > crate::gateway::select::SLOT_TTL,
+            "the shipped ceiling is longer than the crash lease; heartbeats are \
+             what make that safe"
+        );
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        AppState::new(config, db, cache).expect("the shipped default must start");
     }
 }

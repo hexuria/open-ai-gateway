@@ -42,10 +42,9 @@ security:
   # secret is refused when it looks like a placeholder; the KEK is refused
   # unless it decodes to exactly 32 bytes, which is the only check it gets.
   #
-  # They must be byte-identical across every replica. sub2api generates its
-  # equivalents per instance when the environment does not supply them, so
-  # replica A mints tokens replica B rejects — an intermittent auth failure
-  # that looks like anything but a config problem.
+  # They must be byte-identical across every replica. A secret generated per
+  # instance makes replica A mint tokens replica B rejects — an intermittent
+  # auth failure that looks like anything but a config problem.
   #
   # signing_secret also authenticates the auth cache in Redis, so an entry
   # planted there cannot pass for an identity. Changing it invalidates that

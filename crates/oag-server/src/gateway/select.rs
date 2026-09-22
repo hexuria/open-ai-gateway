@@ -16,18 +16,31 @@ use std::time::Duration;
 /// abandoned conversation releases its pin rather than skewing the pool.
 const STICKY_TTL: Duration = Duration::from_mins(30);
 
-/// How long a concurrency slot survives without being released.
+/// How often a held slot refreshes its Redis score.
 ///
-/// The backstop for a replica that dies holding slots. Must exceed the longest
-/// request, or a live request's slot expires under it and the credential is
-/// oversubscribed — silently, because nothing observes a slot vanishing.
+/// Must be comfortably inside [`SLOT_TTL`]: two missed beats still leave the
+/// member inside the window, and a replica that dies stops refreshing, so the
+/// leaked members age out in one TTL instead of waiting for a 35-minute
+/// backstop that was sized for the longest possible stream.
+const SLOT_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// How long a concurrency slot survives without being refreshed or released.
 ///
-/// "The longest request" is `gateway.max_stream_duration`, which is
-/// configurable, and this is not. `AppState::new` refuses a configuration that
-/// sets the ceiling at or above this, because the alternative is a deployment
-/// that looks fine and dispatches more concurrent requests to a credential than
-/// its limit allows.
-pub(crate) const SLOT_TTL: Duration = Duration::from_mins(35);
+/// The backstop for a replica that dies holding slots. Used to be 35 minutes,
+/// sized to outlive `gateway.max_stream_duration` because a live request never
+/// touched the score after acquire — so shortening the TTL oversubscribed a
+/// long stream. The guard now heartbeats, so the TTL is a crash lease, not a
+/// stream ceiling: two minutes of silence and the seat is empty again.
+///
+/// Held as a constant rather than configuration because the heartbeat interval
+/// is compiled against it. A deployment that needs a longer crash lease is
+/// waiting too long to notice a dead replica.
+pub(crate) const SLOT_TTL: Duration = Duration::from_mins(2);
+
+const _: () = assert!(
+    SLOT_HEARTBEAT.as_secs() * 2 < SLOT_TTL.as_secs(),
+    "a slot must survive two missed heartbeats or a delayed tick drops a live request"
+);
 
 /// Where a concurrency slot goes back to.
 ///
@@ -36,6 +49,12 @@ pub(crate) const SLOT_TTL: Duration = Duration::from_mins(35);
 #[async_trait::async_trait]
 pub trait SlotStore: Send + Sync + 'static {
     async fn release(&self, account: AccountId, request_id: &str);
+    /// `true` while the member is still held. `false` means Redis no longer has
+    /// it — expired while Redis was away, or cleared by an admin — and the
+    /// request is now running unseated.
+    async fn refresh(&self, account: AccountId, request_id: &str) -> bool;
+    /// Take a seat back for a request that is already running. Honours `limit`.
+    async fn acquire(&self, account: AccountId, request_id: &str, limit: u32) -> bool;
 }
 
 #[async_trait::async_trait]
@@ -46,6 +65,32 @@ impl SlotStore for oag_store::Cache {
         // bounded, not permanent.
         if let Err(e) = self.release_slot(account, request_id).await {
             tracing::debug!(error = %e, "could not release slot; it will expire");
+        }
+    }
+
+    async fn refresh(&self, account: AccountId, request_id: &str) -> bool {
+        match self.refresh_slot(account, request_id, SLOT_TTL).await {
+            Ok(held) => held,
+            Err(e) => {
+                // Unknown, not lost: a refresh that could not reach Redis says
+                // nothing about the member, and re-acquiring on every blip
+                // would churn the key for no reason.
+                tracing::debug!(error = %e, "could not refresh slot; it may expire");
+                true
+            }
+        }
+    }
+
+    async fn acquire(&self, account: AccountId, request_id: &str, limit: u32) -> bool {
+        match self
+            .acquire_slot(account, request_id, limit, SLOT_TTL)
+            .await
+        {
+            Ok(acquired) => acquired,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not re-acquire an expired slot");
+                false
+            }
         }
     }
 }
@@ -68,6 +113,9 @@ pub struct SlotGuard {
     store: Arc<dyn SlotStore>,
     account: AccountId,
     request_id: String,
+    /// The credential's concurrency limit, so the heartbeat can take the seat
+    /// back under the same rule the scheduler granted it.
+    limit: u32,
     released: AtomicBool,
 }
 
@@ -91,7 +139,7 @@ impl SlotGuard {
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        if *self.released.get_mut() {
+        if self.released.swap(true, Ordering::SeqCst) {
             return;
         }
         // Redis is async and `Drop` is not, so the release becomes a task.
@@ -104,9 +152,66 @@ impl Drop for SlotGuard {
         };
         let store = Arc::clone(&self.store);
         let account = self.account;
-        let request_id = std::mem::take(&mut self.request_id);
+        let request_id = self.request_id.clone();
         runtime.spawn(async move { store.release(account, &request_id).await });
     }
+}
+
+/// Keep a held slot inside the TTL window for as long as the guard lives.
+///
+/// A `Weak` so the task cannot keep the guard alive: if it held a strong
+/// `Arc`, `Drop` would wait for the heartbeat to notice `released`, and the
+/// heartbeat would wait for `Drop` to set it.
+fn spawn_heartbeat(slot: &Arc<SlotGuard>) {
+    let weak = Arc::downgrade(slot);
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    runtime.spawn(async move {
+        let mut ticker = tokio::time::interval(SLOT_HEARTBEAT);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(slot) = weak.upgrade() else {
+                return;
+            };
+            if slot.released.load(Ordering::SeqCst) {
+                return;
+            }
+            if slot.store.refresh(slot.account, &slot.request_id).await {
+                continue;
+            }
+            // The member is gone: Redis was away longer than SLOT_TTL, or an
+            // admin cleared the key. This request is still running, so it still
+            // occupies a seat at the provider whatever Redis forgot. Take it
+            // back; if that is refused, the seat really is over-subscribed now
+            // and the only honest thing left is to say so loudly.
+            metrics::counter!("oag_slot_lost_total", "reason" => "expired").increment(1);
+            if slot
+                .store
+                .acquire(slot.account, &slot.request_id, slot.limit)
+                .await
+            {
+                tracing::warn!(request_id = %slot.request_id, "slot expired mid-stream; re-acquired");
+            } else {
+                tracing::warn!(
+                    request_id = %slot.request_id,
+                    "slot expired mid-stream and could not be re-acquired; the seat is over-subscribed"
+                );
+                metrics::counter!("oag_slot_lost_total", "reason" => "oversubscribed").increment(1);
+            }
+        }
+    });
+}
+
+/// Publish the scheduler's Redis count, including zero.
+///
+/// The gauge is last-write-wins per replica. Leaving it untouched when Redis
+/// is empty is how operators chased a full `grok-seat` after `ZCARD` was 0:
+/// nothing successfully selected, so nothing wrote, and Prometheus kept the
+/// last observation. Zero is a real reading and must be published.
+pub(crate) fn publish_slots_in_use(account: &str, in_flight: u32) {
+    metrics::gauge!("oag_slots_in_use", "account" => account.to_owned()).set(f64::from(in_flight));
 }
 
 /// The chosen credential, plus the slot that has to be given back.
@@ -135,17 +240,19 @@ impl Lease {
 
 /// A lease over `account`, holding its slot until the last clone is dropped.
 fn leased(state: &AppState, account: AccountRow, request_id: &str, via_sticky: bool) -> Lease {
-    let slot = SlotGuard {
+    let slot = Arc::new(SlotGuard {
         store: Arc::new(state.cache.clone()),
         account: account.account_id(),
         request_id: request_id.to_owned(),
+        limit: u32::try_from(account.max_concurrency).unwrap_or(0),
         released: AtomicBool::new(false),
-    };
+    });
+    spawn_heartbeat(&slot);
     Lease {
         account,
         request_id: request_id.to_owned(),
         via_sticky,
-        slot: Arc::new(slot),
+        slot,
     }
 }
 
@@ -220,7 +327,7 @@ fn nothing_usable(search: &NothingUsable) -> Error {
 /// before anything else looks at it — including the sticky pin, which would
 /// otherwise hand a conversation that started unqualified straight back to an
 /// API key on the turn the caller asked for a seat.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn lease(
     state: &AppState,
     route_id: uuid::Uuid,
@@ -298,6 +405,10 @@ pub async fn lease(
         .iter()
         .filter(|r| !excluded.contains(&r.account_id()))
         .collect();
+    // One retry after a snapshot that said full while Redis had room. Without
+    // the bound, a lying count would spin the loop; with none, a ghost gauge
+    // became `at_capacity` until restart.
+    let mut ghost_retry = false;
 
     while !remaining.is_empty() {
         let candidates = candidates_for(state, &remaining, now).await;
@@ -307,6 +418,29 @@ pub async fn lease(
         let tie_breaker = fastrand_u64();
         let Some(selection) = oag_pool::select(&candidates, now, tie_breaker) else {
             if let Some(full) = every_candidate_is_full(&candidates, now) {
+                // Probe only the credentials the snapshot actually considered.
+                // `remaining` still holds rows that are cooling, rate-limited or
+                // reserved; one of those having room in Redis is not a ghost, and
+                // it fired the ERROR and the counter every time.
+                let eligible: Vec<&AccountRow> = remaining
+                    .iter()
+                    .copied()
+                    .filter(|row| {
+                        candidates
+                            .iter()
+                            .any(|c| is_live(c, now) && c.account == row.account_id())
+                    })
+                    .collect();
+                if !ghost_retry && redis_has_room(state, &eligible).await {
+                    tracing::error!(
+                        %provider,
+                        candidates = full,
+                        "selection snapshot was full but redis has room; recounting"
+                    );
+                    metrics::counter!("oag_slot_ghost_total", "op" => "snapshot").increment(1);
+                    ghost_retry = true;
+                    continue;
+                }
                 metrics::counter!("oag_at_capacity_total", "provider" => provider.as_str())
                     .increment(1);
                 return Err(Error::AtCapacity {
@@ -325,42 +459,48 @@ pub async fn lease(
             return Err(none_left());
         };
 
-        let limit = u32::try_from(row.max_concurrency).unwrap_or(0);
-        let acquired = match state
-            .cache
-            .acquire_slot(selection.account, request_id, limit, SLOT_TTL)
-            .await
-        {
-            Ok(acquired) => acquired,
-            // Fail OPEN. `unwrap_or(false)` here turned a Redis outage into
-            // "lost the race" for every candidate in turn, and the request
-            // into `AtCapacity` — a full product outage reported as a sizing
-            // problem. Admit, and count the admission.
-            Err(e) => {
-                slot_accounting_degraded("acquire", &e);
-                true
-            }
-        };
-        if acquired {
-            let _ = state
-                .cache
-                .sticky_set(&sticky_key, selection.account, STICKY_TTL)
-                .await;
-            metrics::counter!("oag_selection_total", "stage" => format!("{:?}", selection.stage))
-                .increment(1);
-            return Ok(leased(state, row.clone(), request_id, false));
+        if !claim_slot(state, row, request_id, "acquire").await {
+            // Lost the race for the last slot. Drop it and re-run rather than
+            // failing: another credential is very likely free.
+            remaining.retain(|r| r.account_id() != selection.account);
+            exhausted += 1;
+            continue;
         }
 
-        // Lost the race for the last slot. Drop it and re-run rather than
-        // failing: another credential is very likely free.
-        remaining.retain(|r| r.account_id() != selection.account);
-        exhausted += 1;
+        let _ = state
+            .cache
+            .sticky_set(&sticky_key, selection.account, STICKY_TTL)
+            .await;
+        metrics::counter!("oag_selection_total", "stage" => format!("{:?}", selection.stage))
+            .increment(1);
+        return Ok(leased(state, row.clone(), request_id, false));
     }
 
     // Distinguish "nothing to pick from" from "everything is busy". The first
     // means somebody has to add a credential; the second means waiting, or
     // raising max_concurrency, and resolves without anyone doing anything.
     if exhausted > 0 {
+        let probe: Vec<&AccountRow> = rows
+            .iter()
+            .filter(|r| !excluded.contains(&r.account_id()))
+            .collect();
+        if let Some(row) = first_with_redis_room(state, &probe).await {
+            tracing::error!(
+                %provider,
+                exhausted,
+                account = %row.name,
+                "every acquire lost but redis has room; retrying"
+            );
+            metrics::counter!("oag_slot_ghost_total", "op" => "exhausted").increment(1);
+            if claim_slot(state, row, request_id, "exhausted").await {
+                let _ = state
+                    .cache
+                    .sticky_set(&sticky_key, row.account_id(), STICKY_TTL)
+                    .await;
+                metrics::counter!("oag_selection_total", "stage" => "ghost").increment(1);
+                return Ok(leased(state, row.clone(), request_id, false));
+            }
+        }
         metrics::counter!("oag_at_capacity_total", "provider" => provider.as_str()).increment(1);
         return Err(Error::AtCapacity {
             provider,
@@ -410,30 +550,88 @@ async fn try_pinned(
     if !is_eligible(&candidate, now) || !state.breakers.permits(pinned, now) {
         return None;
     }
-    let acquired = match state
-        .cache
-        .acquire_slot(
-            candidate.account,
-            request_id,
-            candidate.max_concurrency,
-            SLOT_TTL,
-        )
-        .await
-    {
-        Ok(acquired) => acquired,
-        // Same policy as the cascade: an unanswerable Redis admits. The pin
-        // was the right credential a moment ago; a blink does not change that.
-        Err(e) => {
-            slot_accounting_degraded("acquire", &e);
-            true
-        }
-    };
-
-    if acquired {
+    // Same policy as the cascade: an unanswerable Redis admits. The pin
+    // was the right credential a moment ago; a blink does not change that.
+    if claim_slot(state, row, request_id, "sticky").await {
         metrics::counter!("oag_selection_total", "stage" => "sticky").increment(1);
         Some(row.clone())
     } else {
         None
+    }
+}
+
+/// Take a Redis slot, or admit if Redis is empty despite a refusal.
+///
+/// Capacity truth is the store. A snapshot or a last-write gauge that still
+/// says full after `ZCARD` is 0 is the ghost lockout: remasure then 503s
+/// `at_capacity` until restart. Retry the acquire against the empty key so
+/// the lease is a real member; only admit without one if the retry still
+/// sees none. A limit of zero is a closed seat, not a ghost.
+async fn claim_slot(
+    state: &AppState,
+    row: &AccountRow,
+    request_id: &str,
+    op: &'static str,
+) -> bool {
+    let limit = u32::try_from(row.max_concurrency).unwrap_or(0);
+    let acquired = match state
+        .cache
+        .acquire_slot(row.account_id(), request_id, limit, SLOT_TTL)
+        .await
+    {
+        Ok(acquired) => acquired,
+        Err(e) => {
+            slot_accounting_degraded("acquire", &e);
+            return true;
+        }
+    };
+    if acquired {
+        return true;
+    }
+    let live = match state.cache.slots_in_use(row.account_id(), SLOT_TTL).await {
+        Ok(n) => n,
+        Err(e) => {
+            // Degraded, not empty: acquire just said the seat was full, so
+            // publishing 0 here would wipe a real reading with a guess.
+            slot_accounting_degraded("count", &e);
+            return true;
+        }
+    };
+    publish_slots_in_use(&row.name, live);
+    if live > 0 || limit == 0 {
+        return false;
+    }
+    tracing::error!(
+        account = %row.name,
+        op,
+        "acquire refused a slot while redis has none; retrying"
+    );
+    metrics::counter!("oag_slot_ghost_total", "op" => op).increment(1);
+    match state
+        .cache
+        .acquire_slot(row.account_id(), request_id, limit, SLOT_TTL)
+        .await
+    {
+        Ok(true) => true,
+        Ok(false) => {
+            // An atomic refusal is capacity truth. ACQUIRE_SLOT only returns 0
+            // after `ZCARD >= limit`, and it returns before the ZADD -- so this
+            // caller holds no member. The retry exists to tell a stale snapshot
+            // from a full key, and it just answered "full": the key refilled
+            // between the count and this retry. Admitting here admits a request
+            // that nothing counts and nothing releases, which is the ghost this
+            // whole path was written to stop.
+            tracing::warn!(
+                account = %row.name,
+                op,
+                "retry refused: the key refilled between the count and the retry"
+            );
+            false
+        }
+        Err(e) => {
+            slot_accounting_degraded("acquire", &e);
+            true
+        }
     }
 }
 
@@ -455,7 +653,9 @@ async fn candidate_for(state: &AppState, row: &AccountRow, _now: i64) -> Option<
     // The gauge `metrics::describe` has declared since the beginning and
     // nothing ever set. Set here, from the number the scheduler is about to
     // rank by, because this is the one place the answer is already in hand.
-    metrics::gauge!("oag_slots_in_use", "account" => row.name.clone()).set(f64::from(in_flight));
+    // Zero is a reading: skipping it left operators staring at a stuck max
+    // after Redis had already dropped the key.
+    publish_slots_in_use(&row.name, in_flight);
     row.to_candidate(in_flight, 0)
 }
 
@@ -574,14 +774,48 @@ async fn candidates_for(state: &AppState, remaining: &[&AccountRow], now: i64) -
         // would show every credential idle during the one outage in which
         // nothing knows. The gauge keeps its last real value instead.
         if counted {
-            metrics::gauge!("oag_slots_in_use", "account" => row.name.clone())
-                .set(f64::from(in_flight));
+            publish_slots_in_use(&row.name, in_flight);
         }
         if let Some(c) = row.to_candidate(in_flight, 0) {
             candidates.push(c);
         }
     }
     candidates
+}
+
+/// Whether Redis currently shows room on any of these credentials.
+///
+/// Capacity truth is the store, not the last Prometheus write and not a
+/// snapshot that just lost a race with a trim. Unreachable Redis is room:
+/// that is the same fail-open as acquire.
+async fn redis_has_room(state: &AppState, rows: &[&AccountRow]) -> bool {
+    first_with_redis_room(state, rows).await.is_some()
+}
+
+/// The first credential Redis currently shows room on, gauges updated.
+///
+/// Unreachable Redis is the first row: fail open, same as acquire.
+async fn first_with_redis_room<'a>(
+    state: &AppState,
+    rows: &[&'a AccountRow],
+) -> Option<&'a AccountRow> {
+    if rows.is_empty() {
+        return None;
+    }
+    let ids: Vec<AccountId> = rows.iter().map(|r| r.account_id()).collect();
+    let counts = match state.cache.slots_in_use_many(&ids, SLOT_TTL).await {
+        Ok(counts) if counts.len() == ids.len() => counts,
+        Ok(_) | Err(_) => return rows.first().copied(),
+    };
+    let mut idle = None;
+    for (row, n) in rows.iter().zip(counts) {
+        publish_slots_in_use(&row.name, n);
+        let limit = u32::try_from(row.max_concurrency).unwrap_or(0);
+        if n < limit && idle.is_none() {
+            idle = Some(*row);
+        }
+    }
+    idle
 }
 
 /// How many candidates there were, when nothing was selectable because every
@@ -660,6 +894,14 @@ pub(crate) mod testing {
         async fn release(&self, _account: AccountId, _request_id: &str) {
             self.released.fetch_add(1, Ordering::SeqCst);
         }
+
+        async fn refresh(&self, _account: AccountId, _request_id: &str) -> bool {
+            true
+        }
+
+        async fn acquire(&self, _account: AccountId, _request_id: &str, _limit: u32) -> bool {
+            true
+        }
     }
 
     /// A credential row with nothing but its identity and its kind set.
@@ -713,12 +955,17 @@ pub(crate) mod testing {
         Lease {
             request_id: "req-1".to_owned(),
             via_sticky: false,
-            slot: Arc::new(SlotGuard {
-                store: Arc::clone(store) as Arc<dyn SlotStore>,
-                account: account.account_id(),
-                request_id: "req-1".to_owned(),
-                released: AtomicBool::new(false),
-            }),
+            slot: {
+                let slot = Arc::new(SlotGuard {
+                    store: Arc::clone(store) as Arc<dyn SlotStore>,
+                    account: account.account_id(),
+                    request_id: "req-1".to_owned(),
+                    limit: 8,
+                    released: AtomicBool::new(false),
+                });
+                super::spawn_heartbeat(&slot);
+                slot
+            },
             account,
         }
     }
@@ -769,6 +1016,73 @@ mod tests {
             .await
             .expect_err("a dead Redis is an error, not a lost race");
         assert!(err.to_string().contains("redis"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_redis_key_ranks_the_credential_idle() {
+        // Redis empty ⇒ in_flight 0, including after a live member was
+        // cleared. The gauge used to keep the last full observation because
+        // nothing successfully selected; the count itself is what selection
+        // ranks by, and it must say idle.
+        let Ok(redis_url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            "postgres://oag:oag@127.0.0.1:1/oag",
+            &redis_url,
+            "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("client");
+        let state = Arc::new(AppState::new(config, db, cache).expect("state"));
+        let row = super::testing::account("grok-seat", "oauth");
+
+        assert!(
+            state
+                .cache
+                .acquire_slot(row.account_id(), "ghost", 8, SLOT_TTL)
+                .await
+                .expect("acquire")
+        );
+        assert_eq!(
+            state
+                .cache
+                .slots_in_use(row.account_id(), SLOT_TTL)
+                .await
+                .expect("count"),
+            1
+        );
+        let dropped = state
+            .cache
+            .clear_slots(row.account_id())
+            .await
+            .expect("clear");
+        assert_eq!(dropped, 1);
+
+        let candidates = candidates_for(&state, &[&row], 0).await;
+        let [candidate] = candidates.as_slice() else {
+            panic!("one row in, one candidate out; got {}", candidates.len());
+        };
+        assert_eq!(candidate.in_flight, 0, "cleared Redis is idle, not full");
+        assert!(is_eligible(candidate, 0));
+        assert!(
+            redis_has_room(&state, &[&row]).await,
+            "empty redis is room, so at_capacity must not fire"
+        );
+    }
+
+    #[test]
+    fn the_slot_lease_is_a_crash_bound_inside_the_stream_ceiling() {
+        assert!(
+            SLOT_HEARTBEAT.as_secs() * 2 < SLOT_TTL.as_secs(),
+            "two missed heartbeats must not drop a live member"
+        );
+        assert!(
+            SLOT_TTL < oag_core::config::Config::default_gateway_max_stream_duration(),
+            "a long agent stream outlives the crash lease; heartbeats are why"
+        );
     }
 
     #[test]
@@ -1219,9 +1533,7 @@ mod tests {
     }
 
     // The slot-TTL-against-the-ceiling assertion used to live here and compared
-    // `SLOT_TTL` against the shipped default — two constants, agreeing by
-    // construction. It is now
-    // `state::tests::a_stream_ceiling_that_outlives_a_slot_is_refused_at_startup`,
-    // which drives `AppState::new` and so covers a deployment that raises the
-    // ceiling in its own YAML. That is the case the check was written for.
+    // `SLOT_TTL` against the shipped default. Heartbeats made that comparison
+    // the wrong invariant: see
+    // `state::tests::a_stream_ceiling_may_outlive_the_slot_lease`.
 }

@@ -9,8 +9,8 @@
 //! - **admin** carries the admin API, the SPA, `/metrics`, and `/health/ready`.
 //!   Bound to the internal network.
 //!
-//! sub2api serves both from one port, which means every admin endpoint inherits
-//! whatever exposure the inference endpoint has. Splitting them makes "do not
+//! One port for both means every admin endpoint inherits whatever exposure the
+//! inference endpoint has. Splitting them makes "do not
 //! expose the admin API" a deployment fact rather than a routing rule someone
 //! has to remember to write.
 
@@ -21,6 +21,7 @@ pub mod health;
 pub mod listen;
 pub mod metrics;
 pub mod shutdown;
+pub mod slots;
 pub mod state;
 pub mod usage_poll;
 
@@ -165,6 +166,7 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/accounts/{id}/disable", post(admin::disable_account))
         .route("/accounts/{id}/enable", post(admin::enable_account))
         .route("/accounts/{id}/clear-cooldown", post(admin::clear_cooldown))
+        .route("/accounts/{id}/clear-slots", post(admin::clear_slots))
         .route("/keys/{id}/revoke", post(admin::revoke_key))
         // The identity-integration set: a partner service binds each of its orgs
         // to a principal and each member to a key on it, so an org admin can hand
@@ -433,6 +435,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<()> {
     spawn_catalog_refresh(Arc::clone(&state));
     usage_poll::spawn_usage_poll(Arc::clone(&state));
     spawn_spend_reconcile(Arc::clone(&state));
+    slots::spawn_slot_sweep(Arc::clone(&state));
 
     if state.config.server.single_listener {
         tracing::warn!(
@@ -560,6 +563,7 @@ mod background_task_tests {
             "spawn_catalog_refresh(",
             "spawn_usage_poll(",
             "spawn_spend_reconcile(",
+            "spawn_slot_sweep(",
         ] {
             let calls = body.matches(task).count();
             assert_eq!(
@@ -580,6 +584,7 @@ mod background_task_tests {
             "spawn_catalog_refresh(",
             "spawn_usage_poll(",
             "spawn_spend_reconcile(",
+            "spawn_slot_sweep(",
         ] {
             let at = body.find(task).expect("checked by the test above");
             assert!(
@@ -1004,6 +1009,10 @@ mod router_tests {
         (
             "POST",
             "/admin/api/accounts/00000000-0000-0000-0000-000000000001/clear-cooldown",
+        ),
+        (
+            "POST",
+            "/admin/api/accounts/00000000-0000-0000-0000-000000000001/clear-slots",
         ),
         (
             "POST",

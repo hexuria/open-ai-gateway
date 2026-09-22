@@ -336,9 +336,10 @@ impl RoutingPolicy {
     /// answer when it is available, because it is measured against what this
     /// deployment could really have used rather than against a rung someone
     /// configured. But that set is a partial discovery, not an inventory: only
-    /// an adapter that overrides `served_models` populates it, and today only
-    /// Codex does. On a route holding a Codex seat beside an Anthropic key it
-    /// therefore lists gpt-5 and says nothing about Opus — so a request Opus
+    /// an adapter that overrides `served_models` populates it, which Codex and
+    /// xAI do and Anthropic does not. On a route holding a Codex seat beside
+    /// an Anthropic key it therefore lists gpt-5 and says nothing about Opus —
+    /// so a request Opus
     /// served took its baseline from a model that costs less than the request
     /// did, and `SUM(counterfactual - cost)` *subtracted* on exactly the rows
     /// where the gateway had spent the most.
@@ -1537,9 +1538,10 @@ mod tests {
     #[test]
     fn the_baseline_is_never_cheaper_than_a_rung_the_route_can_reach() {
         // R2. The served set is a partial discovery, not an inventory: only an
-        // adapter that overrides `served_models` populates it, and today only
-        // Codex does. A route holding such a seat beside an Anthropic key
-        // therefore lists the seat's models and says nothing about Opus — and
+        // adapter that overrides `served_models` populates it, which Codex and
+        // xAI do and Anthropic does not. A route holding such a seat beside an
+        // Anthropic key therefore lists the seat's models and says nothing
+        // about Opus — and
         // taking the served answer whenever it existed priced an Opus request
         // against a model that costs less than the request did. The headline
         // `SUM(counterfactual - cost)` then *subtracted* on exactly the rows

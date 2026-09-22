@@ -5,9 +5,8 @@
 //! instantly. A streamed completion runs for minutes, and the same sequence
 //! with a short deadline severs every one of them.
 //!
-//! sub2api gives in-flight work a hardcoded five seconds. Every deploy drops
-//! every active stream, and to each client it looks like a random upstream
-//! failure rather than a deploy.
+//! A drain of a few seconds drops every active stream, and to each client that
+//! looks like a random upstream failure rather than a deploy.
 //!
 //! The sequence here:
 //!

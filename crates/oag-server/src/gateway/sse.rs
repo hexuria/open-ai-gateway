@@ -170,6 +170,15 @@ pub struct Deadlines {
     pub keepalive: Duration,
 }
 
+fn mark_gone(flag: &mut bool, tx: Option<&tokio::sync::watch::Sender<bool>>) {
+    if !*flag {
+        *flag = true;
+        if let Some(tx) = tx {
+            let _ = tx.send(true);
+        }
+    }
+}
+
 /// Read `response`, forward it to `tx`, and account for usage.
 ///
 /// Long, deliberately: this is one state machine over a handful of locals
@@ -189,6 +198,32 @@ pub async fn pump(
         deadlines,
         egress,
         FunctionNameMap::identity(),
+        None,
+    )
+    .await
+}
+
+/// [`pump`], signalling the moment the client is given up.
+///
+/// The caller decides what the signal does. The stream path holds the seat
+/// until the upstream drain ends, because the seat counts a connection the
+/// provider is still carrying.
+pub async fn pump_notifying(
+    response: reqwest::Response,
+    adapter: Arc<dyn ProviderAdapter>,
+    tx: mpsc::Sender<Chunk>,
+    deadlines: Deadlines,
+    egress: Egress,
+    on_disconnect: Option<tokio::sync::watch::Sender<bool>>,
+) -> StreamOutcome {
+    pump_with(
+        response,
+        adapter,
+        tx,
+        deadlines,
+        egress,
+        FunctionNameMap::identity(),
+        on_disconnect,
     )
     .await
 }
@@ -206,6 +241,7 @@ pub async fn pump_with(
     deadlines: Deadlines,
     egress: Egress,
     names: FunctionNameMap,
+    on_disconnect: Option<tokio::sync::watch::Sender<bool>>,
 ) -> StreamOutcome {
     let Deadlines {
         idle: idle_timeout,
@@ -276,7 +312,7 @@ pub async fn pump_with(
                     let frame = bytes::Bytes::from_static(b": keepalive\n\n");
                     let sent = tokio::time::timeout(client_write_timeout, tx.send(Ok(frame))).await;
                     if !matches!(sent, Ok(Ok(()))) {
-                        client_gone = true;
+                        mark_gone(&mut client_gone, on_disconnect.as_ref());
                         tracing::debug!("client gone during keepalive; draining upstream for accounting");
                     }
                 }
@@ -337,11 +373,11 @@ pub async fn pump_with(
             match tokio::time::timeout(client_write_timeout, tx.send(Ok(outbound))).await {
                 Ok(Ok(())) => acc.mark_committed(),
                 Ok(Err(_)) => {
-                    client_gone = true;
+                    mark_gone(&mut client_gone, on_disconnect.as_ref());
                     tracing::debug!("client disconnected; draining upstream for accounting");
                 }
                 Err(_) => {
-                    client_gone = true;
+                    mark_gone(&mut client_gone, on_disconnect.as_ref());
                     tracing::debug!(
                         timeout_s = client_write_timeout.as_secs(),
                         "client stopped reading; draining upstream for accounting"
@@ -449,6 +485,26 @@ pub async fn pump_with(
     }
     // Anthropic needs no sentinel: its stream ends with message_stop, which the
     // renderer already emitted.
+
+    if !client_gone
+        && error.is_none()
+        && matches!(
+            acc.quality_gate(),
+            Some(oag_router::QualityGate::EmptyResponse)
+        )
+    {
+        let request_id = match &egress {
+            Egress::Passthrough { request_id, .. }
+            | Egress::ChatCompletions { request_id, .. }
+            | Egress::AnthropicMessages { request_id, .. }
+            | Egress::Responses { request_id, .. } => request_id.as_str(),
+            Egress::Gemini => "",
+        };
+        tracing::error!(
+            request_id,
+            "streamed completion finished with an empty answer while the client was still reading"
+        );
+    }
 
     StreamOutcome {
         accumulator: acc,
@@ -1102,6 +1158,47 @@ mod tests {
             outcome.error.is_none(),
             "the upstream itself was fine: {:?}",
             outcome.error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gone_client_is_signalled_so_the_slot_can_drop() {
+        // Remasure aborts were holding the seat until the upstream finished.
+        // The pump tells the caller the moment the client is given up.
+        let (tx, _rx_never_read) = mpsc::channel(1);
+        let (gone_tx, gone_rx) = tokio::sync::watch::channel(false);
+        let frames = vec![
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"one "}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"two"}}"#,
+            ),
+            sse(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+            ),
+        ];
+        let outcome = super::pump_notifying(
+            streamed(frames),
+            anthropic(),
+            tx,
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_millis(50),
+                keepalive: Duration::from_secs(10),
+            },
+            Egress::AnthropicMessages {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+            Some(gone_tx),
+        )
+        .await;
+        assert!(outcome.client_gone);
+        assert!(
+            *gone_rx.borrow(),
+            "the slot waiter must see the disconnect before the drain ends"
         );
     }
 

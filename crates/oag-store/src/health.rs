@@ -23,11 +23,11 @@ pub struct Readiness {
 
 /// Check the dependencies a request actually needs.
 ///
-/// sub2api's `/health` returns a static `{"status":"ok"}` regardless of whether
-/// its database is reachable, so a replica with a dead connection pool stays in
-/// the load balancer's rotation and the failure spreads to every client instead
-/// of being routed around. Readiness has to be a real check or it is worse than
-/// no check at all.
+/// Readiness is a real check of the dependencies a request needs. A static
+/// `{"status":"ok"}` that ignores whether the database is reachable leaves a
+/// replica with a dead connection pool in the load balancer's rotation, and
+/// the failure spreads to every client instead of being routed around.
+/// Readiness that checks nothing is worse than no check at all.
 ///
 /// A reachable database is not a usable one, which is the third check. `ping`
 /// is `SELECT 1` and succeeds against a database with no tables, so a replica

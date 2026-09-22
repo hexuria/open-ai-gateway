@@ -13,10 +13,10 @@ x-gateway: &gateway
     OAG_REDIS__URL: redis://redis:6379
     # Identical across every replica, and supplied from outside.
     #
-    # This is the multi-replica correctness requirement: sub2api generates its
-    # signing secret per instance when the environment does not supply one, so
-    # replica A mints admin tokens replica B rejects. We refuse to boot without
-    # it rather than generating one. See crates/oag-core/src/config.rs.
+    # This is the multi-replica correctness requirement: a signing secret
+    # generated per instance means replica A mints admin tokens replica B
+    # rejects. We refuse to boot without one rather than generating one.
+    # See crates/oag-core/src/config.rs.
     #
     # Not `:?` — compose interpolates on every command, so a required variable
     # makes `docker compose down` fail too, which is a poor way to learn you
@@ -35,8 +35,7 @@ x-gateway: &gateway
     redis: { condition: service_healthy }
     migrate: { condition: service_completed_successfully }
   # Must exceed gateway.max_stream_duration, or a rolling restart severs
-  # in-flight streams — which is exactly what sub2api's hardcoded 5-second
-  # shutdown does on every deploy.
+  # in-flight streams. A shutdown of a few seconds does that on every deploy.
   stop_grace_period: 1830s
   restart: unless-stopped
 
