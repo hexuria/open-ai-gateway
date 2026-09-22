@@ -57,17 +57,8 @@ pub fn describe() {
          operation. Non-zero means selection is running open: credentials can \
          be oversubscribed until Redis returns. Alert on it."
     );
-    describe_counter!(
-        "oag_slot_ghost_total",
-        "Times selection saw a full snapshot or a refused acquire while Redis \
-         had room (or none). Non-zero means a ghost lockout was averted."
-    );
-    describe_counter!(
-        "oag_slot_lost_total",
-        "Held concurrency slots Redis dropped while the request was still running, \
-         by reason. `expired` is a member that aged out and was taken back; \
-         `oversubscribed` is one that could not be, so the seat is over its limit."
-    );
+    // Its own function: these explanations put `describe` over clippy's line cap.
+    describe_slot_metrics();
     describe_counter!(
         "oag_tokens_total",
         "Tokens by kind: input, output, cache read, cache write."
@@ -140,6 +131,20 @@ pub fn describe() {
     // which is indistinguishable from a broken exporter to whoever is scraping
     // it, and to the alert that fires when the scrape returns no series.
     metrics::gauge!("oag_draining").set(0.0);
+}
+
+fn describe_slot_metrics() {
+    metrics::describe_counter!(
+        "oag_slot_ghost_total",
+        "Times selection saw a full snapshot or a refused acquire while Redis \
+         had room (or none). Non-zero means a ghost lockout was averted."
+    );
+    metrics::describe_counter!(
+        "oag_slot_lost_total",
+        "Held concurrency slots Redis dropped while the request was still running, \
+         by reason. `expired` is a member that aged out and was taken back; \
+         `oversubscribed` is one that could not be, so the seat is over its limit."
+    );
 }
 
 pub async fn render(State(state): State<Arc<AppState>>) -> impl IntoResponse {
