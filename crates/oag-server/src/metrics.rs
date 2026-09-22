@@ -75,14 +75,10 @@ pub fn describe() {
         "oag_selection_total",
         "Credential selections, by which cascade stage decided."
     );
-    describe_counter!(
-        "oag_vendor_fields_dropped_total",
-        "Requests whose client sent dialect-specific fields that canonical has no \
-         name for, dispatched to an upstream speaking a different dialect — so the \
-         fields were dropped. Labelled by the pair. Not a fault: cross-dialect \
-         translation is lossy by construction. It is here because the loss used to \
-         be invisible, and a dropped field can read as a successful empty answer."
-    );
+    // Its own function: `describe` is a list, and this explanation put it one
+    // line over clippy's cap. Shortening the text would hide why the loss is
+    // counted at all.
+    describe_vendor_fields();
     describe_counter!(
         "oag_client_disconnects_total",
         "Requests where the client hung up before the upstream finished."
@@ -138,6 +134,17 @@ pub fn describe() {
     // which is indistinguishable from a broken exporter to whoever is scraping
     // it, and to the alert that fires when the scrape returns no series.
     metrics::gauge!("oag_draining").set(0.0);
+}
+
+fn describe_vendor_fields() {
+    metrics::describe_counter!(
+        "oag_vendor_fields_dropped_total",
+        "Requests whose client sent dialect-specific fields that canonical has no \
+         name for, dispatched to an upstream speaking a different dialect — so the \
+         fields were dropped. Labelled by the pair. Not a fault: cross-dialect \
+         translation is lossy by construction. It is here because the loss used to \
+         be invisible, and a dropped field can read as a successful empty answer."
+    );
 }
 
 pub async fn render(State(state): State<Arc<AppState>>) -> impl IntoResponse {
