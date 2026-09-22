@@ -220,8 +220,7 @@ fn model_channel_qualifiers() -> String {
 ///
 /// This is the single decision that separates a gateway that degrades from one
 /// that just fails. It is a pure function of the error so it can be unit-tested
-/// exhaustively without a network — sub2api's equivalent logic is spread across
-/// a 2595-line service and is correspondingly hard to reason about.
+/// exhaustively without a network. The decision lives in this one function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
     /// Transient. Retry the same credential after a backoff.
@@ -239,8 +238,7 @@ pub enum Disposition {
 impl Error {
     /// Classify an upstream failure.
     ///
-    /// The status-code mapping mirrors what sub2api learned the hard way, with
-    /// one deliberate change: a 401 on a refreshable credential is a *cooldown*,
+    /// A 401 on a refreshable credential is a *cooldown*,
     /// not a permanent disable. An expiring OAuth token 401s routinely and
     /// disabling the account on the first one takes a healthy credential out of
     /// the pool until a human notices.

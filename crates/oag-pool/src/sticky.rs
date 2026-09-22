@@ -5,9 +5,9 @@
 //! on an agentic workload where the same system prompt and tool definitions
 //! replay every turn, that is most of the bill.
 //!
-//! So the pool pins a conversation to a credential. The subtlety, learned by
-//! sub2api the hard way, is *what to hash*: hashing the whole conversation
-//! gives a different key every turn, which pins nothing. The key must be
+//! So the pool pins a conversation to a credential. What to hash is the
+//! subtlety: hashing the whole conversation gives a different key every turn,
+//! which pins nothing. The key must be
 //! derived from the part of the prompt that is **stable across turns** — which
 //! is exactly the part the client marked cacheable.
 

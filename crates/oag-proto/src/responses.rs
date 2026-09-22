@@ -30,6 +30,7 @@ use crate::canonical::{
     CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
     ToolResultContent,
 };
+use crate::function_names::FunctionNameMap;
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
 use oag_core::{Error, Result};
@@ -40,9 +41,10 @@ const DIALECT: Dialect = Dialect::OpenAIResponses;
 
 /// Canonical → Responses wire JSON.
 pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Value> {
+    let names = FunctionNameMap::from_request(req);
     let mut input = Vec::new();
     for m in &req.messages {
-        render_message_into(m, &mut input);
+        render_message_into(m, &mut input, &names);
     }
 
     let mut body = json!({
@@ -73,7 +75,7 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
                 .map(|t| {
                     json!({
                         "type": "function",
-                        "name": t.name,
+                        "name": names.wire(&t.name),
                         "description": t.description,
                         "parameters": t.input_schema,
                     })
@@ -115,7 +117,9 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
             ToolChoice::Required => json!("required"),
             ToolChoice::None => json!("none"),
             // Flat, unlike Chat Completions' nested `function` wrapper.
-            ToolChoice::Tool { name } => json!({ "type": "function", "name": name }),
+            ToolChoice::Tool { name } => {
+                json!({ "type": "function", "name": names.wire(name) })
+            }
         };
     }
     if let Some(format) = &req.response_format {
@@ -136,7 +140,7 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
 }
 
 /// One canonical message becomes one or more `input` items.
-fn render_message_into(m: &Message, out: &mut Vec<Value>) {
+fn render_message_into(m: &Message, out: &mut Vec<Value>, names: &FunctionNameMap) {
     // Tool results are their own top-level items, not part of a message.
     for block in &m.content {
         if let ContentBlock::ToolResult {
@@ -185,7 +189,7 @@ fn render_message_into(m: &Message, out: &mut Vec<Value>) {
             out.push(json!({
                 "type": "function_call",
                 "call_id": id,
-                "name": name,
+                "name": names.wire(name),
                 // A JSON string here, as in Chat Completions.
                 "arguments": input.to_string(),
             }));
@@ -428,7 +432,7 @@ pub fn parse_event(payload: &str, acc: &mut StreamAccumulator) -> Result<Vec<Str
             if item["type"].as_str() == Some("function_call") {
                 vec![StreamEvent::ToolUseStart {
                     id: item["call_id"].as_str().unwrap_or_default().to_owned(),
-                    name: item["name"].as_str().unwrap_or_default().to_owned(),
+                    name: acc.restore_function_name(item["name"].as_str().unwrap_or_default()),
                 }]
             } else {
                 vec![]
@@ -2017,6 +2021,83 @@ mod tests {
         let out = render_response(&anthropic, "r");
         assert_eq!(out["status"], "incomplete");
         assert_eq!(out["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    fn typical_agent_tools() -> serde_json::Value {
+        // Flat names, matching this dialect. tools[6] is the luna 400.
+        json!([
+            {"type": "function", "name": "Shell", "parameters": {"type": "object"}},
+            {"type": "function", "name": "Grep", "parameters": {"type": "object"}},
+            {"type": "function", "name": "Read", "parameters": {"type": "object"}},
+            {"type": "function", "name": "Write", "parameters": {"type": "object"}},
+            {"type": "function", "name": "StrReplace", "parameters": {"type": "object"}},
+            {"type": "function", "name": "Glob", "parameters": {"type": "object"}},
+            {"type": "function", "name": "user-Github.get_file", "parameters": {"type": "object"}},
+        ])
+    }
+
+    #[test]
+    fn openai_upstream_never_sees_an_illegal_tool_name() {
+        // luna@sub speaks this dialect (Codex/Responses). The error was
+        // `Invalid 'tools[6].name'` — flat, not nested under `function`.
+        let c = parse_request(&json!({
+            "model": "gpt-5.6-luna",
+            "input": [{ "type": "message", "role": "user",
+                        "content": [{ "type": "input_text", "text": "hi" }] }],
+            "tools": typical_agent_tools(),
+            "tool_choice": {"type": "function", "name": "user-Github.get_file"},
+        }))
+        .expect("parses");
+        assert_eq!(c.tools[6].name, "user-Github.get_file");
+
+        let back = render_request(&c, "gpt-5.6-luna").expect("renders");
+        let tools = back["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 7);
+        for (i, t) in tools.iter().enumerate() {
+            let name = t["name"].as_str().expect("name");
+            assert!(
+                crate::is_legal_openai_function_name(name),
+                "tools[{i}].name = {name:?} would 400 on luna"
+            );
+        }
+        assert_eq!(tools[6]["name"], "user-Github_get_file");
+        assert_eq!(back["tool_choice"]["name"], "user-Github_get_file");
+    }
+
+    #[test]
+    fn a_sanitized_tool_call_restores_the_original_name() {
+        let c = parse_request(&json!({
+            "model": "gpt-5.6-luna",
+            "input": [
+                { "type": "message", "role": "user",
+                  "content": [{ "type": "input_text", "text": "hi" }] },
+                { "type": "function_call", "call_id": "call_1",
+                  "name": "user-Github.get_file", "arguments": "{}" },
+            ],
+            "tools": typical_agent_tools(),
+        }))
+        .expect("parses");
+
+        let back = render_request(&c, "gpt-5.6-luna").expect("renders");
+        let call = back["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .find(|i| i["type"] == "function_call")
+            .expect("historical call");
+        assert_eq!(call["name"], "user-Github_get_file");
+
+        let map = crate::FunctionNameMap::from_request(&c);
+        let mut acc = StreamAccumulator::new().with_function_names(map);
+        let events = parse_event(
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","type":"function_call","call_id":"call_2","name":"user-Github_get_file","arguments":""}}"#,
+            &mut acc,
+        )
+        .expect("parses");
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolUseStart { name, .. } if name == "user-Github.get_file"
+        )));
     }
 }
 

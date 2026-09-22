@@ -6,6 +6,7 @@
 //! lives for the duration of the response. That state is here, in one place,
 //! rather than smeared across each codec.
 
+use crate::function_names::FunctionNameMap;
 use oag_router::Usage;
 use serde::{Deserialize, Serialize};
 
@@ -121,12 +122,39 @@ pub struct StreamAccumulator {
     /// chunk, and because the distinction is lost the moment refusal text is
     /// emitted as an ordinary `TextDelta`, which is what every dialect does.
     saw_refusal: bool,
+    /// Original ↔ wire function names for this request, when the upstream
+    /// speaks an OpenAI dialect that required sanitisation. Empty (identity)
+    /// for every other dialect, and for OpenAI when every name was already
+    /// legal.
+    function_names: FunctionNameMap,
 }
 
 impl StreamAccumulator {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Remember the original ↔ wire function names for this response.
+    ///
+    /// OpenAI parsers restore `ToolUseStart` names through this. An identity
+    /// map (the default) leaves names as they arrived.
+    #[must_use]
+    pub fn with_function_names(mut self, names: FunctionNameMap) -> Self {
+        self.function_names = names;
+        self
+    }
+
+    /// The map this stream restores tool names through.
+    #[must_use]
+    pub const fn function_names(&self) -> &FunctionNameMap {
+        &self.function_names
+    }
+
+    /// The client-facing name a wire function name came from.
+    #[must_use]
+    pub fn restore_function_name(&self, wire: &str) -> String {
+        self.function_names.original(wire).to_owned()
     }
 
     /// Fold an event in.

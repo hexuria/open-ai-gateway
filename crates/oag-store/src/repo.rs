@@ -13,8 +13,8 @@ use uuid::Uuid;
 /// Hash an inbound key for lookup.
 ///
 /// The key is never stored in the clear, so this is also the only way to find
-/// one. sub2api stores inbound keys plaintext and matches on column equality,
-/// which turns read access to one table into every client's credential.
+/// one. Plaintext keys matched on column equality would turn read access to
+/// one table into every client's credential.
 /// What every key this gateway has ever issued looks like: the prefix, then
 /// 32 bytes of entropy as lowercase hex. See `mint_key`.
 pub const KEY_PREFIX: &str = "oag_live_";
@@ -355,6 +355,22 @@ pub async fn account_by_id(db: &Db, id: AccountId) -> Result<Option<AccountRow>>
     .fetch_optional(db.pool())
     .await
     .map_err(|e| Error::Internal(format!("loading account: {e}")))
+}
+
+/// Identity and display name for every credential, for the slot sweep.
+///
+/// The sweep publishes `oag_slots_in_use` from Redis, including zero, so a
+/// gauge that last observed a full seat does not stay full after the key is
+/// gone. Names, not ids, because the gauge is labelled by `account.name`.
+pub async fn account_slot_labels(db: &Db) -> Result<Vec<(AccountId, String)>> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as("SELECT id, name FROM account")
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("listing accounts for slot sweep: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name)| (AccountId::from_uuid(id), name))
+        .collect())
 }
 
 /// Providers this route holds usable credentials for, and by which credential
@@ -1387,6 +1403,30 @@ pub async fn rate_limit(db: &Db, id: AccountId, until: OffsetDateTime) -> Result
         .await
         .map_err(|e| Error::Internal(format!("rate limiting account: {e}")))?;
     Ok(())
+}
+
+/// Schedulable credentials of one provider and kind.
+///
+/// The usage poller asks an xAI API key for its model list. That key has no
+/// quota to read, so it is not in [`schedulable_oauth_accounts`], but a new
+/// model still has to land in the catalog or the picker never grows.
+pub async fn schedulable_accounts(db: &Db, provider: &str, kind: &str) -> Result<Vec<AccountRow>> {
+    sqlx::query_as::<_, AccountRow>(
+        r"
+        SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
+               token_version, token_expires_at, owner_principal_id, proxy_url,
+               priority, max_concurrency, schedulable, cooldown_until,
+               rate_limited_until, window_resets_at,
+               usage_remaining_pct, usage_reserve_pct, last_used_at
+        FROM account
+        WHERE provider = $1 AND kind = $2 AND schedulable
+        ",
+    )
+    .bind(provider)
+    .bind(kind)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("loading {provider} {kind} accounts: {e}")))
 }
 
 /// Every OAuth (subscription seat) account, for the usage poller to sweep.

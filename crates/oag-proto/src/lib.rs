@@ -5,10 +5,9 @@
 //! Four dialects are in play — Anthropic Messages, OpenAI Chat Completions,
 //! OpenAI Responses, Gemini `generateContent` — and any client dialect may need
 //! to reach any upstream one. Pairwise converters would be twelve of them, each
-//! with its own streaming state machine; sub2api learned this and settled on a
-//! hub, and so do we. Everything converts to and from one canonical
-//! representation, so adding a fifth dialect is two converters rather than
-//! eight.
+//! with its own streaming state machine. A hub avoids that. Everything converts
+//! to and from one canonical representation, so adding a fifth dialect is two
+//! converters rather than eight.
 //!
 //! Anthropic Messages is the hub's shape because it is the most expressive of
 //! the four: it has explicit content blocks, tool results as first-class
@@ -21,6 +20,7 @@
 
 pub mod anthropic;
 pub mod canonical;
+pub mod function_names;
 pub mod gemini;
 pub mod openai;
 pub mod responses;
@@ -29,6 +29,10 @@ pub mod stream;
 pub use canonical::{
     CacheControl, CanonicalRequest, ContentBlock, Message, Passthrough, ResponseFormat, Role, Tool,
     ToolChoice, count_input_tokens, extract_cache_blocks,
+};
+pub use function_names::{
+    FunctionNameMap, OPENAI_FUNCTION_NAME_MAX, is_legal_openai_function_name,
+    sanitize_openai_function_name,
 };
 pub use stream::{StopReason, StreamAccumulator, StreamEvent};
 

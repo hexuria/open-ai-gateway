@@ -79,10 +79,10 @@ budgets, and savings reporting all work the same regardless of credential kind.
 
 ## What is deliberately absent
 
-sub2api carries a large subsystem for TLS fingerprint impersonation, HTTP header
-mimicry, client-identity rewriting, and stripping steganographic markers from
-prompts. That exists because resold subscription traffic gets detected, and it
-is an arms race with no end.
+TLS fingerprint impersonation, HTTP header mimicry, client-identity rewriting,
+and stripping steganographic markers from prompts are absent. That machinery
+exists to hide traffic a provider is trying to detect, and it is an arms race
+with no end.
 
 None of it is here. An internal gateway on sanctioned credentials has nothing to
 hide, so the default build links no BoringSSL and ships no impersonation code.

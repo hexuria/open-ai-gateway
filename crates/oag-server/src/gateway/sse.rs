@@ -20,7 +20,7 @@
 use futures_util::StreamExt;
 use oag_core::Error;
 use oag_core::provider::Dialect;
-use oag_proto::{StreamAccumulator, StreamEvent};
+use oag_proto::{FunctionNameMap, StreamAccumulator, StreamEvent};
 use oag_upstream::{Framing, ProviderAdapter};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -170,18 +170,78 @@ pub struct Deadlines {
     pub keepalive: Duration,
 }
 
+fn mark_gone(flag: &mut bool, tx: Option<&tokio::sync::watch::Sender<bool>>) {
+    if !*flag {
+        *flag = true;
+        if let Some(tx) = tx {
+            let _ = tx.send(true);
+        }
+    }
+}
+
 /// Read `response`, forward it to `tx`, and account for usage.
 ///
 /// Long, deliberately: this is one state machine over a handful of locals
 /// that every branch reads, and slicing it into helpers would thread those
 /// locals through five signatures to save the lint.
-#[allow(clippy::too_many_lines)]
 pub async fn pump(
     response: reqwest::Response,
     adapter: Arc<dyn ProviderAdapter>,
     tx: mpsc::Sender<Chunk>,
     deadlines: Deadlines,
     egress: Egress,
+) -> StreamOutcome {
+    pump_with(
+        response,
+        adapter,
+        tx,
+        deadlines,
+        egress,
+        FunctionNameMap::identity(),
+        None,
+    )
+    .await
+}
+
+/// [`pump`], signalling the moment the client is given up.
+///
+/// The caller decides what the signal does. The stream path holds the seat
+/// until the upstream drain ends, because the seat counts a connection the
+/// provider is still carrying.
+pub async fn pump_notifying(
+    response: reqwest::Response,
+    adapter: Arc<dyn ProviderAdapter>,
+    tx: mpsc::Sender<Chunk>,
+    deadlines: Deadlines,
+    egress: Egress,
+    on_disconnect: Option<tokio::sync::watch::Sender<bool>>,
+) -> StreamOutcome {
+    pump_with(
+        response,
+        adapter,
+        tx,
+        deadlines,
+        egress,
+        FunctionNameMap::identity(),
+        on_disconnect,
+    )
+    .await
+}
+
+/// [`pump`] with the original ↔ wire function names for this request.
+///
+/// OpenAI-shaped upstreams sanitise tool names on the way out; this is how
+/// the restored names reach the client on the way back. Identity (the
+/// [`pump`] wrapper) is correct for every other dialect.
+#[allow(clippy::too_many_lines)]
+pub async fn pump_with(
+    response: reqwest::Response,
+    adapter: Arc<dyn ProviderAdapter>,
+    tx: mpsc::Sender<Chunk>,
+    deadlines: Deadlines,
+    egress: Egress,
+    names: FunctionNameMap,
+    on_disconnect: Option<tokio::sync::watch::Sender<bool>>,
 ) -> StreamOutcome {
     let Deadlines {
         idle: idle_timeout,
@@ -190,7 +250,7 @@ pub async fn pump(
         keepalive: keepalive_interval,
     } = deadlines;
     let started = Instant::now();
-    let mut acc = StreamAccumulator::new();
+    let mut acc = StreamAccumulator::new().with_function_names(names);
     let mut ttft = None;
     let mut client_gone = false;
     let mut error = None;
@@ -252,7 +312,7 @@ pub async fn pump(
                     let frame = bytes::Bytes::from_static(b": keepalive\n\n");
                     let sent = tokio::time::timeout(client_write_timeout, tx.send(Ok(frame))).await;
                     if !matches!(sent, Ok(Ok(()))) {
-                        client_gone = true;
+                        mark_gone(&mut client_gone, on_disconnect.as_ref());
                         tracing::debug!("client gone during keepalive; draining upstream for accounting");
                     }
                 }
@@ -313,11 +373,11 @@ pub async fn pump(
             match tokio::time::timeout(client_write_timeout, tx.send(Ok(outbound))).await {
                 Ok(Ok(())) => acc.mark_committed(),
                 Ok(Err(_)) => {
-                    client_gone = true;
+                    mark_gone(&mut client_gone, on_disconnect.as_ref());
                     tracing::debug!("client disconnected; draining upstream for accounting");
                 }
                 Err(_) => {
-                    client_gone = true;
+                    mark_gone(&mut client_gone, on_disconnect.as_ref());
                     tracing::debug!(
                         timeout_s = client_write_timeout.as_secs(),
                         "client stopped reading; draining upstream for accounting"
@@ -425,6 +485,26 @@ pub async fn pump(
     }
     // Anthropic needs no sentinel: its stream ends with message_stop, which the
     // renderer already emitted.
+
+    if !client_gone
+        && error.is_none()
+        && matches!(
+            acc.quality_gate(),
+            Some(oag_router::QualityGate::EmptyResponse)
+        )
+    {
+        let request_id = match &egress {
+            Egress::Passthrough { request_id, .. }
+            | Egress::ChatCompletions { request_id, .. }
+            | Egress::AnthropicMessages { request_id, .. }
+            | Egress::Responses { request_id, .. } => request_id.as_str(),
+            Egress::Gemini => "",
+        };
+        tracing::error!(
+            request_id,
+            "streamed completion finished with an empty answer while the client was still reading"
+        );
+    }
 
     StreamOutcome {
         accumulator: acc,
@@ -606,6 +686,17 @@ pub async fn collect(
     response: reqwest::Response,
     dialect: Dialect,
 ) -> std::result::Result<(bytes::Bytes, Vec<StreamEvent>, StreamAccumulator), Error> {
+    collect_with(response, dialect, &FunctionNameMap::identity()).await
+}
+
+/// [`collect`] with the original ↔ wire function names, so a non-streamed
+/// OpenAI body that echoed sanitised names is restored before the client
+/// dialect renders it.
+pub async fn collect_with(
+    response: reqwest::Response,
+    dialect: Dialect,
+    names: &FunctionNameMap,
+) -> std::result::Result<(bytes::Bytes, Vec<StreamEvent>, StreamAccumulator), Error> {
     let bytes = response
         .bytes()
         .await
@@ -620,7 +711,7 @@ pub async fn collect(
         Error::Internal(format!("a successful upstream response was not JSON: {e}"))
     })?;
 
-    let events = match dialect {
+    let mut events = match dialect {
         Dialect::AnthropicMessages => oag_proto::anthropic::parse_response(&v),
         Dialect::OpenAIChatCompletions => oag_proto::openai::parse_response(&v),
         Dialect::GeminiGenerateContent => oag_proto::gemini::parse_response(&v),
@@ -639,7 +730,9 @@ pub async fn collect(
         }
     };
 
-    let mut acc = StreamAccumulator::new();
+    names.restore_in_events(&mut events);
+
+    let mut acc = StreamAccumulator::new().with_function_names(names.clone());
     for e in &events {
         acc.observe(e);
     }
@@ -666,11 +759,29 @@ pub async fn collect_stream(
     idle_timeout: Duration,
     max_duration: Duration,
 ) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), (Error, StreamAccumulator)> {
+    collect_stream_with(
+        response,
+        adapter,
+        idle_timeout,
+        max_duration,
+        FunctionNameMap::identity(),
+    )
+    .await
+}
+
+/// [`collect_stream`] with the original ↔ wire function names.
+pub async fn collect_stream_with(
+    response: reqwest::Response,
+    adapter: Arc<dyn ProviderAdapter>,
+    idle_timeout: Duration,
+    max_duration: Duration,
+    names: FunctionNameMap,
+) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), (Error, StreamAccumulator)> {
     let started = Instant::now();
     let framing = adapter.framing();
     let mut body = response.bytes_stream();
     let mut pending = Vec::<u8>::new();
-    let mut acc = StreamAccumulator::new();
+    let mut acc = StreamAccumulator::new().with_function_names(names);
     let mut events = Vec::new();
 
     loop {
@@ -1047,6 +1158,47 @@ mod tests {
             outcome.error.is_none(),
             "the upstream itself was fine: {:?}",
             outcome.error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gone_client_is_signalled_so_the_slot_can_drop() {
+        // Remasure aborts were holding the seat until the upstream finished.
+        // The pump tells the caller the moment the client is given up.
+        let (tx, _rx_never_read) = mpsc::channel(1);
+        let (gone_tx, gone_rx) = tokio::sync::watch::channel(false);
+        let frames = vec![
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"one "}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"two"}}"#,
+            ),
+            sse(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}"#,
+            ),
+        ];
+        let outcome = super::pump_notifying(
+            streamed(frames),
+            anthropic(),
+            tx,
+            Deadlines {
+                idle: Duration::from_secs(5),
+                max: Duration::from_secs(30),
+                client_write: Duration::from_millis(50),
+                keepalive: Duration::from_secs(10),
+            },
+            Egress::AnthropicMessages {
+                request_id: "r1".to_owned(),
+                model: "m".to_owned(),
+            },
+            Some(gone_tx),
+        )
+        .await;
+        assert!(outcome.client_gone);
+        assert!(
+            *gone_rx.borrow(),
+            "the slot waiter must see the disconnect before the drain ends"
         );
     }
 

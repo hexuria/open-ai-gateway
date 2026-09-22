@@ -107,6 +107,28 @@ impl ProviderAdapter for OpenAICompatAdapter {
             _ => Ok(None),
         }
     }
+
+    async fn served_models(
+        &self,
+        credential: &oag_core::credential::SecretMaterial,
+        proxy: Option<&str>,
+    ) -> Result<Option<Vec<String>>> {
+        // The other four providers behind this adapter have no model list we
+        // can ask. xAI does, and the host depends on the credential: a seat
+        // token is refused by api.x.ai, an API key is the only thing that
+        // host accepts. A refresh token is what distinguishes the two here,
+        // same as `refresh` above.
+        if self.provider != Provider::XAI {
+            return Ok(None);
+        }
+        let kind = if credential.refresh_token.is_some() {
+            oag_core::credential::CredentialKind::OAuth
+        } else {
+            oag_core::credential::CredentialKind::ApiKey
+        };
+        let listed = crate::xai_models::list(kind, &credential.access_token, proxy).await?;
+        Ok(Some(listed.into_iter().map(|m| m.upstream_name).collect()))
+    }
 }
 
 #[cfg(test)]

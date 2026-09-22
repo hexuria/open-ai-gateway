@@ -22,7 +22,7 @@ use oag_core::provider::Dialect;
 use oag_core::tier::RoutingMode;
 use oag_core::{AccountId, Disposition, Error, RequestId, Result, TierName};
 use oag_pool::SessionKey;
-use oag_proto::{anthropic, extract_cache_blocks};
+use oag_proto::{FunctionNameMap, anthropic, extract_cache_blocks};
 use oag_router::{BudgetState, Budgets, RoutingDecision, RoutingPolicy, TierLadder};
 use oag_upstream::Transport as _;
 use std::collections::HashSet;
@@ -488,6 +488,7 @@ async fn run_with_escalation(
                 response,
                 lease,
                 attempt,
+                names,
             } => {
                 // Empty as the code stands: `Outcome::Lost` is produced only
                 // after `succeeded` has decided the client did not ask for a
@@ -508,6 +509,7 @@ async fn run_with_escalation(
                     ingress,
                     triggering_gate,
                     guard,
+                    names,
                 );
             }
             Attempt::Rejected(e) => Err(e),
@@ -642,6 +644,7 @@ async fn run_with_escalation(
                 |_| (decision.model.provider.native_dialect(), false),
                 |a| (a.dialect(), a.always_streams()),
             );
+        let rewrite_tool_names = accumulator.function_names().rewrites();
         // Before the ledger write, which is ours rather than the credential's.
         lease.release().await;
 
@@ -681,6 +684,7 @@ async fn run_with_escalation(
             ingress,
             upstream_dialect,
             always_streams,
+            rewrite_tool_names,
         ));
     }
 }
@@ -1080,6 +1084,8 @@ enum Attempt {
         lease: select::Lease,
         /// Which dispatch of this request produced it; see [`Dispatches`].
         attempt: u8,
+        /// Original ↔ wire function names, for restoring `tool_calls`.
+        names: FunctionNameMap,
     },
     /// Read in full, so the answer can still be judged and retried.
     Collected {
@@ -1114,6 +1120,10 @@ fn egress_for(
     // The dialect the chosen ADAPTER speaks, which is not always the provider's:
     // a Codex seat is `Provider::OpenAI` and speaks Responses.
     upstream: Dialect,
+    // True when tool names were rewritten for the OpenAI wire. Verbatim
+    // passthrough would then hand the client the sanitised names, which it
+    // cannot dispatch.
+    rewrite_tool_names: bool,
 ) -> Result<sse::Egress> {
     let model = decision.model.id.as_str().to_owned();
     let request_id = request_id.to_string();
@@ -1122,7 +1132,7 @@ fn egress_for(
     // *bytes*, so it also requires that those bytes are already SSE. Bedrock's
     // dialect is Anthropic and its framing is binary — passing that through
     // would hand a client expecting `data:` lines a length-prefixed envelope.
-    if ingress == upstream && framing == oag_upstream::Framing::Sse {
+    if ingress == upstream && framing == oag_upstream::Framing::Sse && !rewrite_tool_names {
         return Ok(sse::Egress::Passthrough {
             dialect: ingress,
             request_id,
@@ -1177,6 +1187,30 @@ pub(crate) fn adapter_for(
     }
 }
 
+/// Function names as an OpenAI-shaped upstream must see them.
+///
+/// Canonical keeps the client's names. Only Chat Completions and Responses
+/// rewrite, because those are the dialects whose wire pattern luna enforces
+/// with a 400. Other dialects keep identity, so same-dialect passthrough is
+/// undisturbed.
+fn openai_function_names(
+    canonical: &oag_proto::CanonicalRequest,
+    upstream: Dialect,
+) -> FunctionNameMap {
+    match upstream {
+        Dialect::OpenAIChatCompletions | Dialect::OpenAIResponses => {
+            let names = FunctionNameMap::from_request(canonical);
+            if names.rewrites() {
+                for (original, wire) in names.rewritten() {
+                    tracing::debug!(original, wire, "sanitized OpenAI function name");
+                }
+            }
+            names
+        }
+        _ => FunctionNameMap::identity(),
+    }
+}
+
 /// Render a collected answer as one body in the client's dialect.
 ///
 /// Every pair goes through the same hub: the events become an Anthropic
@@ -1211,6 +1245,7 @@ fn render_collected(
     Ok(bytes::Bytes::from(out.to_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn json_response(
     body: &bytes::Bytes,
     events: &[oag_proto::StreamEvent],
@@ -1222,13 +1257,17 @@ fn json_response(
     // Whether that adapter streamed the upstream regardless of the client's
     // request, in which case `body` is not a JSON body at all.
     always_streams: bool,
+    // Tool names were rewritten on the way to an OpenAI-shaped upstream, so
+    // the upstream's own body carries wire names the client cannot dispatch.
+    rewrite_tool_names: bool,
 ) -> Response {
     // Verbatim when the dialects agree and the upstream actually sent a body
     // — the upstream's own bytes are the most faithful answer we can give,
     // and re-serialising can only differ from them. An adapter that streamed
     // has no such bytes: what it has is events, and a body is rendered from
-    // those like any translated pair's.
-    let out = if ingress == upstream_dialect && !always_streams {
+    // those like any translated pair's. Rewritten tool names are the other
+    // exception: the events have been restored, the body has not.
+    let out = if ingress == upstream_dialect && !always_streams && !rewrite_tool_names {
         body.clone()
     } else {
         match render_collected(
@@ -1241,6 +1280,25 @@ fn json_response(
             Err(e) => return error_response(&e),
         }
     };
+
+    {
+        let mut acc = oag_proto::StreamAccumulator::new();
+        for event in events {
+            acc.observe(event);
+        }
+        if matches!(
+            acc.quality_gate(),
+            Some(oag_router::QualityGate::EmptyResponse)
+        ) && (always_streams || ingress != upstream_dialect || body.is_empty())
+        {
+            tracing::error!(
+                %request_id,
+                ?ingress,
+                body_len = body.len(),
+                "completion had no content for the client"
+            );
+        }
+    }
 
     oag_headers(
         Response::builder()
@@ -1550,6 +1608,7 @@ fn note_dropped_vendor_fields(
 /// conflict — rather than about the credential. Anything that says the
 /// credential itself is unhealthy returns `Switch` immediately rather than
 /// spending the retry budget on it.
+#[allow(clippy::too_many_lines)]
 async fn try_credential(
     state: &Arc<AppState>,
     decision: &RoutingDecision,
@@ -1567,6 +1626,7 @@ async fn try_credential(
         Ok(a) => a,
         Err(e) => return Outcome::Fatal(e),
     };
+    let names = openai_function_names(canonical, adapter.dialect());
     note_dropped_vendor_fields(canonical, adapter.dialect(), request_id);
     // Refreshes first if the token is close to expiry. A credential that is
     // merely expiring must not be treated as a credential that is broken.
@@ -1616,8 +1676,16 @@ async fn try_credential(
         dispatch.sent();
         match transport.execute(request).await {
             Ok(response) if response.status().is_success() => {
-                return succeeded(state, provider, lease, response, canonical.stream, ordinal)
-                    .await;
+                return succeeded(
+                    state,
+                    provider,
+                    lease,
+                    response,
+                    canonical.stream,
+                    ordinal,
+                    names,
+                )
+                .await;
             }
 
             Ok(response) => {
@@ -1737,6 +1805,7 @@ fn stream_response(
     ingress: Dialect,
     triggering_gate: Option<oag_router::QualityGate>,
     guard: crate::shutdown::InFlightGuard,
+    names: FunctionNameMap,
 ) -> Result<Response> {
     // The adapter this lease actually gets, not the provider's default one:
     // both the framing and the dialect below are facts about that adapter, and
@@ -1749,6 +1818,7 @@ fn stream_response(
         request_id,
         adapter.framing(),
         adapter.dialect(),
+        names.rewrites(),
     )?;
 
     // Bounded: a slow client parks the reader instead of buffering the whole
@@ -1779,7 +1849,28 @@ fn stream_response(
         // is what keeps the credential's slot held for exactly as long as it is
         // really in use.
         let _guard = guard;
-        let outcome = sse::pump(response, adapter, tx, deadlines, egress).await;
+        // The slot is NOT released when the client goes: the seat counts what the
+        // provider is carrying, and the provider is still carrying this stream
+        // until the drain ends. Releasing early made N aborted streams N live
+        // upstream connections nobody counted, which is the ghost this seat
+        // exists to prevent, from the other side.
+        let (gone_tx, _gone_rx) = tokio::sync::watch::channel(false);
+        let outcome = sse::pump_with(
+            response,
+            adapter,
+            tx,
+            deadlines,
+            egress,
+            names,
+            Some(gone_tx),
+        )
+        .await;
+        if outcome.client_gone {
+            tracing::warn!(
+                %request_id,
+                "client disconnected; slot held while the upstream drains for accounting"
+            );
+        }
         lease.release().await;
         // `triggering_gate` when we escalated to get here, otherwise whatever
         // this attempt tripped — the same rule the collected path applies, so
@@ -1815,6 +1906,7 @@ async fn succeeded(
     response: reqwest::Response,
     stream: bool,
     attempt: u8,
+    names: FunctionNameMap,
 ) -> Outcome {
     let account = lease.account.account_id();
     // No `touch_account` here any more. It was a Postgres write awaited
@@ -1836,6 +1928,7 @@ async fn succeeded(
             response,
             lease: lease.clone(),
             attempt,
+            names,
         }));
     }
     // The ADAPTER's facts, not the provider's: a Codex seat is
@@ -1852,7 +1945,7 @@ async fn succeeded(
     let collected = if adapter.always_streams() {
         let idle = state.config.gateway.stream_idle_timeout;
         let max = state.config.gateway.max_stream_duration;
-        match sse::collect_stream(response, adapter, idle, max).await {
+        match sse::collect_stream_with(response, adapter, idle, max, names).await {
             Ok((events, accumulator)) => Ok((bytes::Bytes::new(), events, accumulator)),
             // The stream failed after the provider had generated some of the
             // answer: that much is invoiced whether or not it was whole, so
@@ -1863,7 +1956,7 @@ async fn succeeded(
             Err((e, _)) => Err(e),
         }
     } else {
-        sse::collect(response, adapter.dialect()).await
+        sse::collect_with(response, adapter.dialect(), &names).await
     };
     match collected {
         Ok((body, events, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
@@ -3023,6 +3116,7 @@ mod tests {
             RequestId::new(),
             oag_upstream::Framing::Sse,
             Dialect::OpenAIChatCompletions,
+            false,
         )
         .expect("supported");
         assert!(matches!(
@@ -3032,6 +3126,27 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rewritten_tool_names_disable_byte_passthrough() {
+        // luna 400: we sanitise `user-Github.get_file` on the way out. If we
+        // then forwarded the upstream's bytes, the client would see the wire
+        // name and fail to dispatch. Same dialect is not sufficient.
+        let d = decision_for(oag_core::Provider::OpenAI);
+        let e = egress_for(
+            Dialect::OpenAIChatCompletions,
+            &d,
+            RequestId::new(),
+            oag_upstream::Framing::Sse,
+            Dialect::OpenAIChatCompletions,
+            true,
+        )
+        .expect("supported");
+        assert!(
+            matches!(e, sse::Egress::ChatCompletions { .. }),
+            "must re-render so restored names reach the client"
+        );
     }
 
     #[test]
@@ -3046,6 +3161,7 @@ mod tests {
             RequestId::new(),
             oag_upstream::Framing::AwsEventStream,
             Dialect::AnthropicMessages,
+            false,
         )
         .expect("supported");
         assert!(
@@ -3063,6 +3179,7 @@ mod tests {
             RequestId::new(),
             oag_upstream::Framing::Sse,
             Dialect::AnthropicMessages,
+            false,
         )
         .expect("supported");
         assert!(matches!(e, sse::Egress::ChatCompletions { .. }));
@@ -3086,6 +3203,7 @@ mod tests {
             RequestId::new(),
             oag_upstream::Framing::Sse,
             Dialect::OpenAIResponses,
+            false,
         )
         .expect("supported");
         assert!(
@@ -3252,6 +3370,7 @@ mod tests {
             Dialect::AnthropicMessages,
             None,
             state.lifecycle.track(),
+            oag_proto::FunctionNameMap::identity(),
         );
 
         assert!(result.is_err(), "there is no adapter for vertex");
@@ -3286,6 +3405,7 @@ mod tests {
             Dialect::AnthropicMessages,
             None,
             state.lifecycle.track(),
+            oag_proto::FunctionNameMap::identity(),
         );
 
         assert!(result.is_ok());

@@ -1,11 +1,10 @@
 //! What models exist, what they cost, and what they can do.
 //!
 //! Seeded from `LiteLLM`'s `model_prices_and_context_window.json`, which is the
-//! most complete public pricing table and is what sub2api uses too. We vendor
-//! it as a build asset and refresh it with a command, rather than sub2api's
-//! background download-and-hash-check service — pricing changes a few times a
-//! year, and a gateway that cannot start because a GitHub fetch failed is a
-//! worse trade than a table that is occasionally a week stale.
+//! most complete public pricing table. We vendor it as a build asset and
+//! refresh it with a command. A background download-and-hash-check would make
+//! startup depend on a GitHub fetch. Pricing changes a few times a year, and a
+//! table that is occasionally a week stale is the better trade.
 
 use oag_core::Provider;
 use rust_decimal::Decimal;

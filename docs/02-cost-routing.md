@@ -1,7 +1,7 @@
 # Cost routing
 
-The reason this project exists. sub2api pools credentials and meters usage but
-always sends a request to whatever model the client named; this decides.
+The reason this project exists. Pooling credentials and metering usage still
+sends a request to whatever model the client named. This decides.
 
 ## Ladders
 

@@ -1,20 +1,21 @@
-//! The admin mutations: four incident verbs, and the identity-integration set.
+//! The admin mutations: five incident verbs, and the identity-integration set.
 //!
-//! **The four incident verbs.** This project dropped sub2api's admin sprawl — a
-//! 2466-line settings handler over a generic key/value table — and the way back
-//! to that is one reasonable-looking endpoint at a time. Each of these answers a
-//! question an operator has *during an incident*, when reaching for psql is
-//! slower and the CLI may not be to hand:
+//! **The five incident verbs.** The admin surface stays this small on purpose.
+//! A generic settings handler over a key/value table grows without a bound, and
+//! the way back to that is one reasonable-looking endpoint at a time. Each of
+//! these answers a question an operator has *during an incident*, when reaching
+//! for psql is slower and the CLI may not be to hand:
 //!
 //! - a credential is misbehaving          → disable
 //! - it has recovered                     → enable
 //! - it was cooled down and is fine now   → clear the cooldown
+//! - ghost concurrency slots lock a seat  → clear the slots
 //! - a key leaked                         → revoke
 //!
 //! Anything an operator can do calmly, at a prompt, with a schema in front of
 //! them, stays in the CLI. Nothing here touches sealed credentials, the KEK, or
 //! any signing secret: those are not browser-reachable at any authority level.
-//! Those four take no request body — each is a verb against an id.
+//! Those five take no request body — each is a verb against an id.
 //!
 //! **The identity-integration set** (principals, keys, budgets) is the second
 //! group, and it is a deliberate exception to "calm work stays in the CLI" — not
@@ -23,7 +24,7 @@
 //! principal, so that an org admin can hand a teammate a working credential from
 //! a web console. That flow is a *program* driving us, not an operator at a
 //! prompt, and a program cannot shell out to the CLI. It stays inside the same
-//! rule that governs the four above: minting is an OS RNG, a SHA-256 and an
+//! rule that governs the five above: minting is an OS RNG, a SHA-256 and an
 //! INSERT — it reads no sealed credential, no KEK, and no signing secret. A key
 //! minted here is never `admin`, so this surface cannot widen its own authority,
 //! and an upsert never rewrites an existing principal's role, so it cannot remove
@@ -104,6 +105,34 @@ pub async fn clear_cooldown(
             }))
             .into_response()
         }
+        Ok(None) => not_found("no credential with that id"),
+        Err(e) => failed(&e),
+    }
+}
+
+pub async fn clear_slots(
+    State(state): State<Arc<AppState>>,
+    actor: AdminActor,
+    Path(id): Path<uuid::Uuid>,
+) -> Response {
+    let account = AccountId::from_uuid(id);
+    match oag_store::repo::account_by_id(&state.db, account).await {
+        Ok(Some(row)) => match state.cache.clear_slots(account).await {
+            Ok(dropped) => {
+                crate::gateway::select::publish_slots_in_use(&row.name, 0);
+                audit(&actor, "account.clear-slots", id, &row.name);
+                Json(json!({
+                    "id": id,
+                    "name": row.name,
+                    "dropped": dropped,
+                    "in_flight": 0,
+                    "note": "Redis slots are gone fleet-wide; this replica's gauge is zero now, \
+                             and others publish 0 on their slot sweep",
+                }))
+                .into_response()
+            }
+            Err(e) => failed(&e),
+        },
         Ok(None) => not_found("no credential with that id"),
         Err(e) => failed(&e),
     }
@@ -461,4 +490,89 @@ fn audit(actor: &AdminActor, action: &str, subject: uuid::Uuid, name: &str) {
         name,
         "admin write"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_slots;
+    use crate::admin::AdminActor;
+    use axum::body::to_bytes;
+    use axum::extract::{Path, State};
+    use oag_core::AccountId;
+
+    #[tokio::test]
+    async fn clear_slots_zeros_redis_and_reports_in_flight_zero() {
+        let (Ok(db_url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            &db_url, &redis_url, "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 2).expect("pool");
+        db.migrate().await.expect("migrate");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("client");
+        let state = std::sync::Arc::new(crate::AppState::new(config, db, cache).expect("state"));
+
+        let tag = uuid::Uuid::new_v4();
+        let name = format!("ghost-seat-{tag}");
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce) \
+             VALUES (gen_random_uuid(), $1, 'xai', 'oauth', '\\x00', '\\x00') RETURNING id",
+        )
+        .bind(&name)
+        .fetch_one(state.db.pool())
+        .await
+        .expect("account");
+
+        let ttl = crate::gateway::select::SLOT_TTL;
+        assert!(
+            state
+                .cache
+                .acquire_slot(AccountId::from_uuid(id), "held", 8, ttl)
+                .await
+                .expect("acquire")
+        );
+        assert_eq!(
+            state
+                .cache
+                .slots_in_use(AccountId::from_uuid(id), ttl)
+                .await
+                .expect("count"),
+            1
+        );
+
+        let response = clear_slots(
+            State(std::sync::Arc::clone(&state)),
+            AdminActor {
+                principal_id: uuid::Uuid::nil(),
+                email: "ops@example.invalid".to_owned(),
+            },
+            Path(id),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1 << 16).await.expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            json["in_flight"], 0,
+            "gauge-facing count after clear: {json}"
+        );
+        assert_eq!(json["dropped"], 1, "{json}");
+        assert_eq!(json["name"], name, "{json}");
+        assert_eq!(
+            state
+                .cache
+                .slots_in_use(AccountId::from_uuid(id), ttl)
+                .await
+                .expect("count after"),
+            0,
+            "Redis empty ⇒ in_flight 0"
+        );
+    }
 }
