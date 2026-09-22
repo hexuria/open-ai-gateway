@@ -1,5 +1,6 @@
 //! The hub representation.
 
+use oag_core::provider::Dialect;
 use oag_router::RequestSignal;
 use serde::{Deserialize, Serialize};
 
@@ -273,11 +274,138 @@ impl Effort {
     }
 }
 
-/// `maxOutputTokens` → `max_output_tokens`.
+/// Fields an ingress body carried that canonical has no name for.
 ///
-/// proto3 JSON defines both the proto field name and its lowerCamelCase form,
-/// and a dialect built on it is sent in either. One rule rather than a table
-/// of pairs, so a field added later cannot be half supported.
+/// Translation is lossy by construction: canonical holds what all four
+/// dialects have in common, so a vendor extension has nowhere to land and the
+/// parser drops it. That is right when the request is about to be rendered
+/// into a *different* dialect — inventing a translation for a field we do not
+/// understand would be worse than losing it. It is wrong when the client and
+/// the upstream speak the same dialect, because then nobody has asked us to
+/// translate anything, and dropping the field destroys something the upstream
+/// would have accepted verbatim.
+///
+/// So the residue rides along, and is re-emitted only by a renderer for the
+/// dialect it was written in. The rule is enforced by the value, not by the
+/// caller: `dialect` is carried here precisely so a renderer cannot honour it
+/// wrongly, and a fifth dialect cannot forget to check.
+///
+/// Silent loss is what made the absence of this hard to find — a
+/// transcription config dropped on the way out came back as HTTP 200 with an
+/// empty transcript. Whoever holds both dialects should say so when the
+/// residue is non-empty and cannot be forwarded; `oag-proto` is pure and has
+/// no recorder, so that counter lives in the server.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Passthrough {
+    /// The dialect these fields were written in.
+    pub dialect: Dialect,
+    /// The ingress body with everything canonical carries subtracted, shaped
+    /// like the request it came from — so nesting needs no encoding of its
+    /// own, and `{"generationConfig": {"audioTranscriptionConfig": ...}}`
+    /// merges back exactly where it was found.
+    pub body: serde_json::Value,
+}
+
+impl Passthrough {
+    /// What is left of `body` once `subtracted` is taken out of it.
+    ///
+    /// By subtraction rather than by an allow-list of known vendor fields,
+    /// which is the difference between the two ways this can be wrong. A
+    /// stale subtraction list re-emits a field the renderer also writes, and
+    /// [`Self::merge_into`] lets the renderer win — nothing is lost. A stale
+    /// allow-list would drop a field nobody had thought of yet, silently,
+    /// which is the bug this type exists to stop.
+    ///
+    /// Each path is dotted, and each segment matches either spelling of its
+    /// name: proto3 JSON accepts both `maxOutputTokens` and
+    /// `max_output_tokens`, so a parser that reads both must subtract both.
+    /// For a dialect with one spelling the two forms coincide.
+    ///
+    /// `None` when nothing is left, which is the common case: a request with
+    /// no vendor fields costs an empty map and a clone that is thrown away.
+    #[must_use]
+    pub fn capture(
+        dialect: Dialect,
+        body: &serde_json::Value,
+        subtracted: &[&str],
+    ) -> Option<Self> {
+        let mut residue = body.clone();
+        for path in subtracted {
+            remove_path(&mut residue, path);
+        }
+        prune(&mut residue);
+        match &residue {
+            serde_json::Value::Object(map) if !map.is_empty() => Some(Self {
+                dialect,
+                body: residue,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Merge the residue back into a rendered body, if `dialect` wrote it.
+    ///
+    /// The renderer wins every collision. Passthrough may add what canonical
+    /// has no name for; it may never overwrite what the gateway decided — a
+    /// routed model, an adjusted thinking budget, a normalised tool choice.
+    pub fn merge_into(&self, dialect: Dialect, target: &mut serde_json::Value) {
+        if self.dialect == dialect {
+            merge(target, &self.body);
+        }
+    }
+}
+
+/// Remove one dotted path, in either spelling of each segment.
+fn remove_path(v: &mut serde_json::Value, path: &str) {
+    let Some((head, rest)) = path.split_once('.') else {
+        if let Some(map) = v.as_object_mut() {
+            map.remove(path);
+            map.remove(snake_of(path).as_str());
+        }
+        return;
+    };
+    let Some(map) = v.as_object_mut() else { return };
+    for key in [head.to_owned(), snake_of(head)] {
+        if let Some(child) = map.get_mut(key.as_str()) {
+            remove_path(child, rest);
+        }
+    }
+}
+
+/// Drop objects that subtraction emptied, depth first.
+///
+/// Without this, subtracting `generationConfig.maxOutputTokens` from a config
+/// that held nothing else leaves `{"generationConfig": {}}` behind, and an
+/// empty envelope would make [`Passthrough::capture`] answer `Some` for a
+/// request that carried no vendor fields at all.
+fn prune(v: &mut serde_json::Value) {
+    let Some(map) = v.as_object_mut() else { return };
+    for value in map.values_mut() {
+        prune(value);
+    }
+    map.retain(|_, value| !matches!(value, serde_json::Value::Object(m) if m.is_empty()));
+}
+
+/// Recursive merge where anything already present survives.
+fn merge(target: &mut serde_json::Value, extra: &serde_json::Value) {
+    let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (key, value) in extra {
+        match target.get_mut(key) {
+            // Two objects at the same key are merged rather than one
+            // replacing the other, which is what keeps a vendor field nested
+            // beside a field the renderer wrote: `audioTranscriptionConfig`
+            // has to land in the same `generationConfig` as `temperature`.
+            Some(existing) => merge(existing, value),
+            None => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// `maxOutputTokens` → `max_output_tokens`.
 pub(crate) fn snake_of(camel: &str) -> String {
     let mut out = String::with_capacity(camel.len() + 4);
     for c in camel.chars() {
@@ -346,6 +474,11 @@ pub struct CanonicalRequest {
     /// constraints on the answer.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub previous_response_id: Option<String>,
+    /// What the ingress dialect said that canonical has no name for.
+    ///
+    /// See [`Passthrough`]. Only a renderer for the same dialect re-emits it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub passthrough: Option<Passthrough>,
 }
 
 impl CanonicalRequest {
@@ -615,6 +748,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         };
         assert!(!req.signal().thinking_requested, "nothing was asked for");
 
@@ -657,6 +791,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         }
     }
 
@@ -798,6 +933,7 @@ mod count_tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         }
     }
 

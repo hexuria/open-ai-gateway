@@ -76,6 +76,14 @@ pub fn describe() {
         "Credential selections, by which cascade stage decided."
     );
     describe_counter!(
+        "oag_vendor_fields_dropped_total",
+        "Requests whose client sent dialect-specific fields that canonical has no \
+         name for, dispatched to an upstream speaking a different dialect — so the \
+         fields were dropped. Labelled by the pair. Not a fault: cross-dialect \
+         translation is lossy by construction. It is here because the loss used to \
+         be invisible, and a dropped field can read as a successful empty answer."
+    );
+    describe_counter!(
         "oag_client_disconnects_total",
         "Requests where the client hung up before the upstream finished."
     );

@@ -360,6 +360,7 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
             })
             .unwrap_or_default(),
         previous_response_id: None,
+        passthrough: None,
     })
 }
 
@@ -1125,6 +1126,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         };
         // A model that speaks budgets, and room for one: `High` asks for 16384,
         // which is clamped below `max_tokens` rather than sent as-is. Sent
@@ -1161,6 +1163,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         };
         let body = render_request(&req, "claude-sonnet-4-5").expect("renders");
         assert_eq!(body["thinking"], json!(null), "{body}");
@@ -1188,6 +1191,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         };
         let body = render_request(&req, "claude-opus-5").expect("renders");
         assert_eq!(body["thinking"]["type"], json!("adaptive"));
@@ -1227,6 +1231,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         };
         for model in ["claude-sonnet-4-5", "claude-opus-5"] {
             let body = render_request(&req, model).expect("renders");
@@ -2078,6 +2083,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         };
         let out = render_request(&req, "m").expect("renders");
         assert_eq!(out["messages"][0]["content"][0]["signature"], sig);

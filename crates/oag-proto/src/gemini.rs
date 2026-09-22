@@ -19,8 +19,8 @@
 //!   prefix, like Chat Completions and unlike Anthropic.
 
 use crate::canonical::{
-    CanonicalRequest, ContentBlock, Effort, Message, ResponseFormat, Role, Tool, ToolChoice,
-    ToolResultContent,
+    CanonicalRequest, ContentBlock, Effort, Message, Passthrough, ResponseFormat, Role, Tool,
+    ToolChoice, ToolResultContent,
 };
 use crate::stream::{StopReason, StreamAccumulator, StreamEvent};
 use oag_core::provider::Dialect;
@@ -157,6 +157,14 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
         body["generationConfig"]["stopSequences"] = json!(req.stop);
     }
 
+    // Last, so that everything above has already claimed its key: the merge
+    // adds what canonical had no name for and overwrites nothing. A residue
+    // written in another dialect is left where it is and never reaches an
+    // upstream — `merge_into` checks, not this call site.
+    if let Some(extra) = &req.passthrough {
+        extra.merge_into(DIALECT, &mut body);
+    }
+
     Ok(body)
 }
 
@@ -218,6 +226,42 @@ fn field<'a>(v: &'a Value, camel: &str) -> &'a Value {
         .or_else(|| v.get(crate::canonical::snake_of(camel).as_str()))
         .unwrap_or(&NULL)
 }
+
+/// Everything `parse_request` takes out of the body before what is left
+/// becomes the [`Passthrough`] residue.
+///
+/// Two reasons a path is here, and they are not the same reason:
+///
+/// - Canonical carries it, so the renderer writes it back itself. A path
+///   missing from this group is re-emitted *and* overwritten by the renderer,
+///   which is harmless — that is the direction subtraction is allowed to be
+///   wrong in.
+/// - Forwarding it would be wrong, marked below. These are dropped on
+///   purpose.
+///
+/// Each segment matches either spelling; see [`field`].
+const SUBTRACTED: &[&str] = &[
+    "contents",
+    "systemInstruction",
+    "tools",
+    "toolConfig",
+    "generationConfig.maxOutputTokens",
+    "generationConfig.temperature",
+    "generationConfig.thinkingConfig.thinkingBudget",
+    "generationConfig.responseMimeType",
+    "generationConfig.responseSchema",
+    "generationConfig.stopSequences",
+    // Not canonical's: dropped because forwarding it would be wrong.
+    //
+    // `generateContent` takes the model from the URL, which is the one the
+    // router chose. A `model` in the body could contradict it, and passthrough
+    // must never be able to un-route a routed request.
+    "model",
+    // More than one candidate changes the shape of the response, and the
+    // stream accumulator on the way back reads one. A client that asks for
+    // several would get the first and no word about the rest.
+    "generationConfig.candidateCount",
+];
 
 /// Gemini wire JSON → canonical.
 pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
@@ -291,6 +335,10 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
             .unwrap_or_default(),
         // This dialect has no stored responses; the conversation is `contents`.
         previous_response_id: None,
+        // Whatever the client sent that none of the above reads. It reaches a
+        // Gemini upstream unchanged and is dropped everywhere else; see
+        // `Passthrough` and `SUBTRACTED`.
+        passthrough: Passthrough::capture(DIALECT, body, SUBTRACTED),
     })
 }
 
@@ -767,6 +815,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         };
         f(&mut req);
         req
@@ -1485,6 +1534,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         };
         let back = render_request(&c).expect("renders");
         let parts = back["contents"][0]["parts"].as_array().expect("parts");
@@ -1569,7 +1619,134 @@ mod tests {
         }))
         .expect("parses");
 
+        // Including the residue: subtraction has to take out both spellings,
+        // or reading a field in one of them would pass it through as well.
         assert_eq!(snake, camel);
+        assert_eq!(snake.passthrough, None, "nothing here is a vendor field");
     }
 
+    #[test]
+    fn a_vendor_block_survives_a_same_dialect_round_trip() {
+        let c = parse_request(&transcription_request()).expect("parses");
+        let back = render_request(&c).expect("renders");
+
+        let cfg = &back["generationConfig"];
+        assert_eq!(
+            cfg["audioTranscriptionConfig"],
+            transcription_request()["generationConfig"]["audioTranscriptionConfig"],
+            "the whole block, unchanged",
+        );
+        // The point of subtracting by path rather than by object. `temperature`
+        // is canonical's and comes back from the renderer; the vendor block is
+        // not and comes back from the residue — and they have to land in the
+        // *same* `generationConfig`. Subtracting the object wholesale would
+        // lose the block and leave this looking like it worked.
+        assert_eq!(cfg["temperature"], json!(0.0));
+        assert_eq!(cfg["maxOutputTokens"], json!(4096));
+    }
+
+    #[test]
+    fn an_absent_vendor_field_stays_absent() {
+        // `customVocabulary` is omitted rather than sent empty when there is
+        // no vocabulary, so both shapes occur; nothing may invent it.
+        let mut body = transcription_request();
+        body["generationConfig"]["audioTranscriptionConfig"]
+            .as_object_mut()
+            .expect("object")
+            .remove("customVocabulary");
+
+        let back = render_request(&parse_request(&body).expect("parses")).expect("renders");
+        let cfg = &back["generationConfig"]["audioTranscriptionConfig"];
+        // The rest of the block first, so this cannot pass by losing all of it.
+        assert_eq!(cfg["wordTimestamp"], json!(true));
+        assert_eq!(cfg["languageCodes"], json!(["en-US"]));
+        assert!(cfg.get("customVocabulary").is_none());
+    }
+
+    #[test]
+    fn an_ordinary_request_carries_no_residue() {
+        // The common case has to cost nothing: everything in this body is
+        // canonical's, so there is no pocket at all.
+        let c = parse_request(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": 100, "temperature": 0.5},
+        }))
+        .expect("parses");
+
+        // Not `Some({})`: subtraction empties `generationConfig`, and an empty
+        // envelope left behind would make every request look like it carried
+        // something.
+        assert_eq!(c.passthrough, None);
+    }
+
+    #[test]
+    fn a_residue_never_overrides_the_renderer() {
+        // Passthrough may add what canonical has no name for. It may never
+        // change what the gateway decided — here, a model the router chose and
+        // a ceiling it set.
+        let mut c = parse_request(&transcription_request()).expect("parses");
+        c.max_tokens = 8192;
+        c.passthrough = Some(Passthrough {
+            dialect: DIALECT,
+            body: json!({
+                "model": "some-other-model",
+                "generationConfig": {"maxOutputTokens": 1, "audioTranscriptionConfig": {"x": 1}},
+            }),
+        });
+
+        let back = render_request(&c).expect("renders");
+        assert_eq!(back["generationConfig"]["maxOutputTokens"], json!(8192));
+        // A key the renderer never writes is still added — that is the whole
+        // point — but one it does write is left alone.
+        assert_eq!(back["generationConfig"]["audioTranscriptionConfig"]["x"], 1);
+        assert_eq!(back["model"], "some-other-model");
+    }
+
+    #[test]
+    fn a_model_in_the_body_cannot_un_route_the_request() {
+        // `generateContent` takes the model from the URL, which is the one the
+        // router chose. A `model` the client put in the body is subtracted
+        // rather than passed through, so it cannot contradict that.
+        let mut body = transcription_request();
+        body["model"] = json!("gemini-3.5-pro");
+
+        let c = parse_request(&body).expect("parses");
+        let residue = c.passthrough.as_ref().expect("has a residue");
+        assert!(residue.body.get("model").is_none());
+    }
+
+    #[test]
+    fn a_residue_does_not_cross_dialects() {
+        // Cross-dialect translation stays lossy, deliberately: a field we have
+        // no name for is a field we cannot claim to translate. The check is in
+        // the value, so a renderer cannot honour it wrongly.
+        let c = parse_request(&transcription_request()).expect("parses");
+        let elsewhere = crate::openai::render_request(&c, "grok-4.7").expect("renders");
+
+        assert!(
+            !elsewhere.to_string().contains("audioTranscriptionConfig"),
+            "a Gemini residue must not reach a Chat Completions upstream",
+        );
+
+        // And back the other way: a residue this dialect did not write is left
+        // where it is.
+        let mut foreign = c.clone();
+        foreign.passthrough = Some(Passthrough {
+            dialect: Dialect::OpenAIChatCompletions,
+            body: json!({"logprobs": true}),
+        });
+        let back = render_request(&foreign).expect("renders");
+        assert!(back.get("logprobs").is_none());
+    }
+
+    #[test]
+    fn more_than_one_candidate_is_not_forwarded() {
+        // It changes the shape of the response, and the accumulator reading it
+        // back expects one. Dropping it is a worse answer than a wrong one is.
+        let mut body = transcription_request();
+        body["generationConfig"]["candidateCount"] = json!(3);
+
+        let back = render_request(&parse_request(&body).expect("parses")).expect("renders");
+        assert!(back["generationConfig"].get("candidateCount").is_none());
+    }
 }
