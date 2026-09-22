@@ -63,6 +63,12 @@ pub fn describe() {
          had room (or none). Non-zero means a ghost lockout was averted."
     );
     describe_counter!(
+        "oag_slot_lost_total",
+        "Held concurrency slots Redis dropped while the request was still running, \
+         by reason. `expired` is a member that aged out and was taken back; \
+         `oversubscribed` is one that could not be, so the seat is over its limit."
+    );
+    describe_counter!(
         "oag_tokens_total",
         "Tokens by kind: input, output, cache read, cache write."
     );
