@@ -27,8 +27,8 @@ pub mod responses;
 pub mod stream;
 
 pub use canonical::{
-    CacheControl, CanonicalRequest, ContentBlock, Message, ResponseFormat, Role, Tool, ToolChoice,
-    count_input_tokens, extract_cache_blocks,
+    CacheControl, CanonicalRequest, ContentBlock, Message, Passthrough, ResponseFormat, Role, Tool,
+    ToolChoice, count_input_tokens, extract_cache_blocks,
 };
 pub use function_names::{
     FunctionNameMap, OPENAI_FUNCTION_NAME_MAX, is_legal_openai_function_name,

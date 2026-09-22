@@ -179,6 +179,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         }
     }
 

@@ -1558,6 +1558,50 @@ fn step_for(disposition: Disposition, retries_left: bool) -> Step {
     }
 }
 
+/// Say so when a client's vendor fields are about to be dropped.
+///
+/// A `CanonicalRequest` carries what the four dialects have in common, so a
+/// field only one vendor defines has nowhere to land. It rides along in
+/// `passthrough` and a renderer for its own dialect puts it back; a renderer
+/// for any other dialect leaves it, which is right — we do not invent
+/// translations for fields we do not understand.
+///
+/// What was wrong was that this cost nothing to notice. Losing a Gemini
+/// `audioTranscriptionConfig` on the way to another upstream is a 200 with an
+/// empty transcript, and nothing anywhere said a field had gone. Now the
+/// count is on `/metrics` and the names are one log level away.
+///
+/// Here rather than in `oag-proto`, which is a pure crate with no recorder,
+/// and here rather than at the routing decision, which knows the provider but
+/// not the adapter: a Codex seat is `Provider::OpenAI` and speaks Responses.
+/// This is the one place per dispatch that holds both the request and the
+/// adapter that will actually render it.
+fn note_dropped_vendor_fields(
+    canonical: &oag_proto::CanonicalRequest,
+    upstream: Dialect,
+    request_id: RequestId,
+) {
+    let Some(extra) = &canonical.passthrough else {
+        return;
+    };
+    if extra.dialect == upstream {
+        return;
+    }
+    metrics::counter!(
+        "oag_vendor_fields_dropped_total",
+        "ingress" => extra.dialect.as_str(),
+        "upstream" => upstream.as_str(),
+    )
+    .increment(1);
+    tracing::debug!(
+        %request_id,
+        ingress = %extra.dialect.as_str(),
+        upstream = %upstream.as_str(),
+        fields = ?extra.body.as_object().map(|m| m.keys().collect::<Vec<_>>()),
+        "vendor fields dropped translating between dialects"
+    );
+}
+
 /// Try one credential, with bounded same-credential retries.
 ///
 /// The retries here are for failures that are about *the moment* — a timeout, a
@@ -1583,6 +1627,7 @@ async fn try_credential(
         Err(e) => return Outcome::Fatal(e),
     };
     let names = openai_function_names(canonical, adapter.dialect());
+    note_dropped_vendor_fields(canonical, adapter.dialect(), request_id);
     // Refreshes first if the token is close to expiry. A credential that is
     // merely expiring must not be treated as a credential that is broken.
     let credential = match refresh::ensure_fresh(state, &lease.account).await {

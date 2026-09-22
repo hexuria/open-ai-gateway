@@ -325,6 +325,7 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         stop: parse_stop(&body["stop"]),
         // Stored responses are a Responses-only concept.
         previous_response_id: None,
+        passthrough: None,
     })
 }
 

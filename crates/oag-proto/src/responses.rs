@@ -269,6 +269,11 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         previous_response_id: body["previous_response_id"]
             .as_str()
             .map(std::borrow::ToOwned::to_owned),
+        // Not wired for this dialect: see `gemini::parse_request`. Same-dialect
+        // passthrough here would newly let `n`, `logprobs` and `stream_options`
+        // reach an upstream, and each of them changes the response shape the
+        // stream accumulator is built to read back.
+        passthrough: None,
     })
 }
 
@@ -1502,6 +1507,7 @@ mod tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         };
         let back = render_request(&c, "m").expect("renders");
         assert_eq!(back["input"][0]["content"][0]["type"], "input_text");
@@ -2122,6 +2128,7 @@ mod effort_tests {
             response_format: None,
             stop: Vec::new(),
             previous_response_id: None,
+            passthrough: None,
         }
     }
 
