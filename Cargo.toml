@@ -80,7 +80,7 @@ url = "2"
 rust_decimal = { version = "1", features = ["serde-with-float", "macros"] }
 
 # ── credential sealing ─────────────────────────────────────────────────────────
-sha2 = "0.10"
+sha2 = "0.11"
 # SigV4 for Bedrock. HMAC-SHA256 over a canonical request — a few dozen lines
 # against the AWS SDK's several hundred crates, none of which we would use for
 # anything else.
