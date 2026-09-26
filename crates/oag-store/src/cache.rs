@@ -264,10 +264,10 @@ impl Cache {
                     .set_number_of_retries(2);
                 match ConnectionManager::new_with_config(this.client.clone(), cfg).await {
                     Ok(c) => {
+                        // Unique per connection; only ever compared for equality.
                         let generation = this
                             .conn_gen
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                            + 1;
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         *this.conn.write().await = Some((generation, c));
                     }
                     Err(e) => tracing::warn!(error = %e, "could not connect to redis"),
@@ -317,11 +317,8 @@ impl Cache {
         match tokio::time::timeout(SLOT_OP_TIMEOUT, fut).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => {
-                // redis-rs spells its own timeout "timed out"; the old check for
-                // "timeout" never matched it, so this branch was dead.
-                let text = e.to_string().to_ascii_lowercase();
                 if let Some(generation) = used.get()
-                    && (text.contains("timeout") || text.contains("timed out"))
+                    && is_timeout(&e)
                 {
                     tracing::warn!(
                         op,
@@ -828,6 +825,17 @@ fn auth_key(hash: &str) -> String {
     format!("oag:auth:{hash}")
 }
 
+/// Whether a Redis error is a timeout, which leaves the connection suspect.
+///
+/// Text, because the typed `RedisError` is gone by the time this runs: it was
+/// mapped to `Error::Internal(String)` a layer down. redis-rs spells its own
+/// timeout "timed out"; checking only for "timeout" missed it, and the branch
+/// that drops a wedged connection never ran.
+fn is_timeout(e: &Error) -> bool {
+    let text = e.to_string().to_ascii_lowercase();
+    text.contains("timeout") || text.contains("timed out")
+}
+
 fn slot_key(account: AccountId) -> String {
     format!("oag:slots:{account}")
 }
@@ -956,6 +964,57 @@ mod tests {
         for junk in ["", "v1.", "v1.zz.{}", "v2.00.{}", "not-an-envelope"] {
             assert!(mac.open(&hash, junk).is_none(), "{junk:?} must not open");
         }
+    }
+
+    #[test]
+    fn both_spellings_of_a_redis_timeout_are_timeouts() {
+        for text in ["acquiring slot: timed out", "response timeout", "Timed Out"] {
+            assert!(is_timeout(&Error::Internal(text.to_owned())), "{text}");
+        }
+        assert!(!is_timeout(&Error::Internal(
+            "acquiring slot: NOSCRIPT".to_owned()
+        )));
+    }
+
+    /// A pin written is a pin read back, and an unwritten key reads as none.
+    #[tokio::test]
+    async fn a_sticky_pin_round_trips() {
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let cache = Cache::connect(&url).expect("cache");
+        let key = format!("oag:test:sticky:{}", Uuid::new_v4());
+        let account = AccountId::from_uuid(Uuid::new_v4());
+        let ttl = Duration::from_mins(1);
+
+        assert_eq!(cache.sticky_get(&key, ttl).await.expect("read"), None);
+        cache.sticky_set(&key, account, ttl).await.expect("write");
+        assert_eq!(
+            cache.sticky_get(&key, ttl).await.expect("read"),
+            Some(account)
+        );
+    }
+
+    /// A timeout drops the connection the op ran on, and never a newer one.
+    #[tokio::test]
+    async fn drop_conn_drops_only_the_generation_it_names() {
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let cache = Cache::connect(&url).expect("cache");
+        let (first, _) = cache.conn_with_gen().await.expect("connect");
+
+        // A caller that timed out on some other connection: this one stays.
+        cache.drop_conn(first.wrapping_add(1)).await;
+        let (still, _) = cache.conn_with_gen().await.expect("connected");
+        assert_eq!(still, first, "a stale generation dropped a live connection");
+
+        // The caller that used this one: it goes, and the next caller redials.
+        cache.drop_conn(first).await;
+        let (next, _) = cache.conn_with_gen().await.expect("redial");
+        assert_ne!(next, first, "the named connection was kept");
     }
 
     /// A Redis slower to accept than a slot op may wait still gets connected.
