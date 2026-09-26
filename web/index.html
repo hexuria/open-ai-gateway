@@ -70,6 +70,8 @@
   <span style="flex:1"></span>
   <input id="key" type="password" placeholder="admin API key" autocomplete="off">
   <button id="go">Load</button>
+  <input id="client-key" spellcheck="false" placeholder="client key (Claude Code)" readonly>
+  <button type="button" id="copy-client">Copy client key</button>
 </header>
 <main>
   <div id="err" class="err"></div>
@@ -490,9 +492,43 @@ $('svc-add').addEventListener('click', async () => {
 
 $('go').addEventListener('click', load);
 $('key').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+$('copy-client').addEventListener('click', async () => {
+  const v = $('client-key').value;
+  if (!v) return;
+  try {
+    await navigator.clipboard.writeText(v);
+    $('copy-client').textContent = 'Copied';
+    setTimeout(() => { $('copy-client').textContent = 'Copy client key'; }, 1200);
+  } catch {
+    $('client-key').select();
+  }
+});
 // Convenience only: this page is served on the internal admin listener, and the
 // key is an admin credential either way.
+//
+// `just serve` opens `?token=<admin>&secret=<client>`. `token` fills the
+// dashboard box; `secret` is the inference key for Claude Code / SDKs.
+// Both are stored and then stripped from the address bar so a refresh does
+// not keep secrets in the URL.
+{
+  const params = new URLSearchParams(location.search);
+  const admin = params.get('token') || params.get('key') || params.get('admin');
+  const client = params.get('secret') || params.get('client');
+  if (admin) localStorage.setItem('oag_key', admin);
+  if (client) localStorage.setItem('oag_client_key', client);
+  if (admin || client) {
+    params.delete('token');
+    params.delete('key');
+    params.delete('admin');
+    params.delete('secret');
+    params.delete('client');
+    const qs = params.toString();
+    history.replaceState(null, '', location.pathname + (qs ? `?${qs}` : '') + location.hash);
+  }
+}
 const saved = localStorage.getItem('oag_key');
+const savedClient = localStorage.getItem('oag_client_key');
+if (savedClient) $('client-key').value = savedClient;
 if (saved) { $('key').value = saved; load(); }
 </script>
 </body>

@@ -28,8 +28,9 @@ pub use shutdown::Lifecycle;
 pub use state::AppState;
 
 use axum::Router;
+use axum::extract::State;
 use axum::http::StatusCode;
-use axum::response::IntoResponse as _;
+use axum::response::{IntoResponse as _, Redirect};
 use axum::routing::{get, patch, post};
 use oag_core::Result;
 use std::sync::Arc;
@@ -204,7 +205,11 @@ pub fn public_router(state: Arc<AppState>) -> Router {
     let routes = if state.config.server.single_listener {
         routes.merge(admin_routes(&state))
     } else {
-        routes
+        // A browser that opens the inference port expecting the dashboard.
+        // Query string (`?token=&secret=`) is forwarded so a `just serve`
+        // landing link still fills the page after the hop. Not merged in
+        // single-listener mode: that already serves the dashboard at `/`.
+        routes.route("/", get(public_root))
     };
 
     routes
@@ -212,6 +217,14 @@ pub fn public_router(state: Arc<AppState>) -> Router {
         // Outermost, so it also covers the layers below it.
         .layer(catch_panic())
         .with_state(state)
+}
+
+/// Send a browser from the inference port to the dashboard, keeping `?token=`
+/// / `?secret=` so the page can fill both keys.
+async fn public_root(State(state): State<Arc<AppState>>, uri: axum::http::Uri) -> Redirect {
+    let q = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    let loc = format!("http://{}{q}", state.config.server.admin_addr);
+    Redirect::temporary(&loc)
 }
 
 /// Admin API, metrics, readiness. Internal network only.
@@ -639,11 +652,18 @@ server:
             );
         }
 
-        // And with two listeners they are not on the public port to begin with.
-        for path in ["/", "/metrics"] {
-            let got = status(public_router(state(false)), "GET", path).await;
-            assert_eq!(got, StatusCode::NOT_FOUND, "{path} leaked onto inference");
-        }
+        // `/metrics` stays off the inference port. `/` is a hop to the
+        // dashboard so a browser pointed at the printed inference URL is not
+        // a dead 404; it is not the dashboard itself (that would put the SPA
+        // on the public listener).
+        let got = status(public_router(state(false)), "GET", "/metrics").await;
+        assert_eq!(got, StatusCode::NOT_FOUND, "/metrics leaked onto inference");
+        let got = status(public_router(state(false)), "GET", "/").await;
+        assert_eq!(
+            got,
+            StatusCode::TEMPORARY_REDIRECT,
+            "inference `/` should send a browser to the dashboard"
+        );
     }
 
     #[tokio::test]

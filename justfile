@@ -110,19 +110,54 @@ admin-key name="admin":
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
       cargo run --quiet -p oag -- admin key create --email dev@localhost --name {{name}} --admin
 
-# Run the gateway against the dev infrastructure.
-serve:
-    @set -- $(just _free-ports); pub=$1; adm=$2; \
-      if [ "$pub" != "{{pub_port}}" ] || [ "$adm" != "{{adm_port}}" ]; then \
-        echo "port {{pub_port}}/{{adm_port}} taken — using $pub/$adm instead"; \
-      fi; \
-      echo "  inference  http://127.0.0.1:$pub"; \
-      echo "  dashboard  http://127.0.0.1:$adm"; \
+# Mint (once) and print the two local keys: ADMIN for the dashboard, CLIENT
+# for Claude Code / SDKs. Stored under target/ so a restart does not mint
+# another pair. Delete target/oag-dev-keys to rotate.
+_ensure-dev-keys:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    f=target/oag-dev-keys
+    mkdir -p target
+    if [ -f "$f" ]; then
+      cat "$f"
+      exit 0
+    fi
+    env_prefix() {
       OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
-      OAG_SERVER__PUBLIC_ADDR="127.0.0.1:$pub" \
-      OAG_SERVER__ADMIN_ADDR="127.0.0.1:$adm" \
       OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
       OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
+        cargo run --quiet -p oag -- "$@"
+    }
+    admin=$(env_prefix admin key create --email dev@localhost --name dashboard --admin \
+      | grep -oE 'oag_live_[0-9a-f]+' | head -1)
+    client=$(env_prefix admin key create --email dev@localhost --name claude \
+      | grep -oE 'oag_live_[0-9a-f]+' | head -1)
+    printf 'ADMIN=%s\nCLIENT=%s\n' "$admin" "$client" | tee "$f"
+
+# Run the gateway against the dev infrastructure.
+serve:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    set -- $(just _free-ports)
+    pub=$1
+    adm=$2
+    if [ "$pub" != "{{pub_port}}" ] || [ "$adm" != "{{adm_port}}" ]; then
+      echo "port {{pub_port}}/{{adm_port}} taken — using $pub/$adm instead"
+    fi
+    eval "$(just _ensure-dev-keys)"
+    dash="http://127.0.0.1:${adm}/?token=${ADMIN}&secret=${CLIENT}"
+    echo "  inference  http://127.0.0.1:$pub"
+    echo "  dashboard  $dash"
+    echo "  claude     ANTHROPIC_BASE_URL=http://127.0.0.1:$pub"
+    echo "  claude     ANTHROPIC_API_KEY=$CLIENT"
+    if command -v open >/dev/null 2>&1; then
+      open "$dash"
+    fi
+    OAG_DATABASE__URL="{{dev_db}}" OAG_REDIS__URL="{{dev_rd}}" \
+    OAG_SERVER__PUBLIC_ADDR="127.0.0.1:$pub" \
+    OAG_SERVER__ADMIN_ADDR="127.0.0.1:$adm" \
+    OAG_SECURITY__SIGNING_SECRET="$(just _dev-secret)" \
+    OAG_SECURITY__CREDENTIAL_KEK="$(just _dev-kek)" \
       cargo run -p oag -- serve
 
 # The pair `serve` would use right now.
