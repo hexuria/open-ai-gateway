@@ -158,6 +158,17 @@ static TAKE_TOKEN_SCRIPT: std::sync::LazyLock<redis::Script> =
 /// Redis already gets.
 const SLOT_OP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long one connection attempt may take, handshake included.
+///
+/// Longer than [`SLOT_OP_TIMEOUT`] on purpose: a Redis that is slow to accept
+/// after a restart (cold DNS, TLS, loading its dataset) still gets connected,
+/// because the dial runs in the background and no request waits on it.
+const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a caller waits for a connection that is being dialled. The same
+/// budget as a slot op: past it the caller fails open.
+const CONNECT_WAIT: Duration = SLOT_OP_TIMEOUT;
+
 /// Redis, for cross-replica coordination.
 ///
 /// Connects lazily. A gateway that refuses to boot because Redis is not up yet
@@ -168,12 +179,16 @@ const SLOT_OP_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Clone)]
 pub struct Cache {
     client: redis::Client,
-    conn: Arc<RwLock<Option<ConnectionManager>>>,
-    /// Bumped every time a connection is established. A caller that timed
-    /// out captures it first and may only drop the connection it timed out
-    /// on; without this, hundreds of callers timing out on one wedged socket
-    /// each destroyed whatever healthy connection had been built since.
+    /// The live connection and the generation it was built as. A caller that
+    /// timed out may only drop the generation it used; without that, hundreds
+    /// of callers timing out on one wedged socket each destroyed whatever
+    /// healthy connection had been built since.
+    conn: Arc<RwLock<Option<(u64, ConnectionManager)>>>,
     conn_gen: Arc<std::sync::atomic::AtomicU64>,
+    /// Set while a background dial is running, so there is only ever one.
+    dialing: Arc<std::sync::atomic::AtomicBool>,
+    /// Woken when a dial finishes, either way.
+    dialed: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for Cache {
@@ -191,83 +206,140 @@ impl Cache {
             client,
             conn: Arc::new(RwLock::new(None)),
             conn_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dialing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dialed: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
-    /// A live connection, dialling on first use and after a failed attempt.
+    /// A live connection, dialling on first use and after a dropped one.
     ///
     /// `ConnectionManager` reconnects internally once it exists, so this only
-    /// has to handle "we have never successfully connected".
+    /// has to handle "we have no connection".
     async fn conn(&self) -> Result<ConnectionManager> {
+        self.conn_with_gen().await.map(|(_, c)| c)
+    }
+
+    /// [`Self::conn`], with the generation the connection was built as.
+    ///
+    /// The dial runs as its own task, and a caller only waits for it, for at
+    /// most [`CONNECT_WAIT`]. A caller that gives up stops waiting; the dial
+    /// carries on, and the next caller finds the connection built. When the
+    /// caller's deadline cancelled the dial itself, a Redis slower to accept
+    /// than that deadline could never be connected from any path that had
+    /// one -- and the dial held the write lock while it ran, so every other
+    /// cache user, `ping` included, queued behind it.
+    async fn conn_with_gen(&self) -> Result<(u64, ConnectionManager)> {
+        // Registered before looking, so a dial that finishes between the look
+        // and the wait still wakes this caller.
+        let dialed = self.dialed.notified();
+        tokio::pin!(dialed);
+        dialed.as_mut().enable();
         if let Some(c) = self.conn.read().await.clone() {
             return Ok(c);
         }
-        let mut guard = self.conn.write().await;
-        // Another task may have connected while we waited for the write lock.
-        if let Some(c) = guard.clone() {
-            return Ok(c);
-        }
-        // Bounded reconnects: the crate default is six exponential retries,
-        // and every in-flight command waits on that future. Completions that
-        // share this manager then look empty/`RemoteDisconnected` while
-        // `/v1/models` still answers. Two tries, two-second caps; the caller
-        // fail-opens.
-        let cfg = ConnectionManagerConfig::new()
-            .set_response_timeout(Some(SLOT_OP_TIMEOUT))
-            .set_connection_timeout(Some(SLOT_OP_TIMEOUT))
-            .set_number_of_retries(2);
-        let c = ConnectionManager::new_with_config(self.client.clone(), cfg)
+        self.start_dial();
+        let _ = tokio::time::timeout(CONNECT_WAIT, dialed).await;
+        self.conn
+            .read()
             .await
-            .map_err(|e| Error::Internal(format!("connecting to redis: {e}")))?;
-        *guard = Some(c.clone());
-        self.conn_gen
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(c)
+            .clone()
+            .ok_or_else(|| Error::Internal("connecting to redis: not connected yet".to_owned()))
     }
 
-    /// Forget the cached connection so the next call redials.
+    /// Start a background dial unless one is already running.
+    fn start_dial(&self) {
+        if self.dialing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            // A dial that finished just before this one was claimed.
+            if this.conn.read().await.is_none() {
+                // Bounded reconnects: the crate default is six exponential
+                // retries. Three attempts of DIAL_ATTEMPT_TIMEOUT each; nobody
+                // waits on them past CONNECT_WAIT.
+                let cfg = ConnectionManagerConfig::new()
+                    .set_response_timeout(Some(SLOT_OP_TIMEOUT))
+                    .set_connection_timeout(Some(DIAL_ATTEMPT_TIMEOUT))
+                    .set_number_of_retries(2);
+                match ConnectionManager::new_with_config(this.client.clone(), cfg).await {
+                    Ok(c) => {
+                        let generation = this
+                            .conn_gen
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            + 1;
+                        *this.conn.write().await = Some((generation, c));
+                    }
+                    Err(e) => tracing::warn!(error = %e, "could not connect to redis"),
+                }
+            }
+            this.dialing
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            this.dialed.notify_waiters();
+        });
+    }
+
+    /// Forget the cached connection so the next call redials -- but only if
+    /// it is still the one the caller used.
     ///
     /// A timed-out command can leave `ConnectionManager` holding a socket that
     /// will never answer; keeping it would hang every subsequent slot op on
     /// this replica, which is the completions wedge.
-    async fn drop_conn(&self, expected_gen: u64) {
+    async fn drop_conn(&self, used: u64) {
         let mut guard = self.conn.write().await;
-        if self.conn_gen.load(std::sync::atomic::Ordering::SeqCst) != expected_gen {
-            // Already replaced by a newer connection; the one that timed out is gone.
-            return;
+        if guard
+            .as_ref()
+            .is_some_and(|(generation, _)| *generation == used)
+        {
+            *guard = None;
         }
-        *guard = None;
     }
 
-    /// Run a slot Redis op with a deadline. Timeout drops the connection.
+    /// Run a slot Redis op with a deadline. A timeout drops the connection
+    /// the op used, and only that one.
+    ///
+    /// The deadline covers waiting for a connection too, so a request never
+    /// waits past it; the dial it may have started is not cancelled with it.
     async fn slot_timed<T>(
         &self,
         op: &'static str,
-        fut: impl std::future::Future<Output = Result<T>>,
+        f: impl AsyncFnOnce(ConnectionManager) -> Result<T>,
     ) -> Result<T> {
-        let generation = self.conn_gen.load(std::sync::atomic::Ordering::SeqCst);
+        // The generation of the connection this op actually ran on. Read
+        // before the op, it was the one before any dial the op started, and a
+        // timeout on the fresh connection dropped nothing.
+        let used = std::sync::OnceLock::new();
+        let fut = async {
+            let (generation, conn) = self.conn_with_gen().await?;
+            let _ = used.set(generation);
+            f(conn).await
+        };
         match tokio::time::timeout(SLOT_OP_TIMEOUT, fut).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => {
                 // redis-rs spells its own timeout "timed out"; the old check for
                 // "timeout" never matched it, so this branch was dead.
                 let text = e.to_string().to_ascii_lowercase();
-                if text.contains("timeout") || text.contains("timed out") {
+                if let Some(generation) = used.get()
+                    && (text.contains("timeout") || text.contains("timed out"))
+                {
                     tracing::warn!(
                         op,
                         error = %e,
                         "redis slot op timed out; dropping the cached connection"
                     );
-                    self.drop_conn(generation).await;
+                    self.drop_conn(*generation).await;
                 }
                 Err(e)
             }
             Err(_) => {
-                tracing::warn!(
-                    op,
-                    "redis slot op timed out; dropping the cached connection"
-                );
-                self.drop_conn(generation).await;
+                if let Some(generation) = used.get() {
+                    tracing::warn!(
+                        op,
+                        "redis slot op timed out; dropping the cached connection"
+                    );
+                    self.drop_conn(*generation).await;
+                }
                 Err(Error::Internal(format!("{op}: redis timed out")))
             }
         }
@@ -291,8 +363,7 @@ impl Cache {
         limit: u32,
         ttl: Duration,
     ) -> Result<bool> {
-        self.slot_timed("acquiring slot", async {
-            let mut conn = self.conn().await?;
+        self.slot_timed("acquiring slot", async |mut conn| {
             let mut inv = ACQUIRE_SLOT_SCRIPT.key(slot_key(account));
             inv.arg(request).arg(limit).arg(ttl.as_secs());
             let taken: i64 = eval_slot_script(&mut conn, "acquiring slot", &inv).await?;
@@ -319,8 +390,7 @@ impl Cache {
         let (rate, burst) = rate_and_burst(rpm);
 
         match self
-            .slot_timed("taking rate token", async {
-                let mut conn = self.conn().await?;
+            .slot_timed("taking rate token", async |mut conn| {
                 let mut inv = TAKE_TOKEN_SCRIPT.key(format!("oag:rate:{route}"));
                 inv.arg(rate).arg(burst);
                 let wait: String = eval_slot_script(&mut conn, "taking rate token", &inv).await?;
@@ -338,8 +408,7 @@ impl Cache {
 
     /// Give a slot back.
     pub async fn release_slot(&self, account: AccountId, request: &str) -> Result<()> {
-        self.slot_timed("releasing slot", async {
-            let mut conn = self.conn().await?;
+        self.slot_timed("releasing slot", async |mut conn| {
             let _: i64 = conn
                 .zrem(slot_key(account), request)
                 .await
@@ -359,8 +428,7 @@ impl Cache {
         request: &str,
         ttl: Duration,
     ) -> Result<bool> {
-        self.slot_timed("refreshing slot", async {
-            let mut conn = self.conn().await?;
+        self.slot_timed("refreshing slot", async |mut conn| {
             let mut inv = REFRESH_SLOT_SCRIPT.key(slot_key(account));
             inv.arg(request).arg(ttl.as_secs());
             let kept: i64 = eval_slot_script(&mut conn, "refreshing slot", &inv).await?;
@@ -373,8 +441,7 @@ impl Cache {
     /// expired included — the operator asked to clear the key, not to apply
     /// the scheduler's window to it.
     pub async fn clear_slots(&self, account: AccountId) -> Result<u32> {
-        self.slot_timed("clearing slots", async {
-            let mut conn = self.conn().await?;
+        self.slot_timed("clearing slots", async |mut conn| {
             let key = slot_key(account);
             let n: i64 = conn
                 .zcard(&key)
@@ -404,8 +471,7 @@ impl Cache {
     /// candidate pass that finds the credential idle) can clear ghosts
     /// without waiting for a successful acquire.
     pub async fn slots_in_use(&self, account: AccountId, ttl: Duration) -> Result<u32> {
-        self.slot_timed("counting slots", async {
-            let mut conn = self.conn().await?;
+        self.slot_timed("counting slots", async |mut conn| {
             let mut inv = SLOTS_IN_USE_SCRIPT.key(slot_key(account));
             inv.arg(ttl.as_secs());
             eval_slot_script(&mut conn, "counting slots", &inv).await
@@ -428,8 +494,7 @@ impl Cache {
         if accounts.is_empty() {
             return Ok(Vec::new());
         }
-        self.slot_timed("counting slots", async {
-            let mut conn = self.conn().await?;
+        self.slot_timed("counting slots", async |mut conn| {
             let mut pipe = redis::pipe();
             for account in accounts {
                 pipe.invoke_script(
@@ -471,8 +536,7 @@ impl Cache {
 
     /// Which credential a session is pinned to, refreshing the pin's lifetime.
     pub async fn sticky_get(&self, key: &str, ttl: Duration) -> Result<Option<AccountId>> {
-        self.slot_timed("reading sticky pin", async {
-            let mut conn = self.conn().await?;
+        self.slot_timed("reading sticky pin", async |mut conn| {
             // Refresh on read: an active conversation should keep its pin, and an
             // abandoned one should let go of it. `GETEX` does both in one round
             // trip; this was a GET and an EXPIRE, on every request with a pin.
@@ -487,8 +551,7 @@ impl Cache {
     }
 
     pub async fn sticky_set(&self, key: &str, account: AccountId, ttl: Duration) -> Result<()> {
-        self.slot_timed("writing sticky pin", async {
-            let mut conn = self.conn().await?;
+        self.slot_timed("writing sticky pin", async |mut conn| {
             let _: () = conn
                 .set_ex(key, account.to_string(), ttl.as_secs())
                 .await
@@ -893,6 +956,68 @@ mod tests {
         for junk in ["", "v1.", "v1.zz.{}", "v2.00.{}", "not-an-envelope"] {
             assert!(mac.open(&hash, junk).is_none(), "{junk:?} must not open");
         }
+    }
+
+    /// A Redis slower to accept than a slot op may wait still gets connected.
+    ///
+    /// A proxy holds every new connection for three seconds before passing it
+    /// through: past the op deadline, inside one dial attempt. When the op's
+    /// deadline cancelled the dial with it, every attempt died at two seconds
+    /// and this never connected. Now the first op fails open on time, the dial
+    /// it started carries on, and a later op finds the connection built.
+    #[tokio::test]
+    async fn a_dial_slower_than_the_op_deadline_still_connects() {
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let upstream = url
+            .trim_start_matches("redis://")
+            .split('/')
+            .next()
+            .expect("host:port")
+            .to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    if let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                    }
+                });
+            }
+        });
+
+        let cache = Cache::connect(&format!("redis://127.0.0.1:{port}")).expect("cache");
+        let account = AccountId::from_uuid(Uuid::new_v4());
+
+        let started = std::time::Instant::now();
+        assert!(
+            cache
+                .slots_in_use(account, Duration::from_mins(2))
+                .await
+                .is_err(),
+            "the dial outlasts the op deadline, so the first op fails open"
+        );
+        assert!(
+            started.elapsed() < SLOT_OP_TIMEOUT + Duration::from_millis(500),
+            "and it does not wait past its deadline: {:?}",
+            started.elapsed()
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            cache
+                .slots_in_use(account, Duration::from_mins(2))
+                .await
+                .expect("the dial the first op started finished in the background"),
+            0
+        );
     }
 
     /// The same forgery against a real Redis, through the accessor the auth

@@ -27,5 +27,10 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+# A delaying TCP proxy in front of the test Redis; see
+# `a_dial_slower_than_the_op_deadline_still_connects`.
+tokio = { workspace = true, features = ["net", "io-util"] }
+
 [lints]
 workspace = true
