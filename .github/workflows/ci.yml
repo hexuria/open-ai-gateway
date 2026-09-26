@@ -275,8 +275,11 @@ jobs:
         run: git diff "origin/${BASE_REF}...HEAD" > "$RUNNER_TEMP/pr.diff"
         env:
           BASE_REF: ${{ github.base_ref }}
+      # --cap-lints: this workflow sets RUSTFLAGS=-D warnings, so a mutant that
+      # leaves an argument unused failed to build and was counted "unviable"
+      # instead of tested -- 27 of 29 on #97, against 6 of 29 locally.
       - name: cargo mutants
-        run: cargo mutants --no-shuffle --in-diff "$RUNNER_TEMP/pr.diff" -o "$RUNNER_TEMP"
+        run: cargo mutants --no-shuffle --cap-lints true --in-diff "$RUNNER_TEMP/pr.diff" -o "$RUNNER_TEMP"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

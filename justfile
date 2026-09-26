@@ -57,7 +57,7 @@ race:
 mutants base="origin/main":
     git diff {{base}}...HEAD > target/mutants.diff
     OAG_TEST_REDIS_URL={{dev_rd}} OAG_TEST_DATABASE_URL={{dev_db}} \
-      cargo mutants --in-diff target/mutants.diff
+      cargo mutants --cap-lints true --in-diff target/mutants.diff
 
 # ── dev loop ───────────────────────────────────────────────────────────────────
 # Infrastructure only; the gateway runs on the host so rebuilds stay fast.
