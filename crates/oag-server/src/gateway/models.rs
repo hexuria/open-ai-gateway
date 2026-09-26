@@ -73,7 +73,7 @@ pub async fn list(
         pressure,
     } = match resolve(&state, &auth).await {
         Ok(r) => r,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let aliases = wants_aliases(
@@ -196,7 +196,7 @@ pub async fn list_gemini(State(state): State<Arc<AppState>>, Caller(auth): Calle
         pressure,
     } = match resolve(&state, &auth).await {
         Ok(r) => r,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let providers: BTreeSet<Provider> = channels.keys().copied().collect();
@@ -239,13 +239,15 @@ struct Resolved {
 }
 
 /// Who is asking, and what the route lets them reach.
+///
+/// The refusal is boxed: a `Response` is large and this is the cold path.
 async fn resolve(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
-) -> Result<Resolved, Response> {
+) -> Result<Resolved, Box<Response>> {
     let (route, policy, spend) = policy_for(state, auth)
         .await
-        .map_err(|e| error_response(&e))?;
+        .map_err(|e| Box::new(error_response(&e)))?;
     let mode = if route.default_mode == "managed" {
         RoutingMode::Managed
     } else {
@@ -259,7 +261,7 @@ async fn resolve(
     } else {
         channels_for(state, route.id, auth.principal_id)
             .await
-            .map_err(|e| error_response(&e))?
+            .map_err(|e| Box::new(error_response(&e)))?
     };
 
     Ok(Resolved {

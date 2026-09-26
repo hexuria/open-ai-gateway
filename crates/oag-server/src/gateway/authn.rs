@@ -33,18 +33,21 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         // Absent means [`require_key_layer`] is not in front of this route,
         // which is a wiring bug. The safe reading of a wiring bug on a billed
         // path is to refuse rather than to serve an unidentified caller.
-        parts.extensions.get::<Self>().cloned().ok_or_else(|| {
+        std::future::ready(parts.extensions.get::<Self>().cloned().ok_or_else(|| {
             tracing::error!(
                 "an inference handler was reached without the auth layer in front of it"
             );
             super::error_response(&Error::Internal(
                 "inference route is missing its auth layer".to_owned(),
             ))
-        })
+        }))
     }
 }
 

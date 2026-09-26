@@ -758,7 +758,7 @@ pub async fn collect_stream(
     adapter: Arc<dyn ProviderAdapter>,
     idle_timeout: Duration,
     max_duration: Duration,
-) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), (Error, StreamAccumulator)> {
+) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), StreamFailure> {
     collect_stream_with(
         response,
         adapter,
@@ -769,6 +769,12 @@ pub async fn collect_stream(
     .await
 }
 
+/// Why a collected stream failed, and what the provider had produced by then.
+///
+/// Boxed because the accumulator is large and the failure is the cold path:
+/// unboxed, every `Ok` would carry its size.
+pub type StreamFailure = Box<(Error, StreamAccumulator)>;
+
 /// [`collect_stream`] with the original ↔ wire function names.
 pub async fn collect_stream_with(
     response: reqwest::Response,
@@ -776,7 +782,7 @@ pub async fn collect_stream_with(
     idle_timeout: Duration,
     max_duration: Duration,
     names: FunctionNameMap,
-) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), (Error, StreamAccumulator)> {
+) -> std::result::Result<(Vec<StreamEvent>, StreamAccumulator), StreamFailure> {
     let started = Instant::now();
     let framing = adapter.framing();
     let mut body = response.bytes_stream();
@@ -786,24 +792,27 @@ pub async fn collect_stream_with(
 
     loop {
         if started.elapsed() >= max_duration {
-            return Err((
+            return Err(Box::new((
                 Error::Internal(format!(
                     "upstream stream exceeded {}s",
                     max_duration.as_secs()
                 )),
                 acc,
-            ));
+            )));
         }
         let chunk = match tokio::time::timeout(idle_timeout, body.next()).await {
             Err(_) => {
-                return Err((
+                return Err(Box::new((
                     Error::Internal(format!("upstream idle for {}s", idle_timeout.as_secs())),
                     acc,
-                ));
+                )));
             }
             Ok(None) => break,
             Ok(Some(Err(e))) => {
-                return Err((Error::Internal(format!("upstream read failed: {e}")), acc));
+                return Err(Box::new((
+                    Error::Internal(format!("upstream read failed: {e}")),
+                    acc,
+                )));
             }
             Ok(Some(Ok(bytes))) => bytes,
         };
@@ -816,13 +825,13 @@ pub async fn collect_stream_with(
         // the delimiter, and this reader was the one path that let it
         // choose how much memory a replica allocates.
         if pending.len() > MAX_PENDING {
-            return Err((
+            return Err(Box::new((
                 Error::Internal(format!(
                     "upstream sent {} bytes without completing an event",
                     pending.len()
                 )),
                 acc,
-            ));
+            )));
         }
     }
 
@@ -841,10 +850,10 @@ pub async fn collect_stream_with(
         StreamEvent::Error { message } => Some(message.clone()),
         _ => None,
     }) {
-        return Err((
+        return Err(Box::new((
             Error::Internal(format!("upstream stream error: {message}")),
             acc,
-        ));
+        )));
     }
 
     // A body that ends before its terminal event is a truncated answer, and
@@ -856,10 +865,10 @@ pub async fn collect_stream_with(
     // for it recorded as zero. An error is the honest outcome, and a cheap
     // one: nothing has reached the client, so this is a clean failover.
     if acc.stop_reason().is_none() {
-        return Err((
+        return Err(Box::new((
             Error::Internal("upstream closed before the response was complete".to_owned()),
             acc,
-        ));
+        )));
     }
 
     Ok((events, acc))

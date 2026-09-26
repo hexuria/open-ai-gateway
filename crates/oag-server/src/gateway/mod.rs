@@ -1950,10 +1950,12 @@ async fn succeeded(
             // The stream failed after the provider had generated some of the
             // answer: that much is invoiced whether or not it was whole, so
             // it goes out with the error rather than being dropped with it.
-            Err((e, accumulator)) if accumulator.usage().output_tokens > 0 => {
-                return Outcome::Lost(e, accumulator);
-            }
-            Err((e, _)) => Err(e),
+            Err(failure) => match *failure {
+                (e, accumulator) if accumulator.usage().output_tokens > 0 => {
+                    return Outcome::Lost(e, accumulator);
+                }
+                (e, _) => Err(e),
+            },
         }
     } else {
         sse::collect_with(response, adapter.dialect(), &names).await
