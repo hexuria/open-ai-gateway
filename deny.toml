@@ -1,0 +1,61 @@
+# `cargo deny check` reads this. It owns what `cargo audit` cannot: which
+# licenses may ship, which crates are banned, and where code may come from.
+# Advisories are checked here too, on the feature-resolved graph.
+
+[graph]
+all-features = false
+
+[advisories]
+# Unmaintained crates are reported for every dependency, not just direct ones:
+# a dead transitive crate is still ours to replace.
+unmaintained = "all"
+yanked = "deny"
+# No ignores. `.cargo/audit.toml` ignores RUSTSEC-2026-0235 (rkyv) because
+# audit reads Cargo.lock, which records optional dependencies. cargo-deny
+# resolves features, never sees rkyv, and so needs no ignore -- and will fail
+# if rust_decimal ever starts enabling it.
+ignore = []
+
+[licenses]
+# Permissive only. Every entry is here because the tree uses it today; adding
+# one is a decision, not a fix for a red build.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "BSL-1.0",
+  "Unicode-3.0",
+  "Unlicense",
+  # webpki-root-certs / webpki-roots: Mozilla's CA bundle data.
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# The workspace crates are `publish = false`; their own license is not in scope.
+ignore = true
+
+[bans]
+# Duplicate majors are common in the async ecosystem and usually not ours to
+# fix. Warn, so the list stays visible, rather than blocking a merge.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+  # rustls only: see docs/03-providers.md §Transport.
+  { crate = "openssl", reason = "rustls only; see docs/03-providers.md §Transport" },
+  { crate = "openssl-sys", reason = "rustls only; see docs/03-providers.md §Transport" },
+  { crate = "native-tls", reason = "rustls only; see docs/03-providers.md §Transport" },
+]
+
+[sources]
+# crates.io only. A git dependency is a review decision, so it has to be
+# listed here to build.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
