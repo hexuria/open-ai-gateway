@@ -1428,6 +1428,10 @@ mod tests {
             return;
         };
         let cache = Cache::connect(&url).expect("cache");
+        // Every take below fails open on a dead connection, two seconds each,
+        // so without this a broken connection is a very slow failure rather
+        // than a fast one.
+        assert!(cache.ping().await, "redis must be reachable for this test");
         let route = Uuid::new_v4();
 
         // Five per minute: a burst of five, then a refusal.
