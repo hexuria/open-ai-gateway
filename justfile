@@ -42,6 +42,19 @@ lint:
 test:
     cargo test --workspace
 
+# Licenses, banned crates, sources and advisories. See deny.toml.
+deny:
+    cargo deny --locked check
+
+# Every surviving mutant is a behaviour change the tests would not notice.
+# Start `just dev-up` first, or the Redis- and Postgres-gated tests skip and
+# every mutant they guard survives.
+# Mutation-test what this branch changed against main.
+mutants base="origin/main":
+    git diff {{base}}...HEAD > target/mutants.diff
+    OAG_TEST_REDIS_URL={{dev_rd}} OAG_TEST_DATABASE_URL={{dev_db}} \
+      cargo mutants --in-diff target/mutants.diff
+
 # ── dev loop ───────────────────────────────────────────────────────────────────
 # Infrastructure only; the gateway runs on the host so rebuilds stay fast.
 dev-up:

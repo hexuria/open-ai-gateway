@@ -29,18 +29,21 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
         // Absent means the layer is not in front of this route. That is a wiring
         // bug, and the safe reading of a wiring bug on an admin write path is to
         // refuse rather than to proceed with no idea who is asking.
-        parts.extensions.get::<Self>().cloned().ok_or_else(|| {
+        std::future::ready(parts.extensions.get::<Self>().cloned().ok_or_else(|| {
             tracing::error!("admin handler reached without the auth layer in front of it");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": "admin route is misconfigured" })),
             )
                 .into_response()
-        })
+        }))
     }
 }
 

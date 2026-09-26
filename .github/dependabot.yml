@@ -1,0 +1,22 @@
+# Stagnation is a choice with a rising cost. These PRs are the reminder;
+# CI decides whether each one can land.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for every semver-compatible bump, so the weekly batch is one
+      # review rather than thirty.
+      cargo-minor:
+        update-types: [minor, patch]
+
+  # Actions are pinned to commit SHAs; Dependabot moves the SHA and the
+  # version comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      actions:
+        patterns: ["*"]

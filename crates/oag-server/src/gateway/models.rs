@@ -73,7 +73,7 @@ pub async fn list(
         pressure,
     } = match resolve(&state, &auth).await {
         Ok(r) => r,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let aliases = wants_aliases(
@@ -196,7 +196,7 @@ pub async fn list_gemini(State(state): State<Arc<AppState>>, Caller(auth): Calle
         pressure,
     } = match resolve(&state, &auth).await {
         Ok(r) => r,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
 
     let providers: BTreeSet<Provider> = channels.keys().copied().collect();
@@ -239,13 +239,15 @@ struct Resolved {
 }
 
 /// Who is asking, and what the route lets them reach.
+///
+/// The refusal is boxed: a `Response` is large and this is the cold path.
 async fn resolve(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
-) -> Result<Resolved, Response> {
+) -> Result<Resolved, Box<Response>> {
     let (route, policy, spend) = policy_for(state, auth)
         .await
-        .map_err(|e| error_response(&e))?;
+        .map_err(|e| Box::new(error_response(&e)))?;
     let mode = if route.default_mode == "managed" {
         RoutingMode::Managed
     } else {
@@ -259,7 +261,7 @@ async fn resolve(
     } else {
         channels_for(state, route.id, auth.principal_id)
             .await
-            .map_err(|e| error_response(&e))?
+            .map_err(|e| Box::new(error_response(&e)))?
     };
 
     Ok(Resolved {
@@ -1388,5 +1390,21 @@ mod tests {
         // in a Claude Code picker that says otherwise.
         assert_eq!(grok().label(), "xAI: grok-4.6");
         assert_eq!(spec().label(), "Anthropic: claude-opus-5");
+    }
+
+    /// A listing whose route lookup fails refuses. An empty 200 would tell a
+    /// client the key reaches nothing, which it caches and acts on.
+    #[tokio::test]
+    async fn both_listings_refuse_when_the_route_cannot_be_read() {
+        // Closed ports, so the lookup fails; the cache and pool retries make
+        // that take seconds, not milliseconds.
+        let state = crate::testing::state("");
+        let caller = || crate::gateway::authn::Caller(Arc::new(key(Decimal::ONE)));
+
+        let res = list(State(state.clone()), caller(), Query(ListQuery::default())).await;
+        assert!(!res.status().is_success(), "{}", res.status());
+
+        let res = list_gemini(State(state), caller()).await;
+        assert!(!res.status().is_success(), "{}", res.status());
     }
 }
