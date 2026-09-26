@@ -95,6 +95,27 @@ impl SlotStore for oag_store::Cache {
     }
 }
 
+/// What [`claim_slot`] asks the slot store.
+///
+/// Separate from [`SlotStore`] because admission has to tell "refused" from
+/// "could not ask": a refusal is capacity truth, an error fails open. The
+/// lease-side trait folds both into `false`, which is right for a heartbeat
+/// and wrong here.
+pub(crate) trait SlotLedger {
+    async fn acquire_slot(&self, account: AccountId, request_id: &str, limit: u32) -> Result<bool>;
+    async fn slots_in_use(&self, account: AccountId) -> Result<u32>;
+}
+
+impl SlotLedger for oag_store::Cache {
+    async fn acquire_slot(&self, account: AccountId, request_id: &str, limit: u32) -> Result<bool> {
+        oag_store::Cache::acquire_slot(self, account, request_id, limit, SLOT_TTL).await
+    }
+
+    async fn slots_in_use(&self, account: AccountId) -> Result<u32> {
+        oag_store::Cache::slots_in_use(self, account, SLOT_TTL).await
+    }
+}
+
 /// The concurrency slot a lease holds, given back when the lease is dropped.
 ///
 /// The same shape as `InFlightGuard`, for the same reason. Both are counts a
@@ -459,7 +480,7 @@ pub async fn lease(
             return Err(none_left());
         };
 
-        if !claim_slot(state, row, request_id, "acquire").await {
+        if !claim_slot(&state.cache, row, request_id, "acquire").await {
             // Lost the race for the last slot. Drop it and re-run rather than
             // failing: another credential is very likely free.
             remaining.retain(|r| r.account_id() != selection.account);
@@ -492,7 +513,7 @@ pub async fn lease(
                 "every acquire lost but redis has room; retrying"
             );
             metrics::counter!("oag_slot_ghost_total", "op" => "exhausted").increment(1);
-            if claim_slot(state, row, request_id, "exhausted").await {
+            if claim_slot(&state.cache, row, request_id, "exhausted").await {
                 let _ = state
                     .cache
                     .sticky_set(&sticky_key, row.account_id(), STICKY_TTL)
@@ -552,7 +573,7 @@ async fn try_pinned(
     }
     // Same policy as the cascade: an unanswerable Redis admits. The pin
     // was the right credential a moment ago; a blink does not change that.
-    if claim_slot(state, row, request_id, "sticky").await {
+    if claim_slot(&state.cache, row, request_id, "sticky").await {
         metrics::counter!("oag_selection_total", "stage" => "sticky").increment(1);
         Some(row.clone())
     } else {
@@ -568,15 +589,14 @@ async fn try_pinned(
 /// the lease is a real member; only admit without one if the retry still
 /// sees none. A limit of zero is a closed seat, not a ghost.
 async fn claim_slot(
-    state: &AppState,
+    slots: &impl SlotLedger,
     row: &AccountRow,
     request_id: &str,
     op: &'static str,
 ) -> bool {
     let limit = u32::try_from(row.max_concurrency).unwrap_or(0);
-    let acquired = match state
-        .cache
-        .acquire_slot(row.account_id(), request_id, limit, SLOT_TTL)
+    let acquired = match slots
+        .acquire_slot(row.account_id(), request_id, limit)
         .await
     {
         Ok(acquired) => acquired,
@@ -588,7 +608,7 @@ async fn claim_slot(
     if acquired {
         return true;
     }
-    let live = match state.cache.slots_in_use(row.account_id(), SLOT_TTL).await {
+    let live = match slots.slots_in_use(row.account_id()).await {
         Ok(n) => n,
         Err(e) => {
             // Degraded, not empty: acquire just said the seat was full, so
@@ -607,9 +627,8 @@ async fn claim_slot(
         "acquire refused a slot while redis has none; retrying"
     );
     metrics::counter!("oag_slot_ghost_total", "op" => op).increment(1);
-    match state
-        .cache
-        .acquire_slot(row.account_id(), request_id, limit, SLOT_TTL)
+    match slots
+        .acquire_slot(row.account_id(), request_id, limit)
         .await
     {
         Ok(true) => true,
@@ -975,6 +994,107 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{CountingSlots, lease as test_lease};
     use super::*;
+
+    /// A slot store that answers from a script, in order, and counts the
+    /// questions. `None` in a slot means "not asked for": asking panics, so a
+    /// test also pins which round trips a branch makes.
+    struct ScriptedSlots {
+        acquires: std::sync::Mutex<std::collections::VecDeque<Result<bool>>>,
+        count: std::sync::Mutex<Option<Result<u32>>>,
+    }
+
+    fn down() -> Error {
+        Error::Internal("redis unreachable".to_owned())
+    }
+
+    impl SlotLedger for ScriptedSlots {
+        fn acquire_slot(
+            &self,
+            _: AccountId,
+            _: &str,
+            _: u32,
+        ) -> impl Future<Output = Result<bool>> {
+            let mut acquires = self.acquires.lock().expect("script lock");
+            std::future::ready(
+                acquires
+                    .pop_front()
+                    .expect("an acquire the branch should not make"),
+            )
+        }
+
+        fn slots_in_use(&self, _: AccountId) -> impl Future<Output = Result<u32>> {
+            let mut count = self.count.lock().expect("script lock");
+            std::future::ready(count.take().expect("a count the branch should not make"))
+        }
+    }
+
+    /// Run `claim_slot` against the script; every scripted answer must be used.
+    async fn claim(limit: i32, acquires: Vec<Result<bool>>, count: Option<Result<u32>>) -> bool {
+        let slots = ScriptedSlots {
+            acquires: std::sync::Mutex::new(acquires.into()),
+            count: std::sync::Mutex::new(count),
+        };
+        let mut row = super::testing::account("seat", "api_key");
+        row.max_concurrency = limit;
+        let admitted = claim_slot(&slots, &row, "req", "acquire").await;
+        assert!(
+            slots.acquires.lock().expect("script lock").is_empty(),
+            "a scripted acquire went unasked"
+        );
+        assert!(
+            slots.count.lock().expect("script lock").is_none(),
+            "the scripted count went unasked"
+        );
+        admitted
+    }
+
+    #[tokio::test]
+    async fn claim_slot_admits_a_granted_acquire_without_counting() {
+        assert!(claim(8, vec![Ok(true)], None).await);
+    }
+
+    #[tokio::test]
+    async fn claim_slot_fails_open_when_the_acquire_cannot_reach_redis() {
+        // Coordination is a courtesy: refusing everything because Redis blinked
+        // trades a real outage for a theoretical oversubscription.
+        assert!(claim(8, vec![Err(down())], None).await);
+    }
+
+    #[tokio::test]
+    async fn claim_slot_refuses_a_full_seat_without_retrying() {
+        assert!(!claim(8, vec![Ok(false)], Some(Ok(8))).await);
+    }
+
+    #[tokio::test]
+    async fn claim_slot_fails_open_when_the_count_cannot_reach_redis() {
+        assert!(claim(8, vec![Ok(false)], Some(Err(down()))).await);
+    }
+
+    #[tokio::test]
+    async fn claim_slot_treats_a_zero_limit_as_closed_not_as_a_ghost() {
+        // An empty key and a refusal is the ghost signature, except when the
+        // limit is zero: that seat is closed, and a retry would be refused too.
+        assert!(!claim(0, vec![Ok(false)], Some(Ok(0))).await);
+    }
+
+    #[tokio::test]
+    async fn claim_slot_retries_a_ghost_refusal_and_admits_with_a_real_member() {
+        assert!(claim(8, vec![Ok(false), Ok(true)], Some(Ok(0))).await);
+    }
+
+    #[tokio::test]
+    async fn claim_slot_refuses_when_the_ghost_retry_is_refused_too() {
+        // oag86-1. The key refilled between the count and the retry, so the
+        // retry's refusal is capacity truth and this caller holds no member.
+        // Admitting here ran a request nothing counted and nothing released;
+        // `scripts/claim-slot-race.sh` saw 7 such on an 8-seat limit.
+        assert!(!claim(8, vec![Ok(false), Ok(false)], Some(Ok(0))).await);
+    }
+
+    #[tokio::test]
+    async fn claim_slot_fails_open_when_the_ghost_retry_cannot_reach_redis() {
+        assert!(claim(8, vec![Ok(false), Err(down())], Some(Ok(0))).await);
+    }
 
     /// A state whose Redis is a port nothing listens on: every slot question
     /// fails at connect, immediately. `Db::connect` is lazy and never dialled.
@@ -1530,6 +1650,90 @@ mod tests {
              it only can if the two live under different keys"
         );
         third.release().await;
+    }
+
+    /// A free one-seat credential is leased, holding exactly its one slot.
+    ///
+    /// Gated, because it runs the real `lease` against the real candidate
+    /// query and Redis. One seat is the point: with room for two, a `lease`
+    /// that threw away the slot it had just won would take a second one on
+    /// the exhausted path and still succeed, so nothing would notice.
+    #[tokio::test]
+    async fn a_free_one_seat_credential_is_leased_with_its_one_slot() {
+        let (Ok(db_url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            &db_url, &redis_url, "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 4).expect("pool");
+        db.migrate().await.expect("migrate");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("client");
+        let state = Arc::new(AppState::new(config, db.clone(), cache).expect("state"));
+
+        let tag = uuid::Uuid::new_v4();
+        let principal: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member') \
+             RETURNING id",
+        )
+        .bind(format!("one-seat-{tag}@example.invalid"))
+        .fetch_one(db.pool())
+        .await
+        .expect("principal");
+        let route: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]') RETURNING id",
+        )
+        .bind(format!("one-seat-{tag}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("route");
+        let account: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce, max_concurrency) \
+             VALUES (gen_random_uuid(), $1, 'anthropic', 'api_key', '\\x00', '\\x00', 1) \
+             RETURNING id",
+        )
+        .bind(format!("one-seat-{tag}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("account");
+        sqlx::query("INSERT INTO account_route (account_id, route_id) VALUES ($1, $2)")
+            .bind(account)
+            .bind(route)
+            .execute(db.pool())
+            .await
+            .expect("join");
+
+        let session = oag_pool::SessionKey::from_caller(&format!("key-{tag}"), "a-model");
+        let none = HashSet::<AccountId, std::collections::hash_map::RandomState>::new();
+        let leased = lease(
+            &state,
+            route,
+            principal,
+            Provider::Anthropic,
+            &session,
+            &none,
+            &format!("one-seat-{tag}"),
+            None,
+        )
+        .await
+        .expect("the only credential is free, so it is leased");
+        assert_eq!(leased.account.account_id(), AccountId::from_uuid(account));
+        assert_eq!(
+            state
+                .cache
+                .slots_in_use(leased.account.account_id(), SLOT_TTL)
+                .await
+                .expect("count"),
+            1,
+            "the lease holds its seat, and only that one"
+        );
+        leased.release().await;
     }
 
     // The slot-TTL-against-the-ceiling assertion used to live here and compared

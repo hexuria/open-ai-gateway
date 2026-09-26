@@ -28,3 +28,6 @@ deploy/tofu/gcp-deploy.local.env
 # Resumable session state. Deliberately not tracked: disposable, rebuildable, and
 # never a record. See .handoff/STATE.md.
 .handoff/
+
+# cargo mutants output (`just mutants`)
+mutants.out*/
