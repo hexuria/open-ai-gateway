@@ -42,6 +42,8 @@ async-trait.workspace = true
 oag-core = { workspace = true, features = ["test-fixtures"] }
 base64.workspace = true
 http-body-util.workspace = true
+# A paused clock, so the 30s slot heartbeat can be driven in a test.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

@@ -995,6 +995,109 @@ mod tests {
     use super::testing::{CountingSlots, lease as test_lease};
     use super::*;
 
+    /// A slot store for the heartbeat: `refresh` answers from a script (then
+    /// "still held"), `acquire` answers `grant`, and every call is recorded.
+    #[derive(Default)]
+    struct BeatStore {
+        refreshes: std::sync::Mutex<std::collections::VecDeque<bool>>,
+        grant: bool,
+        refreshed: std::sync::atomic::AtomicUsize,
+        acquired_under: std::sync::Mutex<Vec<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SlotStore for BeatStore {
+        async fn release(&self, _: AccountId, _: &str) {}
+
+        async fn refresh(&self, _: AccountId, _: &str) -> bool {
+            self.refreshed.fetch_add(1, Ordering::SeqCst);
+            let mut script = self.refreshes.lock().expect("script lock");
+            script.pop_front().unwrap_or(true)
+        }
+
+        async fn acquire(&self, _: AccountId, _: &str, limit: u32) -> bool {
+            self.acquired_under.lock().expect("lock").push(limit);
+            self.grant
+        }
+    }
+
+    /// A heartbeating guard over `store`, with a limit of 8.
+    fn beating(store: &Arc<BeatStore>) -> Arc<SlotGuard> {
+        let slot = Arc::new(SlotGuard {
+            store: Arc::clone(store) as Arc<dyn SlotStore>,
+            account: AccountId::from_uuid(uuid::Uuid::nil()),
+            request_id: "req".to_owned(),
+            limit: 8,
+            released: AtomicBool::new(false),
+        });
+        spawn_heartbeat(&slot);
+        slot
+    }
+
+    /// Two beats and a second: the ticks at 30s and 60s, and time for each to
+    /// finish its round trip on the paused clock.
+    async fn two_beats() {
+        tokio::time::sleep(SLOT_HEARTBEAT * 2 + Duration::from_secs(1)).await;
+    }
+
+    fn store(refreshes: &[bool], grant: bool) -> Arc<BeatStore> {
+        Arc::new(BeatStore {
+            refreshes: std::sync::Mutex::new(refreshes.iter().copied().collect()),
+            grant,
+            ..BeatStore::default()
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_held_slot_is_refreshed_every_beat_and_never_retaken() {
+        let store = store(&[], true);
+        let _slot = beating(&store);
+        two_beats().await;
+        assert_eq!(store.refreshed.load(Ordering::SeqCst), 2);
+        assert!(store.acquired_under.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_slot_is_taken_back_under_its_own_limit_and_kept_beating() {
+        // Redis was away past the TTL: the member is gone while the request
+        // runs. The heartbeat takes the seat back, by the rule it was granted
+        // under, and carries on refreshing the new member.
+        let store = store(&[false], true);
+        let _slot = beating(&store);
+        two_beats().await;
+        assert_eq!(*store.acquired_under.lock().expect("lock"), vec![8]);
+        assert_eq!(store.refreshed.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_retake_keeps_beating_rather_than_giving_up() {
+        // The seat filled while the member was gone. The request is still
+        // running, so the heartbeat keeps going: the next beat may find room.
+        let store = store(&[false, false], false);
+        let _slot = beating(&store);
+        two_beats().await;
+        assert_eq!(*store.acquired_under.lock().expect("lock"), vec![8, 8]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_released_slot_stops_beating() {
+        let store = store(&[], true);
+        let slot = beating(&store);
+        slot.release().await;
+        two_beats().await;
+        assert_eq!(store.refreshed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_slot_stops_beating() {
+        // The heartbeat holds a Weak: it must not keep the guard alive, and
+        // must not beat for a guard that is gone.
+        let store = store(&[], true);
+        drop(beating(&store));
+        two_beats().await;
+        assert_eq!(store.refreshed.load(Ordering::SeqCst), 0);
+    }
+
     /// A slot store that answers from a script, in order, and counts the
     /// questions. `None` in a slot means "not asked for": asking panics, so a
     /// test also pins which round trips a branch makes.
