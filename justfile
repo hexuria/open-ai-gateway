@@ -46,6 +46,10 @@ test:
 deny:
     cargo deny --locked check
 
+# Race claim_slot's sequence on the dev Redis; must report no admission without a slot.
+race:
+    REDIS_PORT={{ trim_start_match(dev_rd, "redis://127.0.0.1:") }} ./scripts/claim-slot-race.sh
+
 # Every surviving mutant is a behaviour change the tests would not notice.
 # Start `just dev-up` first, or the Redis- and Postgres-gated tests skip and
 # every mutant they guard survives.
