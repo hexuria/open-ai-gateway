@@ -1867,6 +1867,34 @@ mod tests {
         assert_eq!(acc.quality_gate(), None, "the tool call reassembled");
     }
 
+    async fn collect_unterminated(len: usize) -> String {
+        let codex: Arc<dyn ProviderAdapter> = Arc::new(oag_upstream::codex::CodexAdapter::new());
+        let failure = collect_stream(
+            body(&"x".repeat(len)),
+            codex,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("no terminal event, so not an answer");
+        failure.0.to_string()
+    }
+
+    #[tokio::test]
+    async fn collect_stream_holds_exactly_the_pending_cap() {
+        // The cap is on bytes past MAX_PENDING, not at it: a tail of exactly
+        // the cap is still a frame that might complete, so this ends as a
+        // truncated answer rather than as a runaway upstream.
+        let err = collect_unterminated(MAX_PENDING).await;
+        assert!(err.contains("before the response was complete"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn collect_stream_refuses_a_tail_past_the_pending_cap() {
+        let err = collect_unterminated(MAX_PENDING + 1).await;
+        assert!(err.contains("without completing an event"), "{err}");
+    }
+
     #[tokio::test]
     async fn a_stream_that_closes_before_its_terminal_event_is_an_error_not_an_answer() {
         // The Codex seat's connection drops mid-generation. The body simply

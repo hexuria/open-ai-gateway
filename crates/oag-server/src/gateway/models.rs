@@ -1391,4 +1391,20 @@ mod tests {
         assert_eq!(grok().label(), "xAI: grok-4.6");
         assert_eq!(spec().label(), "Anthropic: claude-opus-5");
     }
+
+    /// A listing whose route lookup fails refuses. An empty 200 would tell a
+    /// client the key reaches nothing, which it caches and acts on.
+    #[tokio::test]
+    async fn both_listings_refuse_when_the_route_cannot_be_read() {
+        // Closed ports, so the lookup fails; the cache and pool retries make
+        // that take seconds, not milliseconds.
+        let state = crate::testing::state("");
+        let caller = || crate::gateway::authn::Caller(Arc::new(key(Decimal::ONE)));
+
+        let res = list(State(state.clone()), caller(), Query(ListQuery::default())).await;
+        assert!(!res.status().is_success(), "{}", res.status());
+
+        let res = list_gemini(State(state), caller()).await;
+        assert!(!res.status().is_success(), "{}", res.status());
+    }
 }

@@ -1947,15 +1947,7 @@ async fn succeeded(
         let max = state.config.gateway.max_stream_duration;
         match sse::collect_stream_with(response, adapter, idle, max, names).await {
             Ok((events, accumulator)) => Ok((bytes::Bytes::new(), events, accumulator)),
-            // The stream failed after the provider had generated some of the
-            // answer: that much is invoiced whether or not it was whole, so
-            // it goes out with the error rather than being dropped with it.
-            Err(failure) => match *failure {
-                (e, accumulator) if accumulator.usage().output_tokens > 0 => {
-                    return Outcome::Lost(e, accumulator);
-                }
-                (e, _) => Err(e),
-            },
+            Err(failure) => return collect_failed(failure),
         }
     } else {
         sse::collect_with(response, adapter.dialect(), &names).await
@@ -1969,6 +1961,19 @@ async fn succeeded(
             attempt,
         })),
         Err(e) => Outcome::Switch(e),
+    }
+}
+
+/// A collected stream that failed: `Lost` once the provider had generated
+/// part of the answer, because that much is invoiced whether or not it was
+/// whole, so it goes out with the error rather than being dropped with it.
+/// Before any output it is a plain failover.
+fn collect_failed(failure: sse::StreamFailure) -> Outcome {
+    let (e, accumulator) = *failure;
+    if accumulator.usage().output_tokens > 0 {
+        Outcome::Lost(e, accumulator)
+    } else {
+        Outcome::Switch(e)
     }
 }
 
@@ -2337,6 +2342,35 @@ fn no_viable_message(route: &str, requested: &str, ladder: &TierLadder) -> Strin
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn failure_after(output_tokens: u64) -> sse::StreamFailure {
+        let mut accumulator = oag_proto::StreamAccumulator::new();
+        accumulator.observe(&oag_proto::StreamEvent::UsageUpdate {
+            usage: oag_router::Usage {
+                output_tokens,
+                ..oag_router::Usage::default()
+            },
+        });
+        Box::new((Error::Internal("stream dropped".to_owned()), accumulator))
+    }
+
+    #[test]
+    fn a_collected_stream_that_failed_after_output_is_lost_and_metered() {
+        // One generated token is one invoiced token: dropping the accumulator
+        // with the error is how a lost stream reached the ledger as free.
+        match collect_failed(failure_after(1)) {
+            Outcome::Lost(_, accumulator) => assert_eq!(accumulator.usage().output_tokens, 1),
+            _ => panic!("a failure after output must be Lost"),
+        }
+    }
+
+    #[test]
+    fn a_collected_stream_that_failed_before_output_is_a_plain_failover() {
+        assert!(
+            matches!(collect_failed(failure_after(0)), Outcome::Switch(_)),
+            "nothing was generated, so nothing is metered"
+        );
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
