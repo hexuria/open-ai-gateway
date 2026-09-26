@@ -13,7 +13,8 @@ trusting a green run.
 | Deterministic logic (router, pool, proto) | unit tests; `cargo mutants` on the diff |
 | Request path across dialects | `deploy/test/*-verify.sh` against mocks |
 | Store and slot accounting | gated integration tests with real Redis/Postgres |
-| Slot admission under concurrent callers | `scripts/claim-slot-race.sh` (manual) -- no automated owner yet |
+| Slot admission decision (`claim_slot`) | scripted-store unit tests in `gateway/select.rs`, one per branch |
+| Slot admission under concurrent callers | `scripts/claim-slot-race.sh` (manual, not in the repo yet) -- no automated owner |
 | Unsafe / memory | none needed: `unsafe_code = "forbid"` workspace-wide |
 | Vulnerable, unlicensed or off-registry dependency | `cargo audit`, `cargo deny` (`deny.toml`) |
 | Stale dependencies and actions | Dependabot (`.github/dependabot.yml`) |
