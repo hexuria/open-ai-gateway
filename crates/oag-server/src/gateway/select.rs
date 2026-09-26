@@ -1652,6 +1652,90 @@ mod tests {
         third.release().await;
     }
 
+    /// A free one-seat credential is leased, holding exactly its one slot.
+    ///
+    /// Gated, because it runs the real `lease` against the real candidate
+    /// query and Redis. One seat is the point: with room for two, a `lease`
+    /// that threw away the slot it had just won would take a second one on
+    /// the exhausted path and still succeed, so nothing would notice.
+    #[tokio::test]
+    async fn a_free_one_seat_credential_is_leased_with_its_one_slot() {
+        let (Ok(db_url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            &db_url, &redis_url, "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 4).expect("pool");
+        db.migrate().await.expect("migrate");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("client");
+        let state = Arc::new(AppState::new(config, db.clone(), cache).expect("state"));
+
+        let tag = uuid::Uuid::new_v4();
+        let principal: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO principal (id, email, role) VALUES (gen_random_uuid(), $1, 'member') \
+             RETURNING id",
+        )
+        .bind(format!("one-seat-{tag}@example.invalid"))
+        .fetch_one(db.pool())
+        .await
+        .expect("principal");
+        let route: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]') RETURNING id",
+        )
+        .bind(format!("one-seat-{tag}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("route");
+        let account: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce, max_concurrency) \
+             VALUES (gen_random_uuid(), $1, 'anthropic', 'api_key', '\\x00', '\\x00', 1) \
+             RETURNING id",
+        )
+        .bind(format!("one-seat-{tag}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("account");
+        sqlx::query("INSERT INTO account_route (account_id, route_id) VALUES ($1, $2)")
+            .bind(account)
+            .bind(route)
+            .execute(db.pool())
+            .await
+            .expect("join");
+
+        let session = oag_pool::SessionKey::from_caller(&format!("key-{tag}"), "a-model");
+        let none = HashSet::<AccountId, std::collections::hash_map::RandomState>::new();
+        let leased = lease(
+            &state,
+            route,
+            principal,
+            Provider::Anthropic,
+            &session,
+            &none,
+            &format!("one-seat-{tag}"),
+            None,
+        )
+        .await
+        .expect("the only credential is free, so it is leased");
+        assert_eq!(leased.account.account_id(), AccountId::from_uuid(account));
+        assert_eq!(
+            state
+                .cache
+                .slots_in_use(leased.account.account_id(), SLOT_TTL)
+                .await
+                .expect("count"),
+            1,
+            "the lease holds its seat, and only that one"
+        );
+        leased.release().await;
+    }
+
     // The slot-TTL-against-the-ceiling assertion used to live here and compared
     // `SLOT_TTL` against the shipped default. Heartbeats made that comparison
     // the wrong invariant: see
