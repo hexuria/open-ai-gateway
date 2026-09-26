@@ -33,7 +33,7 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -44,7 +44,7 @@ jobs:
           # kind binary and warms the node image.
           install_only: true
 
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
 
       - name: runner capabilities
         # If any of these is missing the failure below is confusing, so state it
