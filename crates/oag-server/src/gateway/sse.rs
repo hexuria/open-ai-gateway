@@ -1529,12 +1529,14 @@ mod tests {
             anthropic(),
             tx,
             // Long enough that neither watchdog can be what stops this: the cap
-            // trips within milliseconds of the bytes arriving.
+            // trips within milliseconds of the bytes arriving. Five seconds was
+            // not, on a loaded machine: pushing 9 MiB through the pump under a
+            // cargo-mutants build lost to the watchdog (#96).
             Deadlines {
-                idle: Duration::from_secs(5),
-                max: Duration::from_secs(5),
-                client_write: Duration::from_secs(5),
-                keepalive: Duration::from_secs(10),
+                idle: Duration::from_secs(60),
+                max: Duration::from_secs(60),
+                client_write: Duration::from_secs(60),
+                keepalive: Duration::from_secs(120),
             },
             Egress::ChatCompletions {
                 request_id: "r1".to_owned(),
