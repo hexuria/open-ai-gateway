@@ -183,13 +183,24 @@ impl Drop for SlotGuard {
 /// A `Weak` so the task cannot keep the guard alive: if it held a strong
 /// `Arc`, `Drop` would wait for the heartbeat to notice `released`, and the
 /// heartbeat would wait for `Drop` to set it.
-fn spawn_heartbeat(slot: &Arc<SlotGuard>) {
+///
+/// For at most `lifetime`. No request holds a lease longer than its deadlines
+/// allow, so a heartbeat still beating past them is keeping a *leaked* lease
+/// alive -- a clone parked in a task that will never finish -- and, beaten
+/// forever, its seat never frees: the ghost lockout, in a form no TTL cures.
+/// Past `lifetime` it stops and says so, and the member expires within
+/// [`SLOT_TTL`] like any dead replica's.
+fn spawn_heartbeat(slot: &Arc<SlotGuard>, lifetime: Duration) {
     let weak = Arc::downgrade(slot);
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("no runtime to heartbeat a slot on; it will expire in {SLOT_TTL:?}");
         return;
     };
     runtime.spawn(async move {
+        let started = tokio::time::Instant::now();
         let mut ticker = tokio::time::interval(SLOT_HEARTBEAT);
+        // A starved task catches up with one beat, not a burst of them.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
         loop {
             ticker.tick().await;
@@ -197,6 +208,15 @@ fn spawn_heartbeat(slot: &Arc<SlotGuard>) {
                 return;
             };
             if slot.released.load(Ordering::SeqCst) {
+                return;
+            }
+            if started.elapsed() >= lifetime {
+                tracing::warn!(
+                    request_id = %slot.request_id,
+                    "slot heartbeat outlived every request deadline; stopping so a leaked \
+                     lease frees its seat"
+                );
+                metrics::counter!("oag_slot_heartbeat_stopped_total").increment(1);
                 return;
             }
             if slot.store.refresh(slot.account, &slot.request_id).await {
@@ -268,13 +288,20 @@ fn leased(state: &AppState, account: AccountRow, request_id: &str, via_sticky: b
         limit: u32::try_from(account.max_concurrency).unwrap_or(0),
         released: AtomicBool::new(false),
     });
-    spawn_heartbeat(&slot);
+    spawn_heartbeat(&slot, heartbeat_lifetime(&state.config.gateway));
     Lease {
         account,
         request_id: request_id.to_owned(),
         via_sticky,
         slot,
     }
+}
+
+/// The longest any request can legitimately hold a lease: waiting for
+/// response headers, then streaming for as long as a stream may run, and one
+/// beat of slack.
+fn heartbeat_lifetime(gateway: &oag_core::config::GatewayConfig) -> Duration {
+    gateway.upstream_response_timeout + gateway.max_stream_duration + SLOT_HEARTBEAT
 }
 
 /// What the search was, when it found nothing this caller can use.
@@ -997,7 +1024,7 @@ pub(crate) mod testing {
                     limit: 8,
                     released: AtomicBool::new(false),
                 });
-                super::spawn_heartbeat(&slot);
+                super::spawn_heartbeat(&slot, std::time::Duration::from_hours(1));
                 slot
             },
             account,
@@ -1052,7 +1079,7 @@ mod tests {
             limit: 8,
             released: AtomicBool::new(false),
         });
-        spawn_heartbeat(&slot);
+        spawn_heartbeat(&slot, Duration::from_hours(1));
         slot
     }
 
@@ -1099,6 +1126,41 @@ mod tests {
         let _slot = beating(&store);
         two_beats().await;
         assert_eq!(*store.acquired_under.lock().expect("lock"), vec![8, 8]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_leaked_slot_stops_beating_after_its_lifetime() {
+        // Held and never released: a leak. Beats at 30s and 60s refresh it;
+        // the 90s beat finds the lifetime spent and stops, so the member can
+        // expire. Five more beats' worth of time changes nothing.
+        let store = store(&[], true);
+        let slot = Arc::new(SlotGuard {
+            store: Arc::clone(&store) as Arc<dyn SlotStore>,
+            account: AccountId::from_uuid(uuid::Uuid::nil()),
+            request_id: "leaked".to_owned(),
+            limit: 8,
+            released: AtomicBool::new(false),
+        });
+        spawn_heartbeat(&slot, SLOT_HEARTBEAT * 3);
+        tokio::time::sleep(SLOT_HEARTBEAT * 8).await;
+        assert_eq!(store.refreshed.load(Ordering::SeqCst), 2);
+        drop(slot);
+    }
+
+    #[test]
+    fn a_lease_may_beat_through_every_deadline_a_request_has() {
+        let gateway = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            "postgres://x@127.0.0.1:1/x",
+            "redis://127.0.0.1:1",
+            "",
+        ))
+        .expect("config")
+        .gateway;
+        assert_eq!(
+            heartbeat_lifetime(&gateway),
+            gateway.upstream_response_timeout + gateway.max_stream_duration + SLOT_HEARTBEAT
+        );
+        assert!(heartbeat_lifetime(&gateway) > gateway.max_stream_duration);
     }
 
     #[tokio::test(start_paused = true)]
