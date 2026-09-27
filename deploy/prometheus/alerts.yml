@@ -75,8 +75,44 @@ groups:
             rather than refuses, so at_capacity never comes from a blind
             pool. Add a credential or raise max_concurrency — unless
             oag_slots_in_use for the credential stays at max_concurrency
-            while nothing is running through it, which is a leaked slot and
-            clears on its own within the slot TTL.
+            while nothing is running through it. That is leaked slots: a
+            replica that died holding them stops heartbeating, and they
+            expire within the 2-minute slot TTL. Stuck longer, check
+            OagSlotGhostLockout; `oag admin account clear-slots <name>`
+            empties the key, and any live request on it takes its seat back
+            on its next heartbeat.
+
+      # Selection saw "full" where Redis had room (or none): a stale snapshot
+      # or an empty key refusing. Each one was averted, so requests are not
+      # failing — but a steady rate means slots are leaking or Redis and the
+      # scheduler disagree, and the next miss is an at_capacity nobody earned.
+      - alert: OagSlotGhostLockout
+        expr: sum by (op) (rate(oag_slot_ghost_total[10m])) > 0
+        for: 10m
+        labels: { severity: warn }
+        annotations:
+          summary: "slot ghost lockouts being averted ({{ $labels.op }})"
+          description: >-
+            Selection keeps finding a credential full in its snapshot while
+            Redis says it has room. Compare oag_slots_in_use with what is
+            actually running; look for a replica that died holding slots,
+            or heartbeats failing (oag_slot_lost_total).
+
+      # A running request's slot vanished (Redis outage past the TTL, or an
+      # admin clear) and could not be taken back because the seat had filled.
+      # The credential is over max_concurrency at the provider right now:
+      # this is the provider's rate limit or ban, arriving early.
+      - alert: OagSlotOversubscribed
+        expr: sum(increase(oag_slot_lost_total{reason="oversubscribed"}[5m])) > 0
+        for: 0m
+        labels: { severity: warn }
+        annotations:
+          summary: "a credential is running over its concurrency limit"
+          description: >-
+            {{ $value }} running requests lost their slot and could not take it
+            back in the last 5 minutes. Their credentials are over
+            max_concurrency until those requests finish. Check Redis
+            (OagSlotAccountingDegraded) and recent clear-slots.
 
       # This replica is shedding at its in-flight ceiling. A brief burst is
       # the ceiling working; sustained shedding is under-provisioning.

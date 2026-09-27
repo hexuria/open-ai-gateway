@@ -85,6 +85,16 @@ jobs:
       - name: tofu reachability
         run: ./deploy/test/tofu-verify.sh
 
+      # alerts.yml had no check at all: a rule with a broken expression loads
+      # nowhere and pages nobody, and that is found at the incident. `check
+      # config` parses prometheus.yml and every rule file it names. Pinned by
+      # digest, like the actions.
+      - name: prometheus config and rules
+        run: >-
+          docker run --rm -v "$PWD/deploy/prometheus:/p:ro" --entrypoint promtool
+          prom/prometheus:v3.7.0@sha256:29c1e0b48ad816750245dea3d65ac3ce57dda30547e67b1e9a5176e2953cc4dc
+          check config /p/prometheus.yml
+
       # The mock upstream is what every request-path check trusts to say which
       # credential served a request. Nothing else can check it: a mock that read
       # the header wrongly would agree with itself and the scripts would pass.
