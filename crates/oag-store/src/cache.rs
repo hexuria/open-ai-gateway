@@ -28,6 +28,10 @@ use uuid::Uuid;
 /// resulting size is under the limit. Atomic, so two replicas cannot both see
 /// the last free slot.
 ///
+/// Returns `{taken, live}`: whether the member was added, and how many members
+/// the key holds after this call. A refusal and its count come from the same
+/// atomic step, so "refused" can never be read beside "empty".
+///
 /// `TIME` comes from Redis rather than the caller so replicas with skewed
 /// clocks still agree on what "expired" means.
 const ACQUIRE_SLOT: &str = r"
@@ -39,13 +43,14 @@ local ttl    = tonumber(ARGV[3])
 local now = redis.call('TIME')[1]
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now - ttl)
 
-if redis.call('ZCARD', key) >= limit then
-  return 0
+local live = redis.call('ZCARD', key)
+if live >= limit then
+  return {0, live}
 end
 
 redis.call('ZADD', key, now, member)
 redis.call('EXPIRE', key, ttl * 2)
-return 1";
+return {1, live + 1}";
 
 /// Count the live slots on a credential: the members `ACQUIRE_SLOT` would
 /// keep, by the same clock and the same expiry.
@@ -192,6 +197,16 @@ const DIAL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a caller waits for a connection that is being dialled. The same
 /// budget as a slot op: past it the caller fails open.
 const CONNECT_WAIT: Duration = SLOT_OP_TIMEOUT;
+
+/// What an attempt to take a concurrency slot found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotClaim {
+    /// The member was added.
+    Taken,
+    /// The key was at its limit: `live` members, read in the same atomic step
+    /// as the refusal.
+    Full { live: u32 },
+}
 
 /// Redis, for cross-replica coordination.
 ///
@@ -384,11 +399,31 @@ impl Cache {
         limit: u32,
         ttl: Duration,
     ) -> Result<bool> {
+        self.try_acquire_slot(account, request, limit, ttl)
+            .await
+            .map(|claim| claim == SlotClaim::Taken)
+    }
+
+    /// [`Self::acquire_slot`], saying on a refusal how full the key is.
+    pub async fn try_acquire_slot(
+        &self,
+        account: AccountId,
+        request: &str,
+        limit: u32,
+        ttl: Duration,
+    ) -> Result<SlotClaim> {
         self.slot_timed("acquiring slot", async |mut conn| {
             let mut inv = ACQUIRE_SLOT_SCRIPT.key(slot_key(account));
             inv.arg(request).arg(limit).arg(ttl.as_secs());
-            let taken: i64 = eval_slot_script(&mut conn, "acquiring slot", &inv).await?;
-            Ok(taken == 1)
+            let (taken, live): (i64, i64) =
+                eval_slot_script(&mut conn, "acquiring slot", &inv).await?;
+            Ok(if taken == 1 {
+                SlotClaim::Taken
+            } else {
+                SlotClaim::Full {
+                    live: u32::try_from(live.max(0)).unwrap_or(u32::MAX),
+                }
+            })
         })
         .await
     }
@@ -1324,6 +1359,50 @@ mod tests {
             "two live members and a limit of three leaves room"
         );
         let _: () = conn.del(slot_key(account)).await.expect("cleanup");
+    }
+
+    /// A refusal carries the count it was refused on, from the same step.
+    #[tokio::test]
+    async fn a_refused_acquire_says_how_full_the_key_is() {
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let cache = Cache::connect(&url).expect("cache");
+        let account = AccountId::new();
+        let ttl = Duration::from_mins(1);
+        for member in ["a", "b"] {
+            assert_eq!(
+                cache
+                    .try_acquire_slot(account, member, 2, ttl)
+                    .await
+                    .expect("acquire"),
+                SlotClaim::Taken
+            );
+        }
+        assert_eq!(
+            cache
+                .try_acquire_slot(account, "c", 2, ttl)
+                .await
+                .expect("acquire"),
+            SlotClaim::Full { live: 2 }
+        );
+        assert!(
+            !cache
+                .acquire_slot(account, "c", 2, ttl)
+                .await
+                .expect("acquire")
+        );
+        // A closed seat refuses an empty key, and says it is empty.
+        let closed = AccountId::new();
+        assert_eq!(
+            cache
+                .try_acquire_slot(closed, "x", 0, ttl)
+                .await
+                .expect("acquire"),
+            SlotClaim::Full { live: 0 }
+        );
+        cache.clear_slots(account).await.expect("clean up");
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ pub mod repo;
 pub mod rows;
 
 pub use auth::AuthCache;
-pub use cache::{AuthMac, Cache};
+pub use cache::{AuthMac, Cache, SlotClaim};
 pub use db::{Db, MIGRATION_LOCK_ID};
 pub use health::{Readiness, readiness};
 pub use repo::{NewService, ServiceUpdate};

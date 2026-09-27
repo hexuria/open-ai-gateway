@@ -13,7 +13,7 @@ trusting a green run.
 | Deterministic logic (router, pool, proto) | unit tests; `cargo mutants` on the diff |
 | Request path across dialects | `deploy/test/*-verify.sh` against mocks |
 | Store and slot accounting | gated integration tests with real Redis/Postgres |
-| Slot admission decision (`claim_slot`) | scripted-store unit tests in `gateway/select.rs`, one per branch |
+| Slot admission decision (`claim_slot`) | scripted-store unit tests in `gateway/select.rs`, one per outcome; `try_acquire_slot` gated tests in `oag-store` |
 | Slot admission under concurrent callers | `scripts/claim-slot-race.sh` in the `integration` job (`just race` locally); it reads the Lua from `cache.rs` |
 | Unsafe / memory | none needed: `unsafe_code = "forbid"` workspace-wide |
 | Vulnerable, unlicensed or off-registry dependency | `cargo audit`, `cargo deny` (`deny.toml`) |
