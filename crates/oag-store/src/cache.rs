@@ -50,7 +50,9 @@ end
 
 redis.call('ZADD', key, now, member)
 redis.call('EXPIRE', key, ttl * 2)
-return {1, live + 1}";
+-- Counted, not `live + 1`: a member already present (the same request taking
+-- its seat back) only has its score refreshed.
+return {1, redis.call('ZCARD', key)}";
 
 /// Count the live slots on a credential: the members `ACQUIRE_SLOT` would
 /// keep, by the same clock and the same expiry.

@@ -82,8 +82,8 @@ groups:
             empties the key, and any live request on it takes its seat back
             on its next heartbeat.
 
-      # Selection saw "full" where Redis had room (or none): a stale snapshot
-      # or an empty key refusing. Each one was averted, so requests are not
+      # Selection saw every credential full -- a stale snapshot, or every
+      # acquire lost -- while Redis had room. Each one was averted, so requests are not
       # failing — but a steady rate means slots are leaking or Redis and the
       # scheduler disagree, and the next miss is an at_capacity nobody earned.
       - alert: OagSlotGhostLockout
