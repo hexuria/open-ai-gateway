@@ -137,7 +137,12 @@ pub struct SlotGuard {
     /// The credential's concurrency limit, so the heartbeat can take the seat
     /// back under the same rule the scheduler granted it.
     limit: u32,
+    /// Claimed by whoever gives the slot back first: an explicit release, or
+    /// the drop.
     released: AtomicBool,
+    /// Flipped by the release task once its store call has finished. Shared
+    /// with that task, so no caller's cancellation can leave it unset.
+    gone: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl std::fmt::Debug for SlotGuard {
@@ -150,11 +155,58 @@ impl std::fmt::Debug for SlotGuard {
 }
 
 impl SlotGuard {
-    async fn release(&self) {
-        if self.released.swap(true, Ordering::SeqCst) {
-            return;
+    fn new(store: Arc<dyn SlotStore>, account: AccountId, request_id: &str, limit: u32) -> Self {
+        Self {
+            store,
+            account,
+            request_id: request_id.to_owned(),
+            limit,
+            released: AtomicBool::new(false),
+            gone: Arc::new(tokio::sync::watch::Sender::new(false)),
         }
-        self.store.release(self.account, &self.request_id).await;
+    }
+
+    /// Give the slot back, and return once the store has finished trying.
+    ///
+    /// "Finished" rather than "gone": `Cache::release` logs a failed `ZREM`
+    /// and returns, and then the TTL is what removes the member.
+    ///
+    /// The store call is its own task, and every caller -- the first included
+    /// -- waits on `gone`, which that task flips. Two earlier shapes were each
+    /// wrong: a second caller returned the moment the first had claimed the
+    /// release, while its `ZREM` was still in flight, so escalation's next
+    /// acquire on the same credential and request id could have its fresh
+    /// member removed underneath it; and when the first caller awaited the
+    /// store itself, cancelling it there (a client gone mid-release) left
+    /// `gone` unset and every other caller waiting forever.
+    async fn release(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                // No runtime to release on: the member expires with the TTL.
+                self.gone.send_replace(true);
+                return;
+            };
+            let store = Arc::clone(&self.store);
+            let account = self.account;
+            let request_id = self.request_id.clone();
+            let gone = Arc::clone(&self.gone);
+            runtime.spawn(async move {
+                store.release(account, &request_id).await;
+                gone.send_replace(true);
+            });
+        }
+        // Bounded: the store call is a slot op, which gives up after its own
+        // two-second deadline, so a release that has not finished well past
+        // that is not going to. The TTL is then the backstop, as for any
+        // failed release. The watch cannot close while we wait: `self` holds
+        // the sender.
+        let mut gone = self.gone.subscribe();
+        if tokio::time::timeout(RELEASE_WAIT, gone.wait_for(|gone| *gone))
+            .await
+            .is_err()
+        {
+            tracing::debug!(request_id = %self.request_id, "slot release did not finish; it will expire");
+        }
     }
 }
 
@@ -280,15 +332,18 @@ impl Lease {
     }
 }
 
+/// How long [`SlotGuard::release`] waits for the store to finish: well past
+/// the store's own two-second slot-op deadline.
+const RELEASE_WAIT: Duration = Duration::from_secs(5);
+
 /// A lease over `account`, holding its slot until the last clone is dropped.
 fn leased(state: &AppState, account: AccountRow, request_id: &str, via_sticky: bool) -> Lease {
-    let slot = Arc::new(SlotGuard {
-        store: Arc::new(state.cache.clone()),
-        account: account.account_id(),
-        request_id: request_id.to_owned(),
-        limit: u32::try_from(account.max_concurrency).unwrap_or(0),
-        released: AtomicBool::new(false),
-    });
+    let slot = Arc::new(SlotGuard::new(
+        Arc::new(state.cache.clone()),
+        account.account_id(),
+        request_id,
+        u32::try_from(account.max_concurrency).unwrap_or(0),
+    ));
     spawn_heartbeat(&slot, heartbeat_lifetime(&state.config.gateway));
     Lease {
         account,
@@ -1019,7 +1074,7 @@ fn process_seed() -> u64 {
 /// a lease's guard is private to this module.
 #[cfg(test)]
 pub(crate) mod testing {
-    use super::{AccountId, AtomicBool, Lease, SlotGuard, SlotStore};
+    use super::{AccountId, Lease, SlotGuard, SlotStore};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1108,13 +1163,12 @@ pub(crate) mod testing {
             request_id: "req-1".to_owned(),
             via_sticky: false,
             slot: {
-                let slot = Arc::new(SlotGuard {
-                    store: Arc::clone(store) as Arc<dyn SlotStore>,
-                    account: account.account_id(),
-                    request_id: "req-1".to_owned(),
-                    limit: 8,
-                    released: AtomicBool::new(false),
-                });
+                let slot = Arc::new(SlotGuard::new(
+                    Arc::clone(store) as Arc<dyn SlotStore>,
+                    account.account_id(),
+                    "req-1",
+                    8,
+                ));
                 super::spawn_heartbeat(&slot, std::time::Duration::from_hours(1));
                 slot
             },
@@ -1163,13 +1217,12 @@ mod tests {
 
     /// A heartbeating guard over `store`, with a limit of 8.
     fn beating(store: &Arc<BeatStore>) -> Arc<SlotGuard> {
-        let slot = Arc::new(SlotGuard {
-            store: Arc::clone(store) as Arc<dyn SlotStore>,
-            account: AccountId::from_uuid(uuid::Uuid::nil()),
-            request_id: "req".to_owned(),
-            limit: 8,
-            released: AtomicBool::new(false),
-        });
+        let slot = Arc::new(SlotGuard::new(
+            Arc::clone(store) as Arc<dyn SlotStore>,
+            AccountId::from_uuid(uuid::Uuid::nil()),
+            "req",
+            8,
+        ));
         spawn_heartbeat(&slot, Duration::from_hours(1));
         slot
     }
@@ -1225,13 +1278,12 @@ mod tests {
         // the 90s beat finds the lifetime spent and stops, so the member can
         // expire. Five more beats' worth of time changes nothing.
         let store = store(&[], true);
-        let slot = Arc::new(SlotGuard {
-            store: Arc::clone(&store) as Arc<dyn SlotStore>,
-            account: AccountId::from_uuid(uuid::Uuid::nil()),
-            request_id: "leaked".to_owned(),
-            limit: 8,
-            released: AtomicBool::new(false),
-        });
+        let slot = Arc::new(SlotGuard::new(
+            Arc::clone(&store) as Arc<dyn SlotStore>,
+            AccountId::from_uuid(uuid::Uuid::nil()),
+            "leaked",
+            8,
+        ));
         spawn_heartbeat(&slot, SLOT_HEARTBEAT * 3);
         tokio::time::sleep(SLOT_HEARTBEAT * 8).await;
         assert_eq!(store.refreshed.load(Ordering::SeqCst), 2);
@@ -1274,6 +1326,85 @@ mod tests {
             + g.stream_idle_timeout
             + g.client_write_timeout;
         assert!(heartbeat_lifetime(&g) > slowest);
+    }
+
+    /// A store whose release takes two seconds -- a slot op's deadline, the
+    /// longest a real one takes -- and says when it is done.
+    #[derive(Default)]
+    struct SlowRelease {
+        done: AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SlotStore for SlowRelease {
+        async fn release(&self, _: AccountId, _: &str) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            self.done.store(true, Ordering::SeqCst);
+        }
+
+        async fn refresh(&self, _: AccountId, _: &str) -> bool {
+            true
+        }
+
+        async fn acquire(&self, _: AccountId, _: &str, _: u32) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_the_first_release_neither_strands_the_second_nor_skips_the_store() {
+        // The first caller is cancelled mid-release (a client gone during
+        // `lease.release()`). The store call must still run, once, and the
+        // second caller must still return -- it used to wait forever.
+        let store = Arc::new(SlowRelease::default());
+        let slot = Arc::new(SlotGuard::new(
+            Arc::clone(&store) as Arc<dyn SlotStore>,
+            AccountId::from_uuid(uuid::Uuid::nil()),
+            "req",
+            8,
+        ));
+        let first = {
+            let slot = Arc::clone(&slot);
+            tokio::spawn(async move { slot.release().await })
+        };
+        tokio::task::yield_now().await;
+        first.abort();
+        tokio::time::timeout(Duration::from_secs(30), slot.release())
+            .await
+            .expect("the second release returns");
+        assert!(store.done.load(Ordering::SeqCst));
+        assert_eq!(store.calls.load(Ordering::SeqCst), 1, "released once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_second_release_returns_only_once_the_slot_is_gone() {
+        // Escalation releases and then acquires, possibly on this same
+        // credential; a release that returned while another caller's ZREM was
+        // still in flight let the acquire race it.
+        let store = Arc::new(SlowRelease::default());
+        let slot = Arc::new(SlotGuard::new(
+            Arc::clone(&store) as Arc<dyn SlotStore>,
+            AccountId::from_uuid(uuid::Uuid::nil()),
+            "req",
+            8,
+        ));
+        let first = {
+            let slot = Arc::clone(&slot);
+            tokio::spawn(async move { slot.release().await })
+        };
+        tokio::task::yield_now().await;
+        // A deadline, so a release that never starts the store call fails
+        // here in milliseconds rather than hanging the suite.
+        tokio::time::timeout(Duration::from_secs(30), slot.release())
+            .await
+            .expect("the second release returns");
+        assert!(
+            store.done.load(Ordering::SeqCst),
+            "the second release returned before the first had given the slot back"
+        );
+        first.await.expect("first release");
     }
 
     #[tokio::test(start_paused = true)]
