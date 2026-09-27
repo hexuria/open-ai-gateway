@@ -53,9 +53,10 @@ async fn sweep_forever(state: Arc<AppState>) {
 ///
 /// Accounts are added and renamed by an operator, not per request. Reading
 /// the whole table on every 15s sweep, on every replica, was a full scan four
-/// times a minute to learn nothing new. Five minutes is how long a new
-/// credential's gauge can take to appear; its slots are counted by selection
-/// from the first request regardless.
+/// times a minute to learn nothing new. A new credential's gauge can take up
+/// to this plus one [`SWEEP_INTERVAL`] to appear (the read happens on the
+/// first sweep after the window closes); selection counts its slots from the
+/// first request regardless.
 const LABEL_REFRESH: Duration = Duration::from_mins(5);
 
 /// The accounts the sweep publishes a gauge for, read at most every
@@ -77,19 +78,33 @@ impl Labels {
         db: &oag_store::Db,
         now: tokio::time::Instant,
     ) -> &[(oag_core::AccountId, String)] {
-        let due = self
-            .read_at
-            .is_none_or(|at| now.duration_since(at) >= LABEL_REFRESH);
-        if due {
-            match oag_store::repo::account_slot_labels(db).await {
-                Ok(list) => {
-                    self.list = list;
-                    self.read_at = Some(now);
-                }
-                Err(e) => tracing::warn!(error = %e, "slot sweep: could not list accounts"),
-            }
+        if self.due(now) {
+            let read = oag_store::repo::account_slot_labels(db).await;
+            self.apply(read, now);
         }
         &self.list
+    }
+
+    fn due(&self, now: tokio::time::Instant) -> bool {
+        self.read_at
+            .is_none_or(|at| now.duration_since(at) >= LABEL_REFRESH)
+    }
+
+    /// Take a read's result. A successful read replaces the list, empty
+    /// included, and starts the window; a failed one changes nothing, so the
+    /// next sweep is still due to read.
+    fn apply(
+        &mut self,
+        read: oag_core::Result<Vec<(oag_core::AccountId, String)>>,
+        now: tokio::time::Instant,
+    ) {
+        match read {
+            Ok(list) => {
+                self.list = list;
+                self.read_at = Some(now);
+            }
+            Err(e) => tracing::warn!(error = %e, "slot sweep: could not list accounts"),
+        }
     }
 }
 
@@ -230,21 +245,55 @@ mod tests {
         assert!(after, "not read again once the window had passed");
     }
 
-    #[tokio::test]
-    async fn a_failed_reread_keeps_the_list_it_has() {
-        let Ok(db_url) = std::env::var("OAG_TEST_DATABASE_URL") else {
-            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
-            return;
-        };
-        let db = oag_store::Db::connect(&db_url, 4).expect("pool");
-        db.migrate().await.expect("migrate");
+    fn label(name: &str) -> (oag_core::AccountId, String) {
+        (
+            oag_core::AccountId::from_uuid(uuid::Uuid::new_v4()),
+            name.to_owned(),
+        )
+    }
+
+    #[test]
+    fn a_failed_reread_keeps_the_list_and_stays_due() {
         let start = tokio::time::Instant::now();
         let mut labels = Labels::default();
-        let known = labels.current(&db, start).await.to_vec();
+        labels.apply(Ok(vec![label("seat")]), start);
+        let later = start + LABEL_REFRESH;
+        assert!(labels.due(later));
 
-        let dead = oag_store::Db::connect("postgres://oag:oag@127.0.0.1:1/oag", 1).expect("lazy");
-        let kept = labels.current(&dead, start + LABEL_REFRESH).await.to_vec();
-        assert_eq!(kept, known, "an unreadable table is not an empty one");
+        labels.apply(
+            Err(oag_core::Error::Internal("postgres down".to_owned())),
+            later,
+        );
+        assert_eq!(
+            labels.list.len(),
+            1,
+            "an unreadable table is not an empty one"
+        );
+        assert!(
+            labels.due(later + Duration::from_secs(1)),
+            "a failed read must not start a new window: the next sweep reads again"
+        );
+    }
+
+    #[test]
+    fn a_successful_empty_read_empties_the_list() {
+        // Every account deleted is a real answer, unlike a failed read.
+        let start = tokio::time::Instant::now();
+        let mut labels = Labels::default();
+        labels.apply(Ok(vec![label("seat")]), start);
+        labels.apply(Ok(Vec::new()), start + LABEL_REFRESH);
+        assert!(labels.list.is_empty());
+        assert!(!labels.due(start + LABEL_REFRESH + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn the_list_is_due_again_exactly_at_the_end_of_its_window() {
+        let start = tokio::time::Instant::now();
+        let mut labels = Labels::default();
+        assert!(labels.due(start), "never read");
+        labels.apply(Ok(Vec::new()), start);
+        assert!(!labels.due(start + LABEL_REFRESH - Duration::from_secs(1)));
+        assert!(labels.due(start + LABEL_REFRESH));
     }
 
     /// Every account is counted, across more than one chunk.
