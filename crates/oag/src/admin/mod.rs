@@ -1017,10 +1017,27 @@ async fn clear_account_slots(db: &Db, redis_url: &str, name: &str) -> Result<()>
     let dropped = cache
         .clear_slots(oag_core::AccountId::from_uuid(id))
         .await?;
-    println!("cleared {dropped} slot(s) on {name} ({id})");
-    println!("  Redis is empty fleet-wide; each replica zeros oag_slots_in_use on its sweep");
-    println!("  or immediately via POST /admin/api/accounts/{id}/clear-slots");
+    println!("{}", clear_slots_report(&name, id, dropped));
     Ok(())
+}
+
+/// What `account clear-slots` prints: what was dropped, and what that means
+/// for any of it that was a live request.
+fn clear_slots_report(name: &str, id: uuid::Uuid, dropped: u32) -> String {
+    let mut out = format!(
+        "cleared {dropped} slot(s) on {name} ({id})\n  \
+         Redis is empty fleet-wide; each replica zeros oag_slots_in_use on its sweep\n  \
+         or immediately via POST /admin/api/accounts/{id}/clear-slots"
+    );
+    if dropped > 0 {
+        use std::fmt::Write as _;
+        let _ = write!(
+            out,
+            "\n  if any of those were live requests, they take their seat back on their next \
+             heartbeat; until then {name} can admit up to {dropped} over its limit"
+        );
+    }
+    out
 }
 
 async fn list_keys(db: &Db) -> Result<()> {
@@ -3247,6 +3264,69 @@ mod tests {
             AdminCommand::Account(AccountCommand::SetReserve { pct, .. }) => assert_eq!(pct, None),
             other => panic!("expected account set-reserve, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn clearing_an_empty_seat_says_nothing_about_live_requests() {
+        let report = clear_slots_report("grok-seat", Uuid::nil(), 0);
+        assert!(report.starts_with("cleared 0 slot(s) on grok-seat"));
+        assert!(!report.contains("live requests"), "{report}");
+    }
+
+    #[test]
+    fn clearing_held_slots_warns_how_far_over_its_limit_the_seat_can_go() {
+        for dropped in [1, 8] {
+            let report = clear_slots_report("grok-seat", Uuid::nil(), dropped);
+            assert!(
+                report.contains(&format!("can admit up to {dropped} over its limit")),
+                "{report}"
+            );
+        }
+    }
+
+    /// The command empties the credential's key, by name.
+    #[tokio::test]
+    async fn clear_slots_empties_the_named_credential() {
+        let (Ok(db_url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let db = Db::connect(&db_url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let name = format!("clear-{}", Uuid::new_v4());
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce) VALUES (gen_random_uuid(), $1, 'anthropic', 'api_key', \
+             '\\x00', '\\x00') RETURNING id",
+        )
+        .bind(&name)
+        .fetch_one(db.pool())
+        .await
+        .expect("account");
+        let account = oag_core::AccountId::from_uuid(id);
+        let cache = oag_store::Cache::connect(&redis_url).expect("cache");
+        let ttl = std::time::Duration::from_mins(1);
+        for member in ["a", "b"] {
+            assert!(
+                cache
+                    .acquire_slot(account, member, 8, ttl)
+                    .await
+                    .expect("acquire")
+            );
+        }
+
+        clear_account_slots(&db, &redis_url, &name)
+            .await
+            .expect("clear");
+        assert_eq!(cache.slots_in_use(account, ttl).await.expect("count"), 0);
+        sqlx::query("DELETE FROM account WHERE id = $1")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .expect("cleanup");
     }
 
     #[test]

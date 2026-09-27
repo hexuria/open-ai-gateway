@@ -22,7 +22,7 @@ const STICKY_TTL: Duration = Duration::from_mins(30);
 /// member inside the window, and a replica that dies stops refreshing, so the
 /// leaked members age out in one TTL instead of waiting for a 35-minute
 /// backstop that was sized for the longest possible stream.
-const SLOT_HEARTBEAT: Duration = Duration::from_secs(30);
+pub(crate) const SLOT_HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// How long a concurrency slot survives without being refreshed or released.
 ///

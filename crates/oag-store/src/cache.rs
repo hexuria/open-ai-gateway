@@ -70,6 +70,18 @@ redis.call('ZREMRANGEBYSCORE', key, '-inf', now - ttl)
 return redis.call('ZCARD', key)
 ";
 
+/// Drop a credential's slot key and say how many members it held, in one step.
+///
+/// One script rather than `ZCARD` then `DEL`: a member acquired between the
+/// two was deleted uncounted, and one released between them was counted
+/// without existing. The number is the operator's evidence of whether the
+/// seat really had ghosts, so it has to be the key that was actually dropped.
+const CLEAR_SLOTS: &str = r"
+local n = redis.call('ZCARD', KEYS[1])
+redis.call('DEL', KEYS[1])
+return n
+";
+
 /// Refresh a live slot's score so a short TTL can outlive a long stream.
 ///
 /// No-ops if the member is gone: an admin clear, a release, or a trim must
@@ -143,6 +155,8 @@ static ACQUIRE_SLOT_SCRIPT: std::sync::LazyLock<redis::Script> =
     std::sync::LazyLock::new(|| redis::Script::new(ACQUIRE_SLOT));
 static SLOTS_IN_USE_SCRIPT: std::sync::LazyLock<redis::Script> =
     std::sync::LazyLock::new(|| redis::Script::new(SLOTS_IN_USE));
+static CLEAR_SLOTS_SCRIPT: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(CLEAR_SLOTS));
 static REFRESH_SLOT_SCRIPT: std::sync::LazyLock<redis::Script> =
     std::sync::LazyLock::new(|| redis::Script::new(REFRESH_SLOT));
 static TAKE_TOKEN_SCRIPT: std::sync::LazyLock<redis::Script> =
@@ -439,15 +453,8 @@ impl Cache {
     /// the scheduler's window to it.
     pub async fn clear_slots(&self, account: AccountId) -> Result<u32> {
         self.slot_timed("clearing slots", async |mut conn| {
-            let key = slot_key(account);
-            let n: i64 = conn
-                .zcard(&key)
-                .await
-                .map_err(|e| Error::Internal(format!("counting slots to clear: {e}")))?;
-            let _: i64 = conn
-                .del(&key)
-                .await
-                .map_err(|e| Error::Internal(format!("clearing slots: {e}")))?;
+            let inv = CLEAR_SLOTS_SCRIPT.key(slot_key(account));
+            let n: i64 = eval_slot_script(&mut conn, "clearing slots", &inv).await?;
             Ok(u32::try_from(n.max(0)).unwrap_or(u32::MAX))
         })
         .await

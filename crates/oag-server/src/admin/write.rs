@@ -126,8 +126,14 @@ pub async fn clear_slots(
                     "name": row.name,
                     "dropped": dropped,
                     "in_flight": 0,
-                    "note": "Redis slots are gone fleet-wide; this replica's gauge is zero now, \
-                             and others publish 0 on their slot sweep",
+                    "note": format!(
+                        "Redis slots are gone fleet-wide; this replica's gauge is zero now, and \
+                         others publish 0 on their slot sweep. Any of the dropped members that \
+                         were live requests take their seat back on their next heartbeat \
+                         (within {}s); until then this credential can admit up to `dropped` \
+                         more than its limit.",
+                        crate::gateway::select::SLOT_HEARTBEAT.as_secs()
+                    ),
                 }))
                 .into_response()
             }
