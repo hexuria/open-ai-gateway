@@ -686,20 +686,38 @@ pub async fn collect(
     response: reqwest::Response,
     dialect: Dialect,
 ) -> std::result::Result<(bytes::Bytes, Vec<StreamEvent>, StreamAccumulator), Error> {
-    collect_with(response, dialect, &FunctionNameMap::identity()).await
+    collect_with(
+        response,
+        dialect,
+        &FunctionNameMap::identity(),
+        Duration::MAX,
+    )
+    .await
 }
 
 /// [`collect`] with the original ↔ wire function names, so a non-streamed
 /// OpenAI body that echoed sanitised names is restored before the client
 /// dialect renders it.
+///
+/// The body is read under `max_duration`. It had no deadline at all: headers
+/// are bounded by `upstream_response_timeout` and a stream by its ceiling, but
+/// a non-streamed body that trickled, or stalled after its first bytes, held
+/// the request, its credential slot and its heartbeat for as long as the
+/// connection stayed open.
 pub async fn collect_with(
     response: reqwest::Response,
     dialect: Dialect,
     names: &FunctionNameMap,
+    max_duration: Duration,
 ) -> std::result::Result<(bytes::Bytes, Vec<StreamEvent>, StreamAccumulator), Error> {
-    let bytes = response
-        .bytes()
+    let bytes = tokio::time::timeout(max_duration, response.bytes())
         .await
+        .map_err(|_| {
+            Error::Internal(format!(
+                "upstream response body not complete after {}s",
+                max_duration.as_secs()
+            ))
+        })?
         .map_err(|e| Error::Internal(format!("reading upstream response: {e}")))?;
 
     // A 200 whose body is not JSON is not an answer in any dialect. This used
@@ -1583,6 +1601,20 @@ mod tests {
         S: futures_util::stream::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static,
     {
         reqwest::Response::from(http::Response::new(reqwest::Body::wrap_stream(stream)))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_non_streamed_body_that_never_finishes_is_cut_off() {
+        let response = into_response(futures_util::stream::pending());
+        let err = collect_with(
+            response,
+            Dialect::AnthropicMessages,
+            &FunctionNameMap::identity(),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("a body that never ends is not an answer");
+        assert!(err.to_string().contains("not complete after 30s"), "{err}");
     }
 
     /// Everything the client's response body received, as text.

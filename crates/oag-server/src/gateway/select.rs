@@ -212,6 +212,7 @@ fn spawn_heartbeat(slot: &Arc<SlotGuard>, lifetime: Duration) {
             }
             if started.elapsed() >= lifetime {
                 tracing::warn!(
+                    account = %slot.account,
                     request_id = %slot.request_id,
                     "slot heartbeat outlived every request deadline; stopping so a leaked \
                      lease frees its seat"
@@ -297,11 +298,26 @@ fn leased(state: &AppState, account: AccountRow, request_id: &str, via_sticky: b
     }
 }
 
-/// The longest any request can legitimately hold a lease: waiting for
-/// response headers, then streaming for as long as a stream may run, and one
-/// beat of slack.
-fn heartbeat_lifetime(gateway: &oag_core::config::GatewayConfig) -> Duration {
-    gateway.upstream_response_timeout + gateway.max_stream_duration + SLOT_HEARTBEAT
+/// The longest any request can legitimately hold a lease, and one beat more.
+///
+/// Every term is a deadline the request path enforces, so a lease still held
+/// past their sum is not a request -- it is a leak:
+///
+/// - every header wait the same-credential retries allow, each after a
+///   backoff of at most [`super::MAX_BACKOFF`];
+/// - then a stream's ceiling, which the read loops check at the top, so it can
+///   run over by one wait for the upstream (`stream_idle_timeout`) or for the
+///   client (`client_write_timeout`). A non-streamed body is read under the
+///   same ceiling.
+///
+/// The first version counted one header wait and no overruns: a request that
+/// retried slow headers and then streamed to the ceiling outlived it, lost its
+/// heartbeat while still running, and its seat aged out under it.
+fn heartbeat_lifetime(g: &oag_core::config::GatewayConfig) -> Duration {
+    let tries = u32::from(g.same_account_retries) + 1;
+    let headers = (g.upstream_response_timeout + super::MAX_BACKOFF) * tries;
+    let stream = g.max_stream_duration + g.stream_idle_timeout + g.client_write_timeout;
+    headers + stream + SLOT_HEARTBEAT
 }
 
 /// What the search was, when it found nothing this caller can use.
@@ -1147,20 +1163,42 @@ mod tests {
         drop(slot);
     }
 
-    #[test]
-    fn a_lease_may_beat_through_every_deadline_a_request_has() {
-        let gateway = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+    fn gateway_with(extra: &str) -> oag_core::config::GatewayConfig {
+        oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
             "postgres://x@127.0.0.1:1/x",
             "redis://127.0.0.1:1",
-            "",
+            extra,
         ))
         .expect("config")
-        .gateway;
+        .gateway
+    }
+
+    #[test]
+    fn every_same_credential_retry_widens_the_lease_by_a_header_wait() {
+        // The review's case: slow headers retried on one credential, then a
+        // stream to its ceiling. Each retry is another header wait and backoff
+        // the lease has to outlive.
+        let two = gateway_with("gateway:\n  same_account_retries: 2\n");
+        let five = gateway_with("gateway:\n  same_account_retries: 5\n");
         assert_eq!(
-            heartbeat_lifetime(&gateway),
-            gateway.upstream_response_timeout + gateway.max_stream_duration + SLOT_HEARTBEAT
+            heartbeat_lifetime(&five),
+            heartbeat_lifetime(&two)
+                + (two.upstream_response_timeout + super::super::MAX_BACKOFF) * 3
         );
-        assert!(heartbeat_lifetime(&gateway) > gateway.max_stream_duration);
+    }
+
+    #[test]
+    fn the_lease_outlives_its_slowest_legal_request() {
+        // Three header waits with the longest backoff before each, then a
+        // stream to its ceiling that overruns by an idle wait and a client
+        // write: the slowest request the deadlines allow still has a beat.
+        let g = gateway_with("");
+        let slowest = (g.upstream_response_timeout + super::super::MAX_BACKOFF)
+            * (u32::from(g.same_account_retries) + 1)
+            + g.max_stream_duration
+            + g.stream_idle_timeout
+            + g.client_write_timeout;
+        assert!(heartbeat_lifetime(&g) > slowest);
     }
 
     #[tokio::test(start_paused = true)]
