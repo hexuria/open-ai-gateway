@@ -495,7 +495,7 @@ pub async fn lease(
                             .any(|c| is_live(c, now) && c.account == row.account_id())
                     })
                     .collect();
-                if !ghost_retry && redis_has_room(state, &eligible).await {
+                if worth_a_recount(state, &eligible, now, ghost_retry).await {
                     tracing::error!(
                         %provider,
                         candidates = full,
@@ -548,7 +548,7 @@ pub async fn lease(
             .iter()
             .filter(|r| !excluded.contains(&r.account_id()))
             .collect();
-        if let Some(row) = first_with_redis_room(state, &probe).await {
+        if let Some(row) = pick_with_redis_room(state, &probe, now).await {
             tracing::error!(
                 %provider,
                 exhausted,
@@ -845,39 +845,114 @@ async fn candidates_for(state: &AppState, remaining: &[&AccountRow], now: i64) -
     candidates
 }
 
+/// Whether a full snapshot is worth one more look: only once per selection,
+/// and only if Redis shows room the snapshot did not. A second full snapshot
+/// is the answer, not another ghost -- recounting again would loop for as
+/// long as the two reads kept disagreeing.
+async fn worth_a_recount(
+    state: &AppState,
+    eligible: &[&AccountRow],
+    now: i64,
+    already_recounted: bool,
+) -> bool {
+    !already_recounted && redis_has_room(state, eligible, now).await
+}
+
 /// Whether Redis currently shows room on any of these credentials.
 ///
 /// Capacity truth is the store, not the last Prometheus write and not a
 /// snapshot that just lost a race with a trim. Unreachable Redis is room:
 /// that is the same fail-open as acquire.
-async fn redis_has_room(state: &AppState, rows: &[&AccountRow]) -> bool {
-    first_with_redis_room(state, rows).await.is_some()
+async fn redis_has_room(state: &AppState, rows: &[&AccountRow], now: i64) -> bool {
+    pick_with_redis_room(state, rows, now).await.is_some()
 }
 
-/// The first credential Redis currently shows room on, gauges updated.
+/// A credential Redis currently shows room on, gauges updated.
 ///
-/// Unreachable Redis is the first row: fail open, same as acquire.
-async fn first_with_redis_room<'a>(
+/// Counts are read fresh; the choice is [`pick_with_room`]'s.
+async fn pick_with_redis_room<'a>(
     state: &AppState,
     rows: &[&'a AccountRow],
+    now: i64,
 ) -> Option<&'a AccountRow> {
     if rows.is_empty() {
         return None;
     }
     let ids: Vec<AccountId> = rows.iter().map(|r| r.account_id()).collect();
-    let counts = match state.cache.slots_in_use_many(&ids, SLOT_TTL).await {
-        Ok(counts) if counts.len() == ids.len() => counts,
-        Ok(_) | Err(_) => return rows.first().copied(),
-    };
-    let mut idle = None;
-    for (row, n) in rows.iter().zip(counts) {
-        publish_slots_in_use(&row.name, n);
-        let limit = u32::try_from(row.max_concurrency).unwrap_or(0);
-        if n < limit && idle.is_none() {
-            idle = Some(*row);
+    let counts = usable_counts(
+        state.cache.slots_in_use_many(&ids, SLOT_TTL).await,
+        ids.len(),
+    );
+    // Only a count that was read is published, as in `candidates_for`.
+    if let Some(counts) = &counts {
+        for (row, n) in rows.iter().zip(counts) {
+            publish_slots_in_use(&row.name, *n);
         }
     }
-    idle
+    pick_with_room(
+        rows,
+        counts.as_deref(),
+        now,
+        |account| state.breakers.permits(account, now),
+        fastrand_u64(),
+    )
+}
+
+/// A slot count to act on, or `None` for degraded -- counted as such.
+///
+/// The same reading `candidates_for` takes. A reply that does not cover every
+/// credential is degraded, not partial: publishing the prefix and treating the
+/// rest as full made the exhausted retry answer `AtCapacity` when the only seat
+/// with room sat past the prefix.
+fn usable_counts(read: Result<Vec<u32>>, asked: usize) -> Option<Vec<u32>> {
+    match read {
+        Ok(counts) if counts.len() == asked => Some(counts),
+        Ok(_) => {
+            slot_accounting_degraded("count", &Error::Internal("short pipeline reply".to_owned()));
+            None
+        }
+        Err(e) => {
+            slot_accounting_degraded("count", &e);
+            None
+        }
+    }
+}
+
+/// One of `rows` that could take a request now, chosen by `draw`.
+///
+/// Eligible by the same rules the cascade applies -- live (schedulable, not
+/// cooling, not rate-limited, not held by its reserve), breaker permitting,
+/// and under its limit by `counts` -- then one of those by `draw`, not the
+/// first. The first was every replica's answer to the same Redis read at the
+/// same moment: the whole fleet stampeded one credential on the path taken
+/// exactly when the pool is most contended. And this path used to skip the
+/// eligibility rules entirely, so a credential in cooldown or behind an open
+/// breaker could be handed a request here that the cascade had just refused
+/// it.
+///
+/// `counts: None` is Redis unanswerable: fail open, as acquire does, but only
+/// among credentials that are otherwise eligible.
+fn pick_with_room<'a>(
+    rows: &[&'a AccountRow],
+    counts: Option<&[u32]>,
+    now: i64,
+    permits: impl Fn(AccountId) -> bool,
+    draw: u64,
+) -> Option<&'a AccountRow> {
+    let open: Vec<&'a AccountRow> = rows
+        .iter()
+        .enumerate()
+        .filter(|(i, row)| {
+            let in_flight = counts.map_or(0, |c| c.get(*i).copied().unwrap_or(u32::MAX));
+            row.to_candidate(in_flight, 0)
+                .is_some_and(|c| is_eligible(&c, now))
+                && permits(row.account_id())
+        })
+        .map(|(_, row)| *row)
+        .collect();
+    let len = u64::try_from(open.len()).ok().filter(|&n| n > 0)?;
+    let at = usize::try_from(draw % len).ok()?;
+    open.get(at).copied()
 }
 
 /// How many candidates there were, when nothing was selectable because every
@@ -1363,6 +1438,49 @@ mod tests {
         assert!(err.to_string().contains("redis"), "{err}");
     }
 
+    /// A full snapshot is recounted once, and only if Redis shows room.
+    #[tokio::test]
+    async fn a_full_snapshot_is_recounted_once_and_only_when_redis_has_room() {
+        let Ok(redis_url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            "postgres://oag:oag@127.0.0.1:1/oag",
+            &redis_url,
+            "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("client");
+        let state = Arc::new(AppState::new(config, db, cache).expect("state"));
+        let mut row = super::testing::account("recount-seat", "api_key");
+        row.max_concurrency = 1;
+
+        // Room: worth one recount, and only one.
+        assert!(worth_a_recount(&state, &[&row], 0, false).await);
+        assert!(!worth_a_recount(&state, &[&row], 0, true).await);
+
+        // Full: nothing to recount -- the snapshot was right.
+        assert!(
+            state
+                .cache
+                .acquire_slot(row.account_id(), "holder", 1, SLOT_TTL)
+                .await
+                .expect("acquire")
+        );
+        assert!(
+            !redis_has_room(&state, &[&row], 0).await,
+            "a full seat has no room"
+        );
+        assert!(!worth_a_recount(&state, &[&row], 0, false).await);
+        state
+            .cache
+            .clear_slots(row.account_id())
+            .await
+            .expect("clean up");
+    }
+
     #[tokio::test]
     async fn an_empty_redis_key_ranks_the_credential_idle() {
         // Redis empty ⇒ in_flight 0, including after a live member was
@@ -1413,9 +1531,101 @@ mod tests {
         assert_eq!(candidate.in_flight, 0, "cleared Redis is idle, not full");
         assert!(is_eligible(candidate, 0));
         assert!(
-            redis_has_room(&state, &[&row]).await,
+            redis_has_room(&state, &[&row], 0).await,
             "empty redis is room, so at_capacity must not fire"
         );
+    }
+
+    /// Rows for `pick_with_room`: a limit of 8 each, all live unless changed.
+    fn room_rows() -> [AccountRow; 3] {
+        ["a", "b", "c"].map(|name| {
+            let mut row = super::testing::account(name, "api_key");
+            row.max_concurrency = 8;
+            row
+        })
+    }
+
+    fn pick<'a>(
+        rows: &'a [AccountRow],
+        counts: Option<&[u32]>,
+        blocked: Option<&str>,
+        draw: u64,
+    ) -> Option<&'a str> {
+        let refs: Vec<&AccountRow> = rows.iter().collect();
+        let blocked = blocked.and_then(|n| rows.iter().find(|r| r.name == n));
+        pick_with_room(
+            &refs,
+            counts,
+            100,
+            |account| blocked.is_none_or(|b| b.account_id() != account),
+            draw,
+        )
+        .map(|r| r.name.as_str())
+    }
+
+    #[test]
+    fn the_exhausted_pick_takes_only_a_credential_with_room() {
+        let rows = room_rows();
+        for draw in 0..6 {
+            assert_eq!(pick(&rows, Some(&[8, 8, 3]), None, draw), Some("c"));
+        }
+        assert_eq!(pick(&rows, Some(&[8, 8, 8]), None, 0), None);
+    }
+
+    #[test]
+    fn the_exhausted_pick_honours_cooldown_schedulable_and_breaker() {
+        // Room in Redis is not permission. Each of these was refused by the
+        // cascade a moment ago, and the exhausted path used to hand it the
+        // request anyway.
+        let mut rows = room_rows();
+        rows[0].cooldown_until = Some(time::OffsetDateTime::from_unix_timestamp(200).expect("t"));
+        rows[1].schedulable = false;
+        for draw in 0..6 {
+            assert_eq!(pick(&rows, Some(&[0, 0, 0]), None, draw), Some("c"));
+            assert_eq!(pick(&rows, Some(&[0, 0, 0]), Some("c"), draw), None);
+        }
+    }
+
+    #[test]
+    fn the_exhausted_pick_honours_rate_limit_and_reserve() {
+        let mut rows = room_rows();
+        rows[0].rate_limited_until =
+            Some(time::OffsetDateTime::from_unix_timestamp(200).expect("t"));
+        rows[1].usage_remaining_pct = Some(rust_decimal::Decimal::from(5));
+        rows[1].usage_reserve_pct = Some(10);
+        for draw in 0..6 {
+            assert_eq!(pick(&rows, Some(&[0, 0, 0]), None, draw), Some("c"));
+            assert_eq!(pick(&rows, None, None, draw), Some("c"));
+        }
+    }
+
+    #[test]
+    fn a_count_that_does_not_cover_every_credential_is_degraded_not_partial() {
+        assert_eq!(usable_counts(Ok(vec![1, 2, 3]), 3), Some(vec![1, 2, 3]));
+        assert_eq!(usable_counts(Ok(vec![1, 2]), 3), None);
+        assert_eq!(
+            usable_counts(Err(Error::Internal("redis down".to_owned())), 3),
+            None
+        );
+    }
+
+    #[test]
+    fn replicas_reading_the_same_counts_do_not_all_pick_the_same_credential() {
+        let rows = room_rows();
+        let picks: std::collections::HashSet<_> = (0..6)
+            .filter_map(|draw| pick(&rows, Some(&[0, 0, 0]), None, draw))
+            .collect();
+        assert_eq!(picks.len(), 3, "the draw spreads the choice: {picks:?}");
+    }
+
+    #[test]
+    fn with_redis_unanswerable_the_pick_fails_open_among_eligible_credentials() {
+        let mut rows = room_rows();
+        rows[0].schedulable = false;
+        let picks: std::collections::HashSet<_> = (0..6)
+            .filter_map(|draw| pick(&rows, None, None, draw))
+            .collect();
+        assert_eq!(picks, ["b", "c"].into_iter().collect());
     }
 
     #[test]
