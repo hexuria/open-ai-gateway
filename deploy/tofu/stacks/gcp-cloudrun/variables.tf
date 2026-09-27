@@ -14,7 +14,7 @@ variable "image" {
 
     `ghcr.io/hexuria/open-ai-gateway:main` is published on every push to the
     default branch, and `:sha-<full sha>` on the same pushes — either is a real
-    tag today. A semver tag such as `:0.1.0` exists only once a `v0.1.0` git tag
+    tag today. A semver tag such as `:0.2.0` exists once its `v0.2.0` git tag
     has been pushed; the release workflow publishes semver on `v*` and nothing
     else does, so naming one before it is cut lands on ImagePullBackOff.
 
