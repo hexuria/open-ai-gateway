@@ -162,7 +162,7 @@ impl Db {
         migrator.set_ignore_missing(true);
 
         let result = match Self::adopt_superseded_checksums(&mut conn, &migrator).await {
-            Ok(()) => migrator
+            Ok(_) => migrator
                 .run(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("applying migrations: {e}"))),
@@ -262,18 +262,20 @@ fn schema_is_ready(applied: i64, embedded: usize) -> bool {
 impl Db {
     /// Record the current checksum for any applied migration still carrying a
     /// [`SUPERSEDED_CHECKSUMS`] entry's old one. Under the migration lock.
+    /// Returns the versions it adopted, each also logged at `warn`.
     async fn adopt_superseded_checksums(
         conn: &mut sqlx::PgConnection,
         migrator: &sqlx::migrate::Migrator,
-    ) -> Result<()> {
+    ) -> Result<Vec<i64>> {
         // A fresh database has no ledger yet, and nothing to adopt.
         let ledger: Option<String> =
             sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::text")
                 .fetch_one(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("looking for the migration ledger: {e}")))?;
+        let mut adopted = Vec::new();
         if ledger.is_none() {
-            return Ok(());
+            return Ok(adopted);
         }
         for &(version, old) in SUPERSEDED_CHECKSUMS {
             let Some(current) = migrator.iter().find(|m| m.version == version) else {
@@ -281,7 +283,7 @@ impl Db {
             };
             let old = hex::decode(old)
                 .map_err(|e| Error::Internal(format!("superseded checksum for {version}: {e}")))?;
-            let adopted = sqlx::query(
+            let rows = sqlx::query(
                 "UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2 AND checksum = $3",
             )
             .bind(current.checksum.as_ref())
@@ -291,15 +293,16 @@ impl Db {
             .await
             .map_err(|e| Error::Internal(format!("adopting migration {version}'s checksum: {e}")))?
             .rows_affected();
-            if adopted > 0 {
+            if rows > 0 {
                 tracing::warn!(
                     version,
                     "migration was recorded with a superseded checksum (a comment-only \
                      edit after release); recorded the current one"
                 );
+                adopted.push(version);
             }
         }
-        Ok(())
+        Ok(adopted)
     }
 }
 
@@ -364,12 +367,30 @@ mod tests {
         db.migrate().await.expect("first migrate");
         let current = recorded(&db, 1).await;
         let (_, v0_1_0) = super::SUPERSEDED_CHECKSUMS[0];
-        record(&db, 1, v0_1_0).await;
+        assert_ne!(v0_1_0, current, "the planted checksum must be a real swap");
 
+        // A current ledger adopts nothing; a v0.1.0 one adopts version 1, once.
+        let migrator = sqlx::migrate!("../../migrations");
+        let mut conn = db.pool().acquire().await.expect("conn");
+        let none = Db::adopt_superseded_checksums(&mut conn, &migrator).await;
+        record(&db, 1, v0_1_0).await;
+        let healed = Db::adopt_superseded_checksums(&mut conn, &migrator).await;
+        let again = Db::adopt_superseded_checksums(&mut conn, &migrator).await;
+        drop(conn);
+        // And the full migrate path runs clean on a v0.1.0 ledger.
+        record(&db, 1, v0_1_0).await;
         let result = db.migrate().await;
         let after = recorded(&db, 1).await;
         drop(db);
         drop_database(&name).await;
+
+        assert_eq!(none.expect("adopt"), Vec::<i64>::new());
+        assert_eq!(healed.expect("adopt"), vec![1]);
+        assert_eq!(
+            again.expect("adopt"),
+            Vec::<i64>::new(),
+            "adopted once, not every boot"
+        );
         result.expect("a v0.1.0 database migrates");
         assert_eq!(after, current, "the current checksum is recorded");
     }
@@ -389,9 +410,11 @@ mod tests {
         let result = db.migrate().await;
         drop(db);
         drop_database(&name).await;
+        let err = result.expect_err("an unlisted checksum must still fail closed");
         assert!(
-            result.is_err(),
-            "an unlisted checksum must still fail closed"
+            err.to_string()
+                .contains("migration 1 was previously applied but has been modified"),
+            "{err}"
         );
     }
 
