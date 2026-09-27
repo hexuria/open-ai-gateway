@@ -478,6 +478,10 @@ impl Cache {
 
     /// `slots_in_use` for several credentials in one round trip, in order.
     ///
+    /// Exactly one count per account, in the order given: a pipeline answers
+    /// every command or fails as a whole, so a caller can zip the result
+    /// against its input without checking the length.
+    ///
     /// Selection asks about every candidate before choosing one. Asked one at
     /// a time that was a sequential Redis round trip per credential per
     /// attempt — and re-run per failover and per lost race, so a pool of
