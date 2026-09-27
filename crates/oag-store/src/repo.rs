@@ -4441,6 +4441,26 @@ mod tests {
                 .execute(&mut *tx)
                 .await
                 .expect("ask for the index plan");
+            // Private copies of the two tables, which shadow the real ones for
+            // every unqualified name below (`pg_temp` is searched first), so
+            // the queries under test are unchanged. On the shared table this
+            // flaked: other tests update `account` concurrently, and an index
+            // built over broken HOT chains is marked `indcheckxmin`, which
+            // makes it invisible to the transaction that created it. The
+            // planner then had no index to take, seq-scanned at the disabled
+            // cost, and the control "could not say yes". A fresh table has no
+            // HOT chains, and no other test's rows.
+            for copy in [
+                "CREATE TEMP TABLE account (LIKE public.account INCLUDING DEFAULTS) \
+                 ON COMMIT DROP",
+                "CREATE TEMP TABLE account_route (LIKE public.account_route INCLUDING DEFAULTS) \
+                 ON COMMIT DROP",
+            ] {
+                sqlx::query(copy)
+                    .execute(&mut *tx)
+                    .await
+                    .expect("a private copy of the table");
+            }
             sqlx::query(index)
                 .execute(&mut *tx)
                 .await
