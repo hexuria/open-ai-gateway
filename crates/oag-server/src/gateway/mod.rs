@@ -679,6 +679,7 @@ async fn run_with_escalation(
         return Ok(json_response(
             &body,
             &events,
+            gate,
             &decision,
             request_id,
             ingress,
@@ -1249,6 +1250,13 @@ fn render_collected(
 fn json_response(
     body: &bytes::Bytes,
     events: &[oag_proto::StreamEvent],
+    // What the served attempt's own accumulator judged it. Not necessarily
+    // what the ledger records: after an escalation the ledger names the gate
+    // that triggered the climb, while this is about the answer actually being
+    // sent. This used to rebuild a second accumulator over every event just
+    // to ask the same question again: a full extra pass on every collected
+    // response.
+    gate: Option<oag_router::QualityGate>,
     decision: &RoutingDecision,
     request_id: RequestId,
     ingress: Dialect,
@@ -1281,23 +1289,13 @@ fn json_response(
         }
     };
 
-    {
-        let mut acc = oag_proto::StreamAccumulator::new();
-        for event in events {
-            acc.observe(event);
-        }
-        if matches!(
-            acc.quality_gate(),
-            Some(oag_router::QualityGate::EmptyResponse)
-        ) && (always_streams || ingress != upstream_dialect || body.is_empty())
-        {
-            tracing::error!(
-                %request_id,
-                ?ingress,
-                body_len = body.len(),
-                "completion had no content for the client"
-            );
-        }
+    if client_got_nothing(gate, always_streams, ingress, upstream_dialect, body) {
+        tracing::error!(
+            %request_id,
+            ?ingress,
+            body_len = body.len(),
+            "completion had no content for the client"
+        );
     }
 
     oag_headers(
@@ -1309,6 +1307,23 @@ fn json_response(
     )
     .body(Body::from(out))
     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Whether an empty answer reached the client as nothing at all.
+///
+/// An empty completion passed through verbatim is the provider's own body, and
+/// the client sees exactly what the provider said. Rendered -- because the
+/// adapter streamed, or the dialects differ, or there was no body to pass
+/// through -- it is ours, and an empty one is worth an error.
+fn client_got_nothing(
+    gate: Option<oag_router::QualityGate>,
+    always_streams: bool,
+    ingress: Dialect,
+    upstream_dialect: Dialect,
+    body: &bytes::Bytes,
+) -> bool {
+    gate == Some(oag_router::QualityGate::EmptyResponse)
+        && (always_streams || ingress != upstream_dialect || body.is_empty())
 }
 
 /// Routing identity on the way out. `x-oag-tier` is omitted when the model
@@ -2784,6 +2799,23 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_answer_is_an_error_only_when_we_rendered_it() {
+        use oag_core::provider::Dialect::{AnthropicMessages as A, OpenAIChatCompletions as O};
+        use oag_router::QualityGate::{EmptyResponse, Truncated};
+        let body = bytes::Bytes::from_static(b"{}");
+        let none = bytes::Bytes::new();
+        // The provider's own body, passed through: what the provider said.
+        assert!(!client_got_nothing(Some(EmptyResponse), false, A, A, &body));
+        // Ours: rendered from a stream, across dialects, or from no body.
+        assert!(client_got_nothing(Some(EmptyResponse), true, A, A, &body));
+        assert!(client_got_nothing(Some(EmptyResponse), false, O, A, &body));
+        assert!(client_got_nothing(Some(EmptyResponse), false, A, A, &none));
+        // Not empty, or no gate: nothing to report.
+        assert!(!client_got_nothing(Some(Truncated), true, O, A, &none));
+        assert!(!client_got_nothing(None, true, O, A, &none));
+    }
+
+    #[test]
     fn backoff_grows_and_is_capped() {
         assert!(backoff(0) < backoff(1));
         assert!(backoff(1) < backoff(2));
@@ -3147,6 +3179,36 @@ mod tests {
             capability_escalated_from: None,
             ceiling_model: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_same_dialect_body_is_served_verbatim_as_json() {
+        // The upstream's own bytes are the most faithful answer there is: a
+        // same-dialect collected response goes out byte for byte, as JSON.
+        let body = bytes::Bytes::from_static(br#"{"id":"msg_1","content":[]}"#);
+        let response = json_response(
+            &body,
+            &[],
+            None,
+            &decision_for(oag_core::Provider::Anthropic),
+            RequestId::new(),
+            Dialect::AnthropicMessages,
+            Dialect::AnthropicMessages,
+            false,
+            false,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(axum::http::HeaderValue::as_bytes),
+            Some(&b"application/json"[..])
+        );
+        let sent = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .expect("body");
+        assert_eq!(sent, body);
     }
 
     #[test]
