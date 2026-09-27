@@ -37,14 +37,15 @@ pub(crate) const SLOT_HEARTBEAT: Duration = Duration::from_secs(30);
 /// waiting too long to notice a dead replica.
 pub(crate) const SLOT_TTL: Duration = Duration::from_mins(2);
 
-// A live member must survive three missed heartbeats, the last of which may
-// itself take a whole slot-op deadline to land. The trim is inclusive -- the
-// scripts drop scores `<= now - ttl` -- so a member last refreshed at `t` is
-// gone at exactly `t + SLOT_TTL`, when the fourth beat is only just due. Two
-// beats was the old check, and it said nothing about the op deadline.
+// A live member must survive two missed heartbeats and a slow third. The trim
+// is inclusive -- the scripts drop scores `<= now - ttl` -- so a member last
+// refreshed at `t` is gone at exactly `t + SLOT_TTL`. With beats at 30s and
+// 60s missed, the third is due at 90s and may itself take a whole slot-op
+// deadline to land: it must commit before the trim. Two beats was the old
+// check, and it said nothing about the op deadline.
 const _: () = assert!(
     SLOT_HEARTBEAT.as_secs() * 3 + oag_store::cache::SLOT_OP_TIMEOUT.as_secs() < SLOT_TTL.as_secs(),
-    "a slot must survive three missed heartbeats and a slow fourth"
+    "a slot must survive two missed heartbeats and a slow third"
 );
 
 /// Where a concurrency slot goes back to.

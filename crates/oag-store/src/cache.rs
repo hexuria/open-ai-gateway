@@ -172,9 +172,11 @@ static TAKE_TOKEN_SCRIPT: std::sync::LazyLock<redis::Script> =
 /// Redis already gets.
 pub const SLOT_OP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How many times a slot script is tried when Redis answers `NOSCRIPT`.
+/// How many outer attempts a slot script gets when Redis answers `NOSCRIPT`.
 ///
-/// Each `NOSCRIPT` is answered by loading the script and going again. More
+/// Outer: on the single-eval path each attempt is `invoke_async`, which does
+/// its own load-and-retry, so one attempt can be two `EVALSHA`s. Each
+/// `NOSCRIPT` that escapes is answered by loading the script and going again. More
 /// than one retry because a `SCRIPT FLUSH` can land between the load and the
 /// eval; a bound because a Redis that flushes on every load would otherwise be
 /// retried forever.
