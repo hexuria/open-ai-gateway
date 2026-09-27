@@ -1033,8 +1033,10 @@ fn clear_slots_report(name: &str, id: uuid::Uuid, dropped: u32) -> String {
         use std::fmt::Write as _;
         let _ = write!(
             out,
-            "\n  if any of those were live requests, they take their seat back on their next \
-             heartbeat; until then {name} can admit up to {dropped} over its limit"
+            "\n  those were ghosts and live requests alike. A live one tries to retake its \
+             seat on its next heartbeat, under the limit; if the seat has filled by then it \
+             is refused, and {name} runs over its limit until that request finishes \
+             (watch oag_slot_lost_total{{reason=\"oversubscribed\"}})"
         );
     }
     out
@@ -3274,14 +3276,22 @@ mod tests {
     }
 
     #[test]
-    fn clearing_held_slots_warns_how_far_over_its_limit_the_seat_can_go() {
-        for dropped in [1, 8] {
-            let report = clear_slots_report("grok-seat", Uuid::nil(), dropped);
-            assert!(
-                report.contains(&format!("can admit up to {dropped} over its limit")),
-                "{report}"
-            );
+    fn clearing_held_slots_warns_that_a_refused_retake_lasts_the_request() {
+        // Not "within one heartbeat": the retake honours the limit, so a seat
+        // that filled meanwhile refuses it, and the over-admission lasts as
+        // long as the request. Nor is `dropped` a bound: it counts ghosts too.
+        let report = clear_slots_report("grok-seat", Uuid::nil(), 3);
+        for says in [
+            "ghosts and live requests alike",
+            "is refused",
+            "until that request finishes",
+        ] {
+            assert!(report.contains(says), "should say {says:?}: {report}");
         }
+        assert!(
+            !report.contains("up to 3"),
+            "dropped is not a ceiling: {report}"
+        );
     }
 
     /// The command empties the credential's key, by name.
