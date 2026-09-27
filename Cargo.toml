@@ -84,7 +84,7 @@ sha2 = "0.10"
 # SigV4 for Bedrock. HMAC-SHA256 over a canonical request — a few dozen lines
 # against the AWS SDK's several hundred crates, none of which we would use for
 # anything else.
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
