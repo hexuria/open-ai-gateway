@@ -140,8 +140,9 @@ pub struct SlotGuard {
     /// Claimed by whoever gives the slot back first: an explicit release, or
     /// the drop.
     released: AtomicBool,
-    /// Flipped once that claimant's store call has finished.
-    gone: tokio::sync::watch::Sender<bool>,
+    /// Flipped by the release task once its store call has finished. Shared
+    /// with that task, so no caller's cancellation can leave it unset.
+    gone: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl std::fmt::Debug for SlotGuard {
@@ -161,23 +162,41 @@ impl SlotGuard {
             request_id: request_id.to_owned(),
             limit,
             released: AtomicBool::new(false),
-            gone: tokio::sync::watch::Sender::new(false),
+            gone: Arc::new(tokio::sync::watch::Sender::new(false)),
         }
     }
 
-    /// Give the slot back, and return only once it is gone.
+    /// Give the slot back, and return once the store has finished trying.
     ///
-    /// A second caller used to return the moment the first had claimed the
-    /// release, while the first's `ZREM` was still in flight -- so "release
-    /// returned" did not mean "the slot is gone", which is the one guarantee
-    /// [`Lease::release`] exists to give. It now waits for the first.
+    /// "Finished" rather than "gone": `Cache::release` logs a failed `ZREM`
+    /// and returns, and then the TTL is what removes the member.
+    ///
+    /// The store call is its own task, and every caller -- the first included
+    /// -- waits on `gone`, which that task flips. Two earlier shapes were each
+    /// wrong: a second caller returned the moment the first had claimed the
+    /// release, while its `ZREM` was still in flight, so escalation's next
+    /// acquire on the same credential and request id could have its fresh
+    /// member removed underneath it; and when the first caller awaited the
+    /// store itself, cancelling it there (a client gone mid-release) left
+    /// `gone` unset and every other caller waiting forever.
     async fn release(&self) {
-        if self.released.swap(true, Ordering::SeqCst) {
-            let _ = self.gone.subscribe().wait_for(|gone| *gone).await;
-            return;
+        if !self.released.swap(true, Ordering::SeqCst) {
+            let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+                // No runtime to release on: the member expires with the TTL.
+                self.gone.send_replace(true);
+                return;
+            };
+            let store = Arc::clone(&self.store);
+            let account = self.account;
+            let request_id = self.request_id.clone();
+            let gone = Arc::clone(&self.gone);
+            runtime.spawn(async move {
+                store.release(account, &request_id).await;
+                gone.send_replace(true);
+            });
         }
-        self.store.release(self.account, &self.request_id).await;
-        self.gone.send_replace(true);
+        // Cannot close while we wait: `self` holds the sender.
+        let _ = self.gone.subscribe().wait_for(|gone| *gone).await;
     }
 }
 
@@ -1299,11 +1318,13 @@ mod tests {
     #[derive(Default)]
     struct SlowRelease {
         done: AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
     impl SlotStore for SlowRelease {
         async fn release(&self, _: AccountId, _: &str) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_secs(5)).await;
             self.done.store(true, Ordering::SeqCst);
         }
@@ -1315,6 +1336,31 @@ mod tests {
         async fn acquire(&self, _: AccountId, _: &str, _: u32) -> bool {
             true
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_the_first_release_neither_strands_the_second_nor_skips_the_store() {
+        // The first caller is cancelled mid-release (a client gone during
+        // `lease.release()`). The store call must still run, once, and the
+        // second caller must still return -- it used to wait forever.
+        let store = Arc::new(SlowRelease::default());
+        let slot = Arc::new(SlotGuard::new(
+            Arc::clone(&store) as Arc<dyn SlotStore>,
+            AccountId::from_uuid(uuid::Uuid::nil()),
+            "req",
+            8,
+        ));
+        let first = {
+            let slot = Arc::clone(&slot);
+            tokio::spawn(async move { slot.release().await })
+        };
+        tokio::task::yield_now().await;
+        first.abort();
+        tokio::time::timeout(Duration::from_secs(30), slot.release())
+            .await
+            .expect("the second release returns");
+        assert!(store.done.load(Ordering::SeqCst));
+        assert_eq!(store.calls.load(Ordering::SeqCst), 1, "released once");
     }
 
     #[tokio::test(start_paused = true)]
