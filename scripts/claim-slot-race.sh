@@ -91,4 +91,7 @@ redis-cli -p "$P" del "$KEY" >/dev/null
 
 echo "limit $LIMIT, $N callers, $ROUNDS rounds, model $MODEL"
 echo "admitted: $TOTA   admitted holding no slot: $TOTG (must be 0)"
+# A script that admitted nobody tested nothing: a Lua that refused every
+# acquire would otherwise pass here.
+[ "$TOTA" -gt 0 ] || { echo "nobody was admitted: the race did not run" >&2; exit 1; }
 [ "$TOTG" -eq 0 ]
