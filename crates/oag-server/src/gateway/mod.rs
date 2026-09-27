@@ -1950,7 +1950,13 @@ async fn succeeded(
             Err(failure) => return collect_failed(failure),
         }
     } else {
-        sse::collect_with(response, adapter.dialect(), &names).await
+        sse::collect_with(
+            response,
+            adapter.dialect(),
+            &names,
+            state.config.gateway.max_stream_duration,
+        )
+        .await
     };
     match collected {
         Ok((body, events, accumulator)) => Outcome::Ok(Box::new(Attempt::Collected {
@@ -2073,10 +2079,13 @@ fn upstream_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::tim
         .then(|| std::time::Duration::from_secs(secs))
 }
 
-/// Exponential backoff, capped.
+/// The longest [`backoff`] waits. The slot heartbeat's lifetime counts it.
+pub(crate) const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Exponential backoff, capped at [`MAX_BACKOFF`].
 fn backoff(attempt: u8) -> std::time::Duration {
     let ms = 300u64.saturating_mul(1 << u32::from(attempt.min(4)));
-    std::time::Duration::from_millis(ms.min(3_000))
+    std::time::Duration::from_millis(ms).min(MAX_BACKOFF)
 }
 
 /// The inbound key, from any header a client might use.

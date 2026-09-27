@@ -183,13 +183,24 @@ impl Drop for SlotGuard {
 /// A `Weak` so the task cannot keep the guard alive: if it held a strong
 /// `Arc`, `Drop` would wait for the heartbeat to notice `released`, and the
 /// heartbeat would wait for `Drop` to set it.
-fn spawn_heartbeat(slot: &Arc<SlotGuard>) {
+///
+/// For at most `lifetime`. No request holds a lease longer than its deadlines
+/// allow, so a heartbeat still beating past them is keeping a *leaked* lease
+/// alive -- a clone parked in a task that will never finish -- and, beaten
+/// forever, its seat never frees: the ghost lockout, in a form no TTL cures.
+/// Past `lifetime` it stops and says so, and the member expires within
+/// [`SLOT_TTL`] like any dead replica's.
+fn spawn_heartbeat(slot: &Arc<SlotGuard>, lifetime: Duration) {
     let weak = Arc::downgrade(slot);
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!("no runtime to heartbeat a slot on; it will expire in {SLOT_TTL:?}");
         return;
     };
     runtime.spawn(async move {
+        let started = tokio::time::Instant::now();
         let mut ticker = tokio::time::interval(SLOT_HEARTBEAT);
+        // A starved task catches up with one beat, not a burst of them.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
         loop {
             ticker.tick().await;
@@ -197,6 +208,16 @@ fn spawn_heartbeat(slot: &Arc<SlotGuard>) {
                 return;
             };
             if slot.released.load(Ordering::SeqCst) {
+                return;
+            }
+            if started.elapsed() >= lifetime {
+                tracing::warn!(
+                    account = %slot.account,
+                    request_id = %slot.request_id,
+                    "slot heartbeat outlived every request deadline; stopping so a leaked \
+                     lease frees its seat"
+                );
+                metrics::counter!("oag_slot_heartbeat_stopped_total").increment(1);
                 return;
             }
             if slot.store.refresh(slot.account, &slot.request_id).await {
@@ -268,13 +289,35 @@ fn leased(state: &AppState, account: AccountRow, request_id: &str, via_sticky: b
         limit: u32::try_from(account.max_concurrency).unwrap_or(0),
         released: AtomicBool::new(false),
     });
-    spawn_heartbeat(&slot);
+    spawn_heartbeat(&slot, heartbeat_lifetime(&state.config.gateway));
     Lease {
         account,
         request_id: request_id.to_owned(),
         via_sticky,
         slot,
     }
+}
+
+/// The longest any request can legitimately hold a lease, and one beat more.
+///
+/// Every term is a deadline the request path enforces, so a lease still held
+/// past their sum is not a request -- it is a leak:
+///
+/// - every header wait the same-credential retries allow, each after a
+///   backoff of at most [`super::MAX_BACKOFF`];
+/// - then a stream's ceiling, which the read loops check at the top, so it can
+///   run over by one wait for the upstream (`stream_idle_timeout`) or for the
+///   client (`client_write_timeout`). A non-streamed body is read under the
+///   same ceiling.
+///
+/// The first version counted one header wait and no overruns: a request that
+/// retried slow headers and then streamed to the ceiling outlived it, lost its
+/// heartbeat while still running, and its seat aged out under it.
+fn heartbeat_lifetime(g: &oag_core::config::GatewayConfig) -> Duration {
+    let tries = u32::from(g.same_account_retries) + 1;
+    let headers = (g.upstream_response_timeout + super::MAX_BACKOFF) * tries;
+    let stream = g.max_stream_duration + g.stream_idle_timeout + g.client_write_timeout;
+    headers + stream + SLOT_HEARTBEAT
 }
 
 /// What the search was, when it found nothing this caller can use.
@@ -997,7 +1040,7 @@ pub(crate) mod testing {
                     limit: 8,
                     released: AtomicBool::new(false),
                 });
-                super::spawn_heartbeat(&slot);
+                super::spawn_heartbeat(&slot, std::time::Duration::from_hours(1));
                 slot
             },
             account,
@@ -1052,7 +1095,7 @@ mod tests {
             limit: 8,
             released: AtomicBool::new(false),
         });
-        spawn_heartbeat(&slot);
+        spawn_heartbeat(&slot, Duration::from_hours(1));
         slot
     }
 
@@ -1099,6 +1142,63 @@ mod tests {
         let _slot = beating(&store);
         two_beats().await;
         assert_eq!(*store.acquired_under.lock().expect("lock"), vec![8, 8]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_leaked_slot_stops_beating_after_its_lifetime() {
+        // Held and never released: a leak. Beats at 30s and 60s refresh it;
+        // the 90s beat finds the lifetime spent and stops, so the member can
+        // expire. Five more beats' worth of time changes nothing.
+        let store = store(&[], true);
+        let slot = Arc::new(SlotGuard {
+            store: Arc::clone(&store) as Arc<dyn SlotStore>,
+            account: AccountId::from_uuid(uuid::Uuid::nil()),
+            request_id: "leaked".to_owned(),
+            limit: 8,
+            released: AtomicBool::new(false),
+        });
+        spawn_heartbeat(&slot, SLOT_HEARTBEAT * 3);
+        tokio::time::sleep(SLOT_HEARTBEAT * 8).await;
+        assert_eq!(store.refreshed.load(Ordering::SeqCst), 2);
+        drop(slot);
+    }
+
+    fn gateway_with(extra: &str) -> oag_core::config::GatewayConfig {
+        oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            "postgres://x@127.0.0.1:1/x",
+            "redis://127.0.0.1:1",
+            extra,
+        ))
+        .expect("config")
+        .gateway
+    }
+
+    #[test]
+    fn every_same_credential_retry_widens_the_lease_by_a_header_wait() {
+        // The review's case: slow headers retried on one credential, then a
+        // stream to its ceiling. Each retry is another header wait and backoff
+        // the lease has to outlive.
+        let two = gateway_with("gateway:\n  same_account_retries: 2\n");
+        let five = gateway_with("gateway:\n  same_account_retries: 5\n");
+        assert_eq!(
+            heartbeat_lifetime(&five),
+            heartbeat_lifetime(&two)
+                + (two.upstream_response_timeout + super::super::MAX_BACKOFF) * 3
+        );
+    }
+
+    #[test]
+    fn the_lease_outlives_its_slowest_legal_request() {
+        // Three header waits with the longest backoff before each, then a
+        // stream to its ceiling that overruns by an idle wait and a client
+        // write: the slowest request the deadlines allow still has a beat.
+        let g = gateway_with("");
+        let slowest = (g.upstream_response_timeout + super::super::MAX_BACKOFF)
+            * (u32::from(g.same_account_retries) + 1)
+            + g.max_stream_duration
+            + g.stream_idle_timeout
+            + g.client_write_timeout;
+        assert!(heartbeat_lifetime(&g) > slowest);
     }
 
     #[tokio::test(start_paused = true)]

@@ -160,6 +160,11 @@ fn describe_slot_metrics() {
          by reason. `expired` is a member that aged out and was taken back; \
          `oversubscribed` is one that could not be, so the seat is over its limit."
     );
+    metrics::describe_counter!(
+        "oag_slot_heartbeat_stopped_total",
+        "Slot heartbeats stopped because their lease outlived every request deadline: \
+         a leaked lease. Its member then expires within the slot TTL."
+    );
 }
 
 pub async fn render(State(state): State<Arc<AppState>>) -> impl IntoResponse {
