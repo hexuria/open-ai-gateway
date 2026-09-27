@@ -151,8 +151,8 @@ fn describe_vendor_fields() {
 fn describe_slot_metrics() {
     metrics::describe_counter!(
         "oag_slot_ghost_total",
-        "Times selection saw a full snapshot or a refused acquire while Redis \
-         had room (or none). Non-zero means a ghost lockout was averted."
+        "Times selection saw every credential full (a stale snapshot, or every \
+         acquire lost) while Redis had room. Non-zero means a ghost lockout was averted."
     );
     metrics::describe_counter!(
         "oag_slot_lost_total",

@@ -4,16 +4,21 @@
 #
 # The unit tests in crates/oag-server/src/gateway/select.rs own claim_slot's
 # decisions, one call at a time. This owns what they cannot see: many callers
-# interleaving on a real key while a batch of leases expires, which is how
-# oag86-1 admitted requests holding no member (peak seen: 7 on an 8-seat limit).
+# racing on a real key while a batch of leases expires, which is how oag86-1
+# admitted requests holding no member (peak seen: 7 on an 8-seat limit).
+#
+# claim_slot is now one atomic ACQUIRE_SLOT: the refusal and the live count
+# come from the same step, so the count-then-retry window oag86-1 lived in no
+# longer exists. The fixed model below is that single call. MODEL=buggy is the
+# pre-#86 three-step flow (acquire, separate count, retry, admit on refusal),
+# kept so this script can still be shown to fail.
 #
 # The Lua is read from crates/oag-store/src/cache.rs at run time, so this
-# always races the scripts production runs. The caller below is a second copy
-# of claim_slot's control flow (acquire, count, retry); if claim_slot changes
-# shape, change `caller` with it.
+# always races the scripts production runs. ACQUIRE_SLOT answers {taken, live};
+# the first line of redis-cli's reply is `taken`.
 #
 #   REDIS_PORT=6399 ./scripts/claim-slot-race.sh      # the fixed code: exits 0
-#   MODEL=buggy ./scripts/claim-slot-race.sh          # pre-fix code: exits 1
+#   MODEL=buggy ./scripts/claim-slot-race.sh          # pre-fix code: exits 1 in most runs (a race)
 set -euo pipefail
 
 P="${REDIS_PORT:-6399}"
@@ -58,17 +63,20 @@ for r in $(seq 1 "$ROUNDS"); do
     redis-cli -p "$P" zadd "$KEY" $((NOW - TTL + 1)) "seed-$r-$i" >/dev/null
   done
 
-  # claim_slot: acquire; on refusal count; on an empty key retry once.
+  acquire() {
+    redis-cli -p "$P" eval "$ACQ" 1 "$KEY" "$1" "$LIMIT" "$TTL" | head -1
+  }
   caller() {
     local id="r$r-req$1" a1 live a2
-    a1=$(redis-cli -p "$P" eval "$ACQ" 1 "$KEY" "$id" "$LIMIT" "$TTL")
+    a1=$(acquire "$id")
     if [ "$a1" = "1" ]; then echo admitted > "$OUT/$1"; return; fi
+    if [ "$MODEL" != buggy ]; then echo refused > "$OUT/$1"; return; fi
+    # Pre-#86: count separately, retry on an empty key, admit on refusal.
     live=$(redis-cli -p "$P" eval "$CNT" 1 "$KEY" "$TTL")
     if [ "$live" -gt 0 ]; then echo refused > "$OUT/$1"; return; fi
-    a2=$(redis-cli -p "$P" eval "$ACQ" 1 "$KEY" "$id" "$LIMIT" "$TTL")
+    a2=$(acquire "$id")
     if [ "$a2" = "1" ]; then echo admitted > "$OUT/$1"
-    elif [ "$MODEL" = buggy ]; then echo admitted_without_slot > "$OUT/$1"
-    else echo refused > "$OUT/$1"; fi
+    else echo admitted_without_slot > "$OUT/$1"; fi
   }
   for i in $(seq 1 "$N"); do caller "$i" & done
   wait

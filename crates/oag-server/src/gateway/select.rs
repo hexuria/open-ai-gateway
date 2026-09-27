@@ -4,7 +4,7 @@ use crate::AppState;
 use oag_core::credential::CredentialKind;
 use oag_core::{AccountId, Error, Provider, Result};
 use oag_pool::{Candidate, SessionKey};
-use oag_store::{AccountRow, repo};
+use oag_store::{AccountRow, SlotClaim, repo};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,17 +108,13 @@ impl SlotStore for oag_store::Cache {
 /// lease-side trait folds both into `false`, which is right for a heartbeat
 /// and wrong here.
 pub(crate) trait SlotLedger {
-    async fn acquire_slot(&self, account: AccountId, request_id: &str, limit: u32) -> Result<bool>;
-    async fn slots_in_use(&self, account: AccountId) -> Result<u32>;
+    async fn claim(&self, account: AccountId, request_id: &str, limit: u32) -> Result<SlotClaim>;
 }
 
 impl SlotLedger for oag_store::Cache {
-    async fn acquire_slot(&self, account: AccountId, request_id: &str, limit: u32) -> Result<bool> {
-        oag_store::Cache::acquire_slot(self, account, request_id, limit, SLOT_TTL).await
-    }
-
-    async fn slots_in_use(&self, account: AccountId) -> Result<u32> {
-        oag_store::Cache::slots_in_use(self, account, SLOT_TTL).await
+    async fn claim(&self, account: AccountId, request_id: &str, limit: u32) -> Result<SlotClaim> {
+        self.try_acquire_slot(account, request_id, limit, SLOT_TTL)
+            .await
     }
 }
 
@@ -584,7 +580,7 @@ pub async fn lease(
             return Err(none_left());
         };
 
-        if !claim_slot(&state.cache, row, request_id, "acquire").await {
+        if !claim_slot(&state.cache, row, request_id).await {
             // Lost the race for the last slot. Drop it and re-run rather than
             // failing: another credential is very likely free.
             remaining.retain(|r| r.account_id() != selection.account);
@@ -617,7 +613,7 @@ pub async fn lease(
                 "every acquire lost but redis has room; retrying"
             );
             metrics::counter!("oag_slot_ghost_total", "op" => "exhausted").increment(1);
-            if claim_slot(&state.cache, row, request_id, "exhausted").await {
+            if claim_slot(&state.cache, row, request_id).await {
                 let _ = state
                     .cache
                     .sticky_set(&sticky_key, row.account_id(), STICKY_TTL)
@@ -677,7 +673,7 @@ async fn try_pinned(
     }
     // Same policy as the cascade: an unanswerable Redis admits. The pin
     // was the right credential a moment ago; a blink does not change that.
-    if claim_slot(&state.cache, row, request_id, "sticky").await {
+    if claim_slot(&state.cache, row, request_id).await {
         metrics::counter!("oag_selection_total", "stage" => "sticky").increment(1);
         Some(row.clone())
     } else {
@@ -685,70 +681,27 @@ async fn try_pinned(
     }
 }
 
-/// Take a Redis slot, or admit if Redis is empty despite a refusal.
+/// Take a Redis slot: one atomic round trip.
 ///
-/// Capacity truth is the store. A snapshot or a last-write gauge that still
-/// says full after `ZCARD` is 0 is the ghost lockout: remasure then 503s
-/// `at_capacity` until restart. Retry the acquire against the empty key so
-/// the lease is a real member; only admit without one if the retry still
-/// sees none. A limit of zero is a closed seat, not a ghost.
-async fn claim_slot(
-    slots: &impl SlotLedger,
-    row: &AccountRow,
-    request_id: &str,
-    op: &'static str,
-) -> bool {
+/// A refusal is capacity truth, and it arrives with the count it was refused
+/// on, which is published. An unanswerable Redis admits: coordination is a
+/// courtesy, and refusing everything because Redis blinked trades a real
+/// outage for a theoretical oversubscription.
+///
+/// This used to be acquire, then a separate count, then a second acquire when
+/// the count read zero: the "ghost" retry, for a refusal beside an empty key.
+/// Three round trips on the saturated path, and two windows between them --
+/// the count/retry race is what `scripts/claim-slot-race.sh` was written for.
+/// With the count taken in the same step as the refusal, a refusal beside an
+/// empty key cannot happen (except at a limit of zero, which is a closed seat),
+/// so the retry had nothing left to catch. A key that empties just after a
+/// refusal is the exhausted path's to find.
+async fn claim_slot(slots: &impl SlotLedger, row: &AccountRow, request_id: &str) -> bool {
     let limit = u32::try_from(row.max_concurrency).unwrap_or(0);
-    let acquired = match slots
-        .acquire_slot(row.account_id(), request_id, limit)
-        .await
-    {
-        Ok(acquired) => acquired,
-        Err(e) => {
-            slot_accounting_degraded("acquire", &e);
-            return true;
-        }
-    };
-    if acquired {
-        return true;
-    }
-    let live = match slots.slots_in_use(row.account_id()).await {
-        Ok(n) => n,
-        Err(e) => {
-            // Degraded, not empty: acquire just said the seat was full, so
-            // publishing 0 here would wipe a real reading with a guess.
-            slot_accounting_degraded("count", &e);
-            return true;
-        }
-    };
-    publish_slots_in_use(&row.name, live);
-    if live > 0 || limit == 0 {
-        return false;
-    }
-    tracing::error!(
-        account = %row.name,
-        op,
-        "acquire refused a slot while redis has none; retrying"
-    );
-    metrics::counter!("oag_slot_ghost_total", "op" => op).increment(1);
-    match slots
-        .acquire_slot(row.account_id(), request_id, limit)
-        .await
-    {
-        Ok(true) => true,
-        Ok(false) => {
-            // An atomic refusal is capacity truth. ACQUIRE_SLOT only returns 0
-            // after `ZCARD >= limit`, and it returns before the ZADD -- so this
-            // caller holds no member. The retry exists to tell a stale snapshot
-            // from a full key, and it just answered "full": the key refilled
-            // between the count and this retry. Admitting here admits a request
-            // that nothing counts and nothing releases, which is the ghost this
-            // whole path was written to stop.
-            tracing::warn!(
-                account = %row.name,
-                op,
-                "retry refused: the key refilled between the count and the retry"
-            );
+    match slots.claim(row.account_id(), request_id, limit).await {
+        Ok(SlotClaim::Taken) => true,
+        Ok(SlotClaim::Full { live }) => {
+            publish_slots_in_use(&row.name, live);
             false
         }
         Err(e) => {
@@ -1432,12 +1385,11 @@ mod tests {
         assert_eq!(store.refreshed.load(Ordering::SeqCst), 0);
     }
 
-    /// A slot store that answers from a script, in order, and counts the
-    /// questions. `None` in a slot means "not asked for": asking panics, so a
-    /// test also pins which round trips a branch makes.
+    /// A slot store that gives one scripted answer and counts the questions,
+    /// so a test also pins that `claim_slot` makes exactly one round trip.
     struct ScriptedSlots {
-        acquires: std::sync::Mutex<std::collections::VecDeque<Result<bool>>>,
-        count: std::sync::Mutex<Option<Result<u32>>>,
+        answer: std::sync::Mutex<Option<Result<SlotClaim>>>,
+        asked: std::sync::atomic::AtomicUsize,
     }
 
     fn down() -> Error {
@@ -1445,92 +1397,48 @@ mod tests {
     }
 
     impl SlotLedger for ScriptedSlots {
-        fn acquire_slot(
-            &self,
-            _: AccountId,
-            _: &str,
-            _: u32,
-        ) -> impl Future<Output = Result<bool>> {
-            let mut acquires = self.acquires.lock().expect("script lock");
-            std::future::ready(
-                acquires
-                    .pop_front()
-                    .expect("an acquire the branch should not make"),
-            )
-        }
-
-        fn slots_in_use(&self, _: AccountId) -> impl Future<Output = Result<u32>> {
-            let mut count = self.count.lock().expect("script lock");
-            std::future::ready(count.take().expect("a count the branch should not make"))
+        fn claim(&self, _: AccountId, _: &str, _: u32) -> impl Future<Output = Result<SlotClaim>> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            let mut answer = self.answer.lock().expect("script lock");
+            std::future::ready(answer.take().expect("one answer, asked once"))
         }
     }
 
-    /// Run `claim_slot` against the script; every scripted answer must be used.
-    async fn claim(limit: i32, acquires: Vec<Result<bool>>, count: Option<Result<u32>>) -> bool {
+    /// Run `claim_slot` against one scripted answer.
+    async fn claim(limit: i32, answer: Result<SlotClaim>) -> bool {
         let slots = ScriptedSlots {
-            acquires: std::sync::Mutex::new(acquires.into()),
-            count: std::sync::Mutex::new(count),
+            answer: std::sync::Mutex::new(Some(answer)),
+            asked: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut row = super::testing::account("seat", "api_key");
         row.max_concurrency = limit;
-        let admitted = claim_slot(&slots, &row, "req", "acquire").await;
-        assert!(
-            slots.acquires.lock().expect("script lock").is_empty(),
-            "a scripted acquire went unasked"
-        );
-        assert!(
-            slots.count.lock().expect("script lock").is_none(),
-            "the scripted count went unasked"
-        );
+        let admitted = claim_slot(&slots, &row, "req").await;
+        assert_eq!(slots.asked.load(Ordering::SeqCst), 1, "one round trip");
         admitted
     }
 
     #[tokio::test]
-    async fn claim_slot_admits_a_granted_acquire_without_counting() {
-        assert!(claim(8, vec![Ok(true)], None).await);
+    async fn claim_slot_admits_a_taken_slot() {
+        assert!(claim(8, Ok(SlotClaim::Taken)).await);
     }
 
     #[tokio::test]
-    async fn claim_slot_fails_open_when_the_acquire_cannot_reach_redis() {
-        // Coordination is a courtesy: refusing everything because Redis blinked
-        // trades a real outage for a theoretical oversubscription.
-        assert!(claim(8, vec![Err(down())], None).await);
+    async fn claim_slot_refuses_a_full_seat_in_one_round_trip() {
+        // The old path counted separately and retried on an empty count; the
+        // count now arrives with the refusal, so there is nothing to retry.
+        assert!(!claim(8, Ok(SlotClaim::Full { live: 8 })).await);
     }
 
     #[tokio::test]
-    async fn claim_slot_refuses_a_full_seat_without_retrying() {
-        assert!(!claim(8, vec![Ok(false)], Some(Ok(8))).await);
+    async fn claim_slot_refuses_a_closed_seat() {
+        // A limit of zero refuses on an empty key. That is a closed seat, not
+        // a ghost.
+        assert!(!claim(0, Ok(SlotClaim::Full { live: 0 })).await);
     }
 
     #[tokio::test]
-    async fn claim_slot_fails_open_when_the_count_cannot_reach_redis() {
-        assert!(claim(8, vec![Ok(false)], Some(Err(down()))).await);
-    }
-
-    #[tokio::test]
-    async fn claim_slot_treats_a_zero_limit_as_closed_not_as_a_ghost() {
-        // An empty key and a refusal is the ghost signature, except when the
-        // limit is zero: that seat is closed, and a retry would be refused too.
-        assert!(!claim(0, vec![Ok(false)], Some(Ok(0))).await);
-    }
-
-    #[tokio::test]
-    async fn claim_slot_retries_a_ghost_refusal_and_admits_with_a_real_member() {
-        assert!(claim(8, vec![Ok(false), Ok(true)], Some(Ok(0))).await);
-    }
-
-    #[tokio::test]
-    async fn claim_slot_refuses_when_the_ghost_retry_is_refused_too() {
-        // oag86-1. The key refilled between the count and the retry, so the
-        // retry's refusal is capacity truth and this caller holds no member.
-        // Admitting here ran a request nothing counted and nothing released;
-        // `scripts/claim-slot-race.sh` saw 7 such on an 8-seat limit.
-        assert!(!claim(8, vec![Ok(false), Ok(false)], Some(Ok(0))).await);
-    }
-
-    #[tokio::test]
-    async fn claim_slot_fails_open_when_the_ghost_retry_cannot_reach_redis() {
-        assert!(claim(8, vec![Ok(false), Err(down())], Some(Ok(0))).await);
+    async fn claim_slot_fails_open_when_redis_cannot_answer() {
+        assert!(claim(8, Err(down())).await);
     }
 
     /// A state whose Redis is a port nothing listens on: every slot question
