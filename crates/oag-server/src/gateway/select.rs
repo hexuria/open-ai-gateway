@@ -689,7 +689,7 @@ async fn candidate_for(state: &AppState, row: &AccountRow, _now: i64) -> Option<
 /// open for the same reason: coordination is a courtesy, and refusing all
 /// traffic because the coordination store blinked trades a real outage for a
 /// theoretical oversubscription.
-fn slot_accounting_degraded(op: &'static str, e: &Error) {
+pub(crate) fn slot_accounting_degraded(op: &'static str, e: &Error) {
     use std::sync::atomic::AtomicU64;
     static SEEN: AtomicU64 = AtomicU64::new(0);
     metrics::counter!("oag_slot_accounting_degraded_total", "op" => op).increment(1);
@@ -860,9 +860,13 @@ fn every_candidate_is_full(candidates: &[Candidate], now: i64) -> Option<usize> 
 /// Only used to spread ties across equally-good credentials, so it needs to be
 /// unpredictable to nobody — but it does need to differ between concurrent
 /// calls in one process, which a time-seeded value does not reliably do.
-fn fastrand_u64() -> u64 {
+pub(crate) fn fastrand_u64() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
-    static STATE: AtomicU64 = AtomicU64::new(0x2545_F491_4F6C_DD1D);
+    // Zero is "not seeded yet" (xorshift never reaches it from a non-zero
+    // state). This was a constant seed, so every replica drew the same
+    // sequence from boot, and replicas started together broke ties the same
+    // way: the stampede the tie-breaker exists to prevent.
+    static STATE: AtomicU64 = AtomicU64::new(0);
     // xorshift64, advanced with one atomic read-modify-write so concurrent
     // callers get distinct draws. The comment above used to say "atomically"
     // over a separate load and store, which is two callers reading the same
@@ -870,6 +874,9 @@ fn fastrand_u64() -> u64 {
     // exact code path whose only job is to make two replicas differ.
     let mut next = 0u64;
     let _ = STATE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mut x| {
+        if x == 0 {
+            x = process_seed();
+        }
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
@@ -877,6 +884,14 @@ fn fastrand_u64() -> u64 {
         Some(x)
     });
     next
+}
+
+/// A seed that differs between processes: std's randomly keyed hasher, which
+/// draws its keys from the OS. A zero seed would leave the state at zero, and
+/// the next draw would simply seed again.
+fn process_seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::hash::RandomState::new().build_hasher().finish()
 }
 
 /// A slot store that counts releases instead of dialling Redis, and a lease
@@ -994,6 +1009,13 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{CountingSlots, lease as test_lease};
     use super::*;
+
+    #[test]
+    fn the_tie_breaker_seed_is_drawn_not_fixed() {
+        // Two draws of the seed differ, so it is not a constant; the process
+        // gets its keys from the OS, so replicas differ too.
+        assert_ne!(process_seed(), process_seed());
+    }
 
     /// A slot store for the heartbeat: `refresh` answers from a script (then
     /// "still held"), `acquire` answers `grant`, and every call is recorded.
