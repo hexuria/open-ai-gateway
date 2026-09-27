@@ -879,7 +879,11 @@ async fn pick_with_redis_room<'a>(
         return None;
     }
     let ids: Vec<AccountId> = rows.iter().map(|r| r.account_id()).collect();
-    let counts = state.cache.slots_in_use_many(&ids, SLOT_TTL).await.ok();
+    let counts = usable_counts(
+        state.cache.slots_in_use_many(&ids, SLOT_TTL).await,
+        ids.len(),
+    );
+    // Only a count that was read is published, as in `candidates_for`.
     if let Some(counts) = &counts {
         for (row, n) in rows.iter().zip(counts) {
             publish_slots_in_use(&row.name, *n);
@@ -892,6 +896,26 @@ async fn pick_with_redis_room<'a>(
         |account| state.breakers.permits(account, now),
         fastrand_u64(),
     )
+}
+
+/// A slot count to act on, or `None` for degraded -- counted as such.
+///
+/// The same reading `candidates_for` takes. A reply that does not cover every
+/// credential is degraded, not partial: publishing the prefix and treating the
+/// rest as full made the exhausted retry answer `AtCapacity` when the only seat
+/// with room sat past the prefix.
+fn usable_counts(read: Result<Vec<u32>>, asked: usize) -> Option<Vec<u32>> {
+    match read {
+        Ok(counts) if counts.len() == asked => Some(counts),
+        Ok(_) => {
+            slot_accounting_degraded("count", &Error::Internal("short pipeline reply".to_owned()));
+            None
+        }
+        Err(e) => {
+            slot_accounting_degraded("count", &e);
+            None
+        }
+    }
 }
 
 /// One of `rows` that could take a request now, chosen by `draw`.
@@ -1560,6 +1584,29 @@ mod tests {
             assert_eq!(pick(&rows, Some(&[0, 0, 0]), None, draw), Some("c"));
             assert_eq!(pick(&rows, Some(&[0, 0, 0]), Some("c"), draw), None);
         }
+    }
+
+    #[test]
+    fn the_exhausted_pick_honours_rate_limit_and_reserve() {
+        let mut rows = room_rows();
+        rows[0].rate_limited_until =
+            Some(time::OffsetDateTime::from_unix_timestamp(200).expect("t"));
+        rows[1].usage_remaining_pct = Some(rust_decimal::Decimal::from(5));
+        rows[1].usage_reserve_pct = Some(10);
+        for draw in 0..6 {
+            assert_eq!(pick(&rows, Some(&[0, 0, 0]), None, draw), Some("c"));
+            assert_eq!(pick(&rows, None, None, draw), Some("c"));
+        }
+    }
+
+    #[test]
+    fn a_count_that_does_not_cover_every_credential_is_degraded_not_partial() {
+        assert_eq!(usable_counts(Ok(vec![1, 2, 3]), 3), Some(vec![1, 2, 3]));
+        assert_eq!(usable_counts(Ok(vec![1, 2]), 3), None);
+        assert_eq!(
+            usable_counts(Err(Error::Internal("redis down".to_owned())), 3),
+            None
+        );
     }
 
     #[test]
