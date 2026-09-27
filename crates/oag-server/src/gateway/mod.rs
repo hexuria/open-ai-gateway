@@ -1250,10 +1250,12 @@ fn render_collected(
 fn json_response(
     body: &bytes::Bytes,
     events: &[oag_proto::StreamEvent],
-    // What the served answer's own accumulator judged it, the value the ledger
-    // records. This used to rebuild a second accumulator over every event just
-    // to ask again: a full extra pass on every collected response, and a
-    // second opinion that could drift from the first.
+    // What the served attempt's own accumulator judged it. Not necessarily
+    // what the ledger records: after an escalation the ledger names the gate
+    // that triggered the climb, while this is about the answer actually being
+    // sent. This used to rebuild a second accumulator over every event just
+    // to ask the same question again: a full extra pass on every collected
+    // response.
     gate: Option<oag_router::QualityGate>,
     decision: &RoutingDecision,
     request_id: RequestId,
