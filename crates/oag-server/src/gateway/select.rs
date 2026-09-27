@@ -195,8 +195,18 @@ impl SlotGuard {
                 gone.send_replace(true);
             });
         }
-        // Cannot close while we wait: `self` holds the sender.
-        let _ = self.gone.subscribe().wait_for(|gone| *gone).await;
+        // Bounded: the store call is a slot op, which gives up after its own
+        // two-second deadline, so a release that has not finished well past
+        // that is not going to. The TTL is then the backstop, as for any
+        // failed release. The watch cannot close while we wait: `self` holds
+        // the sender.
+        let mut gone = self.gone.subscribe();
+        if tokio::time::timeout(RELEASE_WAIT, gone.wait_for(|gone| *gone))
+            .await
+            .is_err()
+        {
+            tracing::debug!(request_id = %self.request_id, "slot release did not finish; it will expire");
+        }
     }
 }
 
@@ -321,6 +331,10 @@ impl Lease {
         self.slot.release().await;
     }
 }
+
+/// How long [`SlotGuard::release`] waits for the store to finish: well past
+/// the store's own two-second slot-op deadline.
+const RELEASE_WAIT: Duration = Duration::from_secs(5);
 
 /// A lease over `account`, holding its slot until the last clone is dropped.
 fn leased(state: &AppState, account: AccountRow, request_id: &str, via_sticky: bool) -> Lease {
@@ -1380,7 +1394,11 @@ mod tests {
             tokio::spawn(async move { slot.release().await })
         };
         tokio::task::yield_now().await;
-        slot.release().await;
+        // A deadline, so a release that never starts the store call fails
+        // here in milliseconds rather than hanging the suite.
+        tokio::time::timeout(Duration::from_secs(30), slot.release())
+            .await
+            .expect("the second release returns");
         assert!(
             store.done.load(Ordering::SeqCst),
             "the second release returned before the first had given the slot back"
