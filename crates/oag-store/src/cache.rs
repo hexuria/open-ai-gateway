@@ -170,7 +170,15 @@ static TAKE_TOKEN_SCRIPT: std::sync::LazyLock<redis::Script> =
 /// answer. Two seconds is well above a healthy RTT and well below a client
 /// timeout; the caller fail-opens, which is the same answer an unreachable
 /// Redis already gets.
-const SLOT_OP_TIMEOUT: Duration = Duration::from_secs(2);
+pub const SLOT_OP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many times a slot script is tried when Redis answers `NOSCRIPT`.
+///
+/// Each `NOSCRIPT` is answered by loading the script and going again. More
+/// than one retry because a `SCRIPT FLUSH` can land between the load and the
+/// eval; a bound because a Redis that flushes on every load would otherwise be
+/// retried forever.
+const NOSCRIPT_ATTEMPTS: usize = 4;
 
 /// How long one connection attempt may take, handshake included.
 ///
@@ -512,7 +520,7 @@ impl Cache {
                 );
             }
             let mut last = None;
-            for _ in 0..4 {
+            for _ in 0..NOSCRIPT_ATTEMPTS {
                 match pipe.query_async::<Vec<u32>>(&mut conn).await {
                     Ok(counts) => return Ok(counts),
                     // A single invocation loads the script on NOSCRIPT and retries; a
@@ -589,7 +597,7 @@ where
     T: redis::FromRedisValue,
 {
     let mut last = None;
-    for _ in 0..4 {
+    for _ in 0..NOSCRIPT_ATTEMPTS {
         match invocation.invoke_async(conn).await {
             Ok(v) => return Ok(v),
             Err(e) if is_noscript(&e) => {

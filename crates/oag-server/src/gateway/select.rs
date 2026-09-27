@@ -18,10 +18,10 @@ const STICKY_TTL: Duration = Duration::from_mins(30);
 
 /// How often a held slot refreshes its Redis score.
 ///
-/// Must be comfortably inside [`SLOT_TTL`]: two missed beats still leave the
-/// member inside the window, and a replica that dies stops refreshing, so the
-/// leaked members age out in one TTL instead of waiting for a 35-minute
-/// backstop that was sized for the longest possible stream.
+/// Must be comfortably inside [`SLOT_TTL`] (see the assertion below), and a
+/// replica that dies stops refreshing, so the leaked members age out in one
+/// TTL instead of waiting for a 35-minute backstop that was sized for the
+/// longest possible stream.
 pub(crate) const SLOT_HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// How long a concurrency slot survives without being refreshed or released.
@@ -37,9 +37,14 @@ pub(crate) const SLOT_HEARTBEAT: Duration = Duration::from_secs(30);
 /// waiting too long to notice a dead replica.
 pub(crate) const SLOT_TTL: Duration = Duration::from_mins(2);
 
+// A live member must survive three missed heartbeats, the last of which may
+// itself take a whole slot-op deadline to land. The trim is inclusive -- the
+// scripts drop scores `<= now - ttl` -- so a member last refreshed at `t` is
+// gone at exactly `t + SLOT_TTL`, when the fourth beat is only just due. Two
+// beats was the old check, and it said nothing about the op deadline.
 const _: () = assert!(
-    SLOT_HEARTBEAT.as_secs() * 2 < SLOT_TTL.as_secs(),
-    "a slot must survive two missed heartbeats or a delayed tick drops a live request"
+    SLOT_HEARTBEAT.as_secs() * 3 + oag_store::cache::SLOT_OP_TIMEOUT.as_secs() < SLOT_TTL.as_secs(),
+    "a slot must survive three missed heartbeats and a slow fourth"
 );
 
 /// Where a concurrency slot goes back to.
@@ -1420,10 +1425,8 @@ mod tests {
 
     #[test]
     fn the_slot_lease_is_a_crash_bound_inside_the_stream_ceiling() {
-        assert!(
-            SLOT_HEARTBEAT.as_secs() * 2 < SLOT_TTL.as_secs(),
-            "two missed heartbeats must not drop a live member"
-        );
+        // Heartbeat against TTL is a compile-time assertion beside the
+        // constants; this is the other half, against the configured ceiling.
         assert!(
             SLOT_TTL < oag_core::config::Config::default_gateway_max_stream_duration(),
             "a long agent stream outlives the crash lease; heartbeats are why"
