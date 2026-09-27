@@ -126,8 +126,17 @@ pub async fn clear_slots(
                     "name": row.name,
                     "dropped": dropped,
                     "in_flight": 0,
-                    "note": "Redis slots are gone fleet-wide; this replica's gauge is zero now, \
-                             and others publish 0 on their slot sweep",
+                    "note": format!(
+                        "Redis slots are gone fleet-wide; this replica's gauge is zero now, and \
+                         others publish 0 on their slot sweep. `dropped` counts every member \
+                         removed, ghosts and live requests alike. A live request tries to take \
+                         its seat back on its next heartbeat (within {}s), under the \
+                         credential's limit: if new requests have filled the seat by then it \
+                         is refused, and that request runs uncounted until it finishes, with \
+                         the credential over its limit meanwhile \
+                         (oag_slot_lost_total{{reason=\"oversubscribed\"}}).",
+                        crate::gateway::select::SLOT_HEARTBEAT.as_secs()
+                    ),
                 }))
                 .into_response()
             }
@@ -565,6 +574,17 @@ mod tests {
         );
         assert_eq!(json["dropped"], 1, "{json}");
         assert_eq!(json["name"], name, "{json}");
+        // The note must not promise that a clear is over within a heartbeat:
+        // the retake is refused when the seat has filled, and then the
+        // over-admission lasts as long as the request does.
+        let note = json["note"].as_str().expect("note");
+        for says in [
+            "ghosts and live requests alike",
+            "is refused",
+            "until it finishes",
+        ] {
+            assert!(note.contains(says), "note should say {says:?}: {note}");
+        }
         assert_eq!(
             state
                 .cache
