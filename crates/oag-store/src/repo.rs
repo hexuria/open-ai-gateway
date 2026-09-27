@@ -4461,6 +4461,22 @@ mod tests {
                     .await
                     .expect("a private copy of the table");
             }
+            // And the copies are what the queries will read. Were `pg_temp`
+            // not first on the search path, every name below would resolve to
+            // the shared tables again and this test would be back to flaking
+            // -- or worse, passing on whatever other tests left there.
+            let shadowed: Vec<String> = sqlx::query_scalar(
+                "SELECT n.nspname::text FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE c.oid IN ('account'::regclass, 'account_route'::regclass)",
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .expect("where the names resolve");
+            assert!(
+                shadowed.len() == 2 && shadowed.iter().all(|n| n.starts_with("pg_temp")),
+                "the plans would be taken on the shared tables: {shadowed:?}"
+            );
             sqlx::query(index)
                 .execute(&mut *tx)
                 .await
