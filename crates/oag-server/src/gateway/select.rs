@@ -1328,7 +1328,8 @@ mod tests {
         assert!(heartbeat_lifetime(&g) > slowest);
     }
 
-    /// A store whose release takes five seconds, and says when it is done.
+    /// A store whose release takes two seconds -- a slot op's deadline, the
+    /// longest a real one takes -- and says when it is done.
     #[derive(Default)]
     struct SlowRelease {
         done: AtomicBool,
@@ -1339,7 +1340,7 @@ mod tests {
     impl SlotStore for SlowRelease {
         async fn release(&self, _: AccountId, _: &str) {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
             self.done.store(true, Ordering::SeqCst);
         }
 
