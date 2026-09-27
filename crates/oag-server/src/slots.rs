@@ -41,9 +41,55 @@ async fn sweep_forever(state: Arc<AppState>) {
     let start = first_tick_at(tokio::time::Instant::now());
     let mut ticker = tokio::time::interval_at(start, SWEEP_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut labels = Labels::default();
     loop {
         ticker.tick().await;
-        sweep_once(&state).await;
+        let now = tokio::time::Instant::now();
+        sweep_once(&state, labels.current(&state.db, now).await).await;
+    }
+}
+
+/// How long the sweep keeps its list of accounts before reading it again.
+///
+/// Accounts are added and renamed by an operator, not per request. Reading
+/// the whole table on every 15s sweep, on every replica, was a full scan four
+/// times a minute to learn nothing new. Five minutes is how long a new
+/// credential's gauge can take to appear; its slots are counted by selection
+/// from the first request regardless.
+const LABEL_REFRESH: Duration = Duration::from_mins(5);
+
+/// The accounts the sweep publishes a gauge for, read at most every
+/// [`LABEL_REFRESH`].
+#[derive(Default)]
+struct Labels {
+    list: Vec<(oag_core::AccountId, String)>,
+    read_at: Option<tokio::time::Instant>,
+}
+
+impl Labels {
+    /// The list, read again if it is older than [`LABEL_REFRESH`].
+    ///
+    /// A failed read keeps the list it has and tries again on the next sweep:
+    /// an old list still publishes every gauge it knows, where no list
+    /// publishes none.
+    async fn current(
+        &mut self,
+        db: &oag_store::Db,
+        now: tokio::time::Instant,
+    ) -> &[(oag_core::AccountId, String)] {
+        let due = self
+            .read_at
+            .is_none_or(|at| now.duration_since(at) >= LABEL_REFRESH);
+        if due {
+            match oag_store::repo::account_slot_labels(db).await {
+                Ok(list) => {
+                    self.list = list;
+                    self.read_at = Some(now);
+                }
+                Err(e) => tracing::warn!(error = %e, "slot sweep: could not list accounts"),
+            }
+        }
+        &self.list
     }
 }
 
@@ -67,14 +113,7 @@ fn first_tick_offset() -> Duration {
 /// real reading during the one outage in which nothing knows. But it is said:
 /// this is the only thing that republishes the gauge when nothing selects, and
 /// a sweep failing in silence looked exactly like the bug it exists to fix.
-async fn sweep_once(state: &AppState) -> usize {
-    let labels = match oag_store::repo::account_slot_labels(&state.db).await {
-        Ok(labels) => labels,
-        Err(e) => {
-            tracing::warn!(error = %e, "slot sweep: could not list accounts");
-            return 0;
-        }
-    };
+async fn sweep_once(state: &AppState, labels: &[(oag_core::AccountId, String)]) -> usize {
     let mut published = 0;
     for chunk in labels.chunks(SWEEP_CHUNK) {
         let ids: Vec<_> = chunk.iter().map(|(id, _)| *id).collect();
@@ -159,6 +198,55 @@ mod tests {
             .expect("cleanup");
     }
 
+    /// The list is read once, reused inside the refresh window, and read again
+    /// after it.
+    #[tokio::test]
+    async fn the_account_list_is_reread_only_after_the_refresh_window() {
+        let Ok(db_url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = oag_store::Db::connect(&db_url, 4).expect("pool");
+        db.migrate().await.expect("migrate");
+        let start = tokio::time::Instant::now();
+        let mut labels = Labels::default();
+        // The first read.
+        labels.current(&db, start).await;
+
+        let tag = with_accounts(&db, 1).await;
+        let within = labels
+            .current(&db, start + LABEL_REFRESH - Duration::from_secs(1))
+            .await
+            .iter()
+            .any(|(_, name)| name.starts_with(&format!("sweep-{tag}")));
+        let after = labels
+            .current(&db, start + LABEL_REFRESH)
+            .await
+            .iter()
+            .any(|(_, name)| name.starts_with(&format!("sweep-{tag}")));
+        forget(&db, &tag).await;
+
+        assert!(!within, "read again inside the window");
+        assert!(after, "not read again once the window had passed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_reread_keeps_the_list_it_has() {
+        let Ok(db_url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = oag_store::Db::connect(&db_url, 4).expect("pool");
+        db.migrate().await.expect("migrate");
+        let start = tokio::time::Instant::now();
+        let mut labels = Labels::default();
+        let known = labels.current(&db, start).await.to_vec();
+
+        let dead = oag_store::Db::connect("postgres://oag:oag@127.0.0.1:1/oag", 1).expect("lazy");
+        let kept = labels.current(&dead, start + LABEL_REFRESH).await.to_vec();
+        assert_eq!(kept, known, "an unreadable table is not an empty one");
+    }
+
     /// Every account is counted, across more than one chunk.
     #[tokio::test]
     async fn a_sweep_counts_every_account_across_chunks() {
@@ -179,7 +267,10 @@ mod tests {
         let state = AppState::new(config, db.clone(), cache).expect("state");
         let tag = with_accounts(&db, SWEEP_CHUNK + 1).await;
 
-        let published = sweep_once(&state).await;
+        let labels = oag_store::repo::account_slot_labels(&db)
+            .await
+            .expect("list");
+        let published = sweep_once(&state, &labels).await;
         forget(&db, &tag).await;
         // Not an exact count: other tests add accounts concurrently. Our own
         // rows alone need two chunks, so a sweep that stopped after the first
@@ -207,7 +298,10 @@ mod tests {
         let state = AppState::new(config, db.clone(), cache).expect("state");
         let tag = with_accounts(&db, SWEEP_CHUNK + 1).await;
 
-        let published = sweep_once(&state).await;
+        let labels = oag_store::repo::account_slot_labels(&db)
+            .await
+            .expect("list");
+        let published = sweep_once(&state, &labels).await;
         forget(&db, &tag).await;
         assert_eq!(published, 0);
     }
