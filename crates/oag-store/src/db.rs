@@ -28,6 +28,25 @@ pub struct Db {
 /// Anything mutating that table must hold this for the width of its window.
 pub const MIGRATION_LOCK_ID: i64 = 0x0A6_1247_0001;
 
+/// Migrations whose file changed after a release, *in comments only*, and the
+/// checksum that release recorded.
+///
+/// sqlx checksums a migration's whole file, comments included, and refuses to
+/// run when an applied migration's recorded checksum differs from the file's.
+/// `0001_baseline.sql` had its comments edited after v0.1.0 (e73cebb), so a
+/// database v0.1.0 migrated would refuse every later release -- and restoring
+/// the old bytes would instead break every database migrated since. Listed
+/// here, the old checksum is recognised as the same migration and updated in
+/// place before sqlx checks. Anything not listed still fails closed.
+///
+/// Only ever add an entry for a comment-only change, with the `git diff` that
+/// shows it; a statement change needs a new migration, not this.
+const SUPERSEDED_CHECKSUMS: &[(i64, &str)] = &[(
+    1,
+    // sha384 of v0.1.0:migrations/0001_baseline.sql
+    "f943ee753ca709f0c28347eae4e0137d993a32d9ff3f38d453fb307ff52122e091730d96ac95c0886c5e2e108bc2d3f0",
+)];
+
 /// How long one statement may run before Postgres cancels it, when the caller
 /// does not say. Generous for a request-path query, which is a primary-key
 /// probe or an indexed range; a statement still running at ten seconds is not
@@ -142,10 +161,13 @@ impl Db {
         let mut migrator = sqlx::migrate!("../../migrations");
         migrator.set_ignore_missing(true);
 
-        let result = migrator
-            .run(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("applying migrations: {e}")));
+        let result = match Self::adopt_superseded_checksums(&mut conn, &migrator).await {
+            Ok(()) => migrator
+                .run(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("applying migrations: {e}"))),
+            Err(e) => Err(e),
+        };
 
         // Release explicitly rather than relying on connection drop, so the
         // next replica proceeds immediately instead of waiting for the pool.
@@ -237,9 +259,141 @@ fn schema_is_ready(applied: i64, embedded: usize) -> bool {
     usize::try_from(applied).is_ok_and(|applied| applied >= embedded)
 }
 
+impl Db {
+    /// Record the current checksum for any applied migration still carrying a
+    /// [`SUPERSEDED_CHECKSUMS`] entry's old one. Under the migration lock.
+    async fn adopt_superseded_checksums(
+        conn: &mut sqlx::PgConnection,
+        migrator: &sqlx::migrate::Migrator,
+    ) -> Result<()> {
+        // A fresh database has no ledger yet, and nothing to adopt.
+        let ledger: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::text")
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("looking for the migration ledger: {e}")))?;
+        if ledger.is_none() {
+            return Ok(());
+        }
+        for &(version, old) in SUPERSEDED_CHECKSUMS {
+            let Some(current) = migrator.iter().find(|m| m.version == version) else {
+                continue;
+            };
+            let old = hex::decode(old)
+                .map_err(|e| Error::Internal(format!("superseded checksum for {version}: {e}")))?;
+            let adopted = sqlx::query(
+                "UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2 AND checksum = $3",
+            )
+            .bind(current.checksum.as_ref())
+            .bind(version)
+            .bind(old)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("adopting migration {version}'s checksum: {e}")))?
+            .rows_affected();
+            if adopted > 0 {
+                tracing::warn!(
+                    version,
+                    "migration was recorded with a superseded checksum (a comment-only \
+                     edit after release); recorded the current one"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Db;
+
+    /// A throwaway database on the test server, dropped by the returned
+    /// closure's owner. These tests rewrite `_sqlx_migrations`, which on the
+    /// shared database would fail every other gated test migrating meanwhile.
+    async fn scratch_database() -> Option<(String, String)> {
+        let url = std::env::var("OAG_TEST_DATABASE_URL").ok()?;
+        let (server, _) = url.rsplit_once('/')?;
+        let name = format!("oag_heal_{}", uuid::Uuid::new_v4().simple());
+        let admin = Db::connect(&url, 1).expect("connect");
+        // The name is a fresh UUID, never input.
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+            .execute(admin.pool())
+            .await
+            .expect("a scratch database");
+        Some((format!("{server}/{name}"), name))
+    }
+
+    async fn drop_database(name: &str) {
+        let url = std::env::var("OAG_TEST_DATABASE_URL").expect("url");
+        let admin = Db::connect(&url, 1).expect("connect");
+        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP DATABASE IF EXISTS {name} WITH (FORCE)"
+        )))
+        .execute(admin.pool())
+        .await;
+    }
+
+    async fn recorded(db: &Db, version: i64) -> String {
+        let checksum: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = $1")
+                .bind(version)
+                .fetch_one(db.pool())
+                .await
+                .expect("recorded checksum");
+        hex::encode(checksum)
+    }
+
+    async fn record(db: &Db, version: i64, checksum_hex: &str) {
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = $1 WHERE version = $2")
+            .bind(hex::decode(checksum_hex).expect("hex"))
+            .bind(version)
+            .execute(db.pool())
+            .await
+            .expect("record");
+    }
+
+    /// A database v0.1.0 migrated carries 0001's old checksum. Migrating it
+    /// with this release must work, and record the current checksum.
+    #[tokio::test]
+    async fn a_database_migrated_by_v0_1_0_still_migrates() {
+        let Some((url, name)) = scratch_database().await else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("first migrate");
+        let current = recorded(&db, 1).await;
+        let (_, v0_1_0) = super::SUPERSEDED_CHECKSUMS[0];
+        record(&db, 1, v0_1_0).await;
+
+        let result = db.migrate().await;
+        let after = recorded(&db, 1).await;
+        drop(db);
+        drop_database(&name).await;
+        result.expect("a v0.1.0 database migrates");
+        assert_eq!(after, current, "the current checksum is recorded");
+    }
+
+    /// Anything not listed still fails closed: a changed migration is not
+    /// silently accepted.
+    #[tokio::test]
+    async fn an_unknown_checksum_still_refuses_to_migrate() {
+        let Some((url, name)) = scratch_database().await else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("first migrate");
+        record(&db, 1, &"ab".repeat(48)).await;
+
+        let result = db.migrate().await;
+        drop(db);
+        drop_database(&name).await;
+        assert!(
+            result.is_err(),
+            "an unlisted checksum must still fail closed"
+        );
+    }
 
     /// A reachable database with no schema is not a ready one.
     ///
