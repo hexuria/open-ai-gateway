@@ -16,10 +16,9 @@ choice is the operator's, and the schema records it so it is visible.
 | Kind | Standing | Use for |
 |---|---|---|
 | `api_key` | **Sanctioned.** Explicitly permitted for the customer's own authorised users. | The default. Pool and rotate freely. |
-| `bedrock`, `vertex` | **Sanctioned**, governed by your cloud agreement. | Deployments already on AWS or GCP. |
+| `bedrock` | **Sanctioned**, governed by your cloud agreement. | Deployments already on AWS. (`account add` stores Bedrock keys as `api_key`; `bedrock` is accepted for rows written by hand.) |
 | `oauth` — Team/Enterprise seat | **Sanctioned.** OAuth covers Free, Pro, Max, Team, and Enterprise purchasers. | Per-person binding: each member signs in with their own seat. |
 | `oauth` — individual Pro/Max seat, shared | **Constrained.** These plans assume ordinary, individual usage. | Personal single-user deployments. |
-| `service_account` | Depends on the provider. | Provider-specific. |
 
 ## What the providers actually say
 
@@ -58,7 +57,7 @@ account.owner_principal_id  uuid REFERENCES principal(id)
   gateway is doing ordinary individual usage; the gateway is routing and
   metering, not intermediating someone else's credential.
 - **NULL** — the credential joins the shared pool, available to every request on
-  its routes. Correct for `api_key`, `bedrock`, and `vertex`.
+  its routes. Correct for `api_key` and `bedrock`.
 
 The scheduler and the router do not care which. Everything else in this
 repository works identically either way.

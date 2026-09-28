@@ -228,6 +228,15 @@ impl AppState {
     }
 
     /// The adapter for a provider, or an error naming the provider we lack.
+    /// This state with `provider`'s adapter taken out, so a test can reach the
+    /// "leased a credential, then found no adapter" arm now that every provider
+    /// in the enum has one.
+    #[cfg(test)]
+    pub(crate) fn without_adapter(mut self, provider: Provider) -> Self {
+        Arc::make_mut(&mut self.adapters).remove(&provider);
+        self
+    }
+
     pub fn adapter(&self, provider: Provider) -> Result<Arc<dyn ProviderAdapter>> {
         self.adapters
             .get(&provider)
@@ -379,9 +388,7 @@ mod tests {
     ///
     /// The refusal is the proof, as it was for Codex: a `?` can only be
     /// rejected by the normaliser, so a provider whose configured base URL is
-    /// refused is a provider whose base URL went through it. `vertex` is absent
-    /// on purpose — it has no adapter here, so its key is inert, and asserting
-    /// a refusal for it would pin a behaviour that does not exist.
+    /// refused is a provider whose base URL went through it.
     #[tokio::test]
     async fn every_configured_base_url_goes_through_the_normaliser() {
         let build = |provider: &str, url: &str| {

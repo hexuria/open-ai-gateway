@@ -25,7 +25,7 @@ Every claim below that says “probed” was hit from this machine. Sources for 
 | piyook/llm-mock, dwmkerr/mock-llm | Skip | OpenAI-shaped paths; not our adapters. |
 | mokksy/ai-mocks, openai-responses, default MSW | Skip | In-process (JVM / Python httpx / Node intercept). Our client is Rust `reqwest`. |
 
-Nothing we found mocks Anthropic OAuth token refresh. `AnthropicAdapter::refresh` is still `Ok(None)`. Nothing we found is Anthropic’s real tokenizer; llm-mock and VidaiMock Gemini `countTokens` are estimates, like ours.
+Anthropic is reached with API keys only (a Claude subscription is never used to serve; see `docs/compliance.md`), so there is no Anthropic token refresh to mock. Nothing we found is Anthropic’s real tokenizer; llm-mock and VidaiMock Gemini `countTokens` are estimates, like ours.
 
 ## Experiments (this machine, 2026-08-24)
 

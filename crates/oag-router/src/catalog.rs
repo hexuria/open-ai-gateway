@@ -465,7 +465,7 @@ mod tests {
     fn ambiguous_bare_names_do_not_resolve() {
         let catalog = Catalog::from_entries([
             spec("openai/gpt-5", Provider::OpenAI, "gpt-5", 400_000),
-            spec("vertex/gpt-5", Provider::Vertex, "gpt-5", 400_000),
+            spec("bedrock/gpt-5", Provider::Bedrock, "gpt-5", 400_000),
         ]);
         // Guessing here would route spend to a provider the operator did not pick.
         assert!(catalog.resolve("gpt-5").is_none());

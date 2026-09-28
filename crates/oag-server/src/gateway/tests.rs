@@ -1102,13 +1102,12 @@ fn auth_context() -> oag_store::AuthContext {
 
 #[tokio::test]
 async fn streaming_adapter_or_egress_error_releases_slot() {
-    // `vertex` is a routable provider with no adapter registered, so the
-    // streaming arm fails *after* a credential has been leased — the same
-    // shape as a dialect pair with no renderer. Both used to return past
-    // every release, stranding the slot for the whole SLOT_TTL; eight of
-    // those on one credential and it answers AtCapacity with nothing in
-    // flight.
-    let state = state();
+    // A provider whose adapter is missing makes the streaming arm fail
+    // *after* a credential has been leased — the same shape as a dialect pair
+    // with no renderer. Both used to return past every release, stranding the
+    // slot for the whole SLOT_TTL; eight of those on one credential and it
+    // answers AtCapacity with nothing in flight.
+    let state = crate::testing::state_without_adapter(oag_core::Provider::Gemini);
     let slots = Arc::new(select::testing::CountingSlots::default());
 
     let result = stream_response(
@@ -1116,7 +1115,7 @@ async fn streaming_adapter_or_egress_error_releases_slot() {
         reqwest::Response::from(http::Response::new("stub")),
         select::testing::lease(&slots),
         &auth_context(),
-        &decision_for(oag_core::Provider::Vertex),
+        &decision_for(oag_core::Provider::Gemini),
         RequestId::new(),
         Instant::now(),
         0,
@@ -1126,7 +1125,7 @@ async fn streaming_adapter_or_egress_error_releases_slot() {
         oag_proto::FunctionNameMap::identity(),
     );
 
-    assert!(result.is_err(), "there is no adapter for vertex");
+    assert!(result.is_err(), "there is no adapter for gemini here");
     assert_eq!(slots.settled().await, 1, "and the slot came back");
 }
 

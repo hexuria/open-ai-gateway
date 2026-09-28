@@ -1,6 +1,6 @@
 use super::accounts::{
-    add_account, add_account_from_args, clear_account_slots, clear_slots_report, rename_account,
-    reserve_holds, validated_reserve,
+    add_account, add_account_from_args, clear_account_slots, clear_slots_report, kind_is_offered,
+    rename_account, reserve_holds, validated_reserve,
 };
 use super::catalog::{catalog_lines, empty_catalog_lines};
 use super::keys::{mint_key, revoke_key_lines};
@@ -1188,4 +1188,33 @@ fn hidden_flat_spellings_still_parse() {
         parse(&["set-mode", "--mode", "managed"]).unwrap_or_else(|e| panic!("{e}")),
         AdminCommand::SetMode { .. }
     ));
+}
+
+/// A Claude subscription is never a credential this gateway serves with, and
+/// the schema cannot say so on its own: its CHECK knows kinds, not pairs.
+#[test]
+fn a_credential_kind_the_provider_does_not_offer_is_refused() {
+    use oag_core::Provider;
+    for (provider, kind) in [
+        (Provider::Anthropic, "oauth"),
+        (Provider::Kimi, "bedrock"),
+        (Provider::Gemini, "oauth"),
+        (Provider::OpenAI, "vertex"),
+        (Provider::OpenAI, "no_such_kind"),
+    ] {
+        let refused = kind_is_offered(provider, kind).expect_err(&format!("{provider} {kind}"));
+        assert!(
+            refused.to_string().contains("does not take"),
+            "{provider} {kind}: {refused}"
+        );
+    }
+    for (provider, kind) in [
+        (Provider::Anthropic, "api_key"),
+        (Provider::OpenAI, "oauth"),
+        (Provider::XAI, "oauth"),
+        (Provider::Bedrock, "api_key"),
+        (Provider::Bedrock, "bedrock"),
+    ] {
+        kind_is_offered(provider, kind).unwrap_or_else(|e| panic!("{provider} {kind}: {e}"));
+    }
 }

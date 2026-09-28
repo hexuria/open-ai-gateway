@@ -891,7 +891,8 @@ impl Attributed {
         for (account, kind) in [(&sub, "oauth"), (&key, "api_key")] {
             sqlx::query(
                 "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
-                     credentials_nonce) VALUES ($1, $2, 'anthropic', $3, '\\x00', '\\x00')",
+                     credentials_nonce, schedulable) \
+                     VALUES ($1, $2, 'anthropic', $3, '\\x00', '\\x00', $3 <> 'oauth')",
             )
             .bind(Uuid::new_v4())
             .bind(account)

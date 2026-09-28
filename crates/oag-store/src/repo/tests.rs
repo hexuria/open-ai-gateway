@@ -2941,3 +2941,73 @@ async fn the_catalog_select_matches_the_schema() {
         .expect("catalog must not fail on a column name");
     assert!(rows.iter().any(|m| m.id == id));
 }
+
+/// 0018: the database refuses a Claude subscription that could serve, and the
+/// kinds no adapter ever served, whatever wrote the row. Each refusal names the
+/// constraint it trips, so a constraint dropped by a later migration fails here
+/// by name rather than by a count.
+#[tokio::test]
+async fn the_schema_refuses_a_claude_subscription_that_can_serve_and_a_dead_kind() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let insert = |provider: &'static str, kind: &'static str, schedulable: bool| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+                 credentials_nonce, schedulable) \
+                 VALUES (gen_random_uuid(), $1, $2, $3, '\\x00', '\\x00', $4) RETURNING id",
+            )
+            .bind(format!("guard-{}", Uuid::new_v4()))
+            .bind(provider)
+            .bind(kind)
+            .bind(schedulable)
+            .fetch_one(db.pool())
+            .await
+        }
+    };
+
+    for (provider, kind, constraint) in [
+        (
+            "anthropic",
+            "oauth",
+            "account_claude_subscription_never_serves",
+        ),
+        ("gemini", "vertex", "account_kind_check"),
+        ("openai", "service_account", "account_kind_check"),
+    ] {
+        let refused = insert(provider, kind, true)
+            .await
+            .expect_err(&format!("{provider}/{kind} must not be insertable"));
+        assert!(
+            refused.to_string().contains(constraint),
+            "{provider}/{kind} tripped the wrong thing: {refused}"
+        );
+    }
+
+    // A Claude plan that only books imported Claude Code usage is allowed —
+    // it can never be leased — and switching it on is what stays refused.
+    let plan = insert("anthropic", "oauth", false)
+        .await
+        .expect("an accounting-only Claude plan");
+    let switched_on = sqlx::query("UPDATE account SET schedulable = true WHERE id = $1")
+        .bind(plan)
+        .execute(db.pool())
+        .await
+        .expect_err("enabling a Claude subscription must be refused");
+    assert!(
+        switched_on
+            .to_string()
+            .contains("account_claude_subscription_never_serves"),
+        "{switched_on}"
+    );
+
+    for (provider, kind) in [("anthropic", "api_key"), ("xai", "oauth")] {
+        insert(provider, kind, true)
+            .await
+            .unwrap_or_else(|e| panic!("{provider}/{kind}: {e}"));
+    }
+}

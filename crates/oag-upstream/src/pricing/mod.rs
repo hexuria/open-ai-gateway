@@ -86,12 +86,7 @@ mod tests {
     /// request is built, which is the whole of the fix.
     #[tokio::test]
     async fn a_seat_credential_is_not_asked_for_a_price_list() {
-        for kind in [
-            CredentialKind::OAuth,
-            CredentialKind::Bedrock,
-            CredentialKind::Vertex,
-            CredentialKind::ServiceAccount,
-        ] {
+        for kind in [CredentialKind::OAuth, CredentialKind::Bedrock] {
             let answered = fetch(Provider::XAI, kind, &material(), None)
                 .await
                 .expect("no request is made, so nothing can fail");

@@ -162,8 +162,6 @@ mod tests {
             CredentialKind::ApiKey,
             CredentialKind::OAuth,
             CredentialKind::Bedrock,
-            CredentialKind::Vertex,
-            CredentialKind::ServiceAccount,
         ] {
             assert_eq!(endpoint_for(Provider::Anthropic, kind), None);
             assert_eq!(endpoint_for(Provider::Gemini, kind), None);
@@ -174,12 +172,7 @@ mod tests {
     fn only_a_flat_rate_kind_is_polled_at_all() {
         // A quota exists because a fee bought one. Any kind that is billed per
         // token has nothing to read, whichever provider it belongs to.
-        for kind in [
-            CredentialKind::ApiKey,
-            CredentialKind::Bedrock,
-            CredentialKind::Vertex,
-            CredentialKind::ServiceAccount,
-        ] {
+        for kind in [CredentialKind::ApiKey, CredentialKind::Bedrock] {
             assert_eq!(endpoint_for(Provider::XAI, kind), None);
             assert_eq!(endpoint_for(Provider::OpenAI, kind), None);
         }

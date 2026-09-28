@@ -228,8 +228,6 @@ fn kind_label(column: &str) -> Option<&'static str> {
         CredentialKind::ApiKey => Some("api"),
         CredentialKind::OAuth => Some("sub"),
         CredentialKind::Bedrock => Some("bedrock"),
-        CredentialKind::Vertex => Some("vertex"),
-        CredentialKind::ServiceAccount => Some("service_account"),
         // Closed for the kinds this build knows. A new kind still has a
         // column spelling; the qualifier vocabulary does not grow until
         // someone names it here.
