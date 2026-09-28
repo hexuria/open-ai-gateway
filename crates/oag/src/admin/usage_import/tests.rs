@@ -1,4 +1,13 @@
+use super::apply::{import, revert};
+use super::claude_code::scan_claude_code;
+use super::grok_cli::{GROK_TURN_COMPLETED, GROK_USAGE_LOG, scan_grok_cli};
+use super::planning::{Pending, Plan, Prices, Seat, plan};
+use super::verdict::{LedgerIndex, Skip, is_native_model};
 use super::*;
+use oag_core::credential::CredentialKind;
+use oag_store::Db;
+use rust_decimal::Decimal;
+use time::format_description::well_known::Rfc3339;
 
 /// A transcript line, spelled the way Claude Code spells one.
 fn line(session: &str, msg_id: &str, ts: &str, model: &str, u: [u64; 4]) -> String {
