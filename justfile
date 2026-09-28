@@ -55,7 +55,7 @@ race:
 # every mutant they guard survives.
 # Mutation-test what this branch changed against main.
 mutants base="origin/main":
-    git diff {{base}}...HEAD > target/mutants.diff
+    python3 scripts/mutants-diff.py {{base}}...HEAD > target/mutants.diff
     OAG_TEST_REDIS_URL={{dev_rd}} OAG_TEST_DATABASE_URL={{dev_db}} \
       cargo mutants --cap-lints true --in-diff target/mutants.diff
 

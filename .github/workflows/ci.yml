@@ -101,6 +101,10 @@ jobs:
       - name: mock upstream selftest
         run: MOCK_SELFTEST=1 python3 deploy/test/mock-upstream.py
 
+      # The mutants gate trusts this filter to drop only moved lines.
+      - name: mutants-diff selftest
+        run: python3 scripts/mutants-diff.py --selftest
+
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
@@ -282,7 +286,12 @@ jobs:
           tool: cargo-mutants
       - run: cargo run -p oag -- migrate
       - name: diff against the base branch
-        run: git diff "origin/${BASE_REF}...HEAD" > "$RUNNER_TEMP/pr.diff"
+        # Only lines that really changed: code git shows as moved unchanged
+        # is left out, so a pure move mutation-tests nothing and an edit
+        # made while moving is still tested. See scripts/mutants-diff.py.
+        # The script runs git itself, so a failed diff fails this step rather
+        # than handing cargo-mutants an empty file (which exits 0).
+        run: python3 scripts/mutants-diff.py "origin/${BASE_REF}...HEAD" > "$RUNNER_TEMP/pr.diff"
         env:
           BASE_REF: ${{ github.base_ref }}
       # --cap-lints: this workflow sets RUSTFLAGS=-D warnings, so a mutant that
