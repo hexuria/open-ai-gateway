@@ -18,7 +18,7 @@
 //! - The canonical URI is the path **URI-encoded exactly once**, which is not
 //!   the same string as the path on the wire. See [`uri_encode_path`].
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -213,7 +213,7 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     // credential down and fails over. A panic is a severed connection with no
     // response at all, and on HTTP/2 it resets every other stream multiplexed
     // onto it — one request's impossible branch taking out unrelated callers.
-    let Ok(mut mac) = <HmacSha256 as Mac>::new_from_slice(key) else {
+    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(key) else {
         return Vec::new();
     };
     mac.update(data);
@@ -236,6 +236,40 @@ fn format_amz_date(t: time::OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Known answers from outside this crate. Every other signature test here
+    // checks the signer against the same `hmac` helper it uses, so a change in
+    // what hmac or sha2 compute would pass them all; these would not.
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_test_case_2() {
+        assert_eq!(
+            hex::encode(hmac(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn sha256_matches_the_fips_180_abc_vector() {
+        assert_eq!(
+            hex::encode(Sha256::digest(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn the_signing_key_matches_awss_published_derivation_example() {
+        // AWS's worked example for deriving a SigV4 signing key: the example
+        // secret, 20150830, us-east-1, iam. The chain is the one `sign` runs.
+        let k_date = hmac(b"AWS4wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", b"20150830");
+        let k_region = hmac(&k_date, b"us-east-1");
+        let k_service = hmac(&k_region, b"iam");
+        let k_signing = hmac(&k_service, b"aws4_request");
+        assert_eq!(
+            hex::encode(k_signing),
+            "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
+        );
+    }
     use time::macros::datetime;
 
     fn creds() -> Credentials {

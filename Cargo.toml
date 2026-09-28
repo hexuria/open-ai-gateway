@@ -31,7 +31,7 @@ oag-server = { path = "crates/oag-server" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util", "limit", "load-shed"] }
-tower-http = { version = "0.6", features = ["catch-panic", "trace", "limit", "request-id", "timeout"] }
+tower-http = { version = "0.7", features = ["catch-panic", "trace", "limit", "request-id", "timeout"] }
 http = "1"
 http-body-util = "0.1"
 
@@ -80,15 +80,15 @@ url = "2"
 rust_decimal = { version = "1", features = ["serde-with-float", "macros"] }
 
 # ── credential sealing ─────────────────────────────────────────────────────────
-sha2 = "0.10"
+sha2 = "0.11"
 # SigV4 for Bedrock. HMAC-SHA256 over a canonical request — a few dozen lines
 # against the AWS SDK's several hundred crates, none of which we would use for
 # anything else.
-hmac = "0.12"
+hmac = "0.13"
 hex = "0.4"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
-rand = "0.8"
+rand = "0.10"
 base64 = "0.22"
 
 # ── observability ──────────────────────────────────────────────────────────────

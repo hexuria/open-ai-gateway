@@ -11,7 +11,7 @@
 //! so it is authenticated with [`AuthMac`] — see that type for why a plain
 //! JSON value was a privilege-escalation primitive.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use oag_core::{AccountId, Error, Result};
 use redis::AsyncCommands;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};

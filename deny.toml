@@ -10,10 +10,8 @@ all-features = false
 # a dead transitive crate is still ours to replace.
 unmaintained = "all"
 yanked = "deny"
-# No ignores. `.cargo/audit.toml` ignores RUSTSEC-2026-0235 (rkyv) because
-# audit reads Cargo.lock, which records optional dependencies. cargo-deny
-# resolves features, never sees rkyv, and so needs no ignore -- and will fail
-# if rust_decimal ever starts enabling it.
+# No ignores. rkyv, the one advisory this repository ever carried an ignore
+# for (in `.cargo/audit.toml`), left the lockfile with rust_decimal 1.43.
 ignore = []
 
 [licenses]
