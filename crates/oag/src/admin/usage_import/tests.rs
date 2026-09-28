@@ -890,9 +890,13 @@ impl Attributed {
         let key = format!("key-{}", Uuid::new_v4());
         for (account, kind) in [(&sub, "oauth"), (&key, "api_key")] {
             sqlx::query(
-                "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
-                     credentials_nonce, schedulable) \
-                     VALUES ($1, $2, 'anthropic', $3, '\\x00', '\\x00', $3 <> 'oauth')",
+                "WITH owner AS (INSERT INTO principal (id, email) \
+                     VALUES (gen_random_uuid(), 'owner-' || gen_random_uuid() || '@test') \
+                     RETURNING id) \
+                     INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+                     credentials_nonce, schedulable, owner_principal_id) \
+                     SELECT $1, $2, 'anthropic', $3, '\\x00', '\\x00', $3 <> 'oauth', owner.id \
+                     FROM owner",
             )
             .bind(Uuid::new_v4())
             .bind(account)

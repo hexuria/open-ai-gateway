@@ -1,9 +1,9 @@
 use super::accounts::{
     add_account, add_account_from_args, clear_account_slots, clear_slots_report, kind_is_offered,
-    rename_account, reserve_holds, validated_reserve,
+    rename_account, reserve_holds, set_account_owner, validated_reserve,
 };
 use super::catalog::{catalog_lines, empty_catalog_lines};
-use super::keys::{mint_key, revoke_key_lines};
+use super::keys::{mint_key, revoke_key_lines, seat_owner_warnings};
 use super::overview::{MONTH_HEADLINE_SQL, init};
 use super::principals::{principal_role, promote_principal, upsert_principal};
 use super::routes::{parse_ladder_rungs, upsert_route};
@@ -376,6 +376,126 @@ async fn a_typed_secret_beside_an_importer_is_refused_by_the_command() {
             .contains("--secret cannot be combined with --from"),
         "the error names the exclusion, so the operator knows which flag to \
              drop and that the environment fallback is not the problem: {err}"
+    );
+}
+
+/// A subscription seat belongs to one person: importing one without
+/// `--owner-email` is refused, and `--shared` — removed, kept hidden so old
+/// scripts learn why — is refused in every form. Each refusal comes before the
+/// first query, so a pool pointed at a closed port is enough.
+#[tokio::test]
+async fn a_seat_is_never_shared_and_never_imported_without_an_owner() {
+    let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag_g0", 1).expect("lazy pool");
+    let kek =
+        oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=").expect("kek");
+    for argv in [
+        &["--from", "codex"][..],
+        &["--from", "grok"],
+        &[
+            "--from",
+            "codex",
+            "--owner-email",
+            "me@example.com",
+            "--shared",
+        ],
+        &["--provider", "xai", "--secret", "s", "--shared"],
+    ] {
+        let mut full = vec!["admin", "account", "add", "--name", "seat"];
+        full.extend_from_slice(argv);
+        let cli = AdminCli::try_parse_from(&full).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+            panic!("expected an account add");
+        };
+        let err = add_account_from_args(&db, &kek, args)
+            .await
+            .expect_err(&format!("{argv:?} must be refused"));
+        assert!(
+            err.to_string().contains("belongs to one person"),
+            "{argv:?}: {err}"
+        );
+    }
+}
+
+/// `account set-owner` binds a seat, and refuses a name it cannot resolve to
+/// exactly one credential rather than moving the wrong one.
+#[tokio::test]
+async fn set_owner_binds_exactly_one_credential() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 2).expect("connect");
+    db.migrate().await.expect("migrate");
+    let email = format!("{}@example.invalid", Uuid::new_v4());
+    let owner: Uuid =
+        sqlx::query_scalar("INSERT INTO principal (id, email) VALUES ($1, $2) RETURNING id")
+            .bind(Uuid::new_v4())
+            .bind(&email)
+            .fetch_one(db.pool())
+            .await
+            .expect("principal");
+    let key = |name: String| {
+        let db = db.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+                 credentials_nonce) VALUES ($1, $2, 'xai', 'api_key', '\\x00', '\\x00')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(name)
+            .execute(db.pool())
+            .await
+            .expect("account");
+        }
+    };
+
+    let name = format!("bind-{}", Uuid::new_v4());
+    key(name.clone()).await;
+    let said = set_account_owner(&db, &name, &email).await.expect("bind");
+    assert!(
+        said.contains(&email) && said.contains("personal (serves its owner only)"),
+        "{said}"
+    );
+    let bound: Option<Uuid> =
+        sqlx::query_scalar("SELECT owner_principal_id FROM account WHERE name = $1")
+            .bind(&name)
+            .fetch_one(db.pool())
+            .await
+            .expect("row");
+    assert_eq!(bound, Some(owner));
+
+    let missing = set_account_owner(&db, &format!("nope-{}", Uuid::new_v4()), &email)
+        .await
+        .expect_err("no such credential");
+    assert!(
+        missing.to_string().contains("no credential named"),
+        "{missing}"
+    );
+    let nobody = set_account_owner(&db, &name, "nobody@example.invalid")
+        .await
+        .expect_err("no such principal");
+    assert!(nobody.to_string().contains("no principal"), "{nobody}");
+
+    let twin = format!("twin-{}", Uuid::new_v4());
+    key(twin.clone()).await;
+    key(twin.clone()).await;
+    let ambiguous = set_account_owner(&db, &twin, &email)
+        .await
+        .expect_err("two credentials share the name");
+    assert!(
+        ambiguous.to_string().contains("rename one first"),
+        "{ambiguous}"
+    );
+    let moved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM account WHERE name = $1 AND owner_principal_id IS NOT NULL",
+    )
+    .bind(&twin)
+    .fetch_one(db.pool())
+    .await
+    .expect("count");
+    assert_eq!(
+        moved, 0,
+        "the refusal rolled back, so neither twin was bound"
     );
 }
 
@@ -1217,4 +1337,133 @@ fn a_credential_kind_the_provider_does_not_offer_is_refused() {
     ] {
         kind_is_offered(provider, kind).unwrap_or_else(|e| panic!("{provider} {kind}: {e}"));
     }
+}
+
+/// `key create` and `doctor` both say it when a seat's owner holds several
+/// live inference keys, naming the seat, the owner and the count; one key says
+/// nothing.
+#[tokio::test]
+async fn a_seat_owner_minting_a_second_key_is_warned() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 2).expect("connect");
+    db.migrate().await.expect("migrate");
+    let email = format!("{}@example.invalid", Uuid::new_v4());
+    let route = format!("r-{}", Uuid::new_v4());
+    let seat = format!("seat-{}", Uuid::new_v4());
+    sqlx::query("INSERT INTO principal (id, email) VALUES ($1, $2)")
+        .bind(Uuid::new_v4())
+        .bind(&email)
+        .execute(db.pool())
+        .await
+        .expect("principal");
+    sqlx::query("INSERT INTO route (id, name, tiers) VALUES ($1, $2, '[]'::jsonb)")
+        .bind(Uuid::new_v4())
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("route");
+    sqlx::query(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce, \
+         owner_principal_id) SELECT $1, $2, 'xai', 'oauth', '\\x00', '\\x00', p.id \
+         FROM principal p WHERE p.email = $3",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&seat)
+    .bind(&email)
+    .execute(db.pool())
+    .await
+    .expect("seat");
+
+    mint_key(&db, &email, &route, "laptop", None, false)
+        .await
+        .expect("first key");
+    assert!(seat_owner_warnings(&db, &email).await.is_empty());
+
+    mint_key(&db, &email, &route, "someone-else", None, false)
+        .await
+        .expect("second key");
+    let warned = seat_owner_warnings(&db, &email).await;
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    for part in [
+        seat.as_str(),
+        email.as_str(),
+        "2 live keys",
+        "shares the seat",
+    ] {
+        assert!(
+            warned[0].contains(part),
+            "{part} missing from {}",
+            warned[0]
+        );
+    }
+    let from_doctor = super::doctor::check_seat_owner_keys(&db)
+        .await
+        .expect("doctor's check");
+    assert!(
+        from_doctor.iter().any(|s| s.seat == seat && s.keys == 2),
+        "doctor sees the same seat: {from_doctor:?}"
+    );
+}
+
+/// The dispatchers hand back what the command they ran said. With a pool that
+/// cannot connect, every command fails; a dispatcher that answered `Ok` without
+/// running anything would pass for a working one.
+#[tokio::test]
+async fn the_account_and_key_dispatchers_surface_the_commands_errors() {
+    let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag_g0", 1).expect("lazy pool");
+    let kek =
+        oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=").expect("kek");
+    let redis = "redis://127.0.0.1:1";
+
+    let AdminCommand::Account(cmd) = AdminCli::try_parse_from([
+        "admin",
+        "account",
+        "set-owner",
+        "seat",
+        "--owner-email",
+        "me@example.com",
+    ])
+    .expect("parses")
+    .cmd
+    else {
+        panic!("expected an account command");
+    };
+    super::accounts::account_cmd(&db, &kek, cmd, redis)
+        .await
+        .expect_err("set-owner cannot succeed without a database");
+
+    let AdminCommand::Key(cli) =
+        AdminCli::try_parse_from(["admin", "key", "create", "--email", "me@example.com"])
+            .expect("parses")
+            .cmd
+    else {
+        panic!("expected a key command");
+    };
+    super::keys::key_cmd(&db, redis, cli)
+        .await
+        .expect_err("key create cannot succeed without a database");
+}
+
+/// `doctor` fails a route it cannot find, rather than printing `ok` for it.
+#[tokio::test]
+async fn doctor_fails_a_route_that_does_not_exist() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 2).expect("connect");
+    db.migrate().await.expect("migrate");
+    let config = oag_core::config::Config::from_yaml(&format!(
+        "database:\n  url: \"{url}\"\nredis:\n  url: \"redis://127.0.0.1:1\"\nsecurity:\n  \
+         signing_secret: \"Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0=\"\n  \
+         credential_kek: \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n"
+    ))
+    .expect("a minimal config parses");
+    let route = format!("no-such-route-{}", Uuid::new_v4());
+    super::doctor::run(&db, &config, &route)
+        .await
+        .expect_err("a missing route is a problem");
 }

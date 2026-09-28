@@ -16,27 +16,43 @@ use oag_store::Db;
 /// below counts the files rather than trusting this line, because the number
 /// that matters is the one on disk and a constant is exactly the thing that
 /// gets forgotten.
-const EXPECTED_MIGRATIONS: usize = 18;
+const EXPECTED_MIGRATIONS: usize = 19;
 
 pub async fn run(db: &Db, config: &Config, route: &str) -> Result<()> {
+    conclude(problems(db, config, route).await?)
+}
+
+/// How many problems `run` reports, for a test to count.
+async fn problems(db: &Db, config: &Config, route: &str) -> Result<u32> {
     let mut failed = 0u32;
 
     failed += check_migrations(db).await?;
     failed += check_catalog(db).await?;
     let Some((_mode, rungs)) = check_route(db, route).await? else {
-        failed += 1;
-        return conclude(failed);
+        return Ok(failed + 1);
     };
     let accounts = load_accounts(db, route).await?;
-    failed += report_accounts(&accounts);
-    failed += check_ladder(&rungs, &accounts, route);
+    failed += route_problems(&rungs, &accounts, route);
+    // Named, never counted: several keys on one seat owner are fine when they
+    // are all that person's, and only the operator knows.
+    let _many_keys = check_seat_owner_keys(db).await?;
+    failed += check_codex(config, &accounts);
+    Ok(failed)
+}
+
+/// Everything doctor can say about a route from its ladder and credentials
+/// alone, as a count of problems. Split from `run` so the arithmetic is
+/// checkable without a database.
+fn route_problems(rungs: &[oag_router::ladder::Rung], accounts: &[Seat], route: &str) -> u32 {
+    let mut failed = report_accounts(accounts);
+    failed += check_ladder(rungs, accounts, route);
     // Named, never counted: an unpriced seat is a reporting gap and the gateway
     // serves perfectly well without the figure. Exiting non-zero over it would
     // make `doctor` unusable in CI.
-    let _unpriced = check_seat_prices(&accounts);
-    failed += check_reserves(&accounts);
-    failed += check_codex(config, &accounts);
-    conclude(failed)
+    let _unpriced = check_seat_prices(accounts);
+    failed += check_orphaned_seats(accounts);
+    failed += check_reserves(accounts);
+    failed
 }
 
 fn conclude(failed: u32) -> Result<()> {
@@ -200,8 +216,17 @@ impl Seat {
     /// entitled to the route. An owner-bound credential answers exactly one
     /// principal, so counting it as coverage told every other principal their
     /// route was healthy right up until `no_viable_model`.
-    const fn shared(&self) -> bool {
-        self.owner_principal_id.is_none()
+    ///
+    /// An owner-less subscription seat answers no one at all — the scheduler
+    /// matches it for nobody until `account set-owner` binds it — so only an
+    /// owner-less key that is not a seat is shared.
+    fn shared(&self) -> bool {
+        self.owner_principal_id.is_none() && self.kind != "oauth"
+    }
+
+    /// A subscription seat with no owner: inert, and reported as such.
+    fn orphaned_seat(&self) -> bool {
+        self.owner_principal_id.is_none() && self.kind == "oauth"
     }
 
     /// Whether the reserve is holding this seat out of the pool right now.
@@ -315,6 +340,22 @@ fn report_accounts(accounts: &[Seat]) -> u32 {
     0
 }
 
+/// Live credentials for `provider` that serve exactly one principal: the
+/// reason a rung can read "no credential" while `account list` shows one
+/// ready. An owner-less seat is not one of them — it serves no one, and
+/// [`check_orphaned_seats`] says so.
+fn bound_elsewhere<'a>(
+    accounts: &'a [Seat],
+    provider: &str,
+    now: time::OffsetDateTime,
+) -> Vec<&'a str> {
+    accounts
+        .iter()
+        .filter(|a| a.provider == provider && a.live(now) && !a.shared() && !a.orphaned_seat())
+        .map(|a| a.name.as_str())
+        .collect()
+}
+
 fn check_ladder(rungs: &[oag_router::ladder::Rung], accounts: &[Seat], route: &str) -> u32 {
     let now = time::OffsetDateTime::now_utc();
     let mut failed = 0;
@@ -355,11 +396,7 @@ fn check_ladder(rungs: &[oag_router::ladder::Rung], accounts: &[Seat], route: &s
             // `account list` shows it ready — and the operator goes looking for
             // an outage that is not there.
             for p in &missing {
-                let bound: Vec<&str> = accounts
-                    .iter()
-                    .filter(|a| a.provider == **p && a.live(now) && !a.shared())
-                    .map(|a| a.name.as_str())
-                    .collect();
+                let bound = bound_elsewhere(accounts, p, now);
                 if !bound.is_empty() {
                     println!(
                         "     note: {} is live but bound to one principal, so it cannot \
@@ -412,6 +449,51 @@ fn check_seat_prices(accounts: &[Seat]) -> Vec<&str> {
     );
     println!("     fix: oag admin account set-cost {first} --monthly-cost <your plan price>");
     unpriced
+}
+
+/// A subscription seat nobody owns, which therefore serves nobody.
+///
+/// Reported as a failure: an older version let `--shared` pool a personal
+/// plan, and the request path now matches such a seat for no one, so it is
+/// silently out of the pool until an owner is named.
+fn check_orphaned_seats(accounts: &[Seat]) -> u32 {
+    let orphaned: Vec<&str> = accounts
+        .iter()
+        .filter(|a| a.orphaned_seat())
+        .map(|a| a.name.as_str())
+        .collect();
+    let Some(first) = orphaned.first() else {
+        return 0;
+    };
+    println!(
+        "FAIL seats       {} has no owner, so serves no one: a subscription seat \
+         belongs to one person",
+        orphaned.join(", ")
+    );
+    println!("     fix: oag admin account set-owner {first} --owner-email <its owner>");
+    u32::try_from(orphaned.len()).unwrap_or(u32::MAX)
+}
+
+/// Seat owners holding more than one live inference key.
+pub(super) async fn check_seat_owner_keys(
+    db: &Db,
+) -> Result<Vec<oag_store::repo::SeatWithManyKeys>> {
+    let many = oag_store::repo::seats_with_many_keys(db, None).await?;
+    for s in &many {
+        println!("{}", many_keys_warning(s));
+    }
+    Ok(many)
+}
+
+/// The one wording for "this seat's owner has several keys", shared with
+/// `key create`, so the operator reads the same sentence wherever it fires.
+pub(super) fn many_keys_warning(s: &oag_store::repo::SeatWithManyKeys) -> String {
+    format!(
+        "WARN seats       {} belongs to {}, who holds {} live keys. Fine if they are \
+         all theirs; a key given to anyone else shares the seat, which its terms \
+         forbid.",
+        s.seat, s.owner_email, s.keys
+    )
 }
 
 /// A seat sitting at or below its reserve, which is a request that will fail
@@ -493,6 +575,11 @@ fn check_codex(config: &Config, accounts: &[Seat]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Held by every test here that reads `_sqlx_migrations` while another
+    /// writes it: the gap test plants a bogus row for a moment, and a check
+    /// that ran in that moment would count it.
+    static SCHEMA_ROWS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn the_expected_migration_count_matches_the_migrations_on_disk() {
@@ -629,14 +716,16 @@ mod tests {
             name: oag_core::TierName::new("cheap"),
             models: vec![oag_router::ModelId::new("xai/grok-4.6")],
         }];
-        assert_eq!(
-            check_ladder(&rungs, &[reserved("grok", 2, 10)], "default"),
-            1
-        );
-        assert_eq!(
-            check_ladder(&rungs, &[reserved("grok", 80, 10)], "default"),
-            0
-        );
+        // A pooled credential carrying the reading, because only an
+        // owner-less non-seat covers a rung for everyone; the reserve rule
+        // itself does not look at the kind.
+        let pooled = |remaining| {
+            let mut s = reserved("grok", remaining, 10);
+            s.kind = "api_key".to_owned();
+            s
+        };
+        assert_eq!(check_ladder(&rungs, &[pooled(2)], "default"), 1);
+        assert_eq!(check_ladder(&rungs, &[pooled(80)], "default"), 0);
     }
     /// C10. An owner-bound seat does not cover a rung for everyone else.
     ///
@@ -666,17 +755,154 @@ mod tests {
             "a rung whose only credential answers one principal is not covered"
         );
 
-        // A shared credential beside it covers the rung for everyone.
+        // A shared credential beside it covers the rung for everyone. It is
+        // an API key: a seat is never shared, and an owner-less one covers
+        // nothing (below).
         assert_eq!(
             check_ladder(
                 &rungs,
                 &[
                     owner_bound("grok-personal"),
-                    seat("grok-team", "oauth", Some(300))
+                    seat("grok-team", "api_key", None)
                 ],
                 "default"
             ),
             0
+        );
+    }
+
+    /// A route's problems add up: an owner-less seat beside a live shared key
+    /// is one problem and nothing else, and binding it clears the count.
+    #[test]
+    fn an_ownerless_seat_is_one_route_problem_and_binding_it_clears_it() {
+        let rungs = vec![oag_router::ladder::Rung {
+            name: oag_core::TierName::new("cheap"),
+            models: vec![oag_router::ModelId::new("xai/grok-4.6")],
+        }];
+        let key = || seat("pooled-key", "api_key", None);
+        assert_eq!(route_problems(&rungs, &[key()], "default"), 0);
+        assert_eq!(
+            route_problems(
+                &rungs,
+                &[key(), seat("grok-pooled", "oauth", Some(300))],
+                "default"
+            ),
+            1
+        );
+        assert_eq!(
+            route_problems(&rungs, &[key(), owner_bound("grok-personal")], "default"),
+            0
+        );
+        assert_eq!(check_orphaned_seats(&[key(), owner_bound("mine")]), 0);
+
+        // The other checks add too: a rung only a personal seat covers is one
+        // problem, and a pooled key held out by its reserve is two (the rung,
+        // and the reserve).
+        assert_eq!(route_problems(&rungs, &[owner_bound("mine")], "default"), 1);
+        let mut held = key();
+        held.usage_remaining_pct = Some(rust_decimal::Decimal::from(2));
+        held.usage_reserve_pct = Some(10);
+        assert_eq!(route_problems(&rungs, &[held], "default"), 2);
+    }
+
+    /// `run`'s total is the schema checks plus the route's own problems: a
+    /// route with a live shared key adds nothing, and the same ladder with no
+    /// credential adds two (no accounts, and an uncovered rung).
+    #[tokio::test]
+    async fn the_route_problems_add_to_the_total() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let config = oag_core::config::Config::from_yaml(&format!(
+            "database:\n  url: \"{url}\"\nredis:\n  url: \"redis://127.0.0.1:1\"\n\
+             security:\n  signing_secret: \"Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG0=\"\n  \
+             credential_kek: \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n"
+        ))
+        .expect("config");
+        let route = |name: String| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, uuid::Uuid>(
+                    "INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, \
+                     '[{\"name\":\"cheap\",\"models\":[\"xai/grok-4.6\"]}]'::jsonb) RETURNING id",
+                )
+                .bind(&name)
+                .fetch_one(db.pool())
+                .await
+                .expect("route");
+                name
+            }
+        };
+        let good = route(format!("good-{}", uuid::Uuid::new_v4())).await;
+        let bad = route(format!("bad-{}", uuid::Uuid::new_v4())).await;
+        let key: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+             VALUES (gen_random_uuid(), $1, 'xai', 'api_key', '\\x00', '\\x00') RETURNING id",
+        )
+        .bind(format!("key-{}", uuid::Uuid::new_v4()))
+        .fetch_one(db.pool())
+        .await
+        .expect("key");
+        sqlx::query(
+            "INSERT INTO account_route (account_id, route_id) SELECT $1, id FROM route WHERE name = $2",
+        )
+        .bind(key)
+        .bind(&good)
+        .execute(db.pool())
+        .await
+        .expect("attach");
+
+        let _rows = SCHEMA_ROWS.lock().await;
+        let schema = check_migrations(&db).await.expect("m") + check_catalog(&db).await.expect("c");
+        assert_eq!(problems(&db, &config, &good).await.expect("good"), schema);
+        assert_eq!(problems(&db, &config, &bad).await.expect("bad"), schema + 2);
+    }
+
+    /// The note on a failed rung names only credentials that serve one
+    /// principal: not a shared key, not an owner-less seat, not another
+    /// provider's, and not one that is out of rotation.
+    #[test]
+    fn the_bound_note_names_only_live_personal_credentials_of_that_provider() {
+        let now = time::OffsetDateTime::now_utc();
+        let mut elsewhere = owner_bound("other-provider");
+        elsewhere.provider = "openai".to_owned();
+        let mut off = owner_bound("disabled");
+        off.schedulable = false;
+        let accounts = [
+            owner_bound("mine"),
+            seat("pooled-key", "api_key", None),
+            seat("grok-pooled", "oauth", Some(300)),
+            elsewhere,
+            off,
+        ];
+        assert_eq!(bound_elsewhere(&accounts, "xai", now), vec!["mine"]);
+    }
+
+    /// Migration 0019: a seat with no owner, pooled by an older version's
+    /// `--shared`, serves no one. It covers no rung, is not described as
+    /// "bound to one principal", and is reported with the command that binds
+    /// it.
+    #[test]
+    fn an_ownerless_seat_covers_nothing_and_is_reported() {
+        let rungs = vec![oag_router::ladder::Rung {
+            name: oag_core::TierName::new("cheap"),
+            models: vec![oag_router::ModelId::new("xai/grok-4.6")],
+        }];
+        let orphan = seat("grok-pooled", "oauth", Some(300));
+        assert!(orphan.live(time::OffsetDateTime::now_utc()));
+        assert!(orphan.orphaned_seat() && !orphan.shared());
+        assert_eq!(check_ladder(&rungs, &[orphan], "default"), 1);
+        assert_eq!(
+            check_orphaned_seats(&[
+                seat("grok-pooled", "oauth", Some(300)),
+                seat("pooled-key", "api_key", None),
+                owner_bound("grok-personal"),
+            ]),
+            1,
+            "only the owner-less seat is a problem; an owner-less key is the pool"
         );
     }
     /// C16. A gap or a failed row is not a healthy schema.
@@ -696,6 +922,7 @@ mod tests {
         };
         let db = Db::connect(&url, 2).expect("connect");
         db.migrate().await.expect("migrate");
+        let _rows = SCHEMA_ROWS.lock().await;
 
         // The healthy case, which is what the test database is in.
         assert_eq!(check_migrations(&db).await.expect("check"), 0);

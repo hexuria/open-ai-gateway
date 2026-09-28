@@ -392,7 +392,8 @@ struct NothingUsable {
 
 /// The error for "nothing to dispatch to", and the line that says who asked.
 ///
-/// `repo::candidates` filters `owner_principal_id IS NULL OR = $3`, so a
+/// `repo::candidates` keeps only the caller's own credentials and owner-less
+/// API keys (an owner-less seat matches no one), so a
 /// credential bound to one principal is *invisible* to another rather than
 /// refused — and the error a caller sees says only "no credential for
 /// <provider>". On 2026-09-08 that cost four hypotheses and an hour: two seats

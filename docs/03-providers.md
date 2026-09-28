@@ -16,7 +16,7 @@ and most providers take one and not the other.
 | Moonshot Kimi | `kimi` (`moonshot`) | OpenAI Chat Completions | `api_key` | No importer. |
 | DeepSeek | `deepseek` | OpenAI Chat Completions | `api_key` | No importer. |
 | Zhipu GLM | `zhipu` (`glm`) | OpenAI Chat Completions | `api_key` | No importer. |
-| xAI | `xai` (`grok`) | OpenAI Chat Completions | `api_key`, `oauth` | **Yes.** `oag admin account add --from grok` imports every signed-in Grok CLI session and requests route through it. A seat binds to one principal unless `--shared` is passed. |
+| xAI | `xai` (`grok`) | OpenAI Chat Completions | `api_key`, `oauth` | **Yes.** `oag admin account add --from grok` imports every signed-in Grok CLI session and requests route through it. A seat serves the one principal named by `--owner-email` and nobody else. |
 | AWS Bedrock | `bedrock` | Anthropic Messages | `api_key` (SigV4 key, packed) | Not a subscription product. |
 
 Subscription support is three states, not a bool: **served** (the importer ships
@@ -94,10 +94,9 @@ holding a usable OAuth session, skipping an API-key-only `auth.json`. A session
 with no refresh token is imported and says so, because it will die at expiry
 rather than rotate.
 
-`--owner-email` or `--shared` is **required**, with no default. A subscription
-is sanctioned for its holder's own use, so binding it to one principal is the
-assumption and pooling it is a decision someone makes on purpose rather than by
-omitting a flag — see [compliance.md](compliance.md). `--monthly-cost` records
+`--owner-email` is **required**. A subscription is sanctioned for its holder's
+own use, so a seat belongs to one principal and is never pooled; one person may
+own several — see [compliance.md](compliance.md). `--monthly-cost` records
 the seat's flat price, which is what lets the dashboard net a subscription
 against the metered spend it displaced.
 

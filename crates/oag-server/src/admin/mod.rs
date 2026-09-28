@@ -1212,10 +1212,12 @@ mod tests {
         let tag = uuid::Uuid::new_v4();
         let mut tx = db.pool().begin().await.expect("begin");
         let seat: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
-             credentials_nonce, schedulable) \
-             VALUES (gen_random_uuid(), $1, 'anthropic', 'oauth', '\\x00', '\\x00', false) \
-             RETURNING id",
+            "WITH owner AS (INSERT INTO principal (id, email) \
+             VALUES (gen_random_uuid(), 'owner-' || gen_random_uuid() || '@test') RETURNING id) \
+             INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce, schedulable, owner_principal_id) \
+             SELECT gen_random_uuid(), $1, 'anthropic', 'oauth', '\\x00', '\\x00', false, owner.id \
+             FROM owner RETURNING id",
         )
         .bind(format!("seat-{tag}"))
         .fetch_one(&mut *tx)

@@ -172,6 +172,17 @@ pub enum AccountCommand {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    /// Bind a credential to the one person it belongs to.
+    ///
+    /// The way to fix a subscription seat left owner-less by an older
+    /// version: until it is bound it serves no one (`oag admin doctor` lists
+    /// such seats). It also moves a seat to a different owner.
+    SetOwner {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long)]
+        owner_email: String,
+    },
     /// Correct a seat's flat monthly price.
     ///
     /// The one figure nothing can infer — a provider's API reports how much of
@@ -267,14 +278,15 @@ pub struct AccountAddArgs {
     max_concurrency: i32,
     #[arg(long, default_value_t = 0)]
     priority: i16,
-    /// Bind to one principal instead of the shared pool. See
-    /// docs/compliance.md.
+    /// The one person this credential belongs to. Required for a
+    /// subscription seat (`--from`): a seat serves its owner and nobody else.
+    /// Optional for an API key, which without it joins the organisation's
+    /// shared pool. See docs/compliance.md.
     #[arg(long)]
     owner_email: Option<String>,
-    /// Put an OAuth seat in the shared pool anyway. Deliberate opt-in:
-    /// subscription seats are sanctioned for the holder's own use, so the
-    /// default for an imported seat is per-principal binding.
-    #[arg(long, conflicts_with = "owner_email")]
+    /// Removed. A subscription seat cannot be pooled; kept hidden so a script
+    /// that still passes it fails with the reason instead of "unknown flag".
+    #[arg(long, hide = true)]
     shared: bool,
     /// The seat's flat monthly price in USD. Lets the dashboard net a
     /// subscription's saved API spend against what it costs. Applies per

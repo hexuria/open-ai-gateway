@@ -225,3 +225,56 @@ pub async fn store_credentials(
 
     Ok(result.rows_affected() == 1)
 }
+
+/// A subscription seat whose owner holds more than one live inference key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatWithManyKeys {
+    pub seat: String,
+    pub owner_email: String,
+    pub keys: i64,
+}
+
+/// Seats whose owner could be handing them to other people.
+///
+/// A seat serves only its owner, but "its owner" is a principal, and a
+/// principal can mint any number of keys. Several keys are fine when they are
+/// all one person's (a laptop and a CI job); a coworker's key on the owner's
+/// principal is the seat being shared, which the schema cannot tell apart. So
+/// this is reported, not refused. Admin keys are not counted: `init` mints one
+/// beside every operator's inference key, and it cannot make model calls on
+/// anyone's behalf that the operator could not.
+///
+/// `principal` narrows it to one owner, which is what minting a key asks.
+pub async fn seats_with_many_keys(
+    db: &Db,
+    principal: Option<Uuid>,
+) -> Result<Vec<SeatWithManyKeys>> {
+    sqlx::query_as::<_, (String, String, i64)>(
+        r"
+        SELECT a.name, p.email, count(k.id)
+        FROM account a
+        JOIN principal p ON p.id = a.owner_principal_id
+        JOIN api_key k ON k.principal_id = p.id
+                      AND k.active AND NOT k.admin
+                      AND (k.expires_at IS NULL OR k.expires_at > now())
+        WHERE a.kind = 'oauth'
+          AND ($1::uuid IS NULL OR a.owner_principal_id = $1)
+        GROUP BY a.name, p.email
+        HAVING count(k.id) > 1
+        ORDER BY a.name
+        ",
+    )
+    .bind(principal)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("counting seat owners' keys: {e}")))
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(seat, owner_email, keys)| SeatWithManyKeys {
+                seat,
+                owner_email,
+                keys,
+            })
+            .collect()
+    })
+}

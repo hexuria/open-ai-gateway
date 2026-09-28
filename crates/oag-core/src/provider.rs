@@ -188,8 +188,8 @@ impl Provider {
                     import: "oag admin account add --from grok",
                 },
                 note: Some(
-                    "A seat binds to one principal unless --shared is passed: it is sanctioned \
-                     for the holder's own use.",
+                    "A seat serves the one principal named by --owner-email and nobody else: \
+                     it is sanctioned for the holder's own use.",
                 ),
             },
             Self::Bedrock => ProviderSupport {
