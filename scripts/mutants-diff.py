@@ -21,13 +21,14 @@ not an empty run) and prints a new, minimal diff naming only the lines that
 really changed, in the new files:
 
 - every added line git did not mark as moved;
-- the new-file line beside every removed line git did not mark as moved
-  (what cargo-mutants itself counts for a deletion).
+- the new-file lines either side of every removed line git did not mark as
+  moved (what cargo-mutants itself counts for a deletion).
 
 Each run of such lines is written as an insert-only hunk, `@@ -N,0 +N,len @@`.
 Hunks never overlap and stay in order by construction, so the output always
-parses. The inserted text is the real new line where there is one; cargo
-mutants reads only the line numbers.
+parses. Every inserted line carries the new file's real text at that number,
+because cargo-mutants compares it with the tree and rejects the whole diff
+(exit 5) on any mismatch; a line past the end of the file is never written.
 """
 
 import os
@@ -57,14 +58,19 @@ def git_diff(args, cwd=None) -> str:
     return subprocess.run(
         ["git", *COLOURS, "diff", "--no-ext-diff", "--color=always",
          "--color-moved=blocks", "--color-moved-ws=allow-indentation-change",
-         "--ws-error-highlight=none", *args],
+         "--ws-error-highlight=none", "--unified=3", *args],
         cwd=cwd, check=True, capture_output=True, text=True,
     ).stdout
 
 
 def changed_lines(coloured: str) -> dict:
-    """{new-file path: {line number: text}} for lines that really changed."""
-    files, path, new_ln = {}, None, 0
+    """{new-file path: {line number: text}} for lines that really changed.
+
+    The text is always the line as it stands in the new file (from the diff's
+    own `+` and context lines), because cargo-mutants checks it against the
+    tree and refuses the whole diff on a mismatch.
+    """
+    texts, marks, path, new_ln = {}, {}, None, 0
     for raw in coloured.split("\n"):
         text = ANSI.sub("", raw)
         if text.startswith("diff --git "):
@@ -74,7 +80,8 @@ def changed_lines(coloured: str) -> dict:
             target = text[4:]
             path = None if target == "/dev/null" else target[2:]
             if path:
-                files.setdefault(path, {})
+                texts.setdefault(path, {})
+                marks.setdefault(path, set())
             continue
         if text.startswith("--- "):
             continue
@@ -86,15 +93,20 @@ def changed_lines(coloured: str) -> dict:
             continue
         kind, code = text[0], first_code(raw)
         if kind == " ":
+            texts[path][new_ln] = text[1:]
             new_ln += 1
         elif kind == "+":
+            texts[path][new_ln] = text[1:]
             if code != NEW_MOVED:
-                files[path][new_ln] = text[1:]
+                marks[path].add(new_ln)
             new_ln += 1
-        elif kind == "-":
-            if code != OLD_MOVED:
-                files[path].setdefault(new_ln, "")
-    return files
+        elif kind == "-" and code != OLD_MOVED:
+            # cargo-mutants counts a deletion against the lines either side.
+            marks[path].update((new_ln - 1, new_ln))
+    return {
+        p: {n: texts[p][n] for n in marks[p] if n in texts[p]}
+        for p in texts
+    }
 
 
 def render(files: dict) -> str:
@@ -139,9 +151,20 @@ def selftest() -> None:
         write("b.rs", ["// b"])
         run("add", "."); run("commit", "-qm", "base")
 
+        def matches_tree(got):
+            # What cargo-mutants checks before it runs anything: every line
+            # the diff inserts is that line of the file, word for word.
+            for path, lines in got.items():
+                with open(os.path.join(d, path)) as f:
+                    tree = f.read().split("\n")[:-1]
+                for n, text in lines.items():
+                    assert 1 <= n <= len(tree), f"{path}:{n} is past the end: {got}"
+                    assert tree[n - 1] == text, f"{path}:{n} is {tree[n - 1]!r}, diff says {text!r}"
+            return got
+
         def case(a_lines, b_lines):
             write("a.rs", a_lines); write("b.rs", b_lines)
-            return changed_lines(git_diff([], cwd=d))
+            return matches_tree(changed_lines(git_diff([], cwd=d)))
 
         # 1. A pure move: nothing changed, nothing to test.
         got = case(["fn a() -> u32 {", "    return 1", "}", *pad, *pad, *fn_c], ["// b", *fn_b])
@@ -164,10 +187,11 @@ def selftest() -> None:
         got = case([*pad], ["// b", *short_b])
         assert got["b.rs"], f"a changed line matching deleted text was hidden: {got}"
 
-        # 4. A plain deletion inside a function marks the line beside it.
+        # 4. A plain deletion marks the lines either side of it, with their
+        #    real text (cargo-mutants checks it), as cargo-mutants does.
         write("a.rs", [*pad, *fn_c]); write("b.rs", ["// b"]); run("add", "."); run("commit", "-qm", "c")
         got = case([*pad, fn_c[0], fn_c[2], fn_c[3]], ["// b"])
-        assert list(got["a.rs"]) == [len(pad) + 2], f"plain deletion: {got}"
+        assert sorted(got["a.rs"]) == [len(pad) + 1, len(pad) + 2], f"plain deletion: {got}"
 
         # 5. The review's other shape: a block moved within the same file,
         #    plus an edit elsewhere in it. The edit is kept, the move is not,
@@ -192,6 +216,21 @@ def selftest() -> None:
         assert not any(n in got["b.rs"] for n in copies), f"a twice-moved block was kept: {got}"
         got = case([*fn_b, *pad], ["// b", *fn_b])
         assert got["b.rs"], f"a copy (original kept) was taken for a move: {got}"
+
+        # 8. The reviews' repros, each of which once wrote a line whose text
+        #    was not the tree's: a function moved out from between two
+        #    others (blank lines around it), a deletion above a blank line,
+        #    and deleting the last line of a file (nothing past the end).
+        first = ["fn first(x: u32) -> bool {", "    let limit_value = x > 2;", "    limit_value", "}"]
+        last = ["fn last(y: u32) -> u32 {", "    y.saturating_add(40)", "}"]
+        write("a.rs", [*first, "", *fn_b, "", *last]); write("b.rs", ["// b"])
+        run("add", "."); run("commit", "-qm", "f")
+        got = case([*first, "", *last], ["// b", "", *fn_b])
+        assert not any(n in got["b.rs"] for n in range(3, 7)), f"a pure mid-file move was kept: {got}"
+        got = case([first[0], first[2], first[3], "", *fn_b, "", *last], ["// b"])
+        assert sorted(got["a.rs"]) == [1, 2], f"deletion above a blank: {got}"
+        got = case([*first, "", *fn_b, "", *last[:-1]], ["// b"])
+        assert sorted(got["a.rs"]) == [len(first) + len(fn_b) + 4], f"deleted last line: {got}"
 
     # 7. Output always parses: runs never overlap and stay in order.
     rendered = render({"x.rs": {3: "a", 4: "b", 9: "c", 10: "d", 11: ""}})
