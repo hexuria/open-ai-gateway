@@ -1,7 +1,7 @@
 # Every error this gateway returns
 
 For whoever is writing the client. Read from `error_response` in
-`crates/oag-server/src/gateway/mod.rs` and the `Error` enum in
+`crates/oag-server/src/gateway/respond.rs` and the `Error` enum in
 `crates/oag-core/src/error.rs` — those two are the source of truth, and
 `errors.hurl` pins the ones this deployment can actually produce.
 
@@ -173,7 +173,7 @@ produced it. Build a client against those bytes and you need no gateway, no
 credential and no failure.
 
 It is GENERATED, by `every_error_shape_matches_the_committed_catalogue` in
-`crates/oag-server/src/gateway/mod.rs`, and two mechanisms keep it honest:
+`crates/oag-server/src/gateway/tests.rs`, and two mechanisms keep it honest:
 
 - `oag_core::error::every_variant()` is exhaustive over `Error`. It lives in the
   defining crate, where `#[non_exhaustive]` does not apply, and its match has no

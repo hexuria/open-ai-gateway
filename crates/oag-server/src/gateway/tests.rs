@@ -1,4 +1,18 @@
+use super::climb::{MAX_ESCALATIONS, budget_alone_prevented_the_climb, spawn_unserved};
+use super::failover::{
+    MAX_RETRY_AFTER, Outcome, Step, TRANSPORT_COOLDOWN, backoff, collect_failed, egress_for,
+    may_try_another, step_for, transport_failure, upstream_retry_after,
+};
+use super::plan::parse_ladder;
+use super::respond::{
+    client_got_nothing, json_response, no_viable_message, render_collected, stream_response,
+    truncate,
+};
 use super::*;
+use crate::breakers::Breakers;
+use axum::http::{StatusCode, header};
+use oag_core::{AccountId, Disposition, TierName};
+use oag_router::{RoutingDecision, RoutingPolicy, TierLadder};
 use std::time::Duration;
 
 fn failure_after(output_tokens: u64) -> sse::StreamFailure {
@@ -53,7 +67,7 @@ fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
 /// at runtime without a live provider, a live breaker and a seat.
 #[test]
 fn the_tier_header_is_validated_before_the_body_is_consulted() {
-    let src = include_str!("mod.rs");
+    let src = include_str!("plan.rs");
     let body = src
         .split_once("let header_tier = headers")
         .expect("the resolution is in this file")
@@ -105,7 +119,7 @@ fn both_retry_arms_re_ask_the_breaker() {
     // haystack includes the test doing the scanning counts its own string
     // literals, which is how the first version of this passed with the fix
     // reverted. It found that on its first revert-check.
-    let src = include_str!("mod.rs");
+    let src = include_str!("failover.rs");
     let code = src
         .split_once("\n#[cfg(test)]\n")
         .map_or(src, |(code, _)| code);
@@ -151,7 +165,7 @@ fn both_retry_arms_re_ask_the_breaker() {
 /// G7. Every same-credential retry asks the breaker, not just the first.
 #[test]
 fn a_retry_rechecks_the_breaker_it_may_have_just_tripped() {
-    let src = include_str!("mod.rs");
+    let src = include_str!("failover.rs");
     let arm = src
         .split_once("Step::Retry => {")
         .expect("the retry arm is in this file")
@@ -182,7 +196,7 @@ fn a_retry_rechecks_the_breaker_it_may_have_just_tripped() {
 /// what this catches; the rule is covered where it can be run.
 #[test]
 fn the_streamed_path_hands_the_ledger_its_triggering_gate() {
-    let src = include_str!("mod.rs");
+    let src = include_str!("respond.rs");
     let body = src
         .split_once("fn stream_response(")
         .expect("declared in this file")
@@ -207,7 +221,7 @@ fn the_streamed_path_hands_the_ledger_its_triggering_gate() {
 /// anything asks, and this is that.
 #[test]
 fn the_selection_error_path_asks_the_disposition() {
-    let src = include_str!("mod.rs");
+    let src = include_str!("climb.rs");
     let body = src
         .split_once("async fn run_with_escalation(")
         .expect("the loop is in this file")
@@ -687,7 +701,7 @@ async fn unserved_rows_are_spawned_off_the_request_future() {
 /// therefore about position, not about absence.
 #[test]
 fn every_unserved_exit_detaches_its_writes() {
-    let src = include_str!("mod.rs");
+    let src = include_str!("climb.rs");
     let body = src
         .split_once("async fn run_with_escalation(")
         .expect("the function is in this file")
