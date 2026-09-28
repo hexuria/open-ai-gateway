@@ -541,6 +541,18 @@ security:
         let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
         Arc::new(AppState::new(config, db, cache).expect("state"))
     }
+
+    /// [`state`] with no adapter registered for `provider`.
+    pub(crate) fn state_without_adapter(provider: oag_core::Provider) -> Arc<AppState> {
+        let config = config("");
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        Arc::new(
+            AppState::new(config, db, cache)
+                .expect("state")
+                .without_adapter(provider),
+        )
+    }
 }
 
 #[cfg(test)]

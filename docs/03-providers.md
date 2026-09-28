@@ -17,8 +17,7 @@ and most providers take one and not the other.
 | DeepSeek | `deepseek` | OpenAI Chat Completions | `api_key` | No importer. |
 | Zhipu GLM | `zhipu` (`glm`) | OpenAI Chat Completions | `api_key` | No importer. |
 | xAI | `xai` (`grok`) | OpenAI Chat Completions | `api_key`, `oauth` | **Yes.** `oag admin account add --from grok` imports every signed-in Grok CLI session and requests route through it. A seat binds to one principal unless `--shared` is passed. |
-| AWS Bedrock | `bedrock` | Anthropic Messages | `bedrock` (SigV4) | Not a subscription product. |
-| Google Vertex AI | `vertex` | Gemini generateContent | `vertex` (service account) | Not a subscription product. No adapter is registered in this build, so it can be configured and cannot serve. |
+| AWS Bedrock | `bedrock` | Anthropic Messages | `api_key` (SigV4 key, packed) | Not a subscription product. |
 
 Subscription support is three states, not a bool: **served** (the importer ships
 and requests route through the seat), **credential-import-only** (the seat
@@ -155,8 +154,8 @@ seat or a 429 as a gated model; the two lead in opposite directions.
 credential is a qualifier.** Gemini resold by Cursor is a different base URL,
 adapter, auth and bill, so it earns a provider id rather than syntax of its own.
 `@api` and `@sub` are the entire vocabulary — they are `CredentialKind`'s two
-qualifiers, and `bedrock`, `vertex` and `service_account` have none because
-nothing can address them a second way.
+qualifiers, and `bedrock` has none because nothing can address it a second
+way.
 
 A qualifier the provider cannot offer is refused rather than dropped:
 `gemini/...@sub` is an error naming the kinds that work, because dropping the

@@ -21,17 +21,13 @@ pub enum CredentialKind {
     OAuth,
     /// AWS `SigV4` credentials for Bedrock.
     Bedrock,
-    /// GCP service-account credentials for Vertex.
-    Vertex,
-    /// A generic service account (provider-specific JSON blob).
-    ServiceAccount,
 }
 
 impl CredentialKind {
     /// Whether this kind carries an expiring token that needs refreshing.
     #[must_use]
     pub const fn refreshable(self) -> bool {
-        matches!(self, Self::OAuth | Self::Vertex | Self::ServiceAccount)
+        matches!(self, Self::OAuth)
     }
 
     /// Whether usage on this kind is billed at a flat rate rather than per
@@ -48,8 +44,8 @@ impl CredentialKind {
     ///
     /// Two, and deliberately only two. `@api` and `@sub` are the choice a
     /// caller actually has — the same upstream reached through a metered key or
-    /// through a seat — while Bedrock, Vertex and a service account are
-    /// different upstreams, and a different upstream is a different provider
+    /// through a seat — while Bedrock is a different upstream, and a
+    /// different upstream is a different provider
     /// with an id of its own. A qualifier for those would be a second way to
     /// spell something that already has a name.
     #[must_use]
@@ -57,7 +53,7 @@ impl CredentialKind {
         match self {
             Self::ApiKey => Some("api"),
             Self::OAuth => Some("sub"),
-            Self::Bedrock | Self::Vertex | Self::ServiceAccount => None,
+            Self::Bedrock => None,
         }
     }
 
@@ -89,8 +85,6 @@ impl CredentialKind {
             Self::ApiKey => "API key",
             Self::OAuth => "subscription",
             Self::Bedrock => "Bedrock",
-            Self::Vertex => "Vertex",
-            Self::ServiceAccount => "service account",
         }
     }
 
@@ -103,8 +97,6 @@ impl CredentialKind {
             "api_key" => Some(Self::ApiKey),
             "oauth" => Some(Self::OAuth),
             "bedrock" => Some(Self::Bedrock),
-            "vertex" => Some(Self::Vertex),
-            "service_account" => Some(Self::ServiceAccount),
             _ => None,
         }
     }
@@ -116,8 +108,6 @@ impl fmt::Display for CredentialKind {
             Self::ApiKey => "api_key",
             Self::OAuth => "oauth",
             Self::Bedrock => "bedrock",
-            Self::Vertex => "vertex",
-            Self::ServiceAccount => "service_account",
         })
     }
 }
@@ -237,13 +227,31 @@ mod tests {
         // Bedrock is a different base URL, adapter, auth and bill, so it is a
         // different provider with an id of its own. A qualifier for it would be
         // a second spelling of something already named.
-        for kind in [
-            CredentialKind::Bedrock,
-            CredentialKind::Vertex,
-            CredentialKind::ServiceAccount,
+        let kind = CredentialKind::Bedrock;
+        assert_eq!(kind.qualifier(), None, "{kind} should not be addressable");
+        assert_eq!(CredentialKind::from_qualifier(&kind.to_string()), None);
+    }
+
+    /// Every kind, pinned once: its `account.kind` spelling both ways, the
+    /// word a caller reads, and whether it expires. A kind that drops out of
+    /// any one of these is a row that parses as something else, or an error
+    /// message with a blank where the credential should be.
+    #[test]
+    fn each_kind_has_one_column_spelling_one_label_and_a_refresh_answer() {
+        for (kind, column, label, refreshable) in [
+            (CredentialKind::ApiKey, "api_key", "API key", false),
+            (CredentialKind::OAuth, "oauth", "subscription", true),
+            (CredentialKind::Bedrock, "bedrock", "Bedrock", false),
         ] {
-            assert_eq!(kind.qualifier(), None, "{kind} should not be addressable");
-            assert_eq!(CredentialKind::from_qualifier(&kind.to_string()), None);
+            assert_eq!(kind.to_string(), column);
+            assert_eq!(CredentialKind::from_column(column), Some(kind), "{column}");
+            assert_eq!(kind.channel_label(), label, "{column}");
+            assert_eq!(kind.refreshable(), refreshable, "{column}");
+        }
+        // 0018 removed these from the schema; a row that still says one reads
+        // as unknown, which the callers treat as metered.
+        for gone in ["vertex", "service_account", "API_KEY", ""] {
+            assert_eq!(CredentialKind::from_column(gone), None, "{gone}");
         }
     }
 

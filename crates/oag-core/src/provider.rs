@@ -22,7 +22,6 @@ pub enum Provider {
     Zhipu,
     XAI,
     Bedrock,
-    Vertex,
 }
 
 impl Provider {
@@ -43,7 +42,7 @@ impl Provider {
             Self::OpenAI | Self::Kimi | Self::DeepSeek | Self::Zhipu | Self::XAI => {
                 Dialect::OpenAIChatCompletions
             }
-            Self::Gemini | Self::Vertex => Dialect::GeminiGenerateContent,
+            Self::Gemini => Dialect::GeminiGenerateContent,
         }
     }
 
@@ -58,7 +57,6 @@ impl Provider {
             Self::Zhipu => "zhipu",
             Self::XAI => "xai",
             Self::Bedrock => "bedrock",
-            Self::Vertex => "vertex",
         }
     }
 
@@ -78,7 +76,6 @@ impl Provider {
         Self::Zhipu,
         Self::XAI,
         Self::Bedrock,
-        Self::Vertex,
     ];
 
     /// What an operator can actually do with this provider.
@@ -91,7 +88,7 @@ impl Provider {
     /// Everything here is a property of the *build*, not of the deployment: it
     /// says what is possible, and the admin API pairs it with what an operator
     /// has actually configured.
-    // Long because it is nine rows of data, not nine branches of logic.
+    // Long because it is eight rows of data, not eight branches of logic.
     // Splitting it into per-provider helpers would buy a shorter function and
     // lose the one property worth having: every provider's answer visible in
     // one place, in one match the compiler will not let go stale.
@@ -199,7 +196,10 @@ impl Provider {
                 provider: self,
                 display_name: "AWS Bedrock",
                 aliases: &[],
-                credential_kinds: &[CredentialKind::Bedrock],
+                // `account add` registers Bedrock like every other key provider,
+                // so its rows are `api_key`; `bedrock` stays admissible for any
+                // written by hand.
+                credential_kinds: &[CredentialKind::ApiKey, CredentialKind::Bedrock],
                 subscription: SubscriptionSupport::NotOffered {
                     why: NoSubscription::NoImporter,
                 },
@@ -207,16 +207,6 @@ impl Provider {
                     "SigV4-signed, billed through your AWS agreement. The credential is stored \
                      packed as access_key:secret[:session_token], so it needs no shape of its own.",
                 ),
-            },
-            Self::Vertex => ProviderSupport {
-                provider: self,
-                display_name: "Google Vertex AI",
-                aliases: &[],
-                credential_kinds: &[CredentialKind::Vertex],
-                subscription: SubscriptionSupport::NotOffered {
-                    why: NoSubscription::NoImporter,
-                },
-                note: Some("GCP service-account credentials, billed through your GCP agreement."),
             },
         }
     }
@@ -241,7 +231,6 @@ impl FromStr for Provider {
             "zhipu" | "glm" => Ok(Self::Zhipu),
             "xai" | "grok" => Ok(Self::XAI),
             "bedrock" => Ok(Self::Bedrock),
-            "vertex" => Ok(Self::Vertex),
             other => Err(crate::Error::UnknownProvider(other.to_owned())),
         }
     }
@@ -302,9 +291,9 @@ pub struct ProviderSupport {
     /// knows the product as "grok" should not have to guess that we filed it
     /// under "xai".
     pub aliases: &'static [&'static str],
-    /// Which credential kinds this provider can be registered with. Not every
-    /// provider takes an API key: the two cloud ones take their cloud's
-    /// credential and nothing else.
+    /// Which credential kinds this provider can be registered with. The
+    /// CLI refuses any other pair (`kind_is_offered`), which is what keeps a
+    /// Claude subscription from ever being registered.
     pub credential_kinds: &'static [CredentialKind],
     pub subscription: SubscriptionSupport,
     /// One line where the row would otherwise mislead. `None` is the common

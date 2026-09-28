@@ -653,6 +653,31 @@ const fn scope_of(owner_id: Option<Uuid>) -> &'static str {
     }
 }
 
+/// Refuse a credential kind the provider does not offer.
+///
+/// `Provider::support` is the build's statement of what each provider takes,
+/// and the schema's CHECK only knows the kinds, not the pairs. Without this an
+/// `anthropic` row of kind `oauth` — a Claude subscription, which this gateway
+/// must never serve with — was insertable by anything that reached here.
+pub(super) fn kind_is_offered(provider: oag_core::Provider, kind: &str) -> Result<()> {
+    let support = provider.support();
+    let offered = oag_core::credential::CredentialKind::from_column(kind)
+        .is_some_and(|k| support.credential_kinds.contains(&k));
+    if offered {
+        return Ok(());
+    }
+    let takes = support
+        .credential_kinds
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(oag_core::Error::Config(format!(
+        "{} does not take a '{kind}' credential; it takes: {takes}. See docs/compliance.md.",
+        support.display_name
+    )))
+}
+
 /// Seal the material and insert one account row, attached to a route.
 #[allow(clippy::too_many_arguments)]
 async fn insert_account(
@@ -668,6 +693,7 @@ async fn insert_account(
     owner_id: Option<Uuid>,
     monthly_cost: Option<Decimal>,
 ) -> Result<Uuid> {
+    kind_is_offered(provider, kind)?;
     let sealed = kek.seal_json(material)?;
     // Denormalised so the scheduler can skip expired credentials without
     // decrypting every candidate; see the schema comment.

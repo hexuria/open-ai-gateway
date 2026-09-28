@@ -893,9 +893,9 @@ pub struct ProviderView {
     /// get wrong.
     pub subscription: oag_core::provider::SubscriptionSupport,
     pub note: Option<String>,
-    /// Whether this build registers an adapter for the provider. Vertex has a
-    /// credential kind, a dialect, and no adapter — so it can be registered and
-    /// cannot serve, and a matrix that omitted this would say it works.
+    /// Whether this build registers an adapter for the provider. A provider
+    /// with a credential kind and a dialect but no adapter could be registered
+    /// and could not serve, and a matrix that omitted this would say it works.
     pub adapter: bool,
     pub accounts: i64,
     pub by_kind: Vec<KindCount>,
@@ -1213,8 +1213,8 @@ mod tests {
         let mut tx = db.pool().begin().await.expect("begin");
         let seat: uuid::Uuid = sqlx::query_scalar(
             "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
-             credentials_nonce) \
-             VALUES (gen_random_uuid(), $1, 'anthropic', 'oauth', '\\x00', '\\x00') \
+             credentials_nonce, schedulable) \
+             VALUES (gen_random_uuid(), $1, 'anthropic', 'oauth', '\\x00', '\\x00', false) \
              RETURNING id",
         )
         .bind(format!("seat-{tag}"))
