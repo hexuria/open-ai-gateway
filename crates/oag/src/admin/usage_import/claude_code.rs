@@ -136,5 +136,3 @@ fn absorb_claude_line(scan: &mut Scan, fallback_session: &str, line: &str) {
         .messages
         .insert(message.external_id.clone(), message);
 }
-
-// ── the Grok CLI ─────────────────────────────────────────────────────────────

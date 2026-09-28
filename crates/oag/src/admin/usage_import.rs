@@ -320,7 +320,5 @@ pub struct Scan {
     incomplete: usize,
 }
 
-// ── parsing ──────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests;

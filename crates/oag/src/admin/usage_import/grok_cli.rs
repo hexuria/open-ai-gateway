@@ -209,5 +209,3 @@ fn grok_instant(v: &serde_json::Value) -> Option<OffsetDateTime> {
     v.as_str()
         .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
 }
-
-// ── the decision ─────────────────────────────────────────────────────────────
