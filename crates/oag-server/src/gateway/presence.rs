@@ -275,6 +275,16 @@ fn pct_json(d: Option<Decimal>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The label each credential kind carries in a model's presence, one
+    /// per kind; an unknown column (a kind 0018 removed) has none.
+    #[test]
+    fn each_credential_kind_has_its_own_label() {
+        assert_eq!(kind_label("api_key"), Some("api"));
+        assert_eq!(kind_label("oauth"), Some("sub"));
+        assert_eq!(kind_label("bedrock"), Some("bedrock"));
+        assert_eq!(kind_label("vertex"), None);
+    }
     use rust_decimal::dec;
     use time::macros::datetime;
 
