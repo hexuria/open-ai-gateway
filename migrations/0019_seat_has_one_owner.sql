@@ -11,12 +11,31 @@
 -- (`repo::candidates`, `route_channels`, `route_channel_status`). This makes the
 -- schema refuse to create one.
 --
--- NOT VALID: the rule binds every row written from now on, but an existing
--- owner-less seat does not stop the gateway from booting. It is inert already,
--- `oag admin doctor` lists it, and `oag admin account set-owner` binds it.
--- Once none are left:
---
---     ALTER TABLE account VALIDATE CONSTRAINT account_seat_has_one_owner;
-ALTER TABLE account
-    ADD CONSTRAINT account_seat_has_one_owner
-    CHECK (kind <> 'oauth' OR owner_principal_id IS NOT NULL) NOT VALID;
+-- A trigger, not a CHECK. Postgres checks a CHECK constraint — NOT VALID
+-- included — on every UPDATE of a row, so a legacy owner-less seat could no
+-- longer be disabled, renamed, priced, polled or have its rotated token
+-- stored: every write to it would fail until someone bound it, and a refresh
+-- that failed to store would drop the new token on the floor. The rule wanted
+-- is narrower: no write may *produce* an owner-less seat that was not one
+-- already. So it refuses an owner-less seat on INSERT, and on UPDATE refuses
+-- clearing a seat's owner or turning an owner-less key into a seat, while an
+-- already owner-less seat can still be written to. It stays inert either way:
+-- the request path matches it for nobody, and the usage poller skips it.
+CREATE FUNCTION account_seat_has_one_owner() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.kind = 'oauth' AND NEW.owner_principal_id IS NULL
+       AND (TG_OP = 'INSERT'
+            OR OLD.owner_principal_id IS NOT NULL
+            OR OLD.kind <> 'oauth') THEN
+        RAISE EXCEPTION 'account_seat_has_one_owner: a subscription seat belongs to one person; '
+            'account % (%) needs an owner (oag admin account set-owner)', NEW.name, NEW.provider
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER account_seat_has_one_owner
+    BEFORE INSERT OR UPDATE OF kind, owner_principal_id ON account
+    FOR EACH ROW EXECUTE FUNCTION account_seat_has_one_owner();

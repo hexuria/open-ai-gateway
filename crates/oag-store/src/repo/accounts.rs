@@ -138,25 +138,31 @@ pub async fn schedulable_accounts(db: &Db, provider: &str, kind: &str) -> Result
     .map_err(|e| Error::Internal(format!("loading {provider} {kind} accounts: {e}")))
 }
 
-/// Every OAuth (subscription seat) account, for the usage poller to sweep.
-///
-/// Not filtered by route or principal like `candidates`: the poller reads a
-/// seat's remaining quota regardless of who may use it. Disabled seats are
-/// skipped — polling one nobody will schedule spends a request for nothing.
-pub async fn schedulable_oauth_accounts(db: &Db) -> Result<Vec<AccountRow>> {
-    sqlx::query_as::<_, AccountRow>(
-        r"
+/// [`schedulable_oauth_accounts`]' statement, a constant so a test can run it
+/// beside a row the schema no longer lets anything create.
+pub(super) const SCHEDULABLE_OAUTH_SQL: &str = r"
         SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
                token_version, token_expires_at, owner_principal_id, proxy_url,
                priority, max_concurrency, schedulable, cooldown_until,
                rate_limited_until, window_resets_at,
                usage_remaining_pct, usage_reserve_pct, last_used_at
         FROM account WHERE kind = 'oauth' AND schedulable
-        ",
-    )
-    .fetch_all(db.pool())
-    .await
-    .map_err(|e| Error::Internal(format!("loading oauth accounts: {e}")))
+          -- An owner-less seat serves no one, so nothing reads or refreshes
+          -- it: a refresh would rotate its token for no request, and a seat
+          -- nobody owns is not one to spend the owner's quota checking.
+          AND owner_principal_id IS NOT NULL
+        ";
+
+/// Every OAuth (subscription seat) account, for the usage poller to sweep.
+///
+/// Not filtered by route or principal like `candidates`: the poller reads a
+/// seat's remaining quota regardless of who may use it. Disabled seats are
+/// skipped — polling one nobody will schedule spends a request for nothing.
+pub async fn schedulable_oauth_accounts(db: &Db) -> Result<Vec<AccountRow>> {
+    sqlx::query_as::<_, AccountRow>(SCHEDULABLE_OAUTH_SQL)
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("loading oauth accounts: {e}")))
 }
 
 /// Store a usage-poll reading: the remaining-quota columns, and the window

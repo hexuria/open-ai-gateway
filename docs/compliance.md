@@ -67,13 +67,14 @@ account banned. So the gateway does not offer it:
 
 - `oag admin account add --from grok|codex` requires `--owner-email`;
   `--shared` is gone and names this rule when passed.
-- The schema refuses an `oauth` row without an owner
-  (`account_seat_has_one_owner`, migration 0019).
+- The schema refuses to make an owner-less seat — inserting one, clearing a
+  seat's owner, or turning an owner-less key into a seat — with the
+  `account_seat_has_one_owner` trigger (migration 0019).
 - A seat left owner-less by an older version serves no one — the request path
   matches it for nobody — until `oag admin account set-owner <name>
   --owner-email <email>` binds it. `oag admin doctor` lists every such seat.
-  Once none remain, `ALTER TABLE account VALIDATE CONSTRAINT
-  account_seat_has_one_owner;` makes the schema vouch for old rows too.
+  Until then it can still be disabled, renamed or priced, and the usage
+  poller neither reads nor refreshes it.
 - A seat's owner is a principal, and a principal can hold several keys. That
   is fine when they are all that person's (a laptop, a CI job); a key handed to
   someone else shares the seat. The gateway cannot tell the two apart, so
