@@ -11,6 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+// ── pricing ──────────────────────────────────────────────────────────────────
+
 /// The catalog, indexed by every name a transcript might use for a model.
 ///
 /// A transcript writes the provider's own spelling (`claude-opus-5`), which is
@@ -362,5 +364,3 @@ pub(super) fn plan(
     out.scan = scan;
     out
 }
-
-// ── writing ──────────────────────────────────────────────────────────────────

@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+// ── writing ──────────────────────────────────────────────────────────────────
+
 /// Rows per INSERT.
 ///
 /// A month of agentic history is tens of thousands of messages, and a row per
