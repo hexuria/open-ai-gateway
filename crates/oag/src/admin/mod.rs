@@ -15,7 +15,6 @@ use clap::{Args, Subcommand, ValueEnum};
 use oag_core::config::Config;
 use oag_core::{Kek, Result, credential::SecretMaterial};
 use oag_store::{Db, repo};
-use rand::Rng;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -1477,7 +1476,8 @@ async fn mint_key(
     // 32 bytes of entropy. The prefix is there so a leaked key is recognisable
     // in a log and can be grepped for during an incident.
     let mut raw = [0u8; 32];
-    rand::thread_rng().fill(&mut raw);
+    // The thread-local CSPRNG, seeded from the OS.
+    rand::fill(&mut raw);
     let key = format!(
         "{}{}",
         oag_store::repo::KEY_PREFIX,

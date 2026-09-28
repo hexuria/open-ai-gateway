@@ -18,7 +18,7 @@
 //! - The canonical URI is the path **URI-encoded exactly once**, which is not
 //!   the same string as the path on the wire. See [`uri_encode_path`].
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -213,7 +213,7 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     // credential down and fails over. A panic is a severed connection with no
     // response at all, and on HTTP/2 it resets every other stream multiplexed
     // onto it — one request's impossible branch taking out unrelated callers.
-    let Ok(mut mac) = <HmacSha256 as Mac>::new_from_slice(key) else {
+    let Ok(mut mac) = <HmacSha256 as KeyInit>::new_from_slice(key) else {
         return Vec::new();
     };
     mac.update(data);

@@ -607,13 +607,13 @@ pub async fn mint_key(
     name: &str,
     quota_usd: Option<Decimal>,
 ) -> Result<Option<MintedKey>> {
-    use rand::Rng as _;
     use std::fmt::Write as _;
 
     // 32 bytes of entropy. The prefix exists so a leaked key is recognisable in
     // a log and greppable during an incident.
     let mut raw = [0u8; 32];
-    rand::thread_rng().fill(&mut raw);
+    // The thread-local CSPRNG, seeded from the OS.
+    rand::fill(&mut raw);
     let key = format!(
         "{KEY_PREFIX}{}",
         raw.iter().fold(String::with_capacity(64), |mut acc, b| {
