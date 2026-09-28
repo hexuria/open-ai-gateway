@@ -1,9 +1,10 @@
 # Agent and contributor notes
 
 The gate is `just check` (fmt, clippy, tests); CI also runs `cargo audit`,
-`cargo deny` and, on pull requests, `cargo mutants` over the diff. Lines the
-diff only moves (text unchanged) are left out by `scripts/mutants-diff.py`, so
-moving code between files is free and editing it is not. Tests that
+`cargo deny` and, on pull requests, `cargo mutants` over the diff. Code the diff
+only moves (git's `--color-moved=blocks`: unchanged blocks of 20+ characters)
+is left out by `scripts/mutants-diff.py`, so moving code is free and editing it
+is not. Tests that
 need Redis or Postgres skip themselves unless `OAG_TEST_REDIS_URL` and
 `OAG_TEST_DATABASE_URL` are set -- `just dev-up` and export them before
 trusting a green run.
