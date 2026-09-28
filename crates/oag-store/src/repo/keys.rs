@@ -165,6 +165,8 @@ pub struct MintedKey {
 /// cannot silently erase a budget an operator set at the CLI; clearing one is
 /// [`set_principal_budget`]'s job, where it is the caller's stated intent.
 ///
+/// [`set_principal_budget`]: super::set_principal_budget
+///
 /// **`role` IS NOT UPDATED ON CONFLICT, and that is the point.** This path can only
 /// ever ask for `member`, so updating the role would mean an upsert against an
 /// existing admin's email SILENTLY DEMOTES them — and since the admin gate wants
