@@ -1,4 +1,3 @@
-
 use super::*;
 
 /// A transcript line, spelled the way Claude Code spells one.
