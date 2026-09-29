@@ -24,6 +24,8 @@ use typesafe_sdk::wire::{
 enum Behaviour {
     /// Answer every question.
     Answer,
+    /// Answer every question, naming this model as the one that answered.
+    AnswerAs(&'static str),
     /// Refuse with this status and a JSON error body.
     Refuse(u16),
     /// Refuse with 429 and this `Retry-After`, in seconds.
@@ -169,7 +171,7 @@ async fn mock_system_one(
             tokio::time::sleep(Duration::from_secs(30)).await;
             StatusCode::OK.into_response()
         }
-        Behaviour::Answer => {
+        behaviour @ (Behaviour::Answer | Behaviour::AnswerAs(_)) => {
             // The server side of the contract, with the SDK's types: parse the
             // question set, answer it, serialise the response.
             let request: SystemOneRequest =
@@ -179,11 +181,11 @@ async fn mock_system_one(
                 .iter()
                 .map(|(name, question)| (name.clone(), answer_for(question)))
                 .collect();
-            let response = SystemOneResponse::new(
-                request.model.as_deref().unwrap_or("jev-latest"),
-                Usage::new(Some(42), Some(3)),
-                answers,
-            );
+            let model = match behaviour {
+                Behaviour::AnswerAs(model) => model,
+                _ => request.model.as_deref().unwrap_or("jev-latest"),
+            };
+            let response = SystemOneResponse::new(model, Usage::new(Some(42), Some(3)), answers);
             let bytes = pretty(&response);
             let n = {
                 let mut seen = mock.lock();
@@ -628,6 +630,28 @@ async fn an_answer_passes_through_byte_for_byte_with_the_gateway_s_headers() {
     // nothing and claims no saving.
     assert_eq!(row.cost_usd, rust_decimal::Decimal::ZERO);
     assert_eq!(row.counterfactual_usd, row.cost_usd);
+}
+
+/// A model name is Jev's to choose, and not every string is a header value.
+/// One that is not loses `x-oag-model`, never the answer: it was given and
+/// billed either way, and the ledger still names it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_naming_a_model_no_header_can_carry_still_arrives() {
+    let Some(gw) = Gateway::start(CHAT_LADDER, None).await else {
+        return;
+    };
+    gw.add_jev_key("jev-key-a", 0).await;
+    gw.mock
+        .behave("jev-key-a", Behaviour::AnswerAs("jev\nlatest"));
+
+    let response = gw.ask(QUESTIONS).await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(header_of(&response, "x-oag-model"), None);
+    assert!(header_of(&response, REQUEST_ID_HEADER).is_some());
+    let request_id = request_id_of(&response);
+    assert_eq!(response.bytes().await.expect("body"), gw.mock.sent()[0]);
+    let row = gw.ledger(request_id).await.expect("metered");
+    assert_eq!(row.model_id, "jev/jev\nlatest");
 }
 
 /// Priced, the row costs what the catalog says — against System One's own

@@ -541,7 +541,9 @@ fn relay<T>(reply: Reply<T>, model: Option<&str>, request_id: RequestId) -> Resp
     if let Some(id) = reply.headers.get(REQUEST_ID_HEADER) {
         builder = builder.header(REQUEST_ID_HEADER, id.clone());
     }
-    if let Some(model) = model {
+    // Named by Jev's answer, so not trusted to be a header value: a model name
+    // that is not one loses this header, never the answer it names.
+    if let Some(model) = model.and_then(|m| HeaderValue::from_str(m).ok()) {
         builder = builder.header("x-oag-model", model);
     }
     builder
