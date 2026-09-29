@@ -102,6 +102,13 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # ── cli ────────────────────────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
 
+# ── System One (Jev) ───────────────────────────────────────────────────────────
+# The owner's SDK, for its wire types in both directions: the gateway parses a
+# client's request and Jev's answer with the same types the client serialises
+# them with, rather than keeping a second copy of the format. A path until 0.2.0
+# is on crates.io; then this becomes `typesafe-sdk = "=0.2.0"`.
+typesafe-sdk = { version = "0.2.0", path = "../typesafe-sdk-rust" }
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

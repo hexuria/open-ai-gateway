@@ -24,6 +24,7 @@ hmac.workspace = true
 hex.workspace = true
 base64.workspace = true
 time.workspace = true
+typesafe-sdk.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

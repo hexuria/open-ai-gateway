@@ -8,6 +8,7 @@ pub mod bedrock;
 pub mod codex;
 pub mod eventstream;
 pub mod gemini;
+pub mod jev;
 pub mod openai;
 pub mod openai_oauth;
 pub mod pricing;
@@ -22,6 +23,7 @@ pub use anthropic::AnthropicAdapter;
 pub use bedrock::BedrockAdapter;
 pub use codex::CodexAdapter;
 pub use gemini::GeminiAdapter;
+pub use jev::JevUpstream;
 pub use openai::OpenAICompatAdapter;
 pub use transport::{HttpTransport, Transport, TransportKey, TransportPool};
 
