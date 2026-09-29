@@ -2,9 +2,12 @@
 
 ## In ten sentences
 
-Every model call an organisation makes goes through one door. At that door the
-gateway authenticates the caller, checks their budget, decides which model
-should serve the request, picks a credential from the pool, translates the
+Every model call an organisation makes goes through one door, in whichever API
+shape the client already speaks: OpenAI, Anthropic, Gemini, or Jev's System
+One. At that door the gateway authenticates the caller, checks their budget,
+decides which model should serve the request, picks a credential from the pool —
+an organisation's pooled API key, or a subscription seat that only its one owner
+may use — translates the
 request into whatever dialect that provider speaks, streams the response back
 while translating it in the other direction, and records what it cost alongside
 what it would have cost on the best model available. If the credential fails, it

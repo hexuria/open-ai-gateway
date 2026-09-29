@@ -1,17 +1,22 @@
 # open-ai-gateway
 
-An internal AI gateway. One door for every model call your organisation makes,
-so you can route the cheap 80% to cheap models, escalate to frontier models only
-when the work needs it, rotate across the credentials you own, and see what you
-actually spent against what frontier-for-everything would have cost.
+An internal AI gateway: one door for every model call your organisation makes.
+Clients speak whichever API they already speak — OpenAI (Chat Completions or
+Responses), Anthropic Messages, Gemini, or Jev's System One — and the gateway
+routes the cheap 80% to cheap models, escalates to frontier models only when the
+work needs it, draws on the credentials you own (API keys pooled for the
+organisation, subscription seats one person each), and shows what you actually
+spent against what frontier-for-everything would have cost.
 
 Written in Rust. Deployed behind a reverse proxy and a load balancer, in the
 three-tier topology that streaming AI traffic actually needs.
 
 > **Not a resale product.** This is built for an organisation to use its own
-> credentials for its own members — not to intermediate anyone else's. See
+> credentials for its own members — not to intermediate anyone else's. An API
+> key may serve the whole organisation; a subscription seat (a ChatGPT/Codex or
+> SuperGrok plan) serves exactly one person and is never shared. See
 > [docs/compliance.md](docs/compliance.md) for which credential kinds each
-> provider sanctions, and why that distinction is one nullable column.
+> provider sanctions, and how the gateway keeps a seat personal.
 
 New here? [docs/08-clients.md](docs/08-clients.md) is the one to read first — how
 to point Claude Code, an OpenAI SDK, or curl at the gateway, and why the model
@@ -53,6 +58,15 @@ Containers still listen on 8080/8081 internally, where nothing can collide.
 
 `oag/auto` lets policy choose the model; `oag/cheap` and `oag/frontier` pin a
 rung. Name a real model and it is honoured.
+
+System One — Jev's typed questions-and-answers API, not a chat — is served at
+`/jev/v1/systemone` by a Jev key on the route, so the TypeSafe SDK works
+unmodified against `https://<gateway>/jev`:
+
+```bash
+curl localhost:29080/jev/v1/systemone -H "authorization: Bearer $OAG_KEY" \
+  -d '{"state":"I was charged twice.","questions":{"billing":{"type":"noul","instructions":"Is this about billing?"}}}'
+```
 
 Clients that expect the usual discovery and preflight endpoints get them:
 
@@ -97,8 +111,8 @@ web/index.html   the dashboard, embedded in the binary
 Four of the eight crates do no I/O at all. That is deliberate and it is the
 main structural bet: routing policy, translation, and credential scheduling are
 the things most worth testing exhaustively and least worth spinning up a
-database for. Those four carry 319 tests and run in well under a second. The
-workspace as a whole is 848.
+database for. Those four carry about a third of the workspace's thousand-odd
+tests and run in well under a second.
 
 The dashboard is a single self-contained HTML file compiled into the binary. A
 build toolchain and `node_modules` for a handful of read views is what "less is
@@ -132,7 +146,7 @@ Ordered by what you are likely to need, not by number.
 | [04-cloud.md](docs/04-cloud.md) | **Cloud deployment** — Kubernetes, Cloud Run, Fargate, Container Apps, Cloudflare, and which of them has actually been applied |
 | [05-services.md](docs/05-services.md) | How do I register a sandbox, guard or reducer beside the gateway without the gateway becoming one? |
 | [06-llm-mocks.md](docs/06-llm-mocks.md) | Which mock server can stand in for a provider, and which gaps no mock closes |
-| [compliance.md](docs/compliance.md) | Which credential kinds each provider sanctions, and why that distinction is one nullable column |
+| [compliance.md](docs/compliance.md) | Which credential kinds each provider sanctions, and why a subscription seat belongs to one person |
 
 ## What it does
 
@@ -146,11 +160,17 @@ Ordered by what you are likely to need, not by number.
   their budget: escalating then would undo the saving the downgrade made.
 - **Pools credentials.** Priority tiers, least-loaded selection, use-it-or-lose-it
   window preference, LRU, circuit breakers, and two-stage failover.
+- **Keeps a subscription seat personal.** A seat serves only the person who owns
+  it — the schema refuses an owner-less one — and behaves like that person's own
+  client: one session per conversation, one quota reader across the fleet, one
+  user-agent, two requests in flight.
 - **Keeps prompt caches hitting.** Conversations pin to a credential, keyed on
   the part of the prompt that is stable across turns. On agentic traffic the
   cache is most of the bill.
-- **Speaks both dialects, in both directions.** Anthropic Messages and OpenAI
-  Chat Completions, inbound and upstream, translated through one canonical form.
+- **Speaks the APIs clients already use.** Anthropic Messages, OpenAI Chat
+  Completions and Responses, and Gemini generateContent, inbound and upstream,
+  translated through one canonical form — plus Jev's System One, passed through
+  byte for byte to a Jev upstream.
 - **Measures itself.** Every request records what it cost *and* what it would
   have cost on the route's top tier. The difference is the point.
 
