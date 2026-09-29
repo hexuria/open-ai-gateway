@@ -217,7 +217,7 @@ async fn mock_models(
             .into_response();
     }
     let listing =
-        ModelsResponse::new([ModelMetadata::new("jev-latest", "Fast model", "2026-08-01")]);
+        ListModelsResponse::new([ModelMetadata::new("jev-latest", "Fast model", "2026-08-01")]);
     let bytes = pretty(&listing);
     mock.lock().sent.push(bytes.clone());
     (
@@ -1200,6 +1200,6 @@ fn an_answer_is_priced_by_its_catalog_row_or_left_unpriced() {
 fn a_body_that_is_not_the_wire_type_is_an_error_naming_it() {
     let err = decoded::<SystemOneResponse>(br#"{"answers":{}}"#).expect_err("no model");
     assert!(err.to_string().contains("SystemOneResponse"), "{err}");
-    let ok = decoded::<ModelsResponse>(br#"{"models":[]}"#).expect("a listing");
+    let ok = decoded::<ListModelsResponse>(br#"{"models":[]}"#).expect("a listing");
     assert!(ok.models.is_empty());
 }

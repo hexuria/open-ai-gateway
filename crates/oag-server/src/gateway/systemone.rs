@@ -43,7 +43,7 @@ use oag_upstream::{JevUpstream, Transport as _, TransportKey};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use typesafe_sdk::wire::{ModelsResponse, SystemOneRequest, SystemOneResponse};
+use typesafe_sdk::wire::{ListModelsResponse, SystemOneRequest, SystemOneResponse};
 
 /// Where Jev names the request that produced an answer, and where the SDK's
 /// `request_id()` reads it. Passed through, so a caller can quote it to Jev's
@@ -165,7 +165,7 @@ async fn list(
         &route,
         request_id,
         JevUpstream::models,
-        decoded::<ModelsResponse>,
+        decoded::<ListModelsResponse>,
     )
     .await?;
     answer.lease.release().await;
