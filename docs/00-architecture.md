@@ -2,13 +2,18 @@
 
 ## In ten sentences
 
-Every model call an organisation makes goes through one door. At that door the
+Every model call an organisation makes goes through one door, in whichever chat
+API the client already speaks: OpenAI, Anthropic or Gemini. At that door the
 gateway authenticates the caller, checks their budget, decides which model
-should serve the request, picks a credential from the pool, translates the
-request into whatever dialect that provider speaks, streams the response back
-while translating it in the other direction, and records what it cost alongside
-what it would have cost on the best model available. If the credential fails, it
-picks another. If the model produces something unusable, it retries one tier up.
+should serve the request, picks a credential from the pool — an organisation's
+pooled API key, or a subscription seat that only its one owner may use —
+translates the request into whatever dialect that provider speaks, streams the
+response back while translating it in the other direction, and records what it
+cost alongside what it would have cost on the best model available. If the
+credential fails, it picks another. If the model produces something unusable,
+it retries one tier up. Jev's System One is the exception: it is not a chat, so
+the gateway admits it, leases a Jev key and passes the request and answer
+through untranslated — no canonical form, no stream, no ladder.
 Postgres holds the truth; Redis holds what the replicas need to agree on. The
 gateway itself is stateless, so you run as many as you need behind a load
 balancer.
