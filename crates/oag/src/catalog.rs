@@ -88,6 +88,31 @@ pub fn builtin() -> Vec<ModelRow> {
         },
     ];
 
+    // System One's models, which no chat request can route to. Unpriced:
+    // TypeSafe publishes no per-token price yet, so an answer is metered with
+    // its token counts at zero cost, and pricing this row later — an override,
+    // which a re-seed leaves alone — prices every answer after it. No
+    // capability flags and no window: those describe what a chat request
+    // needs, and a System One model answers none.
+    const SYSTEM_ONE: &[(&str, &str)] = &[("jev/jev-latest", "jev-latest")];
+
+    let system_one = SYSTEM_ONE.iter().map(|&(id, upstream)| ModelRow {
+        id: id.to_owned(),
+        provider: Provider::Jev.as_str().to_owned(),
+        upstream_name: upstream.to_owned(),
+        input_per_mtok: Decimal::ZERO,
+        output_per_mtok: Decimal::ZERO,
+        cache_read_per_mtok: None,
+        cache_write_per_mtok: None,
+        context_window: 0,
+        max_output_tokens: 0,
+        supports_vision: false,
+        supports_tools: false,
+        supports_reasoning: false,
+        supports_prompt_cache: false,
+        display_label: None,
+    });
+
     MODELS
         .iter()
         .filter_map(|m| {
@@ -114,6 +139,7 @@ pub fn builtin() -> Vec<ModelRow> {
                 display_label: None,
             })
         })
+        .chain(system_one)
         .collect()
 }
 
@@ -385,7 +411,9 @@ mod tests {
     fn the_builtin_catalog_is_internally_consistent() {
         let models = builtin();
         assert!(!models.is_empty());
-        for m in &models {
+        // The chat models: System One's are unpriced by design, and checked
+        // below.
+        for m in models.iter().filter(|m| m.provider != "jev") {
             assert!(m.output_per_mtok > m.input_per_mtok, "{}", m.id);
             assert!(m.context_window > 0, "{}", m.id);
             assert!(m.provider.parse::<oag_core::Provider>().is_ok(), "{}", m.id);
@@ -408,6 +436,40 @@ mod tests {
         assert_eq!(sol.upstream_name, "gpt-5.5");
         assert!(sol.supports_reasoning);
         assert!(sol.input_per_mtok > Decimal::ZERO);
+    }
+
+    #[test]
+    fn the_builtin_catalog_holds_system_one_unpriced_and_capable_of_no_chat() {
+        // The row the System One route prices an answer against, and the one
+        // the ledger's `model_id` names. Zero rather than a guessed price: a
+        // savings or points figure computed from an invented number is worse
+        // than a visible gap.
+        let models = builtin();
+        let jev = models
+            .iter()
+            .find(|m| m.id == "jev/jev-latest")
+            .expect("System One's default model is seeded");
+        assert_eq!(jev.provider.parse::<Provider>().ok(), Some(Provider::Jev));
+        assert_eq!(jev.upstream_name, "jev-latest");
+        assert!(jev.input_per_mtok.is_zero() && jev.output_per_mtok.is_zero());
+        assert_eq!(jev.cache_read_per_mtok, None);
+        assert!(
+            !(jev.supports_vision
+                || jev.supports_tools
+                || jev.supports_reasoning
+                || jev.supports_prompt_cache),
+            "a System One model answers no chat request, so claims no chat capability"
+        );
+        // And it is the only row that is not chat.
+        let not_chat = models
+            .iter()
+            .filter(|m| {
+                m.provider
+                    .parse::<Provider>()
+                    .is_ok_and(|p| !p.native_dialect().is_chat())
+            })
+            .count();
+        assert_eq!(not_chat, 1);
     }
 
     #[test]
