@@ -27,14 +27,16 @@ and prints what it chose, so a clash shifts the port instead of failing the run.
 Override the starting point with `just pub_port=31000 adm_port=31001 serve`.
 Inside containers the listeners are still 8080/8081, where nothing can collide.
 
-Four sibling verifications need no credentials either, and each pins one thing:
+Five sibling verifications need no credentials either, and each pins one thing:
 `just verify-breakers` (408s trip the breaker, the next request is refused
 without another upstream call, and a 529 on one of two credentials is served by
 the other), `just verify-dialects` (the OpenAI and Gemini adapters against
 `aimock`; needs Node), `just verify-translate` (an OpenAI client and a Responses
 client over an Anthropic mock — the translation hub rather than a native
-adapter), and `just verify-bedrock` (the Bedrock event-stream decoder against
-`vidaimock`, which is the one binary frame format in the tree).
+adapter), `just verify-bedrock` (the Bedrock event-stream decoder against
+`vidaimock`, which is the one binary frame format in the tree), and
+`just verify-systemone` (System One against a mock Jev: answers byte for byte,
+the ledger row, failover between two Jev keys, and both refusals).
 
 ## First run, end to end
 

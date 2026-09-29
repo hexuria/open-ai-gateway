@@ -300,6 +300,12 @@ verify-bedrock:
 verify-translate:
     @./deploy/test/translate-verify.sh
 
+# Answers byte for byte, the ledger row, failover between two Jev keys, and
+# both refusals: no Jev key on the route, and a chat request naming Jev's model.
+# System One against a mock Jev. No TypeSafe key.
+verify-systemone:
+    @./deploy/test/systemone-verify.sh
+
 # Used by local-verify.sh. Kept here so there is one definition of the dev
 # environment rather than a second copy inside a shell script.
 _verify-env:

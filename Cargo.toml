@@ -102,6 +102,13 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # ── cli ────────────────────────────────────────────────────────────────────────
 clap = { version = "4", features = ["derive", "env"] }
 
+# ── System One (Jev) ───────────────────────────────────────────────────────────
+# The owner's SDK, for its wire types in both directions: the gateway parses a
+# client's request and Jev's answer with the same types the client serialises
+# them with, rather than keeping a second copy of the format. Pinned exactly: the
+# gateway re-serves its wire types byte for byte.
+typesafe-sdk = "=0.2.0"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"

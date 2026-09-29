@@ -51,6 +51,7 @@ when the body was truncated and no longer parses.
 | `quota_reserve_held` | 503 | every credential is at its reserve floor | retry after the window resets |
 | `at_capacity` | 503 | every credential is at max concurrency | retry shortly — this one really is transient |
 | `overloaded` | 503 | this replica is at its in-flight ceiling; the request was shed, not queued | **honour `Retry-After`**; a balancer will land the retry on a replica with room |
+| `system_one_not_configured` | 503 | a System One request on a route that holds no Jev key. There is no chat fallback to offer instead | do not retry; the operator adds a Jev key to the route |
 | `stream_idle` | 504 | the upstream went quiet mid-stream | retry |
 | `upstream_timeout` | 504 | the upstream accepted the connection and never began a response | retry |
 | `upstream_error` | *see below* | the provider refused | depends on `upstream_status` |
@@ -106,6 +107,12 @@ Gemini-shaped failure and belongs beside the Gemini requests.
 413 is real and verified, but not asserted in the suite: the fixture would be a
 five-megabyte blob committed to test one status code. `errors.hurl` carries the
 one-line reproduction in a comment instead.
+
+`system_one_not_configured` is asserted by `deploy/test/systemone-verify.sh`,
+against a route it creates with no Jev key, rather than here: whether the key
+these files use can reach Jev depends on the route it was minted on.
+`systemone.hurl` asserts the `invalid_request` a System One body with no
+questions gets, and the script runs it.
 
 **Not reachable on this deployment**, and why:
 
@@ -167,7 +174,7 @@ stream. `MOCK_CHUNKS=1 MOCK_STREAM_SECONDS=300` makes that gap 300 seconds and
 the watchdog fires with a request in flight, which is the condition.
 
 **3. Render the shapes without a gateway at all.** `errors.json`, beside this
-file, holds every error exactly as the wire carries it — 20 shapes, each with
+file, holds every error exactly as the wire carries it — 21 shapes, each with
 its status, its `Retry-After` when it has one, and the Rust variant that
 produced it. Build a client against those bytes and you need no gateway, no
 credential and no failure.

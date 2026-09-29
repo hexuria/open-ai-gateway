@@ -136,8 +136,24 @@ fn oag_headers(
     decision: &RoutingDecision,
     request_id: RequestId,
 ) -> axum::http::response::Builder {
-    let builder = builder
-        .header("x-oag-model", decision.model.id.as_str())
+    let builder = identity_headers(
+        builder.header("x-oag-model", decision.model.id.as_str()),
+        request_id,
+    );
+    match decision.rung_name() {
+        Some(tier) => builder.header("x-oag-tier", tier),
+        None => builder,
+    }
+}
+
+/// Which request this was and which build answered it: the part of
+/// [`oag_headers`] that is not about routing, so a System One answer — which
+/// was never routed — carries it too.
+pub(super) fn identity_headers(
+    builder: axum::http::response::Builder,
+    request_id: RequestId,
+) -> axum::http::response::Builder {
+    builder
         .header("x-oag-request-id", request_id.to_string())
         // Which build answered, on the response the caller is already reading.
         //
@@ -149,11 +165,7 @@ fn oag_headers(
         // is readable without a key, and the answer arrives on the very
         // request whose shape is in question rather than on a second probe
         // that could hit a different replica.
-        .header(crate::BUILD_HEADER, crate::build_id());
-    match decision.rung_name() {
-        Some(tier) => builder.header("x-oag-tier", tier),
-        None => builder,
-    }
+        .header(crate::BUILD_HEADER, crate::build_id())
 }
 
 /// Hand the upstream stream to the client.
@@ -327,6 +339,10 @@ fn client_status_for(upstream: u16) -> StatusCode {
 /// *status* is deliberately not always ours: see [`client_status_for`].
 /// Internal errors are surfaced as nothing at all: they can carry connection
 /// strings and file paths.
+// Long because it is a table — one arm per client-facing kind — and not
+// branching logic. Split up, the one place a status is decided for a client
+// would be several.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn error_response(e: &Error) -> Response {
     let (status, kind, message) = match e {
         Error::Unauthenticated => (
@@ -405,6 +421,14 @@ pub(crate) fn error_response(e: &Error) -> Response {
         Error::UpstreamTimeout { .. } => (
             StatusCode::GATEWAY_TIMEOUT,
             "upstream_timeout",
+            e.to_string(),
+        ),
+        // Its own kind, not `no_credential`: that one is also what a route
+        // whose Jev keys are all cooling down gets, and a client that branches
+        // on the kind should not wait out a key nobody has added.
+        Error::SystemOneNotConfigured { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "system_one_not_configured",
             e.to_string(),
         ),
         _ => {
@@ -492,6 +516,19 @@ pub(super) fn no_viable_message(route: &str, requested: &str, ladder: &TierLadde
         .split_once('/')
         .map(|(p, _)| p)
         .filter(|p| *p != "oag");
+
+    // Not a ladder problem, so not the ladder fix: the chat catalog holds no
+    // System One model, so a rung naming one would serve nothing either.
+    if let Some(name) = provider
+        && name
+            .parse::<oag_core::Provider>()
+            .is_ok_and(|p| !p.native_dialect().is_chat())
+    {
+        return format!(
+            "'{requested}' is a System One model: it answers questions rather than continuing \
+             a conversation, so no chat route serves it. Send it to POST /jev/v1/systemone"
+        );
+    }
 
     if let Some(provider) = provider {
         if !ladder_providers.contains(&provider) {

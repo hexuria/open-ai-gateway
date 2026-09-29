@@ -498,6 +498,29 @@ fn no_viable_model_names_the_route_and_the_fix() {
     );
 }
 
+/// A chat request naming a System One model is not a ladder problem, so it is
+/// not told the ladder fix: a rung naming one would serve nothing either,
+/// because the chat catalog never holds one. It is told where the model is
+/// served instead.
+#[test]
+fn a_chat_request_for_a_system_one_model_is_sent_to_system_one() {
+    let ladder = TierLadder::new(vec![oag_router::ladder::Rung {
+        name: oag_core::TierName::from("cheap"),
+        models: vec![oag_router::ModelId::new("anthropic/claude-haiku-4.5")],
+    }])
+    .expect("ladder");
+    let msg = no_viable_message("default", "jev/jev-latest", &ladder);
+    assert!(
+        msg.contains("'jev/jev-latest' is a System One model"),
+        "{msg}"
+    );
+    assert!(msg.contains("POST /jev/v1/systemone"), "{msg}");
+    assert!(!msg.contains("route tiers"), "{msg}");
+    // The alias names the same provider, and gets the same answer.
+    let alias = no_viable_message("default", "typesafe/jev-latest", &ladder);
+    assert!(alias.contains("System One"), "{alias}");
+}
+
 #[test]
 fn transport_error_records_breaker_failure() {
     // A credential behind a dead proxy never returns a status, so nothing
@@ -856,6 +879,66 @@ async fn a_same_dialect_body_is_served_verbatim_as_json() {
         .await
         .expect("body");
     assert_eq!(sent, body);
+}
+
+/// Every answer names what served it: the model, the rung when there was
+/// one, the request and the build. System One shares the last two, and split
+/// them out of this; asserted here so the split cannot drop one from chat.
+#[test]
+fn a_collected_answer_names_its_model_rung_request_and_build() {
+    let header = |response: &Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let request_id = RequestId::new();
+    let body = bytes::Bytes::from_static(br#"{"id":"msg_1","content":[]}"#);
+    let on_rung = json_response(
+        &body,
+        &[],
+        None,
+        &decision_on_rung("balanced", 1),
+        request_id,
+        Dialect::AnthropicMessages,
+        Dialect::AnthropicMessages,
+        false,
+        false,
+    );
+    assert_eq!(
+        header(&on_rung, "x-oag-model").as_deref(),
+        Some("anthropic/sonnet")
+    );
+    assert_eq!(header(&on_rung, "x-oag-tier").as_deref(), Some("balanced"));
+    assert_eq!(
+        header(&on_rung, "x-oag-request-id"),
+        Some(request_id.to_string())
+    );
+    assert_eq!(
+        header(&on_rung, crate::BUILD_HEADER).as_deref(),
+        crate::build_id().to_str().ok()
+    );
+
+    let mut off_ladder = decision_for(oag_core::Provider::Anthropic);
+    off_ladder.tier = None;
+    let named = json_response(
+        &body,
+        &[],
+        None,
+        &off_ladder,
+        request_id,
+        Dialect::AnthropicMessages,
+        Dialect::AnthropicMessages,
+        false,
+        false,
+    );
+    assert_eq!(header(&named, "x-oag-model").as_deref(), Some("p/m"));
+    assert_eq!(
+        header(&named, "x-oag-tier"),
+        None,
+        "a named pin is not `cheap`"
+    );
 }
 
 #[test]
