@@ -4,7 +4,7 @@ use crate::breakers::Breakers;
 use crate::shutdown::Lifecycle;
 use oag_core::config::Config;
 use oag_core::{Error, Kek, Provider, Result};
-use oag_router::Catalog;
+use oag_router::{Catalog, ModelSpec};
 use oag_store::{AuthCache, Cache, Db};
 use oag_upstream::{ProviderAdapter, TransportPool};
 use std::collections::HashMap;
@@ -30,10 +30,19 @@ pub struct AppState {
     /// because it shares OpenAI's provider key but not its dialect — it is
     /// selected per-account for an OpenAI OAuth seat, in the gateway.
     codex: Arc<dyn ProviderAdapter>,
+    /// The System One upstream. Outside `adapters` for the reason Codex is,
+    /// and more so: it is not a chat adapter at all.
+    jev: oag_upstream::JevUpstream,
     /// Swapped wholesale on refresh rather than mutated in place, so a request
     /// that started with one catalog finishes with it — a price changing
     /// halfway through a request would make the ledger disagree with itself.
+    ///
+    /// Chat models only: everything a chat request routes over, lists or
+    /// prices against reads this. See [`AppState::set_catalog`].
     catalog: Arc<RwLock<Arc<Catalog>>>,
+    /// The models no chat request may reach — System One's — which that route
+    /// reads for nothing but their prices.
+    system_one: Arc<RwLock<Arc<Catalog>>>,
     /// A8. The readiness answer, memoised for a second by `health::ready`.
     ///
     /// A field rather than the process-global `OnceLock` it was: that made the
@@ -195,6 +204,11 @@ impl AppState {
                 .with_user_agent(cx.user_agent.clone()),
         );
 
+        let jev = oag_upstream::JevUpstream::new(base(
+            Provider::Jev,
+            oag_upstream::jev::DEFAULT_BASE_URL,
+        )?);
+
         Ok(Self {
             auth: AuthCache::new(
                 db.clone(),
@@ -222,7 +236,9 @@ impl AppState {
             refresh_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             adapters: Arc::new(adapters),
             codex,
+            jev,
             catalog: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
+            system_one: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
             readiness: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
@@ -251,9 +267,21 @@ impl AppState {
         Arc::clone(&self.codex)
     }
 
+    /// The System One upstream, for a leased Jev credential.
+    #[must_use]
+    pub fn jev(&self) -> &oag_upstream::JevUpstream {
+        &self.jev
+    }
+
+    /// Every provider this build can call: one per chat adapter, and Jev,
+    /// which the System One route serves without one.
     #[must_use]
     pub fn providers(&self) -> Vec<Provider> {
-        self.adapters.keys().copied().collect()
+        self.adapters
+            .keys()
+            .copied()
+            .chain([Provider::Jev])
+            .collect()
     }
 
     /// The per-credential refresh gate, creating it on first use.
@@ -267,14 +295,30 @@ impl AppState {
         )
     }
 
-    /// A snapshot of the catalog. Cheap: one `Arc` clone.
+    /// A snapshot of the chat catalog. Cheap: one `Arc` clone.
     pub async fn catalog(&self) -> Arc<Catalog> {
         Arc::clone(&*self.catalog.read().await)
     }
 
-    /// Replace the catalog wholesale.
-    pub async fn set_catalog(&self, catalog: Catalog) {
-        *self.catalog.write().await = Arc::new(catalog);
+    /// A snapshot of System One's models, for pricing an answer.
+    pub async fn system_one_catalog(&self) -> Arc<Catalog> {
+        Arc::clone(&*self.system_one.read().await)
+    }
+
+    /// Replace both catalogs wholesale, from one set of models.
+    ///
+    /// Split here, on the one way in, by whether the model's provider speaks a
+    /// chat dialect. That is the whole of what keeps a chat request off a Jev
+    /// credential: a request is leased a credential for the provider of the
+    /// model routing picked, routing only ever picks from [`Self::catalog`],
+    /// and a System One model is never in it — not by name, not by bare
+    /// upstream name, not on a rung someone wrote into a ladder.
+    pub async fn set_catalog(&self, specs: impl IntoIterator<Item = ModelSpec>) {
+        let (chat, system_one): (Vec<_>, Vec<_>) = specs
+            .into_iter()
+            .partition(|spec| spec.provider.native_dialect().is_chat());
+        *self.system_one.write().await = Arc::new(Catalog::from_entries(system_one));
+        *self.catalog.write().await = Arc::new(Catalog::from_entries(chat));
     }
 
     /// Load the catalog from the database into memory.
@@ -285,7 +329,7 @@ impl AppState {
             .filter_map(oag_store::ModelRow::to_spec)
             .collect();
         let n = specs.len();
-        self.set_catalog(Catalog::from_entries(specs)).await;
+        self.set_catalog(specs).await;
         Ok(n)
     }
 }
@@ -409,6 +453,7 @@ mod tests {
             "deepseek",
             "zhipu",
             "xai",
+            "jev",
         ] {
             build(provider, "https://proxy.internal/upstream/")
                 .unwrap_or_else(|e| panic!("{provider}: a trailing slash normalises away: {e}"));
@@ -420,6 +465,79 @@ mod tests {
                 err.to_string().contains(provider),
                 "the operator has to be told which provider's base URL was \
                  rejected, because they configured several: {err}"
+            );
+        }
+    }
+
+    fn spec(id: &str, provider: oag_core::Provider, upstream: &str) -> oag_router::ModelSpec {
+        oag_router::ModelSpec {
+            id: oag_router::ModelId::new(id),
+            provider,
+            upstream_name: upstream.to_owned(),
+            pricing: oag_router::Pricing {
+                input_per_mtok: rust_decimal::Decimal::ONE,
+                output_per_mtok: rust_decimal::Decimal::TWO,
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
+            },
+            context_window: 200_000,
+            max_output_tokens: 8_192,
+            capabilities: oag_router::Capabilities::default(),
+            display_label: None,
+        }
+    }
+
+    /// No chat request can lease a Jev credential, because no chat request can
+    /// route to a Jev model: the chat catalog never holds one.
+    ///
+    /// A lease is for the provider of the model routing picked, and routing
+    /// picks only from `catalog()` — by full id, by bare upstream name, or off
+    /// a rung. So the split is asserted at all three spellings a chat request
+    /// could reach it by, and the model is still there for System One to price.
+    #[tokio::test]
+    async fn a_system_one_model_never_reaches_the_chat_catalog() {
+        use oag_core::Provider;
+        let state = crate::testing::state("");
+        state
+            .set_catalog([
+                spec(
+                    "anthropic/claude-haiku-4.5",
+                    Provider::Anthropic,
+                    "claude-haiku-4-5",
+                ),
+                spec("jev/jev-latest", Provider::Jev, "jev-latest"),
+            ])
+            .await;
+
+        let chat = state.catalog().await;
+        assert!(chat.resolve("anthropic/claude-haiku-4.5").is_some());
+        assert!(chat.resolve("jev/jev-latest").is_none(), "by id");
+        assert!(chat.resolve("jev-latest").is_none(), "by upstream name");
+        assert!(
+            chat.iter().all(|m| m.provider != Provider::Jev),
+            "off a rung: a ladder naming it finds nothing to pick"
+        );
+
+        let system_one = state.system_one_catalog().await;
+        let jev = oag_router::ModelId::new("jev/jev-latest");
+        assert_eq!(
+            system_one.get(&jev).map(|m| m.pricing.output_per_mtok),
+            Some(rust_decimal::Decimal::TWO),
+            "System One still has it, prices and all"
+        );
+        assert_eq!(system_one.len(), 1, "and nothing that is not its own");
+    }
+
+    /// Every provider in the build can be called. The admin matrix renders a
+    /// provider missing from this as "no adapter in this build"; Jev has no
+    /// chat adapter and is served all the same.
+    #[tokio::test]
+    async fn every_provider_is_reachable_including_the_one_with_no_chat_adapter() {
+        let reachable = crate::testing::state("").providers();
+        for provider in oag_core::Provider::ALL {
+            assert!(
+                reachable.contains(provider),
+                "{provider} is in the enum and nothing calls it"
             );
         }
     }
