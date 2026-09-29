@@ -509,7 +509,7 @@ async function load() {
       { h:'Kind',     f:a => esc(a.kind) },
       { h:'State',    f:a => state(a.state) +
           (a.reason ? `<span class="reason">${esc(a.reason)}</span>` : '') },
-      { h:'Scope',    f:a => a.personal ? 'personal' : 'shared pool' },
+      { h:'Scope',    f:a => a.personal ? 'personal' : (a.kind === 'oauth' ? 'no owner — serves no one' : 'shared pool') },
       { h:'Priority', f:a => a.priority, num:true },
       { h:'Max conc.',f:a => a.max_concurrency, num:true },
       { h:'', f:a => [

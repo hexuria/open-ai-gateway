@@ -64,21 +64,20 @@ not row counts.
 
 ## Ownership: why a credential can be invisible
 
-`account add` requires `--owner-email <email>` or `--shared`, and the refusal is
-deliberate — a personal subscription binds to one principal unless somebody
-deliberately pools it.
+Importing a subscription seat requires `--owner-email <email>`: a seat belongs
+to one person and is never pooled (see [compliance.md](compliance.md)).
 
-The consequence is the part that bites. `repo::candidates` filters
-`owner_principal_id IS NULL OR = $3`, so a bound credential is **invisible** to
-another principal rather than refused. If a consuming service mints its own
+The consequence is the part that bites. `repo::candidates` keeps only the
+caller's own credentials and owner-less API keys, so a bound credential is
+**invisible** to another principal rather than refused. If a consuming service mints its own
 per-user keys on its own principal, those users see no credential at all, and
 the error says only "no credential for `<provider>`".
 
-**There is no CLI path to change ownership afterwards.** `oag admin account` has
-`add`, `rename`, `list`, `disable`, `enable`, `set-cost` and `set-reserve` — no
-`delete`, no `share`, and `--shared` applies only at import. Pooling an existing
-seat today means writing `account.owner_principal_id = NULL` directly. That gap
-is worth a subcommand.
+**Changing a seat's owner** is `oag admin account set-owner <name>
+--owner-email <email>`. There is deliberately no way to un-own a seat: an
+owner-less seat serves no one. A seat an older version pooled with `--shared`
+is in exactly that state, and `oag admin doctor` lists it with the command that
+binds it.
 
 ## Reading a "no credential" error
 

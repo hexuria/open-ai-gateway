@@ -18,7 +18,7 @@ choice is the operator's, and the schema records it so it is visible.
 | `api_key` | **Sanctioned.** Explicitly permitted for the customer's own authorised users. | The default. Pool and rotate freely. |
 | `bedrock` | **Sanctioned**, governed by your cloud agreement. | Deployments already on AWS. (`account add` stores Bedrock keys as `api_key`; `bedrock` is accepted for rows written by hand.) |
 | `oauth` — Team/Enterprise seat | **Sanctioned.** OAuth covers Free, Pro, Max, Team, and Enterprise purchasers. | Per-person binding: each member signs in with their own seat. |
-| `oauth` — individual Pro/Max seat, shared | **Constrained.** These plans assume ordinary, individual usage. | Personal single-user deployments. |
+| `oauth` — individual Pro/Max seat | **Its holder's own use only.** These plans assume ordinary, individual usage. | One person reaching their own seat. OAG refuses to share one: see below. |
 
 ## What the providers actually say
 
@@ -57,10 +57,29 @@ account.owner_principal_id  uuid REFERENCES principal(id)
   gateway is doing ordinary individual usage; the gateway is routing and
   metering, not intermediating someone else's credential.
 - **NULL** — the credential joins the shared pool, available to every request on
-  its routes. Correct for `api_key` and `bedrock`.
+  its routes. Correct for `api_key` and `bedrock`, and **never** for a
+  subscription seat.
 
-The scheduler and the router do not care which. Everything else in this
-repository works identically either way.
+**A subscription seat belongs to exactly one person.** One person may own
+several seats; a seat never serves anyone but its owner. Sharing one personal
+plan across people is what those plans' terms forbid, and it is what got an
+account banned. So the gateway does not offer it:
+
+- `oag admin account add --from grok|codex` requires `--owner-email`;
+  `--shared` is gone and names this rule when passed.
+- The schema refuses to make an owner-less seat — inserting one, clearing a
+  seat's owner, or turning an owner-less key into a seat — with the
+  `account_seat_has_one_owner` trigger (migration 0019).
+- A seat left owner-less by an older version serves no one — the request path
+  matches it for nobody — until `oag admin account set-owner <name>
+  --owner-email <email>` binds it. `oag admin doctor` lists every such seat.
+  Until then it can still be disabled, renamed or priced, and the usage
+  poller neither reads nor refreshes it.
+- A seat's owner is a principal, and a principal can hold several keys. That
+  is fine when they are all that person's (a laptop, a CI job); a key handed to
+  someone else shares the seat. The gateway cannot tell the two apart, so
+  `doctor` and `key create` warn whenever a seat's owner holds more than one
+  live inference key.
 
 ## Practical guidance
 

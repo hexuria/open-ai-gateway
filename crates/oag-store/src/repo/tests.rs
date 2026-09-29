@@ -2957,9 +2957,15 @@ async fn the_schema_refuses_a_claude_subscription_that_can_serve_and_a_dead_kind
         let db = db.clone();
         async move {
             sqlx::query_scalar::<_, Uuid>(
-                "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
-                 credentials_nonce, schedulable) \
-                 VALUES (gen_random_uuid(), $1, $2, $3, '\\x00', '\\x00', $4) RETURNING id",
+                // Every row owned, so each insert trips only the constraint it
+                // is about and not 0019's "a seat has an owner".
+                "WITH owner AS (INSERT INTO principal (id, email) \
+                 VALUES (gen_random_uuid(), 'owner-' || gen_random_uuid() || '@test') \
+                 RETURNING id) \
+                 INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+                 credentials_nonce, schedulable, owner_principal_id) \
+                 SELECT gen_random_uuid(), $1, $2, $3, '\\x00', '\\x00', $4, owner.id \
+                 FROM owner RETURNING id",
             )
             .bind(format!("guard-{}", Uuid::new_v4()))
             .bind(provider)
@@ -3010,4 +3016,352 @@ async fn the_schema_refuses_a_claude_subscription_that_can_serve_and_a_dead_kind
             .await
             .unwrap_or_else(|e| panic!("{provider}/{kind}: {e}"));
     }
+}
+
+/// A seat on `route` for `provider`, owned by `owner`, straight into the table.
+async fn seat_on(db: &Db, route: Uuid, provider: &str, kind: &str, owner: Option<Uuid>) -> Uuid {
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce, \
+         owner_principal_id) VALUES (gen_random_uuid(), $1, $2, $3, '\\x00', '\\x00', $4) \
+         RETURNING id",
+    )
+    .bind(format!("{kind}-{}", Uuid::new_v4()))
+    .bind(provider)
+    .bind(kind)
+    .bind(owner)
+    .fetch_one(db.pool())
+    .await
+    .expect("account");
+    sqlx::query("INSERT INTO account_route (account_id, route_id) VALUES ($1, $2)")
+        .bind(id)
+        .bind(route)
+        .execute(db.pool())
+        .await
+        .expect("join");
+    id
+}
+
+async fn another_principal(db: &Db) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO principal (id, email) VALUES (gen_random_uuid(), $1) RETURNING id",
+    )
+    .bind(format!("{}@example.invalid", Uuid::new_v4()))
+    .fetch_one(db.pool())
+    .await
+    .expect("principal")
+}
+
+/// 0019 and the request path: a subscription seat serves its owner and no one
+/// else, while an owner-less API key stays the route's shared pool. The lease
+/// path has exactly one query (`candidates`), so this is the whole of "can B
+/// be served by A's seat".
+#[tokio::test]
+async fn a_seat_serves_its_owner_and_no_one_else() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let (owner, route, _) = seed(&db).await;
+    let other = another_principal(&db).await;
+    let seat = seat_on(&db, route, "xai", "oauth", Some(owner)).await;
+    let pooled = seat_on(&db, route, "xai", "api_key", None).await;
+
+    let ids =
+        |rows: Vec<crate::rows::AccountRow>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+    let mine = ids(candidates(&db, route, "xai", owner).await.expect("owner"));
+    let theirs = ids(candidates(&db, route, "xai", other).await.expect("other"));
+    assert!(mine.contains(&seat) && mine.contains(&pooled), "{mine:?}");
+    assert!(
+        theirs.contains(&pooled),
+        "the shared key serves everyone: {theirs:?}"
+    );
+    assert!(
+        !theirs.contains(&seat),
+        "another principal was offered the owner's seat: {theirs:?}"
+    );
+
+    // And the schema refuses to make a seat that would belong to nobody.
+    let refused = sqlx::query(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+         VALUES (gen_random_uuid(), $1, 'xai', 'oauth', '\\x00', '\\x00')",
+    )
+    .bind(format!("orphan-{}", Uuid::new_v4()))
+    .execute(db.pool())
+    .await
+    .expect_err("an owner-less seat must not be insertable");
+    assert!(
+        refused.to_string().contains("account_seat_has_one_owner"),
+        "{refused}"
+    );
+}
+
+/// A seat an older version pooled (`--shared`) is still in some databases:
+/// 0019 does not stop a boot over it. It must serve no one. Built inside a
+/// transaction that disables the trigger, because the schema no longer lets
+/// anything create one; the rollback turns it back on.
+#[tokio::test]
+async fn an_ownerless_seat_from_an_older_version_serves_no_one() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let (owner, route, _) = seed(&db).await;
+    let pooled = seat_on(&db, route, "xai", "api_key", None).await;
+
+    let mut tx = db.pool().begin().await.expect("begin");
+    sqlx::query("ALTER TABLE account DISABLE TRIGGER account_seat_has_one_owner")
+        .execute(&mut *tx)
+        .await
+        .expect("disable, inside the transaction only");
+    let orphan: Uuid = sqlx::query_scalar(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+         VALUES (gen_random_uuid(), $1, 'xai', 'oauth', '\\x00', '\\x00') RETURNING id",
+    )
+    .bind(format!("legacy-{}", Uuid::new_v4()))
+    .fetch_one(&mut *tx)
+    .await
+    .expect("a legacy owner-less seat");
+    sqlx::query("INSERT INTO account_route (account_id, route_id) VALUES ($1, $2)")
+        .bind(orphan)
+        .bind(route)
+        .execute(&mut *tx)
+        .await
+        .expect("join");
+
+    for principal in [owner, Uuid::new_v4()] {
+        let rows: Vec<crate::rows::AccountRow> = sqlx::query_as(super::routes::CANDIDATES_SQL)
+            .bind(route)
+            .bind("xai")
+            .bind(principal)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("candidates");
+        let ids: Vec<Uuid> = rows.into_iter().map(|r| r.id).collect();
+        assert!(ids.contains(&pooled), "{ids:?}");
+        assert!(
+            !ids.contains(&orphan),
+            "an owner-less seat was offered to {principal}: {ids:?}"
+        );
+    }
+    tx.rollback().await.expect("rollback");
+}
+
+/// The warning `doctor` and `key create` print: a seat owner with several
+/// live inference keys. Admin keys and revoked keys do not count, and an
+/// owner with one key is not reported.
+#[tokio::test]
+async fn a_seat_owner_with_several_live_keys_is_reported() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let (owner, route, _) = seed(&db).await;
+    let seat = seat_on(&db, route, "xai", "oauth", Some(owner)).await;
+    let seat_name: String = sqlx::query_scalar("SELECT name FROM account WHERE id = $1")
+        .bind(seat)
+        .fetch_one(db.pool())
+        .await
+        .expect("name");
+    let key = |admin: bool, active: bool| {
+        let db = db.clone();
+        async move {
+            let name = format!("k-{}", Uuid::new_v4());
+            sqlx::query(
+                "INSERT INTO api_key (id, key_hash, key_prefix, name, principal_id, route_id, \
+                 admin, active) VALUES (gen_random_uuid(), $1, 'oag_live_test', $2, $3, $4, $5, $6)",
+            )
+            .bind(hash_key(&name))
+            .bind(&name)
+            .bind(owner)
+            .bind(route)
+            .bind(admin)
+            .bind(active)
+            .execute(db.pool())
+            .await
+            .expect("key");
+        }
+    };
+
+    key(false, true).await;
+    key(true, true).await; // an admin key: not counted
+    key(false, false).await; // revoked: not counted
+    let one = seats_with_many_keys(&db, Some(owner)).await.expect("query");
+    assert!(
+        one.is_empty(),
+        "one live inference key is not a warning: {one:?}"
+    );
+
+    key(false, true).await;
+    let two = seats_with_many_keys(&db, Some(owner)).await.expect("query");
+    assert_eq!(two.len(), 1, "{two:?}");
+    assert_eq!((two[0].seat.as_str(), two[0].keys), (seat_name.as_str(), 2));
+    assert!(
+        seats_with_many_keys(&db, None)
+            .await
+            .expect("all")
+            .iter()
+            .any(|s| s.seat == seat_name),
+        "and the unfiltered form, which doctor uses, includes it"
+    );
+}
+
+/// Cursor's finding on #122: a CHECK — even NOT VALID — re-checks a legacy
+/// owner-less seat on every UPDATE, so it could not be disabled, renamed or have
+/// a rotated token stored. The trigger refuses only a write that would make an
+/// owner-less seat: clearing an owner, or turning an owner-less key into a
+/// seat. Everything else on a legacy seat still writes, and the poller, which
+/// would refresh its token for no request, does not pick it up.
+// Long because it walks one transaction through every write the finding
+// named; split, each half would need its own legacy row and trigger dance.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn a_legacy_ownerless_seat_can_still_be_written_but_not_made() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let (owner, _, _) = seed(&db).await;
+
+    let mut tx = db.pool().begin().await.expect("begin");
+    let exec = |sql: &'static str| sqlx::query(sql);
+    exec("ALTER TABLE account DISABLE TRIGGER account_seat_has_one_owner")
+        .execute(&mut *tx)
+        .await
+        .expect("disable");
+    let legacy: Uuid = sqlx::query_scalar(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+         VALUES (gen_random_uuid(), $1, 'xai', 'oauth', '\\x00', '\\x00') RETURNING id",
+    )
+    .bind(format!("legacy-{}", Uuid::new_v4()))
+    .fetch_one(&mut *tx)
+    .await
+    .expect("legacy");
+    exec("ALTER TABLE account ENABLE TRIGGER account_seat_has_one_owner")
+        .execute(&mut *tx)
+        .await
+        .expect("enable");
+
+    // Every ordinary write to the legacy seat still lands.
+    for (what, sql) in [
+        (
+            "disable",
+            "UPDATE account SET schedulable = false WHERE id = $1",
+        ),
+        (
+            "rename",
+            "UPDATE account SET name = name || '-renamed' WHERE id = $1",
+        ),
+        (
+            "store a rotated token",
+            "UPDATE account SET credentials_sealed = '\\x01', \
+          token_version = token_version + 1 WHERE id = $1",
+        ),
+        (
+            "set its kind to what it is",
+            "UPDATE account SET kind = 'oauth' WHERE id = $1",
+        ),
+    ] {
+        sqlx::query("SAVEPOINT w")
+            .execute(&mut *tx)
+            .await
+            .expect("savepoint");
+        sqlx::query(sql)
+            .bind(legacy)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|e| panic!("{what} on a legacy seat was refused: {e}"));
+    }
+
+    // Binding it works; and the poller's sweep never contained it.
+    let polled: Vec<crate::rows::AccountRow> =
+        sqlx::query_as(super::accounts::SCHEDULABLE_OAUTH_SQL)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("sweep");
+    assert!(
+        polled.iter().all(|r| r.id != legacy),
+        "the poller swept an owner-less seat"
+    );
+
+    // What the trigger does refuse: making an owner-less seat out of a bound
+    // one, or out of an owner-less key.
+    let bound: Uuid = sqlx::query_scalar(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce, \
+         owner_principal_id) VALUES (gen_random_uuid(), $1, 'xai', 'oauth', '\\x00', '\\x00', $2) \
+         RETURNING id",
+    )
+    .bind(format!("bound-{}", Uuid::new_v4()))
+    .bind(owner)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("bound seat");
+    let key: Uuid = sqlx::query_scalar(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+         VALUES (gen_random_uuid(), $1, 'xai', 'api_key', '\\x00', '\\x00') RETURNING id",
+    )
+    .bind(format!("key-{}", Uuid::new_v4()))
+    .fetch_one(&mut *tx)
+    .await
+    .expect("pooled key");
+    for (what, sql, id) in [
+        (
+            "clearing a seat's owner",
+            "UPDATE account SET owner_principal_id = NULL WHERE id = $1",
+            bound,
+        ),
+        (
+            "turning an owner-less key into a seat",
+            "UPDATE account SET kind = 'oauth' WHERE id = $1",
+            key,
+        ),
+    ] {
+        sqlx::query("SAVEPOINT r")
+            .execute(&mut *tx)
+            .await
+            .expect("savepoint");
+        let refused = sqlx::query(sql)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .expect_err(what);
+        assert!(
+            refused.to_string().contains("account_seat_has_one_owner"),
+            "{what}: {refused}"
+        );
+        sqlx::query("ROLLBACK TO SAVEPOINT r")
+            .execute(&mut *tx)
+            .await
+            .expect("rollback to");
+    }
+    tx.rollback().await.expect("rollback");
+}
+
+/// The poller's sweep: an owned, enabled seat is in it; a disabled one is not.
+#[tokio::test]
+async fn the_usage_sweep_holds_owned_enabled_seats() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let (owner, route, _) = seed(&db).await;
+    let live = seat_on(&db, route, "xai", "oauth", Some(owner)).await;
+    let off = seat_on(&db, route, "xai", "oauth", Some(owner)).await;
+    sqlx::query("UPDATE account SET schedulable = false WHERE id = $1")
+        .bind(off)
+        .execute(db.pool())
+        .await
+        .expect("disable");
+    let swept: Vec<Uuid> = schedulable_oauth_accounts(&db)
+        .await
+        .expect("sweep")
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert!(swept.contains(&live), "an owned, enabled seat is polled");
+    assert!(!swept.contains(&off), "a disabled seat is not");
 }

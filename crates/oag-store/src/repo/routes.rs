@@ -25,20 +25,9 @@ pub async fn route_by_id(db: &Db, id: Uuid) -> Result<Option<RouteRow>> {
     .map_err(|e| Error::Internal(format!("loading route: {e}")))
 }
 
-/// Credentials a route may draw on for one provider.
-///
-/// Personal credentials are filtered here rather than in the scheduler: a
-/// credential bound to someone else must never appear in another principal's
-/// candidate set, and enforcing that in SQL means it cannot be forgotten by a
-/// later change to selection policy.
-pub async fn candidates(
-    db: &Db,
-    route_id: Uuid,
-    provider: &str,
-    principal_id: Uuid,
-) -> Result<Vec<AccountRow>> {
-    sqlx::query_as::<_, AccountRow>(
-        r"
+/// [`candidates`]' statement, a constant so a test can run it inside a
+/// transaction that holds a row the schema no longer admits.
+pub(super) const CANDIDATES_SQL: &str = r"
         SELECT a.id, a.name, a.provider, a.kind,
                a.credentials_sealed, a.credentials_nonce, a.token_version, a.token_expires_at,
                a.owner_principal_id, a.proxy_url, a.priority, a.max_concurrency,
@@ -49,15 +38,34 @@ pub async fn candidates(
         JOIN account_route ar ON ar.account_id = a.id
         WHERE ar.route_id = $1
           AND a.provider = $2
-          AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $3)
-        ",
-    )
-    .bind(route_id)
-    .bind(provider)
-    .bind(principal_id)
-    .fetch_all(db.pool())
-    .await
-    .map_err(|e| Error::Internal(format!("loading candidates: {e}")))
+          AND (a.owner_principal_id = $3 OR (a.owner_principal_id IS NULL AND a.kind <> 'oauth'))
+        ";
+
+/// Credentials a route may draw on for one provider.
+///
+/// Personal credentials are filtered here rather than in the scheduler: a
+/// credential bound to someone else must never appear in another principal's
+/// candidate set, and enforcing that in SQL means it cannot be forgotten by a
+/// later change to selection policy.
+///
+/// A subscription seat (`oauth`) is personal or nothing. An owner-less API key
+/// is the organisation's shared pool; an owner-less seat is a personal plan
+/// serving whoever asked, which is the sharing its terms forbid, so it matches
+/// no one until `account set-owner` binds it. The same predicate is in
+/// [`route_channels`] and [`route_channel_status`].
+pub async fn candidates(
+    db: &Db,
+    route_id: Uuid,
+    provider: &str,
+    principal_id: Uuid,
+) -> Result<Vec<AccountRow>> {
+    sqlx::query_as::<_, AccountRow>(CANDIDATES_SQL)
+        .bind(route_id)
+        .bind(provider)
+        .bind(principal_id)
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("loading candidates: {e}")))
 }
 
 /// Providers this route holds usable credentials for, and by which credential
@@ -94,7 +102,7 @@ pub async fn route_channels(
         JOIN account_route ar ON ar.account_id = a.id
         WHERE ar.route_id = $1
           AND a.schedulable
-          AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $2)
+          AND (a.owner_principal_id = $2 OR (a.owner_principal_id IS NULL AND a.kind <> 'oauth'))
           -- Exhausted for a while, not merely busy. A seat whose weekly pool is
           -- spent cannot serve a request today, so offering its models lists
           -- something that is certain to fail. The breaker's own cooldown is
@@ -140,7 +148,7 @@ pub async fn route_channel_status(
         FROM account a
         JOIN account_route ar ON ar.account_id = a.id
         WHERE ar.route_id = $1
-          AND (a.owner_principal_id IS NULL OR a.owner_principal_id = $2)
+          AND (a.owner_principal_id = $2 OR (a.owner_principal_id IS NULL AND a.kind <> 'oauth'))
         ",
     )
     .bind(route_id)

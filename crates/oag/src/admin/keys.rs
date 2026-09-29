@@ -23,6 +23,9 @@ pub(super) async fn key_cmd(db: &Db, redis_url: &str, cli: KeyCli) -> Result<()>
             // themselves, and `init` did not check at all.
             let key = mint_key(db, &email, &route, &name, floor_tier.as_deref(), admin).await?;
             print_key(&key);
+            for line in seat_owner_warnings(db, &email).await {
+                eprintln!("{line}");
+            }
             Ok(())
         }
         Some(KeyAction::List) => list_keys(db).await,
@@ -44,7 +47,35 @@ pub(super) async fn key_cmd(db: &Db, redis_url: &str, cli: KeyCli) -> Result<()>
             )
             .await?;
             print_key(&key);
+            for line in seat_owner_warnings(db, &email).await {
+                eprintln!("{line}");
+            }
             Ok(())
+        }
+    }
+}
+
+/// After a key is minted: if its principal owns a subscription seat and now
+/// holds several live keys, say so.
+///
+/// The caller prints them on stderr, so a script that captures the key from
+/// stdout still gets only the key. Never an error: the key is already minted
+/// and valid, and several keys are fine when they are all one person's.
+pub(super) async fn seat_owner_warnings(db: &Db, email: &str) -> Vec<String> {
+    let principal: Option<Uuid> = sqlx::query_scalar("SELECT id FROM principal WHERE email = $1")
+        .bind(email)
+        .fetch_optional(db.pool())
+        .await
+        .ok()
+        .flatten();
+    let Some(principal) = principal else {
+        return Vec::new();
+    };
+    match repo::seats_with_many_keys(db, Some(principal)).await {
+        Ok(many) => many.iter().map(super::doctor::many_keys_warning).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not check the new key's seats");
+            Vec::new()
         }
     }
 }

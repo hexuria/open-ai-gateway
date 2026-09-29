@@ -22,7 +22,56 @@ pub(super) async fn account_cmd(
             set_account_cost(db, &name, monthly_cost).await
         }
         AccountCommand::SetReserve { name, pct } => set_account_reserve(db, &name, pct).await,
+        AccountCommand::SetOwner { name, owner_email } => {
+            println!("{}", set_account_owner(db, &name, &owner_email).await?);
+            Ok(())
+        }
         AccountCommand::ClearSlots { name } => clear_account_slots(db, redis_url, &name).await,
+    }
+}
+
+/// Bind the credential `name` to the principal with `owner_email`, and say
+/// what it now serves.
+///
+/// One statement, and it touches exactly one row: two credentials sharing a
+/// name are refused rather than both rebound, because moving a seat to the
+/// wrong person is the mistake this command exists to undo.
+pub(super) async fn set_account_owner(db: &Db, name: &str, owner_email: &str) -> Result<String> {
+    let owner = find_owner(db, Some(owner_email))
+        .await?
+        .ok_or_else(|| oag_core::Error::Config(format!("no principal with email {owner_email}")))?;
+    let mut tx = db
+        .pool()
+        .begin()
+        .await
+        .map_err(|e| oag_core::Error::Internal(format!("binding credential: {e}")))?;
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "UPDATE account SET owner_principal_id = $2, updated_at = now() \
+         WHERE name = $1 RETURNING kind",
+    )
+    .bind(name)
+    .bind(owner)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| oag_core::Error::Internal(format!("binding credential: {e}")))?;
+    match rows.as_slice() {
+        [] => Err(oag_core::Error::Config(format!(
+            "no credential named '{name}'; see `oag admin account list`"
+        ))),
+        [(kind,)] => {
+            tx.commit()
+                .await
+                .map_err(|e| oag_core::Error::Internal(format!("binding credential: {e}")))?;
+            Ok(format!(
+                "{name} ({kind}) now belongs to {owner_email}: {}",
+                scope_of(Some(owner))
+            ))
+        }
+        many => Err(oag_core::Error::Config(format!(
+            "{} credentials are named '{name}'; rename one first \
+             (`oag admin account rename`) so the right one is bound",
+            many.len()
+        ))),
     }
 }
 
@@ -136,6 +185,9 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
         shared,
         monthly_cost,
     } = args;
+    if shared {
+        return Err(oag_core::Error::Config(SEAT_IS_PERSONAL.to_owned()));
+    }
     let source = if from_grok {
         Some(AccountSource::Grok)
     } else if from_codex {
@@ -172,7 +224,6 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
                 max_concurrency,
                 priority,
                 owner_email.as_deref(),
-                shared,
                 monthly_cost,
             )
             .await
@@ -187,7 +238,6 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
                 max_concurrency,
                 priority,
                 owner_email.as_deref(),
-                shared,
                 monthly_cost,
             )
             .await
@@ -435,18 +485,10 @@ async fn import_grok(
     max_concurrency: i32,
     priority: i16,
     owner_email: Option<&str>,
-    shared: bool,
     monthly_cost: Option<Decimal>,
 ) -> Result<()> {
-    // A subscription seat is sanctioned for its holder's own use, so binding
-    // to a principal is the default and pooling is the explicit choice —
-    // docs/compliance.md has the distinction this encodes.
-    if owner_email.is_none() && !shared {
-        return Err(oag_core::Error::Config(
-            "a subscription seat binds to one principal by default: pass \
-             --owner-email <email>, or --shared to pool it deliberately"
-                .to_owned(),
-        ));
+    if owner_email.is_none() {
+        return Err(oag_core::Error::Config(SEAT_IS_PERSONAL.to_owned()));
     }
 
     let paths: Vec<String> = if auth_files.is_empty() {
@@ -540,17 +582,10 @@ async fn import_codex(
     max_concurrency: i32,
     priority: i16,
     owner_email: Option<&str>,
-    shared: bool,
     monthly_cost: Option<Decimal>,
 ) -> Result<()> {
-    // Same stance as a Grok seat: sanctioned for the holder's own use, so it
-    // binds to a principal by default and pooling is the explicit choice.
-    if owner_email.is_none() && !shared {
-        return Err(oag_core::Error::Config(
-            "a subscription seat binds to one principal by default: pass \
-             --owner-email <email>, or --shared to pool it deliberately"
-                .to_owned(),
-        ));
+    if owner_email.is_none() {
+        return Err(oag_core::Error::Config(SEAT_IS_PERSONAL.to_owned()));
     }
 
     let paths: Vec<String> = if auth_files.is_empty() {
@@ -647,11 +682,20 @@ async fn find_owner(db: &Db, owner_email: Option<&str>) -> Result<Option<Uuid>> 
 
 const fn scope_of(owner_id: Option<Uuid>) -> &'static str {
     if owner_id.is_some() {
-        "personal (bound to one principal)"
+        "personal (serves its owner only)"
     } else {
         "shared pool"
     }
 }
+
+/// Why a subscription seat needs `--owner-email` and cannot be pooled.
+///
+/// One sentence in every place that refuses, so the operator reads the rule
+/// rather than a flag name: a personal plan serving several people is the
+/// sharing its terms forbid, and the reason an account was banned.
+pub(super) const SEAT_IS_PERSONAL: &str = "a subscription seat belongs to one person and serves only them: pass \
+     --owner-email <email>. One person may own several seats; a seat is never \
+     shared (--shared was removed). See docs/compliance.md.";
 
 /// Refuse a credential kind the provider does not offer.
 ///
@@ -694,6 +738,9 @@ async fn insert_account(
     monthly_cost: Option<Decimal>,
 ) -> Result<Uuid> {
     kind_is_offered(provider, kind)?;
+    if kind == "oauth" && owner_id.is_none() {
+        return Err(oag_core::Error::Config(SEAT_IS_PERSONAL.to_owned()));
+    }
     let sealed = kek.seal_json(material)?;
     // Denormalised so the scheduler can skip expired credentials without
     // decrypting every candidate; see the schema comment.
