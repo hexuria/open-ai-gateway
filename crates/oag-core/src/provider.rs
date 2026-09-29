@@ -22,6 +22,9 @@ pub enum Provider {
     Zhipu,
     XAI,
     Bedrock,
+    /// Jev, from `TypeSafe` AI, which answers System One questions. Not a
+    /// chat upstream: see [`Dialect::SystemOne`].
+    Jev,
 }
 
 impl Provider {
@@ -43,6 +46,7 @@ impl Provider {
                 Dialect::OpenAIChatCompletions
             }
             Self::Gemini => Dialect::GeminiGenerateContent,
+            Self::Jev => Dialect::SystemOne,
         }
     }
 
@@ -57,6 +61,7 @@ impl Provider {
             Self::Zhipu => "zhipu",
             Self::XAI => "xai",
             Self::Bedrock => "bedrock",
+            Self::Jev => "jev",
         }
     }
 
@@ -76,6 +81,7 @@ impl Provider {
         Self::Zhipu,
         Self::XAI,
         Self::Bedrock,
+        Self::Jev,
     ];
 
     /// What an operator can actually do with this provider.
@@ -208,6 +214,24 @@ impl Provider {
                      packed as access_key:secret[:session_token], so it needs no shape of its own.",
                 ),
             },
+            // A provider, and not a service beside the enum, for what the rest
+            // of the gateway then gives it without new code: a Jev key is a
+            // sealed `account` row on a route like any other, and leasing, seat
+            // ownership, concurrency slots, breakers, failover and the ledger
+            // all key on the provider. What it does not get is a chat adapter.
+            Self::Jev => ProviderSupport {
+                provider: self,
+                display_name: "Jev (TypeSafe AI)",
+                aliases: &["typesafe"],
+                credential_kinds: &[CredentialKind::ApiKey],
+                subscription: SubscriptionSupport::NotOffered {
+                    why: NoSubscription::NoImporter,
+                },
+                note: Some(
+                    "Answers System One questions at /jev/v1/systemone and serves no chat \
+                     model, so a route's Jev key is never chosen for a chat request.",
+                ),
+            },
         }
     }
 }
@@ -231,6 +255,7 @@ impl FromStr for Provider {
             "zhipu" | "glm" => Ok(Self::Zhipu),
             "xai" | "grok" => Ok(Self::XAI),
             "bedrock" => Ok(Self::Bedrock),
+            "jev" | "typesafe" => Ok(Self::Jev),
             other => Err(crate::Error::UnknownProvider(other.to_owned())),
         }
     }
@@ -250,6 +275,12 @@ pub enum Dialect {
     OpenAIResponses,
     /// `POST /v1beta/models/{model}:generateContent`
     GeminiGenerateContent,
+    /// `POST /jev/v1/systemone` — Jev's System One: named questions about a
+    /// state, each answered with a typed answer and its confidence.
+    ///
+    /// Not a conversation, so the canonical form cannot carry it: nothing
+    /// translates into or out of it, and only a Jev upstream answers it.
+    SystemOne,
 }
 
 impl Dialect {
@@ -265,7 +296,19 @@ impl Dialect {
             Self::OpenAIChatCompletions => "OpenAI Chat Completions",
             Self::OpenAIResponses => "OpenAI Responses",
             Self::GeminiGenerateContent => "Gemini generateContent",
+            Self::SystemOne => "System One",
         }
+    }
+
+    /// Whether this is a conversation, the thing the chat pipeline carries.
+    ///
+    /// False only for [`Dialect::SystemOne`]. The gateway keeps every model
+    /// whose provider speaks a dialect that is not chat out of the catalog
+    /// chat requests route over, which is what stops one from ever leasing a
+    /// Jev credential.
+    #[must_use]
+    pub const fn is_chat(self) -> bool {
+        !matches!(self, Self::SystemOne)
     }
 }
 
@@ -503,6 +546,33 @@ mod tests {
         let absent = serde_json::to_value(Provider::Gemini.support().subscription)
             .expect("a matrix row serialises");
         assert_eq!(absent["why"]["why"], "no_importer");
+    }
+
+    #[test]
+    fn jev_is_the_one_provider_that_serves_no_chat() {
+        // The property the chat path's catalog is filtered on: a provider
+        // whose dialect is not chat has no model a chat request may route to.
+        // Jev is the only such provider, and every other one is chat.
+        for &p in Provider::ALL {
+            assert_eq!(
+                p.native_dialect().is_chat(),
+                p != Provider::Jev,
+                "{p} is on the wrong side of the chat line"
+            );
+        }
+        assert_eq!(Provider::Jev.native_dialect(), Dialect::SystemOne);
+        assert_eq!(Dialect::SystemOne.as_str(), "System One");
+        // The name its SDK and its company go by, so either spelling adds a
+        // key: `oag admin account add --provider typesafe` stores `jev`.
+        assert_eq!("typesafe".parse::<Provider>().ok(), Some(Provider::Jev));
+        let support = Provider::Jev.support();
+        assert_eq!(support.credential_kinds, &[CredentialKind::ApiKey]);
+        assert!(
+            support
+                .note
+                .is_some_and(|n| n.contains("/jev/v1/systemone")),
+            "the matrix is where an operator learns where a Jev key is used"
+        );
     }
 
     #[test]
