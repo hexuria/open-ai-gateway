@@ -2974,6 +2974,8 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 [[package]]
 name = "typesafe-sdk"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1102e5116f2387b12dd09510921efab5b2ea4d2d77e3059c3d19381aa973619"
 dependencies = [
  "bytes",
  "encoding_rs",
