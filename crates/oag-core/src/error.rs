@@ -355,7 +355,11 @@ fn names_a_capability_limit(body: &str) -> bool {
 /// Which is the whole point. A catalogue of error shapes that silently omits the
 /// error somebody's client is about to receive is worse than no catalogue: it
 /// reads as complete.
-#[cfg(feature = "test-fixtures")]
+///
+/// Also compiled for this crate's own tests, so the list is checked where it is
+/// written: under the feature alone, this crate's test build left it out, and a
+/// mutation of it here compiled nothing and was tested by nothing.
+#[cfg(any(test, feature = "test-fixtures"))]
 #[must_use]
 pub fn every_variant() -> Vec<Error> {
     let all = vec![
@@ -468,6 +472,23 @@ mod tests {
             body: body.to_owned(),
             retry_after: None,
         }
+    }
+
+    /// The match inside `every_variant` proves no variant is missing from its
+    /// code; this proves the list it returns is that list — each variant once,
+    /// the newest included — without a round trip through the catalogue test
+    /// in `oag-server`, the only other thing that calls it.
+    #[test]
+    fn every_variant_lists_each_variant_once() {
+        let all = every_variant();
+        let distinct: std::collections::HashSet<_> =
+            all.iter().map(std::mem::discriminant).collect();
+        assert_eq!(distinct.len(), all.len(), "a variant is listed twice");
+        assert!(
+            all.iter()
+                .any(|e| matches!(e, Error::SystemOneNotConfigured { .. })),
+            "the newest variant is in the list its catalogue is rendered from"
+        );
     }
 
     #[test]
