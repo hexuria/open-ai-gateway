@@ -160,6 +160,23 @@ fn openai_function_names(
 ///
 /// Both are bounded because an unbounded retry loop against a provider having a
 /// bad afternoon is indistinguishable from an attack on it.
+/// Namespace for [`conversation_id`]. Fixed: changing it gives every live
+/// conversation a new id mid-stream.
+const CONVERSATION_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x6f61_672d_636f_6e76_6572_7361_7469_6f6e);
+
+/// One id per conversation, the same on every request in it.
+///
+/// A person's own Codex CLI sends one `session_id` for a whole conversation.
+/// A fresh one per request made one seat look like a crowd — hundreds of
+/// sessions an hour from one account — which is the pattern a subscription's
+/// abuse checks look for. The sticky [`SessionKey`] already names the
+/// conversation (and is per principal), so the id is derived from it: stable
+/// across requests and replicas, and meaningless outside this gateway.
+pub(super) fn conversation_id(session: &SessionKey) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&CONVERSATION_NAMESPACE, session.as_str().as_bytes())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn forward_with_failover(
     state: &Arc<AppState>,
@@ -173,6 +190,7 @@ pub(super) async fn forward_with_failover(
 ) -> Result<Attempt> {
     let request_id = dispatches.request_id;
     let provider = decision.model.provider;
+    let conversation = conversation_id(session);
     let mut excluded: HashSet<AccountId> = HashSet::new();
     let mut last_error = Error::NoCredential { provider };
 
@@ -228,7 +246,17 @@ pub(super) async fn forward_with_failover(
         let account = lease.account.account_id();
         let attempt = dispatches.take();
 
-        match try_credential(state, decision, canonical, &lease, request_id, attempt).await {
+        match try_credential(
+            state,
+            decision,
+            canonical,
+            &lease,
+            request_id,
+            attempt,
+            conversation,
+        )
+        .await
+        {
             Outcome::Ok(attempt) => {
                 if switch > 0 {
                     metrics::counter!("oag_failovers_total").increment(1);
@@ -429,6 +457,8 @@ pub(super) async fn try_credential(
     // `attempt` in the ledger's sense — this request's dispatch ordinal — as
     // distinct from the same-credential retry index the loop below counts.
     ordinal: u8,
+    // The conversation's stable id, from [`conversation_id`].
+    conversation: uuid::Uuid,
 ) -> Outcome {
     let provider = decision.model.provider;
     let account = lease.account.account_id();
@@ -465,6 +495,7 @@ pub(super) async fn try_credential(
             canonical,
             model: &decision.model,
             credential: &credential,
+            session: Some(conversation),
         }) {
             Ok(r) => r,
             // We built a bad request; a different credential will build the

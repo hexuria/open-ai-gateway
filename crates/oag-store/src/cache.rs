@@ -875,6 +875,36 @@ impl Cache {
     }
 }
 
+// ── usage-poll claims ─────────────────────────────────────────────────────────
+
+impl Cache {
+    /// Take this interval's right to poll one seat's usage.
+    ///
+    /// Every replica runs the poller, and without this each one read every
+    /// seat's quota and model list on its own clock: three to twenty readers
+    /// per seat per interval, from as many addresses — which is not how one
+    /// person's CLI behaves. `SET NX PX` and never released: the claim *is*
+    /// the interval, and it expires on its own so the next sweep, on whichever
+    /// replica comes first, can take it.
+    pub async fn claim_usage_poll(&self, account: AccountId, hold: Duration) -> Result<bool> {
+        let mut conn = self.conn().await?;
+        let claimed: Option<String> = redis::cmd("SET")
+            .arg(usage_poll_key(account))
+            .arg("1")
+            .arg("NX")
+            .arg("PX")
+            .arg(u64::try_from(hold.as_millis()).unwrap_or(u64::MAX).max(1))
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| Error::Internal(format!("claiming a usage poll: {e}")))?;
+        Ok(claimed.is_some())
+    }
+}
+
+fn usage_poll_key(account: AccountId) -> String {
+    format!("oag:usage-poll:{account}")
+}
+
 fn refresh_key(account: AccountId) -> String {
     format!("oag:refresh-lock:{account}")
 }
@@ -950,6 +980,37 @@ fn rate_and_burst(rpm: u32) -> (f64, f64) {
 mod tests {
     use super::*;
     use crate::rows::AuthContext;
+
+    /// One replica wins a seat's poll for the interval; a second asking in the
+    /// same interval does not; once the claim lapses the next one can.
+    #[tokio::test]
+    async fn one_replica_polls_a_seat_per_interval() {
+        let Ok(url) = std::env::var("OAG_TEST_REDIS_URL") else {
+            eprintln!("skipped: OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let (a, b) = (
+            Cache::connect(&url).expect("replica a"),
+            Cache::connect(&url).expect("replica b"),
+        );
+        let seat = AccountId::from_uuid(uuid::Uuid::new_v4());
+        let hold = Duration::from_millis(200);
+        assert!(a.claim_usage_poll(seat, hold).await.expect("claim"));
+        assert!(
+            !b.claim_usage_poll(seat, hold).await.expect("claim"),
+            "a second replica in the same interval must not poll the seat"
+        );
+        let other = AccountId::from_uuid(uuid::Uuid::new_v4());
+        assert!(
+            b.claim_usage_poll(other, hold).await.expect("claim"),
+            "the claim is per seat"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            b.claim_usage_poll(seat, hold).await.expect("claim"),
+            "the next interval's sweep takes it"
+        );
+    }
     use rust_decimal::Decimal;
 
     const SECRET: &str = "an-adequately-long-test-signing-secret-000000";

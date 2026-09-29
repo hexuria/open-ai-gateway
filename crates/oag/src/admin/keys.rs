@@ -23,9 +23,6 @@ pub(super) async fn key_cmd(db: &Db, redis_url: &str, cli: KeyCli) -> Result<()>
             // themselves, and `init` did not check at all.
             let key = mint_key(db, &email, &route, &name, floor_tier.as_deref(), admin).await?;
             print_key(&key);
-            for line in seat_owner_warnings(db, &email).await {
-                eprintln!("{line}");
-            }
             Ok(())
         }
         Some(KeyAction::List) => list_keys(db).await,
@@ -47,9 +44,6 @@ pub(super) async fn key_cmd(db: &Db, redis_url: &str, cli: KeyCli) -> Result<()>
             )
             .await?;
             print_key(&key);
-            for line in seat_owner_warnings(db, &email).await {
-                eprintln!("{line}");
-            }
             Ok(())
         }
     }
@@ -198,6 +192,13 @@ pub(super) async fn mint_key(
         )));
     }
 
+    // Here, not at the call sites, for the same reason as the admin gate
+    // above: every caller that mints a key — `key create`, the bare `key`
+    // form and `init` — says it when the new key leaves a seat's owner with
+    // several. On stderr, so a script capturing the key gets only the key.
+    for line in seat_owner_warnings(db, email).await {
+        eprintln!("{line}");
+    }
     Ok(key)
 }
 

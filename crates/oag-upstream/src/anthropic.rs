@@ -163,6 +163,7 @@ mod tests {
                 canonical: &canonical,
                 model: &m,
                 credential: &cred,
+                session: None,
             })
             .expect("builds");
 
@@ -199,6 +200,7 @@ mod tests {
                     canonical: &canonical,
                     model: &m,
                     credential: &cred,
+                    session: None,
                 })
                 .expect("builds");
 
@@ -227,6 +229,7 @@ mod tests {
                 canonical: &canonical,
                 model: &m,
                 credential: &cred,
+                session: None,
             })
             .expect("builds");
 
@@ -252,6 +255,7 @@ mod tests {
                 canonical: &canonical,
                 model: &m,
                 credential: &cred,
+                session: None,
             })
             .expect("builds");
         assert_eq!(req.url().as_str(), "http://127.0.0.1:9999/v1/messages");

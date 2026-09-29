@@ -1,6 +1,7 @@
 use super::accounts::{
-    add_account, add_account_from_args, clear_account_slots, clear_slots_report, kind_is_offered,
-    rename_account, reserve_holds, set_account_owner, validated_reserve,
+    add_account, add_account_from_args, clear_account_slots, clear_slots_report,
+    default_concurrency, kind_is_offered, rename_account, reserve_holds, set_account_owner,
+    validated_reserve,
 };
 use super::catalog::{catalog_lines, empty_catalog_lines};
 use super::keys::{mint_key, revoke_key_lines, seat_owner_warnings};
@@ -1466,4 +1467,25 @@ async fn doctor_fails_a_route_that_does_not_exist() {
     super::doctor::run(&db, &config, &route)
         .await
         .expect_err("a missing route is a problem");
+}
+
+/// A seat defaults to two requests in flight, an API key to eight, and the
+/// flag overrides either.
+#[test]
+fn a_seat_defaults_to_two_requests_in_flight_and_a_key_to_eight() {
+    assert_eq!(default_concurrency(Some(AccountSource::Codex)), 2);
+    assert_eq!(default_concurrency(Some(AccountSource::Grok)), 2);
+    assert_eq!(default_concurrency(None), 8);
+    let parsed = |extra: &[&str]| {
+        let mut argv = vec!["admin", "account", "add", "--name", "n", "--from", "codex"];
+        argv.extend_from_slice(extra);
+        let AdminCommand::Account(AccountCommand::Add { args }) =
+            AdminCli::try_parse_from(&argv).expect("parses").cmd
+        else {
+            panic!("expected an account add");
+        };
+        args.max_concurrency
+    };
+    assert_eq!(parsed(&[]), None, "no flag, so the default decides");
+    assert_eq!(parsed(&["--max-concurrency", "5"]), Some(5));
 }

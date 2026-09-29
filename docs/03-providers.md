@@ -67,7 +67,7 @@ before it reaches the row.
 
 Every `api_key` provider in the table takes exactly that command; only
 `--provider` changes. The rest is scheduling — `--route` (`default`),
-`--priority` (0) and `--max-concurrency` (8). Bedrock is the only shape
+`--priority` (0) and `--max-concurrency` (8 for an API key, 2 for an imported seat). Bedrock is the only shape
 difference, and it is not much of one: its secret is packed as
 `access_key:secret[:session_token]`, so it still arrives through `--secret` and
 needs no credential shape of its own.

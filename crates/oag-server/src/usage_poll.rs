@@ -16,6 +16,7 @@ use oag_store::ModelRow;
 use oag_upstream::xai_models::{CatalogInsert, Donor};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 
 /// Start the usage poller, unless the interval is zero (disabled).
@@ -25,19 +26,31 @@ pub fn spawn_usage_poll(state: Arc<AppState>) {
         return;
     }
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        // Poll shortly after boot (the first immediate tick), then on the
-        // interval — a fresh replica should not wait a whole period to know
-        // where its seats stand.
+        // Poll shortly after boot, then about once an interval — a fresh
+        // replica should not wait a whole period to know where its seats
+        // stand. Each wait is jittered so replicas started together drift
+        // apart; the per-seat claim in `poll_once` is what makes one of them
+        // the reader.
         loop {
-            ticker.tick().await;
-            poll_once(&state).await;
+            poll_once(&state, interval).await;
+            tokio::time::sleep(jittered(interval, rand::random::<f64>())).await;
         }
     });
 }
 
-/// One sweep over every subscription seat.
-async fn poll_once(state: &Arc<AppState>) {
+/// `interval`, give or take a fifth, for a `unit` drawn from `[0, 1)`.
+fn jittered(interval: Duration, unit: f64) -> Duration {
+    interval.mul_f64(0.8 + 0.4 * unit.clamp(0.0, 1.0))
+}
+
+/// How long one replica's claim on a seat lasts: the shortest jittered wait,
+/// so the next sweep on any replica always finds it expired.
+fn claim_hold(interval: Duration) -> Duration {
+    jittered(interval, 0.0)
+}
+
+/// One sweep over every subscription seat this replica wins the claim on.
+async fn poll_once(state: &Arc<AppState>, interval: Duration) {
     let accounts = match oag_store::repo::schedulable_oauth_accounts(&state.db).await {
         Ok(a) => a,
         Err(e) => {
@@ -48,6 +61,21 @@ async fn poll_once(state: &Arc<AppState>) {
 
     for row in accounts {
         let account = row.account_id();
+        // One reader per seat per interval, fleet-wide. With Redis down the
+        // seat is skipped rather than read by every replica: a stale quota is
+        // a freshness problem, a crowd of readers on one person's plan is not.
+        match state
+            .cache
+            .claim_usage_poll(account, claim_hold(interval))
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::debug!(%account, error = %e, "usage poll: no claim, skipping seat");
+                continue;
+            }
+        }
         let Ok(provider) = row.provider.parse() else {
             continue;
         };
@@ -67,7 +95,15 @@ async fn poll_once(state: &Arc<AppState>) {
             }
         };
 
-        match oag_upstream::usage::fetch(provider, kind, &material, row.proxy_url.as_deref()).await
+        match oag_upstream::usage::fetch(
+            provider,
+            kind,
+            &material,
+            row.proxy_url.as_deref(),
+            &state.config.gateway.codex.originator,
+            &state.config.gateway.codex.user_agent,
+        )
+        .await
         {
             Ok(Some(snap)) => {
                 let resets = snap
@@ -282,5 +318,84 @@ fn row_from(insert: &CatalogInsert) -> ModelRow {
         supports_reasoning: insert.supports_reasoning,
         supports_prompt_cache: insert.supports_prompt_cache,
         display_label: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{claim_hold, jittered, poll_once, spawn_usage_poll};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    async fn owned_seat(state: &crate::AppState) -> oag_core::AccountId {
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "WITH owner AS (INSERT INTO principal (id, email) \
+             VALUES (gen_random_uuid(), 'owner-' || gen_random_uuid() || '@test') RETURNING id) \
+             INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce, owner_principal_id) \
+             SELECT gen_random_uuid(), 'poll-' || gen_random_uuid(), 'xai', 'oauth', \
+             '\\x00', '\\x00', owner.id FROM owner RETURNING id",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .expect("seat");
+        oag_core::AccountId::from_uuid(id)
+    }
+
+    /// A sweep claims each owned seat for the interval, whether or not its
+    /// read then succeeds (this one's credential cannot even be opened), and
+    /// the spawned poller sweeps as soon as it starts.
+    #[tokio::test]
+    async fn a_sweep_claims_each_owned_seat_and_the_poller_sweeps_on_start() {
+        let Some(state) = crate::testing::live_state().await else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let hold = Duration::from_secs(60);
+
+        let swept = owned_seat(&state).await;
+        poll_once(&state, hold).await;
+        assert!(
+            !state
+                .cache
+                .claim_usage_poll(swept, hold)
+                .await
+                .expect("claim"),
+            "the sweep took this seat's claim, so a second replica would not read it"
+        );
+
+        let later = owned_seat(&state).await;
+        spawn_usage_poll(Arc::clone(&state));
+        // Probe until the poller holds the seat. A probe that wins holds it for
+        // only a millisecond, so it never keeps the poller out for longer than
+        // one of its one-second sweeps. A fixed sleep here was flaky on a
+        // loaded machine: the first sweep had not reached this seat yet.
+        let mut swept_later = false;
+        for _ in 0..100 {
+            if !state
+                .cache
+                .claim_usage_poll(later, Duration::from_millis(1))
+                .await
+                .expect("claim")
+            {
+                swept_later = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(swept_later, "the spawned poller swept within ten seconds");
+    }
+
+    /// Each wait is the interval give or take a fifth, and a claim lasts the
+    /// shortest of them, so the next sweep on any replica finds it expired.
+    #[test]
+    fn a_wait_is_within_a_fifth_of_the_interval_and_a_claim_ends_before_it() {
+        let five = Duration::from_secs(300);
+        assert_eq!(jittered(five, 0.0), Duration::from_secs(240));
+        assert_eq!(jittered(five, 0.5), five);
+        assert_eq!(jittered(five, 1.0), Duration::from_secs(360));
+        assert_eq!(jittered(five, 7.0), Duration::from_secs(360), "clamped");
+        assert_eq!(claim_hold(five), Duration::from_secs(240));
+        assert!(claim_hold(five) <= jittered(five, 0.0));
     }
 }

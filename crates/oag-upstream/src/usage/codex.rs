@@ -53,17 +53,20 @@ const WEEKLY_WINDOW_SECS: f64 = 604_800.0;
 /// The thirty-day pool a free plan is metered on. Observed live.
 const MONTHLY_WINDOW_SECS: f64 = 2_592_000.0;
 
-pub async fn fetch(
+/// The quota read, built exactly as the seat's inference requests are
+/// identified.
+///
+/// The same `originator` and `user-agent` the inference path sends — the
+/// configured ones, not a string of its own. This used to send
+/// `codex_cli_rs/oag-<version>` while inference sent the configured agent, so
+/// one seat named itself two ways: once when it spent the quota and once when
+/// it read it, which is two clients where its owner runs one.
+fn usage_request(
+    client: &reqwest::Client,
     credential: &SecretMaterial,
-    proxy: Option<&str>,
-) -> Result<Option<UsageSnapshot>> {
-    // Through the credential's proxy, like every other call this gateway makes
-    // on its behalf. U12 routed inference, refresh and price lookups through it
-    // and left the quota poll building its own client — so a deployment with a
-    // mandated egress proxy still reached this provider directly, every poll
-    // interval, from every replica.
-    let client = crate::side_channel_client(proxy, std::time::Duration::from_secs(10))?;
-
+    originator: &str,
+    user_agent: &str,
+) -> reqwest::RequestBuilder {
     let mut request = client
         .get(USAGE_URL)
         .header(
@@ -71,16 +74,8 @@ pub async fn fetch(
             format!("Bearer {}", credential.access_token.trim()),
         )
         .header("accept", "application/json")
-        // The same self-identification the inference path sends. Not required
-        // by this endpoint as far as the port shows — a bearer token and the
-        // account header are — but a gateway that names itself one way when it
-        // spends the quota and another way when it reads it is asking to be
-        // told apart for no benefit.
-        .header("originator", crate::codex::DEFAULT_ORIGINATOR)
-        .header(
-            "user-agent",
-            concat!("codex_cli_rs/oag-", env!("CARGO_PKG_VERSION")),
-        );
+        .header("originator", originator)
+        .header("user-agent", user_agent);
 
     // Account-scoped, exactly as on the inference path: the header binds the
     // read to the seat the token belongs to. Absent rather than empty when the
@@ -88,6 +83,22 @@ pub async fn fetch(
     if let Some(account_id) = &credential.account_id {
         request = request.header("chatgpt-account-id", account_id.as_str());
     }
+    request
+}
+
+pub async fn fetch(
+    credential: &SecretMaterial,
+    proxy: Option<&str>,
+    originator: &str,
+    user_agent: &str,
+) -> Result<Option<UsageSnapshot>> {
+    // Through the credential's proxy, like every other call this gateway makes
+    // on its behalf. U12 routed inference, refresh and price lookups through it
+    // and left the quota poll building its own client — so a deployment with a
+    // mandated egress proxy still reached this provider directly, every poll
+    // interval, from every replica.
+    let client = crate::side_channel_client(proxy, std::time::Duration::from_secs(10))?;
+    let request = usage_request(&client, credential, originator, user_agent);
 
     let response = request
         .send()
@@ -274,6 +285,33 @@ fn now_unix() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The quota read names itself as the seat's inference requests do: the
+    /// configured originator and user-agent, and the seat's account id.
+    #[test]
+    fn the_quota_read_carries_the_seats_own_identity() {
+        let credential = SecretMaterial {
+            access_token: "tok".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: Some("acct-9".to_owned()),
+        };
+        let req = usage_request(
+            &reqwest::Client::new(),
+            &credential,
+            "codex_cli_rs",
+            "codex_cli_rs/0.152.1 (Mac OS 15.5; arm64)",
+        )
+        .build()
+        .expect("builds");
+        let h = req.headers();
+        assert_eq!(h["originator"], "codex_cli_rs");
+        assert_eq!(h["user-agent"], "codex_cli_rs/0.152.1 (Mac OS 15.5; arm64)");
+        assert_eq!(h["chatgpt-account-id"], "acct-9");
+        assert_eq!(h["authorization"], "Bearer tok");
+    }
 
     fn body(json: &str) -> Response {
         serde_json::from_str(json).expect("json")

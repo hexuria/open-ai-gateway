@@ -2220,3 +2220,91 @@ mod tests {
     // the wrong invariant: see
     // `state::tests::a_stream_ceiling_may_outlive_the_slot_lease`.
 }
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::lease;
+    use oag_core::Provider;
+    use oag_pool::SessionKey;
+    use std::collections::HashSet;
+
+    /// The whole lease path, not only its query: on a route whose one seat
+    /// belongs to principal A, a request from principal B gets no credential
+    /// — it is not handed A's seat by the sticky pin, the cascade or anything
+    /// else between `candidates` and the slot — while A is served by it.
+    #[tokio::test]
+    async fn a_lease_for_another_principal_never_gets_the_owners_seat() {
+        let Some(state) = crate::testing::live_state().await else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+            return;
+        };
+        let pool = state.db.pool();
+        let principal = || async {
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                "INSERT INTO principal (id, email) VALUES (gen_random_uuid(), \
+                 'p-' || gen_random_uuid() || '@test') RETURNING id",
+            )
+            .fetch_one(pool)
+            .await
+            .expect("principal")
+        };
+        let (owner, other) = (principal().await, principal().await);
+        let route: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), \
+             'r-' || gen_random_uuid(), '[]'::jsonb) RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("route");
+        let seat: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce, owner_principal_id) VALUES (gen_random_uuid(), \
+             's-' || gen_random_uuid(), 'xai', 'oauth', '\\x00', '\\x00', $1) RETURNING id",
+        )
+        .bind(owner)
+        .fetch_one(pool)
+        .await
+        .expect("seat");
+        sqlx::query("INSERT INTO account_route (account_id, route_id) VALUES ($1, $2)")
+            .bind(seat)
+            .bind(route)
+            .execute(pool)
+            .await
+            .expect("attach");
+
+        let none = HashSet::<oag_core::AccountId>::new();
+        let session = |p: uuid::Uuid| {
+            SessionKey::resolve(&p.to_string(), Some("conv"), &[], "key", "xai/grok")
+        };
+        let refused = lease(
+            &state,
+            route,
+            other,
+            Provider::XAI,
+            &session(other),
+            &none,
+            "req-other",
+            None,
+        )
+        .await;
+        assert!(
+            refused.is_err(),
+            "another principal was leased the owner's seat"
+        );
+
+        let served = lease(
+            &state,
+            route,
+            owner,
+            Provider::XAI,
+            &session(owner),
+            &none,
+            "req-owner",
+            None,
+        )
+        .await
+        .expect("the owner is served by their seat");
+        assert_eq!(served.account.id, seat);
+        served.release().await;
+    }
+}

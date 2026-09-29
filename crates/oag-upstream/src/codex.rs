@@ -167,9 +167,13 @@ impl ProviderAdapter for CodexAdapter {
             .header("authorization", format!("Bearer {}", cred.access_token))
             .header("originator", self.originator.as_str())
             .header("user-agent", self.user_agent.as_str())
-            // A fresh id per request: the backend wants one present, and a
-            // stateless gateway has no conversation to key it to.
-            .header("session_id", uuid::Uuid::new_v4().to_string());
+            // The conversation's id when the gateway has one, so a seat sends
+            // one id per conversation as its owner's CLI would; a fresh one
+            // only when there is no conversation to name.
+            .header(
+                "session_id",
+                req.session.unwrap_or_else(uuid::Uuid::new_v4).to_string(),
+            );
 
         // Account-scoped: the header binds the request to the seat the token
         // belongs to. A seat imported by `--from codex` always carries it.
@@ -197,7 +201,8 @@ impl ProviderAdapter for CodexAdapter {
     ) -> Result<Option<SecretMaterial>> {
         // The same OAuth refresh as an imported Codex seat: trade the pair at
         // the token endpoint. No-ops on a credential with no refresh token.
-        crate::openai_oauth::refresh(credential, &self.token_url, proxy).await
+        crate::openai_oauth::refresh_as(credential, &self.token_url, proxy, Some(&self.user_agent))
+            .await
     }
 
     async fn served_models(
@@ -484,6 +489,14 @@ mod tests {
     }
 
     fn build_with(adapter: &CodexAdapter, cred: &SecretMaterial) -> reqwest::Request {
+        build_in(adapter, cred, None)
+    }
+
+    fn build_in(
+        adapter: &CodexAdapter,
+        cred: &SecretMaterial,
+        session: Option<uuid::Uuid>,
+    ) -> reqwest::Request {
         let c = request();
         let m = model();
         adapter
@@ -491,6 +504,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: cred,
+                session,
             })
             .expect("builds")
     }
@@ -574,8 +588,23 @@ mod tests {
         assert_eq!(body["instructions"], "client system prompt");
     }
 
+    /// One id per conversation, as the owner's own CLI sends: a new id on
+    /// every request made one seat look like hundreds of sessions.
     #[test]
-    fn each_request_gets_a_fresh_session_id() {
+    fn a_conversation_keeps_one_session_id_and_another_gets_its_own() {
+        let adapter = CodexAdapter::new();
+        let (one, two) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let first = build_in(&adapter, &seat(), Some(one));
+        let again = build_in(&adapter, &seat(), Some(one));
+        let other = build_in(&adapter, &seat(), Some(two));
+        assert_eq!(first.headers()["session_id"], one.to_string().as_str());
+        assert_eq!(first.headers()["session_id"], again.headers()["session_id"]);
+        assert_ne!(first.headers()["session_id"], other.headers()["session_id"]);
+    }
+
+    /// With no conversation to name, a fresh id rather than none or a shared one.
+    #[test]
+    fn a_request_with_no_conversation_gets_a_fresh_session_id() {
         let a = build_with(&CodexAdapter::new(), &seat());
         let b = build_with(&CodexAdapter::new(), &seat());
         assert_ne!(a.headers()["session_id"], b.headers()["session_id"]);
@@ -646,6 +675,7 @@ mod tests {
                 canonical: &c,
                 model: &model(),
                 credential: &seat(),
+                session: None,
             })
             .expect("builds");
         let body = body_of(&req);

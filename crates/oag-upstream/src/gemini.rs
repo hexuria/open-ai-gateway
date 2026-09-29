@@ -142,6 +142,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
 
@@ -174,6 +175,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
         assert!(
@@ -195,6 +197,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
         assert!(req.headers().contains_key("x-goog-api-key"));

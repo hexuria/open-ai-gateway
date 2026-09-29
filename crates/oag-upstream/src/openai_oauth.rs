@@ -116,12 +116,43 @@ struct TokenResponse {
     refresh_token: Option<String>,
 }
 
+/// The refresh grant, with the seat's user-agent when there is one.
+fn refresh_request(
+    client: &reqwest::Client,
+    token_url: &str,
+    refresh_token: &str,
+    user_agent: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let request = client.post(token_url).form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", CODEX_CLIENT_ID),
+        ("refresh_token", refresh_token),
+    ]);
+    match user_agent {
+        Some(ua) => request.header("user-agent", ua),
+        None => request,
+    }
+}
+
 /// Refresh a Codex OAuth credential. `Ok(None)` means "not refreshable" — an
 /// account with no refresh token takes this path rather than erroring.
 pub async fn refresh(
     credential: &SecretMaterial,
     token_url: &str,
     proxy: Option<&str>,
+) -> Result<Option<SecretMaterial>> {
+    refresh_as(credential, token_url, proxy, None).await
+}
+
+/// [`refresh`], naming the seat's own user-agent on the token endpoint.
+///
+/// The Codex CLI names itself there too, and a seat that refreshes as nobody
+/// in particular is a second client beside the one that spends it.
+pub async fn refresh_as(
+    credential: &SecretMaterial,
+    token_url: &str,
+    proxy: Option<&str>,
+    user_agent: Option<&str>,
 ) -> Result<Option<SecretMaterial>> {
     let Some(refresh_token) = credential.refresh_token.as_deref() else {
         return Ok(None);
@@ -131,13 +162,7 @@ pub async fn refresh(
     // as this credential's failure rather than a wedged lock.
     let client = crate::side_channel_client(proxy, std::time::Duration::from_secs(20))?;
 
-    let response = client
-        .post(token_url)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", CODEX_CLIENT_ID),
-            ("refresh_token", refresh_token),
-        ])
+    let response = refresh_request(&client, token_url, refresh_token, user_agent)
         .send()
         .await
         .map_err(|e| Error::Internal(format!("codex token endpoint: {e}")))?;
@@ -185,6 +210,26 @@ pub async fn refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refresh names the seat's own user-agent when the caller has one,
+    /// and sends none rather than a made-up one when it does not.
+    #[test]
+    fn the_refresh_carries_the_seats_user_agent_only_when_given() {
+        let client = reqwest::Client::new();
+        let with = refresh_request(
+            &client,
+            "https://t.invalid/token",
+            "rt",
+            Some("codex_cli_rs/1"),
+        )
+        .build()
+        .expect("builds");
+        assert_eq!(with.headers()["user-agent"], "codex_cli_rs/1");
+        let without = refresh_request(&client, "https://t.invalid/token", "rt", None)
+            .build()
+            .expect("builds");
+        assert!(without.headers().get("user-agent").is_none());
+    }
 
     /// A JWT with the given `exp` and an unverified signature — enough for the
     /// parser, which never checks the signature.
@@ -279,6 +324,59 @@ mod tests {
             client_id: Some(CODEX_CLIENT_ID.to_owned()),
             account_id: Some("acct-1".to_owned()),
         }
+    }
+
+    /// A Codex seat refreshes under its own user-agent — the one its
+    /// inference requests send — and gets the rotated pair back.
+    #[tokio::test]
+    async fn a_codex_seat_refreshes_under_its_own_user_agent() {
+        use crate::ProviderAdapter as _;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Option<String>>> = Arc::default();
+        let new = jwt_with_exp(1_900_000_000);
+        let body = format!(r#"{{"access_token":"{new}","refresh_token":"new-refresh"}}"#);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!(
+            "http://{}/oauth/token",
+            listener.local_addr().expect("addr")
+        );
+        let app = axum::Router::new().route(
+            "/oauth/token",
+            post({
+                let seen = Arc::clone(&seen);
+                move |headers: axum::http::HeaderMap| async move {
+                    *seen.lock().expect("lock") = headers
+                        .get("user-agent")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .expect("response")
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let adapter = crate::codex::CodexAdapter::new()
+            .with_user_agent("codex_cli_rs/9.9.9")
+            .with_token_url(url);
+        let fresh = adapter
+            .refresh(&oauth_material(), None)
+            .await
+            .expect("ok")
+            .expect("a rotated pair");
+        assert_eq!(fresh.refresh_token.as_deref(), Some("new-refresh"));
+        assert_eq!(
+            seen.lock().expect("lock").as_deref(),
+            Some("codex_cli_rs/9.9.9")
+        );
     }
 
     #[tokio::test]
