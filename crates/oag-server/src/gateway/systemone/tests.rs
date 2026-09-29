@@ -1003,6 +1003,26 @@ async fn a_request_jev_rejects_comes_back_without_trying_another_key() {
     assert_eq!(gw.mock.calls_with("jev-key-b"), 0, "never another key");
 }
 
+/// A budget in its last fifth is `Constrained`, which moves a chat request to
+/// a cheaper rung. System One has no cheaper rung, so a constrained key is
+/// served as normal — only the hard stop below refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_constrained_key_is_still_served() {
+    let Some(gw) = Gateway::start(CHAT_LADDER, Some(rust_decimal::Decimal::TEN)).await else {
+        return;
+    };
+    sqlx::query("UPDATE api_key SET spent_usd = 9 WHERE id = $1")
+        .bind(gw.key_id)
+        .execute(gw.db.pool())
+        .await
+        .expect("spend nine of ten");
+    gw.add_jev_key("jev-key-a", 0).await;
+
+    let response = gw.ask(QUESTIONS).await;
+    assert_eq!(response.status(), 200, "constrained is not a refusal here");
+    assert_eq!(gw.mock.calls_with("jev-key-a"), 1);
+}
+
 /// The spend caps apply as they do to chat: an exhausted key is refused
 /// before Jev is asked.
 #[tokio::test(flavor = "multi_thread")]

@@ -309,8 +309,10 @@ answered>`, with the tokens Jev reported. `jev/jev-latest` is in the built-in
 catalog unpriced — TypeSafe publishes no per-token price yet — so rows carry
 their tokens at zero cost until someone prices the row (as an override, which a
 re-seed leaves alone). A System One row claims no saving: its counterfactual is
-its own cost. The route's rate limit and the caller's spend caps admit a System
-One request exactly as they admit a chat one.
+its own cost. The route's rate limit admits a System One request as it admits a
+chat one. Of the spend caps only the hard stop applies: a budget in its last
+fifth (`Constrained`) moves a chat request to a cheaper rung, and System One has
+no cheaper rung, so it is served as normal until the cap is exhausted.
 
 ## Framing
 
@@ -346,6 +348,13 @@ so a rate limit on one takes the other down with it. The pool is bounded and
 evicts by idle time; an evicted transport's in-flight requests are unaffected,
 because the `Arc` outlives the cache entry — a long-running stream is never cut
 short by eviction.
+
+**System proxy settings.** The build turns on `reqwest`'s `system-proxy`
+feature (it comes in with `typesafe-sdk`, and Cargo enables a feature for the
+whole binary). On macOS and Windows every upstream client — chat, refresh, usage
+poll and Jev alike — therefore honours the operating system's proxy settings
+when no other proxy is set. A credential's `proxy_url` still wins; on Linux
+nothing changes, and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` apply as before.
 
 ## Providers with their own adapter
 
