@@ -211,6 +211,8 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
         ));
     }
 
+    let max_concurrency = max_concurrency.unwrap_or_else(|| default_concurrency(source));
+
     // Only after the conflict check, so the fallback cannot resurrect it.
     let secret = secret.or_else(|| std::env::var("OAG_ACCOUNT_SECRET").ok());
     match source {
@@ -685,6 +687,17 @@ const fn scope_of(owner_id: Option<Uuid>) -> &'static str {
         "personal (serves its owner only)"
     } else {
         "shared pool"
+    }
+}
+
+/// How many requests a credential carries at once when `--max-concurrency`
+/// is not given.
+pub(super) const fn default_concurrency(source: Option<AccountSource>) -> i32 {
+    match source {
+        // A seat is one person's plan: two in flight is what their own CLI
+        // does on a busy moment, and more is what a pool looks like.
+        Some(_) => 2,
+        None => 8,
     }
 }
 

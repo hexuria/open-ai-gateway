@@ -1619,3 +1619,20 @@ fn a_virtual_model_name_pins_its_rung_and_auto_pins_nothing() {
     assert_eq!(virtual_tier("claude-opus-5"), None);
     assert_eq!(virtual_tier("anthropic/claude-opus-5"), None);
 }
+
+/// A seat sends one `session_id` per conversation: the same conversation
+/// always gets the same id, on every replica, and another conversation — or the
+/// same client session id under another principal — gets a different one.
+#[test]
+fn a_conversation_id_is_stable_and_names_only_its_conversation() {
+    use super::failover::conversation_id;
+    use oag_pool::SessionKey;
+    let key = |principal: &str, session: &str| {
+        SessionKey::resolve(principal, Some(session), &[], "key", "model")
+    };
+    let one = conversation_id(&key("alice", "conv-1"));
+    assert_eq!(one, conversation_id(&key("alice", "conv-1")));
+    assert_ne!(one, conversation_id(&key("alice", "conv-2")));
+    assert_ne!(one, conversation_id(&key("bob", "conv-1")));
+    assert_eq!(one.get_version_num(), 5, "derived, not random");
+}

@@ -274,6 +274,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
 
@@ -296,6 +297,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
         let url = req.url().as_str();
@@ -327,6 +329,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
 
@@ -376,6 +379,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
         assert!(req.url().as_str().ends_with("/invoke-with-response-stream"));
@@ -392,6 +396,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
 
@@ -416,6 +421,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
         assert_eq!(req.headers()["x-amz-security-token"], "SESSIONTOKEN");
@@ -435,6 +441,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
 
@@ -469,6 +476,7 @@ mod tests {
                     canonical: &c,
                     model: &m,
                     credential: &cr,
+                    session: None,
                 })
                 .expect("builds");
             let auth = req.headers()["authorization"]

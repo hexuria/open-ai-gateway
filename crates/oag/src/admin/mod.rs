@@ -274,8 +274,11 @@ pub struct AccountAddArgs {
     auth_file: Vec<String>,
     #[arg(long, default_value = "default")]
     route: String,
-    #[arg(long, default_value_t = 8)]
-    max_concurrency: i32,
+    /// Parallel requests this credential may carry. Defaults to 2 for an
+    /// imported seat — one person's CLI rarely has more in flight, and eight
+    /// at once from one plan is a crowd — and to 8 for an API key.
+    #[arg(long)]
+    max_concurrency: Option<i32>,
     #[arg(long, default_value_t = 0)]
     priority: i16,
     /// The one person this credential belongs to. Required for a

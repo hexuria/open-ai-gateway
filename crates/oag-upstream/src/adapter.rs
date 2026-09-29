@@ -18,6 +18,11 @@ pub struct UpstreamRequest<'a> {
     pub canonical: &'a CanonicalRequest,
     pub model: &'a ModelSpec,
     pub credential: &'a SecretMaterial,
+    /// A stable id for the conversation this request continues, for an
+    /// upstream that wants one: a Codex seat sends it as `session_id`, and a
+    /// person's own CLI keeps one id for a whole conversation. `None` where the
+    /// caller has no conversation to name; the adapter then makes one up.
+    pub session: Option<uuid::Uuid>,
 }
 
 /// How an upstream delimits the events in a streamed response.

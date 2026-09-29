@@ -216,6 +216,7 @@ mod tests {
                     canonical: &c,
                     model: &m,
                     credential: &cr,
+                    session: None,
                 })
                 .expect("builds");
 
@@ -238,6 +239,7 @@ mod tests {
             canonical: &c,
             model: &m,
             credential: &cr,
+            session: None,
         });
         assert!(err.is_err());
     }
@@ -255,6 +257,7 @@ mod tests {
                 canonical: &c,
                 model: &m,
                 credential: &cr,
+                session: None,
             })
             .expect("builds");
         let body = req.body().and_then(reqwest::Body::as_bytes).expect("body");

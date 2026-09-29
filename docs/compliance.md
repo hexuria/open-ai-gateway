@@ -81,6 +81,28 @@ account banned. So the gateway does not offer it:
   `doctor` and `key create` warn whenever a seat's owner holds more than one
   live inference key.
 
+## A seat should look like one person
+
+Owning a seat is half of it; the traffic should also look like that one
+person's, because the provider sees only the traffic. What the gateway does:
+
+- **One session per conversation.** A Codex seat sends one `session_id` for a
+  whole conversation, derived from the conversation's sticky key, as the
+  owner's own CLI does — not a fresh one per request, which made one seat look
+  like hundreds of sessions an hour.
+- **One reader per seat.** Every replica runs the usage poller, but each seat's
+  quota and model list is read by one of them per interval (a Redis claim), at
+  a jittered time — not by every replica on its own clock.
+- **One name.** The quota read and the token refresh send the same configured
+  `originator`/`user-agent` as inference, instead of a second name of their own.
+- **Two in flight.** An imported seat defaults to `--max-concurrency 2`; eight
+  at once from one plan is a crowd. Raise it with the flag if the owner truly
+  runs more.
+
+What it cannot do on its own: every replica calls upstream from its own
+address. Running more than one replica, give each seat a `proxy_url` so its
+traffic leaves from one place, as its owner's does.
+
 ## Practical guidance
 
 If you want colleagues to reach frontier models through this gateway, the two

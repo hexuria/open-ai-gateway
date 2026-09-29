@@ -65,15 +65,20 @@ fn endpoint_for(provider: Provider, kind: CredentialKind) -> Option<Endpoint> {
 
 /// Read the seat's remaining quota, or `None` for a credential with no usage
 /// API to read (in which case the poller leaves the account untouched).
+///
+/// `originator` and `user_agent` are the ones the seat's inference requests
+/// send, so a Codex seat names itself one way whether it spends or reads.
 pub async fn fetch(
     provider: Provider,
     kind: CredentialKind,
     credential: &SecretMaterial,
     proxy: Option<&str>,
+    originator: &str,
+    user_agent: &str,
 ) -> oag_core::Result<Option<UsageSnapshot>> {
     match endpoint_for(provider, kind) {
         Some(Endpoint::GrokBilling) => grok::fetch(&credential.access_token, proxy).await,
-        Some(Endpoint::CodexWham) => codex::fetch(credential, proxy).await,
+        Some(Endpoint::CodexWham) => codex::fetch(credential, proxy, originator, user_agent).await,
         None => Ok(None),
     }
 }
@@ -132,7 +137,7 @@ mod tests {
             (Provider::XAI, CredentialKind::OAuth),
             (Provider::OpenAI, CredentialKind::OAuth),
         ] {
-            let err = fetch(provider, kind, &material, Some("not a url"))
+            let err = fetch(provider, kind, &material, Some("not a url"), "o", "ua")
                 .await
                 .expect_err("an unusable proxy is a config error, not silent direct egress");
             assert!(
@@ -149,6 +154,8 @@ mod tests {
                 CredentialKind::ApiKey,
                 &material,
                 Some("not a url"),
+                "o",
+                "ua",
             )
             .await
             .expect("nothing to poll")

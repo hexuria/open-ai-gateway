@@ -542,6 +542,27 @@ security:
         Arc::new(AppState::new(config, db, cache).expect("state"))
     }
 
+    /// A state on the real test backends, or `None` when
+    /// `OAG_TEST_DATABASE_URL` / `OAG_TEST_REDIS_URL` are unset (the caller
+    /// prints "skipped" and returns). Every upstream it could reach sits on a
+    /// closed port, so nothing a test drives leaves the machine.
+    pub(crate) async fn live_state() -> Option<Arc<AppState>> {
+        let (Ok(db_url), Ok(redis_url)) = (
+            std::env::var("OAG_TEST_DATABASE_URL"),
+            std::env::var("OAG_TEST_REDIS_URL"),
+        ) else {
+            return None;
+        };
+        let extra = "gateway:\n  usage_poll_interval: 1\n  provider_base_urls:\n    \
+                     xai: \"http://127.0.0.1:1\"\n    openai: \"http://127.0.0.1:1\"\n";
+        let config = oag_core::config::Config::from_yaml(&config_yaml(&db_url, &redis_url, extra))
+            .expect("config");
+        let db = oag_store::Db::connect(&db_url, 2).expect("db");
+        db.migrate().await.expect("migrate");
+        let cache = oag_store::Cache::connect(&redis_url).expect("cache");
+        Some(Arc::new(AppState::new(config, db, cache).expect("state")))
+    }
+
     /// [`state`] with no adapter registered for `provider`.
     pub(crate) fn state_without_adapter(provider: oag_core::Provider) -> Arc<AppState> {
         let config = config("");
