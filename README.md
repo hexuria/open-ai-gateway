@@ -14,7 +14,7 @@ three-tier topology that streaming AI traffic actually needs.
 > **Not a resale product.** This is built for an organisation to use its own
 > credentials for its own members — not to intermediate anyone else's. An API
 > key may serve the whole organisation; a subscription seat (a ChatGPT/Codex or
-> SuperGrok plan) serves exactly one person and is never shared. See
+> SuperGrok plan) serves exactly one person. See
 > [docs/compliance.md](docs/compliance.md) for which credential kinds each
 > provider sanctions, and how the gateway keeps a seat personal.
 
@@ -161,9 +161,11 @@ Ordered by what you are likely to need, not by number.
 - **Pools credentials.** Priority tiers, least-loaded selection, use-it-or-lose-it
   window preference, LRU, circuit breakers, and two-stage failover.
 - **Keeps a subscription seat personal.** A seat serves only the person who owns
-  it — the schema refuses an owner-less one — and behaves like that person's own
-  client: one session per conversation, one quota reader across the fleet, one
-  user-agent, two requests in flight.
+  it; the schema refuses to make an owner-less one. Its traffic is shaped toward
+  one person's too — one quota reader per seat across the fleet, and for Codex
+  seats one session id per conversation and the configured client name, with
+  new imports defaulting to two requests in flight. Where each of those stops is
+  in [docs/compliance.md](docs/compliance.md).
 - **Keeps prompt caches hitting.** Conversations pin to a credential, keyed on
   the part of the prompt that is stable across turns. On agentic traffic the
   cache is most of the bill.
