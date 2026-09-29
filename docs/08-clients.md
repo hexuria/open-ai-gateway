@@ -34,6 +34,7 @@ What the gateway accepts on its inference listener:
 | OpenAI Responses | `POST /v1/responses`, `POST /responses` | OpenAI |
 | Gemini | `POST /v1beta/models/{model}:generateContent` | Gemini |
 | Discovery | `GET /v1/models`, `GET /models`, `GET /v1beta/models` | OpenAI / Gemini |
+| System One | `POST /jev/v1/systemone`, `GET /jev/v1/models` | System One (Jev) |
 
 The unversioned spellings exist because SDKs disagree about whether a custom
 base URL already contains the version prefix; both work, so neither guess is
@@ -189,6 +190,45 @@ in different places. Importing a seat so the gateway can *serve* from it is
 `oag admin account add --from codex`, plus `gateway.codex.instructions`; that
 is upstream configuration, covered in [03-providers.md](03-providers.md).
 Pointing a client at the gateway is the two settings above and nothing else.
+
+## The TypeSafe SDK (System One)
+
+System One is not a chat surface: questions go in, typed answers with their
+confidence come out ([03-providers.md](03-providers.md#system-one-jev)). The SDK
+appends `/v1/systemone` and `/v1/models` to its base URL, so point it at `/jev`
+on the gateway, with an OAG inference key where a TypeSafe key would go:
+
+```sh
+export TYPESAFE_BASE_URL=https://gateway.example.com/jev   # or http://127.0.0.1:29080/jev
+export TYPESAFE_API_KEY=oag_live_...                       # an OAG key, not a TypeSafe one
+```
+
+```rust
+use typesafe_sdk::{Client, Question};
+
+let client = Client::builder()
+    .api_key(std::env::var("OAG_KEY")?)
+    .base_url("https://gateway.example.com/jev")
+    .build()?;
+let response = client
+    .system_one(
+        "I was charged twice. Please fix this ASAP.",
+        [("billing", Question::noul("Is this ticket about billing?"))],
+    )
+    .await?;
+println!("{}", response.noul("billing")?.noul);
+```
+
+Typed answers, `usage`, and `request_id()` — Jev's `x-typesafe-request-id`,
+passed through — arrive exactly as they would from TypeSafe. The body is Jev's,
+byte for byte. The gateway adds `x-oag-model` (`jev/<model>`) and
+`x-oag-request-id`, the id to find the answer's ledger row by.
+
+The calling key's route needs a Jev key. Without one, the SDK raises an API
+error whose message is the gateway's: "System One is not configured on this
+route". The gateway already retries and fails over between Jev keys, so a
+client retrying on top of it multiplies the attempts; `RetryPolicy::disabled()`
+leaves that to the gateway.
 
 ## curl, in both dialects
 
@@ -351,6 +391,7 @@ it. Run it before reading further.
 | A model you own is missing from `/v1/models` | not on the ladder, below the key's floor tier, owned by another principal, every credential for it is rate limited / reserved-out / spent, or this key's quota is exhausted | `GET /v1/models` `.oag.providers[].reason` and `.oag.budget.pressure`; `oag admin doctor` |
 | Wrong model served | managed mode, or a floor tier | see the section above; check `x-oag-model` and `selection_reason` |
 | A Codex seat imports, then every request fails | `gateway.codex.instructions` (or `instructions_path`) unset — the backend refuses and it reads as a dead credential | `oag admin doctor` names it; `deploy/codex-instructions.txt` is a starting file |
+| `system_one_not_configured` (503) | a System One request on a route with no Jev key; there is no chat fallback | `oag admin account add --provider jev --route <route> ...` |
 | `unsupported_field` (400) | the request set a field the chosen upstream's dialect cannot express; refused rather than silently dropped, because a dropped field is indistinguishable from a model ignoring it | drop the field, or pin the request to a provider whose dialect has it |
 | 429 with `Retry-After` | the route's rpm limit, or the upstream's own throttle forwarded with the provider's body nested under `error.upstream` | wait the header out; `oag admin account list` shows a parked seat |
 | Streaming works locally, 504s in production | a proxy hop between the client and the gateway | [01-deployment.md](01-deployment.md), the seven things that break streaming |

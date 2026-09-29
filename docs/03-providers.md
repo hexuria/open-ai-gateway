@@ -18,6 +18,7 @@ and most providers take one and not the other.
 | Zhipu GLM | `zhipu` (`glm`) | OpenAI Chat Completions | `api_key` | No importer. |
 | xAI | `xai` (`grok`) | OpenAI Chat Completions | `api_key`, `oauth` | **Yes.** `oag admin account add --from grok` imports every signed-in Grok CLI session and requests route through it. A seat serves the one principal named by `--owner-email` and nobody else. |
 | AWS Bedrock | `bedrock` | Anthropic Messages | `api_key` (SigV4 key, packed) | Not a subscription product. |
+| Jev (TypeSafe AI) | `jev` (`typesafe`) | System One | `api_key` | No importer. Serves System One only, never chat — see [System One](#system-one-jev). |
 
 Subscription support is three states, not a bool: **served** (the importer ships
 and requests route through the seat), **credential-import-only** (the seat
@@ -228,8 +229,9 @@ canonical form. When the two agree, bytes pass through **verbatim** — the
 upstream's own bytes are the most faithful answer available, and re-serialising
 can only differ from them.
 
-All four dialects parse inbound and render outbound, so any client shape
-reaches any upstream shape:
+All four chat dialects parse inbound and render outbound, so any chat client
+shape reaches any chat upstream shape. System One is the exception: it is not a
+conversation, so nothing translates into or out of it.
 
 | Dialect | Inbound route | Renders outbound |
 |---|---|---|
@@ -237,6 +239,7 @@ reaches any upstream shape:
 | OpenAI Chat Completions | `/v1/chat/completions` | yes |
 | OpenAI Responses | `/v1/responses` | yes |
 | Gemini | `/v1beta/models/{model}:generateContent` | yes |
+| System One | `/jev/v1/systemone` | no — passed through to a Jev upstream, and only to one |
 
 `Provider::OpenAI`'s registered adapter still speaks Chat Completions, so an
 API-key OpenAI seat takes the passthrough path when the client does too. A
@@ -251,6 +254,60 @@ The Anthropic direction is the harder one: it uses indexed content blocks that
 must be explicitly opened and closed, so the renderer tracks the open block and
 closes it before opening another. A client that receives a delta for a block it
 was never told about drops it silently.
+
+## System One (Jev)
+
+Jev answers questions rather than continuing a conversation. A `state` and named
+`questions` go in — `noul` (yes or no), `choice` or `score` — and typed
+`answers` come back, each with its confidence and the whole distribution. The
+gateway serves it at `POST /jev/v1/systemone` and `GET /jev/v1/models`, under a
+prefix so the unmodified TypeSafe SDK works with its base URL set to
+`https://<gateway>/jev`, and so Jev's listing never collides with this
+gateway's own `/v1/models`. [08-clients.md](08-clients.md) has the client side.
+
+```sh
+oag admin account add --name jev-1 --provider jev --secret <TypeSafe API key> --route default
+```
+
+```yaml
+gateway:
+  provider_base_urls:
+    jev: "https://api.typesafe.ai"   # the default; set it for a proxy or a mock
+```
+
+**Jev is a `Provider`, not a service beside the enum**, for what that buys with
+no new code: its key is a sealed `account` row on a route like any other
+credential, and leasing, seat ownership, concurrency slots, the per-credential
+breaker, retries, failover between Jev keys and the ledger all key on the
+provider. What it does not get is a chat adapter. `Dialect::SystemOne` is the
+one dialect the canonical form cannot carry, and no chat request can reach a
+Jev key: the catalog chat requests route over never holds a System One model,
+so neither its name, its bare upstream name, nor a rung someone wrote it onto
+can send chat there. A chat request naming `jev/jev-latest` is refused, and
+told where System One is served.
+
+**There is no fallback.** No chat model can answer a System One question, so a
+route without a Jev key refuses with 503 `system_one_not_configured` rather than
+answering with a guess. A route whose Jev keys exist and are all disabled or
+cooling down gets the ordinary 503 `no_credential`.
+
+**What passes through.** The request is checked against the SDK's own wire
+types — a body the client would refuse to send is a 400 before any key is
+used — and forwarded as it arrived. Jev's answer is checked the same way and
+returned byte for byte, with Jev's `x-typesafe-request-id` and the gateway's
+`x-oag-model`, `x-oag-request-id` and `x-oag-build` beside it. A 408 is retried
+on the same key; a 429, a 5xx, a key that cannot be reached, or a 2xx that is
+not a System One response moves to the next key, exactly as for chat. A 4xx
+about the request itself comes back to the caller, with Jev's body under
+`error.upstream`: there is no bigger model to climb to.
+
+**Metering.** Every answer is a ledger row under `jev/<the model that
+answered>`, with the tokens Jev reported. `jev/jev-latest` is in the built-in
+catalog unpriced — TypeSafe publishes no per-token price yet — so rows carry
+their tokens at zero cost until someone prices the row (as an override, which a
+re-seed leaves alone). A System One row claims no saving: its counterfactual is
+its own cost. The route's rate limit and the caller's spend caps admit a System
+One request exactly as they admit a chat one.
 
 ## Framing
 

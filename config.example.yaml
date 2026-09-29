@@ -88,6 +88,12 @@ gateway:
   # docs/03-providers.md.
   # claude_code_model_aliases: true
 
+  # Point a provider at a proxy, a regional endpoint or a mock instead of its
+  # public API. Jev, which answers System One at /jev/v1/systemone, defaults
+  # to TypeSafe's own: https://api.typesafe.ai. See docs/03-providers.md.
+  # provider_base_urls:
+  #   jev: "https://api.typesafe.ai"
+
   # Advertise `oag/auto` in /v1/models. Off by default: the classifier behind it
   # picks a rung from the request's SHAPE (token count, tool count, turn count,
   # images, code) and never from what the task is, so the name promises a
