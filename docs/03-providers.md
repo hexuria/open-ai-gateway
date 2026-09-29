@@ -295,11 +295,14 @@ cooling down gets the ordinary 503 `no_credential`.
 types — a body the client would refuse to send is a 400 before any key is
 used — and forwarded as it arrived. Jev's answer is checked the same way and
 returned byte for byte, with Jev's `x-typesafe-request-id` and the gateway's
-`x-oag-model`, `x-oag-request-id` and `x-oag-build` beside it. A 408 is retried
-on the same key; a 429, a 5xx, a key that cannot be reached, or a 2xx that is
-not a System One response moves to the next key, exactly as for chat. A 4xx
-about the request itself comes back to the caller, with Jev's body under
-`error.upstream`: there is no bigger model to climb to.
+`x-oag-model`, `x-oag-request-id` and `x-oag-build` beside it. Failures follow
+the chat path's rules: a 408, or a key that cannot be reached, is retried on
+the same key before the next is tried; a 429, a 5xx, a key silent past
+`upstream_response_timeout`, or a 2xx that is not a System One response moves
+to the next key at once (the first three also bench the failing key). A 400,
+413 or 422 is about the request, so it comes back to the caller with Jev's body
+under `error.upstream`: another key would refuse it too, and there is no
+bigger model to climb to.
 
 **Metering.** Every answer is a ledger row under `jev/<the model that
 answered>`, with the tokens Jev reported. `jev/jev-latest` is in the built-in
