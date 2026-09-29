@@ -528,6 +528,78 @@ mod tests {
         assert_eq!(system_one.len(), 1, "and nothing that is not its own");
     }
 
+    /// The real way in: rows from `model_catalog`, through `reload_catalog`,
+    /// land in the catalog their provider's dialect says — and the count it
+    /// returns is every row it placed.
+    ///
+    /// Gated, because the rows are Postgres's. Cleaned up before asserting,
+    /// so a failure cannot leave a Jev model in a shared test database.
+    #[tokio::test]
+    async fn a_reload_puts_each_model_in_the_catalog_its_dialect_says() {
+        use oag_core::Provider;
+        let Ok(db_url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            &db_url,
+            "redis://127.0.0.1:1",
+            "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 2).expect("pool");
+        db.migrate().await.expect("migrate");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        let state = AppState::new(config, db.clone(), cache).expect("state");
+
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let chat_id = format!("anthropic/reload-{tag}");
+        let jev_id = format!("jev/reload-{tag}");
+        for (id, provider) in [(&chat_id, Provider::Anthropic), (&jev_id, Provider::Jev)] {
+            let row = oag_store::ModelRow {
+                id: id.clone(),
+                provider: provider.as_str().to_owned(),
+                upstream_name: format!("reload-{tag}"),
+                input_per_mtok: rust_decimal::Decimal::ONE,
+                output_per_mtok: rust_decimal::Decimal::TWO,
+                cache_read_per_mtok: None,
+                cache_write_per_mtok: None,
+                context_window: 200_000,
+                max_output_tokens: 8_192,
+                supports_vision: false,
+                supports_tools: false,
+                supports_reasoning: false,
+                supports_prompt_cache: false,
+                display_label: None,
+            };
+            oag_store::repo::upsert_model(&db, &row, false)
+                .await
+                .expect("a catalog row");
+        }
+
+        let loaded = state.reload_catalog().await;
+        sqlx::query("DELETE FROM model_catalog WHERE id = ANY($1)")
+            .bind(vec![chat_id.clone(), jev_id.clone()])
+            .execute(db.pool())
+            .await
+            .expect("clean up");
+        let loaded = loaded.expect("reload");
+
+        let chat = state.catalog().await;
+        let system_one = state.system_one_catalog().await;
+        assert!(chat.get(&oag_router::ModelId::new(&chat_id)).is_some());
+        assert!(
+            chat.get(&oag_router::ModelId::new(&jev_id)).is_none(),
+            "a Jev model read from the database never reaches chat"
+        );
+        assert!(system_one.get(&oag_router::ModelId::new(&jev_id)).is_some());
+        assert_eq!(
+            loaded,
+            chat.len() + system_one.len(),
+            "every row counted went to one catalog or the other"
+        );
+    }
+
     /// Every provider in the build can be called. The admin matrix renders a
     /// provider missing from this as "no adapter in this build"; Jev has no
     /// chat adapter and is served all the same.
