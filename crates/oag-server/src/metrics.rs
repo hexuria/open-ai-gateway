@@ -224,6 +224,7 @@ mod tests {
             include_str!("gateway/authn.rs"),
             include_str!("gateway/presence.rs"),
             include_str!("gateway/count_tokens.rs"),
+            include_str!("gateway/systemone.rs"),
             include_str!("admin/mod.rs"),
             include_str!("admin/auth.rs"),
             include_str!("admin/write.rs"),

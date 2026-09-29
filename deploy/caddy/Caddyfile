@@ -70,7 +70,7 @@ gateway.internal {
 	# allow-list entry for a route that does not exist is not harmless — it says
 	# the gateway serves embeddings, which is the first thing someone reads when
 	# asking whether it does.
-	@inference path /v1/* /v1beta/* /chat/* /responses* /models /health/live
+	@inference path /v1/* /v1beta/* /chat/* /responses* /models /jev/v1/* /health/live
 	handle @inference {
 		reverse_proxy envoy:10000 {
 			# Caddy detects text/event-stream and flushes immediately, so

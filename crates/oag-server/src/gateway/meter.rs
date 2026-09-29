@@ -274,6 +274,20 @@ pub async fn record_collected(
     record_with_gate(state, ctx, &outcome, gate, false, Fate::Served).await;
 }
 
+/// Record one System One answer.
+///
+/// The same row, the same metrics and the same writer as a chat answer. Jev
+/// sends no stream to accumulate, so the usage it reported is the whole of the
+/// accumulator. Its model sat on no rung and was chosen over nothing cheaper,
+/// so the row claims no saving: with no ceiling model its counterfactual is its
+/// own cost, where one priced against a chat model would be a comparison with
+/// something that could never have answered.
+pub async fn record_answer(state: &AppState, ctx: &Context, usage: oag_router::Usage) {
+    let mut accumulator = oag_proto::StreamAccumulator::new();
+    accumulator.observe(&oag_proto::StreamEvent::UsageUpdate { usage });
+    record_collected(state, ctx, &accumulator, None).await;
+}
+
 /// An attempt the quality gate condemned, captured at the moment we gave up on
 /// it and held until the request it belongs to is finished.
 ///

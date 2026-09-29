@@ -206,6 +206,18 @@
     }
   },
   {
+    "type": "system_one_not_configured",
+    "status": 503,
+    "variant": "SystemOneNotConfigured",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "system_one_not_configured",
+        "message": "System One is not configured on this route: route 'default' holds no Jev credential. Add one with `oag admin account add --name <name> --provider jev --secret <key> --route default`"
+      }
+    }
+  },
+  {
     "type": "unsupported_field",
     "status": 400,
     "variant": "UnsupportedField",

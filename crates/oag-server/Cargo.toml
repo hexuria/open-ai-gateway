@@ -37,6 +37,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 futures-util.workspace = true
 tokio-stream = "0.1"
 async-trait.workspace = true
+typesafe-sdk.workspace = true
 
 [dev-dependencies]
 # For the error-shape catalogue test: `every_variant()` is feature-gated.

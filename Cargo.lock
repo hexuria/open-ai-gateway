@@ -1534,6 +1534,7 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "typesafe-sdk",
  "url",
  "uuid",
 ]

@@ -192,6 +192,20 @@ pub enum Error {
     #[error("upstream sent no response within {after:?}")]
     UpstreamTimeout { after: Duration },
 
+    /// A System One request reached a route that holds no Jev credential.
+    ///
+    /// Deliberately not [`Error::NoCredential`], which is also what `lease`
+    /// says of a route whose Jev keys all exist and are cooling down. Here
+    /// there is nothing to wait for and no fallback to name — no chat model
+    /// answers a System One question — so the refusal says what is missing and
+    /// how to add it, rather than answering with a guess.
+    #[error(
+        "System One is not configured on this route: route '{route}' holds no Jev \
+         credential. Add one with `oag admin account add --name <name> --provider jev \
+         --secret <key> --route {route}`"
+    )]
+    SystemOneNotConfigured { route: String },
+
     #[error("serialisation: {0}")]
     Serde(#[from] serde_json::Error),
 
@@ -396,6 +410,9 @@ pub fn every_variant() -> Vec<Error> {
         Error::UpstreamTimeout {
             after: Duration::from_secs(90),
         },
+        Error::SystemOneNotConfigured {
+            route: "default".to_owned(),
+        },
         // `unwrap_err` on a value that is unconditionally an `Err`: the clippy
         // lint is about Results that might be `Ok`, and "not json" is not an i32
         // in any build.
@@ -427,6 +444,7 @@ pub fn every_variant() -> Vec<Error> {
             | Error::Upstream { .. }
             | Error::StreamIdle(_)
             | Error::UpstreamTimeout { .. }
+            | Error::SystemOneNotConfigured { .. }
             | Error::Serde(_)
             | Error::Internal(_) => {}
         }

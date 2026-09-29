@@ -125,6 +125,15 @@ fn inference_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
             "/v1beta/models/{*model_action}",
             axum::routing::post(gateway::gemini_generate),
         )
+        // System One, under a prefix of its own: the unmodified SDK appends
+        // `/v1/systemone` and `/v1/models` to its base URL, so pointing it at
+        // `<gateway>/jev` lands here, and Jev's listing never collides with
+        // this gateway's own `/v1/models`.
+        .route(
+            "/jev/v1/systemone",
+            axum::routing::post(gateway::systemone::system_one),
+        )
+        .route("/jev/v1/models", get(gateway::systemone::models))
         // `route_layer`, so an unmatched path 404s without an auth round trip
         // — and, more importantly, so this runs *before* a handler's `Bytes`
         // extractor. An unauthenticated POST is refused on its headers rather
@@ -1180,7 +1189,7 @@ mod router_tests {
         // top of each handler, for the same reason the admin API has one: with
         // per-handler checks this could only cover the handlers someone
         // remembered to write a check into.
-        const POSTS: [&str; 7] = [
+        const POSTS: [&str; 8] = [
             "/v1/messages",
             "/v1/messages/count_tokens",
             "/v1/chat/completions",
@@ -1188,6 +1197,7 @@ mod router_tests {
             "/v1/responses",
             "/responses",
             "/v1beta/models/gemini-2.5-pro:generateContent",
+            "/jev/v1/systemone",
         ];
         for path in POSTS {
             let got =
@@ -1417,7 +1427,7 @@ mod router_tests {
     async fn client_discovery_routes_require_a_key_too() {
         // /v1/models reports the org's provider inventory and this route's
         // entitlements. It is not public information.
-        for path in ["/v1/models", "/models", "/v1beta/models"] {
+        for path in ["/v1/models", "/models", "/v1beta/models", "/jev/v1/models"] {
             let got = status(public_router(state(false)), "GET", path).await;
             assert_eq!(got, StatusCode::UNAUTHORIZED, "{path} leaked without a key");
         }

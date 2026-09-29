@@ -13,6 +13,7 @@ pub mod refresh;
 mod respond;
 pub mod select;
 pub mod sse;
+pub mod systemone;
 
 pub use authn::{Caller, require_key_layer};
 
