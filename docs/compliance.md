@@ -95,13 +95,18 @@ person's, because the provider sees only the traffic. What the gateway does:
   a jittered time — not by every replica on its own clock.
 - **One name.** The quota read and the token refresh send the same configured
   `originator`/`user-agent` as inference, instead of a second name of their own.
-- **Two in flight.** An imported seat defaults to `--max-concurrency 2`; eight
-  at once from one plan is a crowd. Raise it with the flag if the owner truly
-  runs more.
+- **Two in flight.** A seat imported from now on defaults to
+  `--max-concurrency 2`; eight at once from one plan is a crowd. Raise it with
+  the flag if the owner truly runs more. A seat imported earlier keeps the value
+  it was stored with — usually 8 — and there is no CLI setter for it yet, so
+  lower it with `UPDATE account SET max_concurrency = 2 WHERE name = '<seat>'`.
 
 What it cannot do on its own: every replica calls upstream from its own
 address. Running more than one replica, give each seat a `proxy_url` so its
-traffic leaves from one place, as its owner's does.
+traffic leaves from one place, as its owner's does. The column is honoured by
+inference, refresh and the usage poll alike, but nothing in the CLI sets it
+yet: `UPDATE account SET proxy_url = 'http://proxy.internal:3128' WHERE name =
+'<seat>'`.
 
 ## Practical guidance
 
