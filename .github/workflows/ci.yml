@@ -100,6 +100,9 @@ jobs:
       # the header wrongly would agree with itself and the scripts would pass.
       - name: mock upstream selftest
         run: MOCK_SELFTEST=1 python3 deploy/test/mock-upstream.py
+      # The same, for the mock Jev `systemone-verify.sh` counts keys with.
+      - name: mock Jev selftest
+        run: MOCK_SELFTEST=1 python3 deploy/test/mock-systemone.py
 
       # The mutants gate trusts this filter to drop only moved lines.
       - name: mutants-diff selftest
@@ -238,6 +241,8 @@ jobs:
         run: ./deploy/test/dialects-verify.sh
       - name: Bedrock event-stream against VidaiMock
         run: ./deploy/test/bedrock-verify.sh
+      - name: System One against a mock Jev
+        run: ./deploy/test/systemone-verify.sh
 
   # The error-path litmus test, automated: cargo-mutants breaks each function
   # this PR touches (return a default, flip a comparison, drop a match arm)

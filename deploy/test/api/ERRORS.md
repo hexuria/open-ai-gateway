@@ -108,6 +108,12 @@ Gemini-shaped failure and belongs beside the Gemini requests.
 five-megabyte blob committed to test one status code. `errors.hurl` carries the
 one-line reproduction in a comment instead.
 
+`system_one_not_configured` is asserted by `deploy/test/systemone-verify.sh`,
+against a route it creates with no Jev key, rather than here: whether the key
+these files use can reach Jev depends on the route it was minted on.
+`systemone.hurl` asserts the `invalid_request` a System One body with no
+questions gets, and the script runs it.
+
 **Not reachable on this deployment**, and why:
 
 | kind | why not | how to see it |
