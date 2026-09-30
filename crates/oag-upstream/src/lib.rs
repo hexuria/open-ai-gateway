@@ -7,6 +7,7 @@ pub mod anthropic;
 pub mod bedrock;
 pub mod codex;
 pub mod eventstream;
+pub mod gcp_token;
 pub mod gemini;
 pub mod jev;
 pub mod openai;

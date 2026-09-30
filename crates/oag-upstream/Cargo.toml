@@ -23,11 +23,15 @@ sha2.workspace = true
 hmac.workspace = true
 hex.workspace = true
 base64.workspace = true
+ring.workspace = true
 time.workspace = true
 typesafe-sdk.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+wiremock.workspace = true
+# Reads the form a token request posts, as the token endpoint would.
+url.workspace = true
 
 [lints]
 workspace = true

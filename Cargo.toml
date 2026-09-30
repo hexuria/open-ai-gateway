@@ -90,6 +90,10 @@ chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.10"
 base64 = "0.22"
+# RS256 for the JWT a Google service account signs to get an access token
+# (`oag-upstream/src/gcp_token.rs`). Already in the tree as rustls' crypto
+# provider; named here at the version the lockfile holds, so no crate is added.
+ring = "0.17.14"
 
 # ── observability ──────────────────────────────────────────────────────────────
 tracing = "0.1"
@@ -108,6 +112,13 @@ clap = { version = "4", features = ["derive", "env"] }
 # them with, rather than keeping a second copy of the format. Pinned exactly: the
 # gateway re-serves its wire types byte for byte.
 typesafe-sdk = "=0.2.0"
+
+# ── tests only ─────────────────────────────────────────────────────────────────
+# Stand-in upstreams for tests: a real HTTP server per test, so a request is
+# checked as it arrived over the wire, headers and path included, and a mock can
+# be told to expect no request at all. Nobody holds a key for most of the hosts
+# these tests stand in for.
+wiremock = "0.6"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
