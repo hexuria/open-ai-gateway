@@ -10,6 +10,7 @@ pub mod custom;
 pub mod eventstream;
 pub mod gemini;
 pub mod jev;
+pub mod listing;
 pub mod openai;
 pub mod openai_oauth;
 pub mod pricing;

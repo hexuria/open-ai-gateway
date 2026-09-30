@@ -7,6 +7,7 @@
 //! as every provider's does, and reaches the adapter per request.
 
 use crate::adapter::ProviderAdapter;
+use crate::listing::ModelSource;
 use crate::{AnthropicAdapter, GeminiAdapter, OpenAICompatAdapter};
 use oag_core::provider::{AuthStyle, Dialect, Endpoint, Platform};
 use oag_core::{Error, Provider, Result};
@@ -27,6 +28,9 @@ pub struct EndpointSpec {
     base_url: String,
     auth: AuthStyle,
     extra_headers: ExtraHeaders,
+    /// Whether its adapter answers `served_models` by reading the endpoint's
+    /// model list: the row's `discover_models`.
+    discover: bool,
 }
 
 impl EndpointSpec {
@@ -57,7 +61,30 @@ impl EndpointSpec {
             base_url: base_url.into(),
             auth,
             extra_headers,
+            discover: false,
         })
+    }
+
+    /// This spec, with its adapter asked for the models each key serves when
+    /// `discover` is set: see [`crate::listing::served`]. Off by default, so an
+    /// endpoint whose operator did not ask is never sent a request the gateway
+    /// did not need.
+    #[must_use]
+    pub fn with_discovery(mut self, discover: bool) -> Self {
+        self.discover = discover;
+        self
+    }
+
+    /// Where this endpoint's model list is read from, and how: its dialect,
+    /// base URL, auth style and extra headers.
+    #[must_use]
+    pub fn model_source(&self) -> ModelSource<'_> {
+        ModelSource {
+            dialect: self.endpoint.dialect(),
+            base_url: &self.base_url,
+            auth: self.auth,
+            headers: &self.extra_headers,
+        }
     }
 }
 
@@ -97,7 +124,9 @@ impl ExtraHeaders {
         "content-length",
     ];
 
-    fn parse<K, V>(pairs: impl IntoIterator<Item = (K, V)>) -> std::result::Result<Self, String>
+    pub(crate) fn parse<K, V>(
+        pairs: impl IntoIterator<Item = (K, V)>,
+    ) -> std::result::Result<Self, String>
     where
         K: AsRef<str>,
         V: AsRef<str>,
@@ -161,7 +190,8 @@ pub(crate) fn authenticate(
 ///
 /// The adapter's provider is `Provider::Custom`, never a built-in, so nothing
 /// that keys on a built-in applies to it: no OAuth refresh, no xAI model
-/// discovery, and not the rule that Anthropic's key goes in `x-api-key`.
+/// discovery, and not the rule that Anthropic's key goes in `x-api-key`. It
+/// discovers models only when the spec says to, from the endpoint's own list.
 ///
 /// Only the plain platform is served so far. An endpoint on AWS, GCP or Azure
 /// is refused rather than sent a request built for a plain host, which its
@@ -182,19 +212,20 @@ pub fn adapter(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
     }
 
     let base = spec.base_url.clone();
-    let (auth, headers) = (spec.auth, spec.extra_headers.clone());
+    let (auth, headers, discover) = (spec.auth, spec.extra_headers.clone(), spec.discover);
     let adapter: Arc<dyn ProviderAdapter> = match endpoint.dialect() {
         Dialect::OpenAIChatCompletions => Arc::new(
             OpenAICompatAdapter::new(Provider::Custom(endpoint), base)
                 .with_auth(auth)
-                .with_headers(headers),
+                .with_headers(headers)
+                .with_discovery(discover),
         ),
-        Dialect::AnthropicMessages => Arc::new(AnthropicAdapter::for_endpoint(
-            endpoint, base, auth, headers,
-        )),
-        Dialect::GeminiGenerateContent => {
-            Arc::new(GeminiAdapter::for_endpoint(endpoint, base, auth, headers))
-        }
+        Dialect::AnthropicMessages => Arc::new(
+            AnthropicAdapter::for_endpoint(endpoint, base, auth, headers).with_discovery(discover),
+        ),
+        Dialect::GeminiGenerateContent => Arc::new(
+            GeminiAdapter::for_endpoint(endpoint, base, auth, headers).with_discovery(discover),
+        ),
         // Not a chat upstream, so no `ProviderAdapter` serves it: that trait
         // builds from a canonical conversation, and a System One question set
         // is not one. The System One route calls Jev through a `JevUpstream`
@@ -226,7 +257,7 @@ mod tests {
     use oag_router::{Capabilities, ModelId, ModelSpec, Pricing};
     use rust_decimal::dec;
     use std::time::Duration;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// The key every test sends. Never a real one: there are none to send.
@@ -533,6 +564,64 @@ mod tests {
             assert_eq!(adapter.dialect(), dialect, "{name}");
             assert_eq!(adapter.framing(), Framing::Sse, "{name}");
             assert!(!adapter.always_streams(), "{name}");
+        }
+    }
+
+    /// With discovery on, each dialect's adapter answers `served_models` from
+    /// the endpoint's own list, read with the key where the endpoint takes it
+    /// and with the operator's headers. With it off, the adapter answers that
+    /// it cannot be asked, and sends nothing.
+    #[tokio::test]
+    async fn an_endpoint_that_discovers_reads_its_own_list_and_one_that_does_not_sends_nothing() {
+        for (dialect, base_path, list_path, listed) in [
+            (
+                Dialect::OpenAIChatCompletions,
+                "/v1",
+                "/v1/models",
+                serde_json::json!({"object": "list", "data": [{"id": "some-model"}]}),
+            ),
+            (
+                Dialect::AnthropicMessages,
+                "",
+                "/v1/models",
+                serde_json::json!({"data": [{"id": "some-model"}], "has_more": false}),
+            ),
+            (
+                Dialect::GeminiGenerateContent,
+                "/v1beta",
+                "/v1beta/models",
+                serde_json::json!({"models": [{"name": "models/some-model"}]}),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(list_path))
+                .and(header("x-goog-api-key", KEY))
+                .and(header("x-title", "open-ai-gateway"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(listed))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let name = format!("t6-discover-{}", base_name(dialect));
+            let spec = plain_spec(
+                endpoint(&name, dialect, Platform::Plain),
+                &format!("{}{base_path}", server.uri()),
+                AuthStyle::XGoogApiKey,
+            );
+
+            let off = adapter(&spec.clone()).unwrap();
+            assert_eq!(
+                off.served_models(&credential(), None).await.unwrap(),
+                None,
+                "{name}: not asked to discover"
+            );
+            let on = adapter(&spec.with_discovery(true)).unwrap();
+            assert_eq!(
+                on.served_models(&credential(), None).await.unwrap(),
+                Some(vec!["some-model".to_owned()]),
+                "{name}"
+            );
+            server.verify().await;
         }
     }
 

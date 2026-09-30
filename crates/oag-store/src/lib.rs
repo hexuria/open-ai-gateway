@@ -17,9 +17,11 @@ pub use auth::AuthCache;
 pub use cache::{AuthMac, Cache, SlotClaim};
 pub use db::{Db, MIGRATION_LOCK_ID};
 pub use health::{Readiness, readiness};
-pub use repo::{EndpointDeletion, EndpointUpdate, NewEndpoint, NewService, ServiceUpdate};
+pub use repo::{
+    EndpointDeletion, EndpointSync, EndpointUpdate, NewEndpoint, NewService, ServiceUpdate,
+};
 pub use rows::Spend;
 pub use rows::{
     AccountRow, AuthContext, ChannelStatusRow, EndpointRow, ModelRow, RouteRow, ServiceRow,
-    UsageWrite,
+    StoredModelRow, UsageWrite,
 };

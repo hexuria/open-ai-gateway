@@ -217,6 +217,7 @@ mod tests {
             include_str!("health.rs"),
             include_str!("state.rs"),
             include_str!("egress.rs"),
+            include_str!("endpoint_sync.rs"),
             include_str!("usage_poll.rs"),
             include_str!("breakers.rs"),
             include_str!("shutdown.rs"),

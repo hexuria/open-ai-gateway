@@ -11,6 +11,7 @@
 mod accounts;
 mod catalog;
 mod doctor;
+mod endpoint_sync;
 mod keys;
 mod overview;
 mod principals;
@@ -66,6 +67,9 @@ pub enum AdminCommand {
     /// Model catalog: seed, overlay prices, list.
     #[command(subcommand)]
     Catalog(CatalogCommand),
+    /// Operator-registered endpoints.
+    #[command(subcommand)]
+    Endpoint(EndpointCommand),
     /// The usage ledger: import traffic that bypassed the gateway.
     #[command(subcommand)]
     Usage(UsageCommand),
@@ -432,6 +436,14 @@ pub enum CatalogCommand {
     },
 }
 
+/// `oag admin endpoint`.
+#[derive(Subcommand, Debug)]
+pub enum EndpointCommand {
+    /// `sync` and `models`: an endpoint's own model list.
+    #[command(flatten)]
+    Catalog(endpoint_sync::EndpointCatalogCommand),
+}
+
 #[derive(Subcommand, Debug)]
 pub enum CacheCommand {
     /// Drop the shared auth cache.
@@ -549,6 +561,9 @@ pub async fn run(
             promote_principal(db, &email).await
         }
         AdminCommand::Catalog(cmd) => catalog_cmd(db, kek, cmd).await,
+        AdminCommand::Endpoint(EndpointCommand::Catalog(cmd)) => {
+            endpoint_sync::run(db, kek, config, cmd).await
+        }
         AdminCommand::Usage(cmd) => usage_cmd(db, cmd).await,
         AdminCommand::Cache(CacheCommand::Flush) | AdminCommand::FlushCache => {
             flush_cache(redis_url).await

@@ -17,4 +17,6 @@ pub use spend::*;
 pub use usage::*;
 
 #[cfg(test)]
+mod sync_tests;
+#[cfg(test)]
 mod tests;

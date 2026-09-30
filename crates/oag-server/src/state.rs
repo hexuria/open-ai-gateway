@@ -140,7 +140,8 @@ fn endpoint_adapter(
         config.auth,
         config.extra_headers,
     )
-    .map_err(|e| Refusal::new(Reason::Headers, e))?;
+    .map_err(|e| Refusal::new(Reason::Headers, e))?
+    .with_discovery(row.discover_models);
     let adapter = oag_upstream::custom::adapter(&spec)
         .map_err(|e| Refusal::new(Reason::Unsupported, e.to_string()))?;
     Ok((config.endpoint, adapter))

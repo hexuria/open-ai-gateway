@@ -18,6 +18,9 @@ pub struct AnthropicAdapter {
     auth: AuthStyle,
     /// Added to every request. None for Anthropic.
     headers: ExtraHeaders,
+    /// Whether `served_models` reads `{base}/v1/models`. Only an endpoint
+    /// whose operator asked for it; never Anthropic itself.
+    discover: bool,
 }
 
 impl Default for AnthropicAdapter {
@@ -34,6 +37,7 @@ impl AnthropicAdapter {
             base_url: base_url.into(),
             auth: AuthStyle::XApiKey,
             headers: ExtraHeaders::default(),
+            discover: false,
         }
     }
 
@@ -56,7 +60,15 @@ impl AnthropicAdapter {
             base_url: base_url.into(),
             auth,
             headers,
+            discover: false,
         }
+    }
+
+    /// Answer `served_models` from the endpoint's own `{base}/v1/models`.
+    #[must_use]
+    pub fn with_discovery(mut self, discover: bool) -> Self {
+        self.discover = discover;
+        self
     }
 }
 
@@ -115,6 +127,24 @@ impl ProviderAdapter for AnthropicAdapter {
 
     fn parse_event(&self, raw: &str, acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>> {
         anthropic::parse_event(raw, acc)
+    }
+
+    async fn served_models(
+        &self,
+        credential: &oag_core::credential::SecretMaterial,
+        proxy: Option<&str>,
+    ) -> Result<Option<Vec<String>>> {
+        if !self.discover {
+            return Ok(None);
+        }
+        let source = crate::listing::ModelSource {
+            dialect: oag_core::provider::Dialect::AnthropicMessages,
+            base_url: &self.base_url,
+            auth: self.auth,
+            headers: &self.headers,
+        };
+        let served = crate::listing::served(&source, &credential.access_token, proxy).await?;
+        Ok(Some(served.models))
     }
 }
 
