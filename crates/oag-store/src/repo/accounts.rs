@@ -138,6 +138,79 @@ pub async fn schedulable_accounts(db: &Db, provider: &str, kind: &str) -> Result
     .map_err(|e| Error::Internal(format!("loading {provider} {kind} accounts: {e}")))
 }
 
+/// The credential to read an endpoint's model list with: the one `name`d,
+/// whether or not it is schedulable, or else the endpoint's first schedulable
+/// one, lowest priority first.
+pub async fn endpoint_account(
+    db: &Db,
+    endpoint: &str,
+    name: Option<&str>,
+) -> Result<Option<AccountRow>> {
+    sqlx::query_as::<_, AccountRow>(
+        r"
+        SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
+               token_version, token_expires_at, owner_principal_id, proxy_url,
+               priority, max_concurrency, schedulable, cooldown_until,
+               rate_limited_until, window_resets_at,
+               usage_remaining_pct, usage_reserve_pct, last_used_at
+        FROM account
+        WHERE provider = $1
+          AND (($2::text IS NULL AND schedulable) OR name = $2)
+        ORDER BY priority, name
+        LIMIT 1
+        ",
+    )
+    .bind(endpoint)
+    .bind(name)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("finding a credential for endpoint {endpoint}: {e}")))
+}
+
+/// API keys the usage poller asks for the models they serve: schedulable, and
+/// filed under an endpoint whose `discover_models` is set.
+pub async fn discovering_endpoint_accounts(db: &Db) -> Result<Vec<AccountRow>> {
+    sqlx::query_as::<_, AccountRow>(
+        r"
+        SELECT a.id, a.name, a.provider, a.kind, a.credentials_sealed, a.credentials_nonce,
+               a.token_version, a.token_expires_at, a.owner_principal_id, a.proxy_url,
+               a.priority, a.max_concurrency, a.schedulable, a.cooldown_until,
+               a.rate_limited_until, a.window_resets_at,
+               a.usage_remaining_pct, a.usage_reserve_pct, a.last_used_at
+        FROM account a
+        JOIN endpoint e ON e.name = a.provider
+        WHERE e.discover_models AND a.kind = 'api_key' AND a.schedulable
+        ",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("loading endpoint keys to discover: {e}")))
+}
+
+/// Forget the served set of every key whose endpoint no longer discovers its
+/// models, and say how many were forgotten.
+///
+/// Discovery is the only writer of an endpoint key's `served_models`, and a
+/// set it stopped maintaining is one that goes stale: it goes on hiding every
+/// model the endpoint gains after it, with nothing left to correct it. NULL is
+/// "never asked", which lists what the catalog holds for the endpoint, and that
+/// is what turning discovery off means. A built-in provider's keys have no
+/// endpoint row, and are never touched.
+pub async fn forget_undiscovered_served_models(db: &Db) -> Result<u64> {
+    sqlx::query(
+        r"
+        UPDATE account a
+           SET served_models = NULL, served_models_at = NULL, updated_at = now()
+          FROM endpoint e
+         WHERE e.name = a.provider AND NOT e.discover_models AND a.served_models IS NOT NULL
+        ",
+    )
+    .execute(db.pool())
+    .await
+    .map(|done| done.rows_affected())
+    .map_err(|e| Error::Internal(format!("forgetting undiscovered served models: {e}")))
+}
+
 /// [`schedulable_oauth_accounts`]' statement, a constant so a test can run it
 /// beside a row the schema no longer lets anything create.
 pub(super) const SCHEDULABLE_OAUTH_SQL: &str = r"

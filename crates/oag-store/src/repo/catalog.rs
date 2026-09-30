@@ -1,9 +1,10 @@
 //! The model catalog, its prices, and registered services.
 
 use crate::Db;
-use crate::rows::{ModelRow, ServiceRow};
+use crate::rows::{ModelRow, ServiceRow, StoredModelRow};
 use oag_core::{Error, Result};
 use rust_decimal::Decimal;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 /// The whole model catalog.
@@ -309,4 +310,178 @@ pub async fn update_model_prices(
     .map_err(|e| Error::Internal(format!("repricing model: {e}")))?;
 
     Ok(done.rows_affected() > 0)
+}
+
+/// One provider's catalog rows, and any row of another provider whose id
+/// carries this provider's prefix (`<provider>/…`), each with whether an
+/// operator override protects it: what an endpoint's catalog sync compares its
+/// list against. The second kind holds an id the sync would write, and is
+/// how it learns not to.
+pub async fn provider_models(db: &Db, provider: &str) -> Result<Vec<StoredModelRow>> {
+    sqlx::query_as::<_, StoredModelRow>(
+        r"
+        SELECT id, provider, upstream_name, input_per_mtok, output_per_mtok,
+               cache_read_per_mtok, cache_write_per_mtok, context_window,
+               max_output_tokens, supports_vision, supports_tools,
+               supports_reasoning, supports_prompt_cache, display_label, is_override
+        FROM model_catalog
+        WHERE provider = $1 OR left(id, char_length($1) + 1) = $1 || '/'
+        ORDER BY id
+        ",
+    )
+    .bind(provider)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| Error::Internal(format!("loading {provider}'s catalog rows: {e}")))
+}
+
+/// Every model id a route's ladder names, read from each rung's `models` as the
+/// router reads them. A ladder, or a rung, that is not the shape the router
+/// reads names nothing here, and a route's being inactive does not stop its
+/// ladder naming a model: it can be switched back on.
+///
+/// A macro so that the two statements that read it are each one literal.
+macro_rules! laddered_models_sql {
+    () => {
+        "SELECT m.model FROM route r \
+         CROSS JOIN LATERAL jsonb_array_elements( \
+             CASE jsonb_typeof(r.tiers) WHEN 'array' THEN r.tiers ELSE '[]'::jsonb END \
+         ) AS rung(value) \
+         CROSS JOIN LATERAL jsonb_array_elements_text( \
+             CASE jsonb_typeof(rung.value -> 'models') \
+                  WHEN 'array' THEN rung.value -> 'models' ELSE '[]'::jsonb END \
+         ) AS m(model)"
+    };
+}
+
+const LADDERED_MODELS_SQL: &str = laddered_models_sql!();
+
+/// The ids some route's ladder names, as `laddered_models_sql!` reads them.
+pub async fn laddered_models(db: &Db) -> Result<HashSet<String>> {
+    let ids: Vec<Option<String>> = sqlx::query_scalar(LADDERED_MODELS_SQL)
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("reading the ladders: {e}")))?;
+    // A JSON null in a rung reads as SQL NULL, and names no model.
+    Ok(ids.into_iter().flatten().collect())
+}
+
+/// An endpoint sync's write: every column but `provider` from the listing, as
+/// an override. Unlike [`UPSERT_MODEL_SQL`], its conflict branch rewrites an
+/// override: the rows under an endpoint's name that its list prices are the
+/// list's, and a sync that could not update what it wrote last time could not
+/// follow a price change.
+///
+/// It rewrites only a row of the same provider, so an id another provider's
+/// row already holds is left as it was and returns nothing. It writes a label
+/// only where the row has none: a label is the operator's, as it is to
+/// [`UPSERT_MODEL_SQL`], and a sync supplies one only for a row nobody has
+/// named.
+const SYNC_MODEL_SQL: &str = r"
+        INSERT INTO model_catalog (
+            id, provider, upstream_name, input_per_mtok, output_per_mtok,
+            cache_read_per_mtok, cache_write_per_mtok, context_window, max_output_tokens,
+            supports_vision, supports_tools, supports_reasoning, supports_prompt_cache,
+            is_override, display_label
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true,$14)
+        ON CONFLICT (id) DO UPDATE SET
+            upstream_name = EXCLUDED.upstream_name,
+            input_per_mtok = EXCLUDED.input_per_mtok,
+            output_per_mtok = EXCLUDED.output_per_mtok,
+            cache_read_per_mtok = EXCLUDED.cache_read_per_mtok,
+            cache_write_per_mtok = EXCLUDED.cache_write_per_mtok,
+            context_window = EXCLUDED.context_window,
+            max_output_tokens = EXCLUDED.max_output_tokens,
+            supports_vision = EXCLUDED.supports_vision,
+            supports_tools = EXCLUDED.supports_tools,
+            supports_reasoning = EXCLUDED.supports_reasoning,
+            supports_prompt_cache = EXCLUDED.supports_prompt_cache,
+            is_override = true,
+            display_label = COALESCE(model_catalog.display_label, EXCLUDED.display_label),
+            updated_at = now()
+        WHERE model_catalog.provider = EXCLUDED.provider
+        RETURNING id
+        ";
+
+/// Removes the provider's rows named in `$2` that no ladder names, and says
+/// which it removed.
+const DELETE_STALE_SQL: &str = concat!(
+    "DELETE FROM model_catalog c WHERE c.provider = $1 AND c.id = ANY($2) ",
+    "AND NOT EXISTS (SELECT 1 FROM (",
+    laddered_models_sql!(),
+    ") AS laddered WHERE laddered.model = c.id) ",
+    "RETURNING c.id"
+);
+
+/// What [`sync_endpoint_models`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EndpointSync {
+    /// Inserted or rewritten.
+    pub written: Vec<String>,
+    /// Held by a row of another provider, and left as it was.
+    pub held: Vec<String>,
+    /// Removed: every id in `stale` that no ladder named. The rest a ladder
+    /// names, and they stay.
+    pub removed: Vec<String>,
+}
+
+/// Write one endpoint's synced rows and remove its stale ones, in one
+/// transaction, so a catalog refresh sees the endpoint's rows as they were or
+/// as the sync left them and never half of each.
+///
+/// Every row must be `provider`'s. A stale row is removed only if no ladder
+/// names it, decided in the statement that removes it: a ladder written
+/// between the caller's look and this one still keeps its model.
+pub async fn sync_endpoint_models(
+    db: &Db,
+    provider: &str,
+    rows: &[ModelRow],
+    stale: &[String],
+) -> Result<EndpointSync> {
+    if let Some(stray) = rows.iter().find(|m| m.provider != provider) {
+        return Err(Error::Internal(format!(
+            "syncing {provider}'s catalog rows was handed {}, which is {}'s",
+            stray.id, stray.provider
+        )));
+    }
+    let mut tx = db
+        .pool()
+        .begin()
+        .await
+        .map_err(|e| Error::Internal(format!("starting {provider}'s catalog sync: {e}")))?;
+    let mut done = EndpointSync::default();
+    for m in rows {
+        let written: Option<String> = sqlx::query_scalar(SYNC_MODEL_SQL)
+            .bind(&m.id)
+            .bind(&m.provider)
+            .bind(&m.upstream_name)
+            .bind(m.input_per_mtok)
+            .bind(m.output_per_mtok)
+            .bind(m.cache_read_per_mtok)
+            .bind(m.cache_write_per_mtok)
+            .bind(m.context_window)
+            .bind(m.max_output_tokens)
+            .bind(m.supports_vision)
+            .bind(m.supports_tools)
+            .bind(m.supports_reasoning)
+            .bind(m.supports_prompt_cache)
+            .bind(m.display_label.as_deref())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("syncing model {}: {e}", m.id)))?;
+        match written {
+            Some(id) => done.written.push(id),
+            None => done.held.push(m.id.clone()),
+        }
+    }
+    done.removed = sqlx::query_scalar(DELETE_STALE_SQL)
+        .bind(provider)
+        .bind(stale)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| Error::Internal(format!("removing {provider}'s stale models: {e}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| Error::Internal(format!("committing {provider}'s catalog sync: {e}")))?;
+    Ok(done)
 }

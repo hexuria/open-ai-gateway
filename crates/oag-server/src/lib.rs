@@ -17,6 +17,7 @@
 pub mod admin;
 pub mod breakers;
 pub mod egress;
+pub mod endpoint_sync;
 pub mod gateway;
 pub mod health;
 pub mod listen;

@@ -286,6 +286,83 @@ request gets the new settings. A request in flight when its endpoint is removed
 can fail once its answer arrives, so remove an endpoint's keys, and let their
 requests finish, before the endpoint itself.
 
+### An endpoint's models
+
+An endpoint's models are ordinary catalog rows, `<endpoint>/<model>`, where
+`<model>` is the name the endpoint takes on the wire and may hold slashes of its
+own: `merge/zai/glm-5.3-flash` sends `zai/glm-5.3-flash`, everything after the
+first slash. Two things read the endpoint's own model list, each with one of
+its keys, in the header its auth style names and with its extra headers, and
+neither follows a redirect.
+
+**`oag admin endpoint sync <name>`** writes the list into the catalog, when the
+list prices its models:
+
+```sh
+oag admin endpoint sync merge --dry-run     # what would change; writes nothing
+oag admin endpoint sync merge               # write it
+oag admin endpoint sync merge --include 'anthropic/*' --exclude '*-preview' --price first
+```
+
+- **Where it looks.** At `--listing-url` if given: on the base URL's own origin,
+  because the key goes with the request, and used for that run only, stored
+  nowhere. Otherwise at `{base}/models` (`{base}/v1/models` for an `anthropic`
+  endpoint), and then at `/v1/models` on the base URL's origin, which is where
+  Merge Gateway keeps the priced list for every surface it serves: an endpoint
+  based at `https://api-gateway.merge.dev/v1/openai` is synced from
+  `https://api-gateway.merge.dev/v1/models`. Each request asks for `limit=500`
+  unless the URL names a limit, and the list is followed across `has_more` /
+  `next_cursor` pages, twenty at most. A list read only in part is not used.
+- **What it reads.** Merge's shape: each entry's `model`, `display_name`,
+  `availability_status` and `access_required`, and each vendor's
+  `context_window`, `max_output_tokens`, `availability_status`, `capabilities`
+  and `pricing`. An id-only list, such as OpenAI's `/models`, is refused and
+  nothing is written, because a catalog row needs a price and none is ever
+  invented: add those models one at a time with `oag admin catalog add`. Lists
+  shaped like OpenRouter's or LiteLLM's are not read.
+- **What it keeps.** Chat models: a vendor whose input and output both include
+  `text`, that is not marked deprecated, unavailable, retired, disabled,
+  discontinued or sunset, does not need access (`access_required`), and states
+  both per-token prices, not both zero. A model is priced by the cheapest such
+  vendor, input plus output and the first listed on a tie (`--price cheapest`,
+  the default), because that is where Merge sends it; or by the first listed
+  (`--price first`). The window and the capabilities come from the same vendor:
+  tools from `supports_tool_calling`, reasoning from `supports_reasoning`,
+  vision when the input includes `image`, and a prompt cache when a cache-read
+  price is stated.
+- **What it writes.** Each kept model's row, as an override, so `catalog seed`
+  and `catalog sync-prices` never touch it, and rewritten by the next sync when
+  the list changes: the list owns the numbers of the rows it prices, so a price
+  edited by hand on one of them lasts until the next sync, unless that model is
+  `--exclude`d. A label, `<display_name> (<endpoint display name>)`, is written
+  only where the row has none, so a name you gave a model survives. A row of the
+  endpoint's that the list no longer offers is removed, unless a route's ladder
+  names it: then it is kept and reported. `--include` and `--exclude` globs
+  (`*` and `?`, matched against the upstream id or the catalog id) scope what a
+  run manages, and a model they leave out is neither written nor removed. A list
+  that offers nothing at all is refused rather than read as "remove every
+  model". The whole sync is one transaction.
+- **What it prints.** Added, updated, unchanged, removed and kept counts,
+  skipped entries by reason, and what the filters left out. The running gateway
+  serves the rows from its next catalog refresh
+  (`gateway.catalog_refresh_interval`); nothing restarts.
+
+**Discovery.** With the endpoint's `discover_models` set, the usage poller
+(`gateway.usage_poll_interval`) asks each schedulable API key filed under the
+endpoint for the list at `{base}/models` (`{base}/v1/models`, with
+`anthropic-version`, for `anthropic`; `models[].name` less its `models/` for
+`gemini`), across its pages (`next_cursor`, `last_id` or `nextPageToken`), and
+records the ids in the key's `served_models`. `/v1/models` then lists only the
+endpoint's catalog rows that some key serves. Each key is read by one replica
+per interval, under the claim a seat's quota read takes. A failed read changes
+nothing; an empty list is recorded as empty and hides the endpoint's models;
+turning discovery off forgets what it recorded, so the listing goes back to
+every catalog row the endpoint has. Discovery reads only the dialect's own list
+URL, never the origin's: a served set read from some other service's list would
+hide the endpoint's models. It never writes a catalog row, because it has no
+prices. `oag admin endpoint models <name>` prints what it would record, beside
+the catalog, and writes nothing.
+
 ## Which dialect reaches which upstream
 
 Any inbound dialect can reach any upstream one; translation goes through the

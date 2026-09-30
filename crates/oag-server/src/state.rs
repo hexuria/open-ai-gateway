@@ -161,7 +161,8 @@ fn endpoint_upstream(row: &EndpointRow) -> std::result::Result<(Endpoint, Served
         config.auth,
         config.extra_headers,
     )
-    .map_err(|e| Refusal::new(Reason::Headers, e))?;
+    .map_err(|e| Refusal::new(Reason::Headers, e))?
+    .with_discovery(row.discover_models);
     let unsupported = |e: Error| Refusal::new(Reason::Unsupported, e.to_string());
     let served = if config.endpoint.dialect() == Dialect::SystemOne {
         Served::SystemOne(Arc::new(

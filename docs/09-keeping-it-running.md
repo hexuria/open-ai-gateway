@@ -119,6 +119,12 @@ An advertised model is not a servable one, and the reverse.
   is `gateway.usage_poll_interval` (five minutes unless set otherwise); `0`
   turns it off. `oag admin catalog sync-prices --provider xai` is the same
   insert by hand, and it needs an API key.
+- **An endpoint's new models.** `oag admin endpoint sync <name>` writes a
+  priced endpoint list, such as Merge Gateway's, into the catalog, and removes
+  what it no longer offers unless a ladder names it; run it with `--dry-run`
+  first. With the endpoint's `discover_models` set, the same poller records
+  what each of its keys serves, which narrows `/v1/models` to those models.
+  See [03-providers.md](03-providers.md#an-endpoints-models).
 - **Advertised but unservable.** A Codex seat listed `gpt-5.5` in
   `served_models`; a request for it returns 404.
 - **`served_models` is not a gate.** It feeds the savings baseline, not

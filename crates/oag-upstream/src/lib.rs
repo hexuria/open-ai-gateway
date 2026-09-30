@@ -11,6 +11,7 @@ pub mod eventstream;
 pub mod gcp_token;
 pub mod gemini;
 pub mod jev;
+pub mod listing;
 pub mod openai;
 pub mod openai_oauth;
 pub mod pricing;

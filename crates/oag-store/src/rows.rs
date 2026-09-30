@@ -276,6 +276,15 @@ impl ModelRow {
     }
 }
 
+/// A catalog row with whether an operator override protects it from a refresh:
+/// what an endpoint's catalog sync compares the endpoint's list against.
+#[derive(Debug, Clone, FromRow)]
+pub struct StoredModelRow {
+    #[sqlx(flatten)]
+    pub model: ModelRow,
+    pub is_override: bool,
+}
+
 /// One registered capability service.
 ///
 /// The catalog stores a pointer, not an implementation. `auth_ref` is a
