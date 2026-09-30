@@ -1,14 +1,23 @@
 //! The Gemini adapter.
 
 use crate::adapter::{ProviderAdapter, UpstreamRequest};
+use crate::custom::ExtraHeaders;
 use async_trait::async_trait;
+use oag_core::provider::{AuthStyle, Endpoint};
 use oag_core::{Provider, Result};
 use oag_proto::{StreamAccumulator, StreamEvent, gemini};
 
-/// Talks to Gemini's `generateContent` API.
+/// Talks to Gemini's `generateContent` API, or to an endpoint that speaks it.
 #[derive(Debug, Clone)]
 pub struct GeminiAdapter {
+    /// `Provider::Gemini` from [`GeminiAdapter::new`], and the endpoint from
+    /// [`GeminiAdapter::for_endpoint`].
+    provider: Provider,
     base_url: String,
+    /// `XGoogApiKey` for Gemini; an endpoint's own otherwise.
+    auth: AuthStyle,
+    /// Added to every request. None for Gemini.
+    headers: ExtraHeaders,
 }
 
 impl Default for GeminiAdapter {
@@ -21,7 +30,27 @@ impl GeminiAdapter {
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
+            provider: Provider::Gemini,
             base_url: base_url.into(),
+            auth: AuthStyle::XGoogApiKey,
+            headers: ExtraHeaders::default(),
+        }
+    }
+
+    /// For an endpoint that speaks `generateContent`: its name, its base URL,
+    /// the header its key goes in and the headers its operator added.
+    #[must_use]
+    pub fn for_endpoint(
+        endpoint: Endpoint,
+        base_url: impl Into<String>,
+        auth: AuthStyle,
+        headers: ExtraHeaders,
+    ) -> Self {
+        Self {
+            provider: Provider::Custom(endpoint),
+            base_url: base_url.into(),
+            auth,
+            headers,
         }
     }
 }
@@ -29,7 +58,7 @@ impl GeminiAdapter {
 #[async_trait]
 impl ProviderAdapter for GeminiAdapter {
     fn provider(&self) -> Provider {
-        Provider::Gemini
+        self.provider
     }
 
     fn build(&self, req: &UpstreamRequest<'_>) -> Result<reqwest::Request> {
@@ -48,12 +77,15 @@ impl ProviderAdapter for GeminiAdapter {
             self.base_url, req.model.upstream_name, method
         );
 
-        crate::builder_client()?
+        let builder = crate::builder_client()?
             .post(&url)
-            .header("content-type", "application/json")
-            // Its own header, not Authorization and not x-api-key.
-            .header("x-goog-api-key", &req.credential.access_token)
-            .json(&body)
+            .header("content-type", "application/json");
+        // Its own header for Gemini, not Authorization and not x-api-key. An
+        // endpoint may have been registered to take its key another way.
+        let builder = crate::custom::authenticate(builder, self.auth, &req.credential.access_token)
+            .json(&body);
+        self.headers
+            .apply(builder)
             .build()
             .map_err(|e| oag_core::Error::Internal(format!("building gemini request: {e}")))
     }

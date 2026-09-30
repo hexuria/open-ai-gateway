@@ -1325,6 +1325,26 @@ fn a_request_the_client_can_fix_keeps_the_providers_status() {
 }
 
 #[tokio::test]
+async fn an_upstream_redirect_reaches_the_client_as_a_bad_gateway() {
+    // The transport follows no redirect, so a provider's 3xx ends here. Passed
+    // through, it would tell the client to send its request, gateway key and
+    // all, somewhere else, and name nowhere: the provider's `Location` is not
+    // forwarded, and is not the client's to follow.
+    for status in [300u16, 301, 302, 303, 307, 308] {
+        let response = error_response(&upstream(status, ""));
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "upstream {status} must not become the client's {status}"
+        );
+        assert!(response.headers().get("location").is_none());
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "upstream_error");
+        assert_eq!(body["error"]["upstream_status"], status);
+    }
+}
+
+#[tokio::test]
 async fn upstream_429_forwards_retry_after() {
     // The provider told us how long to wait and we dropped it on the floor:
     // the header was only ever set for our own inbound throttle, so a

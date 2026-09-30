@@ -5,7 +5,9 @@
 //! adding one of them is a catalog entry and a base URL, not code.
 
 use crate::adapter::{ProviderAdapter, UpstreamRequest};
+use crate::custom::ExtraHeaders;
 use async_trait::async_trait;
+use oag_core::provider::AuthStyle;
 use oag_core::{Provider, Result};
 use oag_proto::{StreamAccumulator, StreamEvent, openai};
 
@@ -17,6 +19,10 @@ pub struct OpenAICompatAdapter {
     /// Where xAI's OIDC server lives. Only the refresh path reads it, and only
     /// for `Provider::XAI`; tests point it at a local mock.
     auth_base: String,
+    /// The header the key goes in: a bearer token for every built-in.
+    auth: AuthStyle,
+    /// Added to every request. None for a built-in.
+    headers: ExtraHeaders,
 }
 
 impl OpenAICompatAdapter {
@@ -26,6 +32,8 @@ impl OpenAICompatAdapter {
             provider,
             base_url: base_url.into(),
             auth_base: crate::xai_oauth::DEFAULT_AUTH_BASE.to_owned(),
+            auth: AuthStyle::Bearer,
+            headers: ExtraHeaders::default(),
         }
     }
 
@@ -33,6 +41,21 @@ impl OpenAICompatAdapter {
     #[must_use]
     pub fn with_auth_base(mut self, auth_base: impl Into<String>) -> Self {
         self.auth_base = auth_base.into();
+        self
+    }
+
+    /// Send the key the way an endpoint was registered to take it, rather
+    /// than as a bearer token.
+    #[must_use]
+    pub fn with_auth(mut self, auth: AuthStyle) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// Add an endpoint's extra headers to every request.
+    #[must_use]
+    pub fn with_headers(mut self, headers: ExtraHeaders) -> Self {
+        self.headers = headers;
         self
     }
 
@@ -68,15 +91,15 @@ impl ProviderAdapter for OpenAICompatAdapter {
 
         let body = openai::render_request(req.canonical, &req.model.upstream_name)?;
 
-        crate::builder_client()?
+        let builder = crate::builder_client()?
             .post(format!("{}/chat/completions", self.base_url))
-            .header("content-type", "application/json")
-            // Bearer for every one of them; the dialect's single convention.
-            .header(
-                "authorization",
-                format!("Bearer {}", req.credential.access_token),
-            )
-            .json(&body)
+            .header("content-type", "application/json");
+        // Bearer for every built-in, the dialect's single convention. An
+        // endpoint may have been registered to take its key another way.
+        let builder = crate::custom::authenticate(builder, self.auth, &req.credential.access_token)
+            .json(&body);
+        self.headers
+            .apply(builder)
             .build()
             .map_err(|e| oag_core::Error::Internal(format!("building request: {e}")))
     }

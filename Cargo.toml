@@ -109,6 +109,13 @@ clap = { version = "4", features = ["derive", "env"] }
 # gateway re-serves its wire types byte for byte.
 typesafe-sdk = "=0.2.0"
 
+# ── tests only ─────────────────────────────────────────────────────────────────
+# Stand-in upstreams for tests: a real HTTP server per test, so a request is
+# checked as it arrived over the wire, headers and path included, and a mock can
+# be told to expect no request at all. Nobody holds a key for most of the hosts
+# these tests stand in for.
+wiremock = "0.6"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
