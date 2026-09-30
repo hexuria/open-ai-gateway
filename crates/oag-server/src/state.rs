@@ -4,12 +4,12 @@ use crate::breakers::Breakers;
 use crate::shutdown::Lifecycle;
 use oag_core::config::Config;
 use oag_core::endpoint::{Reason, Refusal, normalise_base_url};
-use oag_core::provider::{Endpoint, EndpointRegistry};
+use oag_core::provider::{Dialect, Endpoint, EndpointRegistry};
 use oag_core::{Error, Kek, Provider, Result};
 use oag_router::{Catalog, ModelSpec};
 use oag_store::{AuthCache, Cache, Db, EndpointRow};
 use oag_upstream::custom::EndpointSpec;
-use oag_upstream::{ProviderAdapter, TransportPool};
+use oag_upstream::{JevUpstream, ProviderAdapter, TransportPool};
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -17,6 +17,19 @@ use tokio::sync::RwLock;
 
 /// Every adapter a request can be served by, keyed by provider.
 type AdapterMap = HashMap<Provider, Arc<dyn ProviderAdapter>>;
+
+/// Every upstream a System One request can be served by, keyed by provider:
+/// the built-in Jev and each System One endpoint the last reload loaded.
+type SystemOneMap = HashMap<Provider, Arc<JevUpstream>>;
+
+/// What serves one endpoint.
+pub(crate) enum Served {
+    /// A chat endpoint's adapter.
+    Chat(Arc<dyn ProviderAdapter>),
+    /// A System One endpoint's upstream, which only the System One route
+    /// calls.
+    SystemOne(Arc<JevUpstream>),
+}
 
 /// Reloads, one at a time in this process.
 ///
@@ -63,9 +76,13 @@ pub struct AppState {
     /// because it shares OpenAI's provider key but not its dialect — it is
     /// selected per-account for an OpenAI OAuth seat, in the gateway.
     codex: Arc<dyn ProviderAdapter>,
-    /// The System One upstream. Outside `adapters` for the reason Codex is,
-    /// and more so: it is not a chat adapter at all.
-    jev: oag_upstream::JevUpstream,
+    /// The built-in Jev's upstream, built once from config and never rebuilt.
+    /// Every map `system_one` holds has it.
+    jev: Arc<JevUpstream>,
+    /// The System One upstreams: outside `adapters`, because none of them is
+    /// a chat adapter at all. Swapped with `adapters` on every reload, by the
+    /// same three steps; see [`AppState::apply_endpoints`].
+    system_one_upstreams: Arc<std::sync::RwLock<Arc<SystemOneMap>>>,
     /// Swapped wholesale on refresh rather than mutated in place, so a request
     /// that started with one catalog finishes with it — a price changing
     /// halfway through a request would make the ledger disagree with itself.
@@ -95,17 +112,18 @@ impl std::fmt::Debug for AppState {
     }
 }
 
-/// The endpoints a reload will serve: one adapter for each row that passes
-/// every rule and that this build can serve.
+/// The endpoints a reload will serve: an adapter, or for a System One endpoint
+/// the upstream the System One route calls, for each row that passes every
+/// rule and that this build can serve.
 ///
 /// Every other row is skipped, and says why in the log and in
 /// `oag_endpoint_invalid_total`, on every reload for as long as it stays that
 /// way. Its credentials and models then serve nothing: the provider name they
 /// carry parses to nothing, as an unknown provider's always has.
-fn load_endpoints(rows: &[EndpointRow]) -> Vec<(Endpoint, Arc<dyn ProviderAdapter>)> {
+fn load_endpoints(rows: &[EndpointRow]) -> Vec<(Endpoint, Served)> {
     let mut served = Vec::with_capacity(rows.len());
     for row in rows {
-        match endpoint_adapter(row) {
+        match endpoint_upstream(row) {
             Ok(loaded) => served.push(loaded),
             Err(refusal) => {
                 metrics::counter!(
@@ -127,13 +145,16 @@ fn load_endpoints(rows: &[EndpointRow]) -> Vec<(Endpoint, Arc<dyn ProviderAdapte
     served
 }
 
-/// The adapter for one endpoint row, or why it gets none.
-fn endpoint_adapter(
-    row: &EndpointRow,
-) -> std::result::Result<(Endpoint, Arc<dyn ProviderAdapter>), Refusal> {
+/// What serves one endpoint row, or why nothing does.
+///
+/// A System One row gets its upstream from `custom::system_one`, at the path it
+/// names or Jev's own, and every other row its dialect's adapter from
+/// `custom::adapter`. Both come from the one factory, so a row is judged by the
+/// same rules whichever it is.
+fn endpoint_upstream(row: &EndpointRow) -> std::result::Result<(Endpoint, Served), Refusal> {
     let config = row.to_endpoint()?;
-    // Only aws and gcp may have no base URL, and `custom::adapter` refuses
-    // both platforms whatever it is given: the empty string is never sent.
+    // Only aws and gcp may have no base URL, and the factory refuses both
+    // platforms whatever it is given: the empty string is never sent.
     let spec = EndpointSpec::new(
         config.endpoint,
         config.base_url.unwrap_or_default(),
@@ -141,17 +162,31 @@ fn endpoint_adapter(
         config.extra_headers,
     )
     .map_err(|e| Refusal::new(Reason::Headers, e))?;
-    let adapter = oag_upstream::custom::adapter(&spec)
-        .map_err(|e| Refusal::new(Reason::Unsupported, e.to_string()))?;
-    Ok((config.endpoint, adapter))
+    let unsupported = |e: Error| Refusal::new(Reason::Unsupported, e.to_string());
+    let served = if config.endpoint.dialect() == Dialect::SystemOne {
+        Served::SystemOne(Arc::new(
+            oag_upstream::custom::system_one(&spec, config.path.as_deref()).map_err(unsupported)?,
+        ))
+    } else {
+        Served::Chat(oag_upstream::custom::adapter(&spec).map_err(unsupported)?)
+    };
+    Ok((config.endpoint, served))
 }
 
-/// Every adapter in `next`, and every one in `current` that `next` has no
-/// entry for: what the map holds while the registry is being replaced.
-fn bridge(next: &AdapterMap, current: &AdapterMap) -> AdapterMap {
+/// The System One map before any endpoint: the built-in Jev alone.
+fn only_jev(jev: &Arc<JevUpstream>) -> SystemOneMap {
+    SystemOneMap::from([(Provider::Jev, Arc::clone(jev))])
+}
+
+/// Every entry in `next`, and every one in `current` that `next` has no entry
+/// for: what a map holds while the registry is being replaced.
+fn bridge<V: Clone>(
+    next: &HashMap<Provider, V>,
+    current: &HashMap<Provider, V>,
+) -> HashMap<Provider, V> {
     let mut both = next.clone();
-    for (provider, adapter) in current {
-        both.entry(*provider).or_insert_with(|| Arc::clone(adapter));
+    for (provider, upstream) in current {
+        both.entry(*provider).or_insert_with(|| upstream.clone());
     }
     both
 }
@@ -263,10 +298,10 @@ impl AppState {
                 .with_user_agent(cx.user_agent.clone()),
         );
 
-        let jev = oag_upstream::JevUpstream::new(base(
+        let jev = Arc::new(JevUpstream::new(base(
             Provider::Jev,
             oag_upstream::jev::DEFAULT_BASE_URL,
-        )?);
+        )?));
         // No endpoint yet: the first reload loads them.
         let builtins = Arc::new(adapters);
 
@@ -298,6 +333,7 @@ impl AppState {
             adapters: Arc::new(std::sync::RwLock::new(Arc::clone(&builtins))),
             builtins,
             codex,
+            system_one_upstreams: Arc::new(std::sync::RwLock::new(Arc::new(only_jev(&jev)))),
             jev,
             catalog: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
             system_one: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
@@ -335,39 +371,70 @@ impl AppState {
             .unwrap_or_else(PoisonError::into_inner) = map;
     }
 
+    /// The System One map as it stands. Cheap: one `Arc` clone.
+    fn system_one_map(&self) -> Arc<SystemOneMap> {
+        Arc::clone(
+            &self
+                .system_one_upstreams
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    fn set_system_one(&self, map: Arc<SystemOneMap>) {
+        *self
+            .system_one_upstreams
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = map;
+    }
+
     /// Make `served` the endpoints this state serves and `registry` resolves.
     ///
     /// Three swaps, in an order that leaves no instant at which `registry`
-    /// resolves an endpoint that has no adapter here:
+    /// resolves an endpoint that has nothing to serve it here:
     ///
-    /// 1. the map gains this reload's adapters and keeps every one it had;
+    /// 1. both maps, the adapters' and the System One upstreams', gain this
+    ///    reload's entries and keep every one they had;
     /// 2. the registry is replaced with this reload's endpoints;
-    /// 3. the map drops what the registry no longer names.
+    /// 3. both maps drop what the registry no longer names.
     ///
-    /// So a new endpoint's adapter is in place before its name parses, and a
-    /// removed one's name stops parsing before its adapter goes. Parsing is
-    /// what a request needs to reach an endpoint at all: a catalog row naming
-    /// it becomes a model only through [`Provider`]'s `FromStr`, and so does a
-    /// credential filed under it. An endpoint whose settings changed gets its
-    /// new adapter in the first swap, and a request the old one already built
-    /// goes where it was built to go.
+    /// So a new endpoint's adapter or upstream is in place before its name
+    /// parses, and a removed one's name stops parsing before its adapter or
+    /// upstream goes. Parsing is what a request needs to reach an endpoint at
+    /// all: a catalog row naming it becomes a model only through
+    /// [`Provider`]'s `FromStr`, and so does a credential filed under it. An
+    /// endpoint whose settings changed gets its new adapter or upstream in the
+    /// first swap, and a request the old one already built goes where it was
+    /// built to go.
     ///
-    /// The built-in adapters are carried into every map as they are.
+    /// The built-in adapters and the built-in Jev are carried into every map
+    /// as they are.
     pub(crate) fn apply_endpoints(
         &self,
         registry: &EndpointRegistry,
-        served: Vec<(Endpoint, Arc<dyn ProviderAdapter>)>,
+        served: Vec<(Endpoint, Served)>,
     ) {
         let mut next = (*self.builtins).clone();
+        let mut system_one = only_jev(&self.jev);
         let mut endpoints = Vec::with_capacity(served.len());
-        for (endpoint, adapter) in served {
-            next.insert(Provider::Custom(endpoint), adapter);
+        for (endpoint, served) in served {
+            let provider = Provider::Custom(endpoint);
+            match served {
+                Served::Chat(adapter) => {
+                    next.insert(provider, adapter);
+                }
+                Served::SystemOne(upstream) => {
+                    system_one.insert(provider, upstream);
+                }
+            }
             endpoints.push(endpoint);
         }
-        let next = Arc::new(next);
+        let (next, system_one) = (Arc::new(next), Arc::new(system_one));
         self.set_adapters(Arc::new(bridge(&next, &self.adapter_map())));
+        self.set_system_one(Arc::new(bridge(&system_one, &self.system_one_map())));
         registry.install(endpoints);
         self.set_adapters(next);
+        self.set_system_one(system_one);
     }
 
     /// The Codex adapter, for an OpenAI subscription seat. Selected in the
@@ -377,21 +444,38 @@ impl AppState {
         Arc::clone(&self.codex)
     }
 
-    /// The System One upstream, for a leased Jev credential.
+    /// The System One upstream for a leased credential of `provider`: the
+    /// built-in Jev, or a System One endpoint the last reload loaded.
+    ///
+    /// A lookup clones the upstream it finds, as [`AppState::adapter`] does,
+    /// and whoever holds the clone keeps it whatever a reload does.
+    pub fn system_one(&self, provider: Provider) -> Result<Arc<JevUpstream>> {
+        self.system_one_map()
+            .get(&provider)
+            .cloned()
+            .ok_or_else(|| {
+                Error::Internal(format!("no System One upstream for provider {provider}"))
+            })
+    }
+
+    /// Every provider the System One route can call, the built-in Jev first
+    /// and then each System One endpoint by name.
     #[must_use]
-    pub fn jev(&self) -> &oag_upstream::JevUpstream {
-        &self.jev
+    pub fn system_one_providers(&self) -> Vec<Provider> {
+        let mut providers: Vec<Provider> = self.system_one_map().keys().copied().collect();
+        providers.sort_unstable();
+        providers
     }
 
     /// Every provider this gateway can call: one per chat adapter, which
-    /// includes each endpoint the last reload loaded, and Jev, which the
-    /// System One route serves without one.
+    /// includes each chat endpoint the last reload loaded, and one per System
+    /// One upstream, which is Jev and each System One endpoint.
     #[must_use]
     pub fn providers(&self) -> Vec<Provider> {
         self.adapter_map()
             .keys()
+            .chain(self.system_one_map().keys())
             .copied()
-            .chain([Provider::Jev])
             .collect()
     }
 
@@ -411,7 +495,9 @@ impl AppState {
         Arc::clone(&*self.catalog.read().await)
     }
 
-    /// A snapshot of System One's models, for pricing an answer.
+    /// A snapshot of System One's models: the built-in Jev's and every System
+    /// One endpoint's, for resolving the model a request names to the
+    /// provider that answers it, and for pricing the answer.
     pub async fn system_one_catalog(&self) -> Arc<Catalog> {
         Arc::clone(&*self.system_one.read().await)
     }
@@ -419,11 +505,12 @@ impl AppState {
     /// Replace both catalogs wholesale, from one set of models.
     ///
     /// Split here, on the one way in, by whether the model's provider speaks a
-    /// chat dialect. That is the whole of what keeps a chat request off a Jev
-    /// credential: a request is leased a credential for the provider of the
-    /// model routing picked, routing only ever picks from [`Self::catalog`],
-    /// and a System One model is never in it — not by name, not by bare
-    /// upstream name, not on a rung someone wrote into a ladder.
+    /// chat dialect. That is the whole of what keeps a chat request off a
+    /// System One credential, Jev's or an endpoint's: a request is leased a
+    /// credential for the provider of the model routing picked, routing only
+    /// ever picks from [`Self::catalog`], and a System One model is never in
+    /// it — not by name, not by bare upstream name, not on a rung someone
+    /// wrote into a ladder.
     pub async fn set_catalog(&self, specs: impl IntoIterator<Item = ModelSpec>) {
         let (chat, system_one): (Vec<_>, Vec<_>) = specs
             .into_iter()
@@ -465,7 +552,7 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, bridge, endpoint_adapter, load_endpoints};
+    use super::{AppState, bridge, endpoint_upstream, load_endpoints};
     use oag_core::Provider;
     use oag_core::endpoint::Reason;
     use oag_core::provider::{Dialect, Endpoint, EndpointRegistry, Platform};
@@ -483,6 +570,7 @@ mod tests {
             region: None,
             project: None,
             api_version: None,
+            path: None,
             extra_headers: serde_json::json!({}),
             display_name: None,
             discover_models: false,
@@ -595,6 +683,78 @@ mod tests {
         }
     }
 
+    /// A System One row is served too, by the System One route rather than a
+    /// chat adapter: an upstream at the path it names, beside the built-in
+    /// Jev, from the reload that loads it until the one that no longer finds
+    /// it.
+    #[tokio::test]
+    async fn a_system_one_endpoint_is_served_by_the_system_one_route_while_its_row_exists() {
+        let state = crate::testing::state("");
+        let registry = EndpointRegistry::default();
+        let decisions = custom("t7-state-decisions");
+        let mut row = endpoint_row("t7-state-decisions", "system_one", "http://127.0.0.1:9/");
+        row.path = Some("/v1/decisions".to_owned());
+        let jev_shaped = custom("t7-state-jev");
+
+        state.apply_endpoints(
+            &registry,
+            load_endpoints(&[
+                row,
+                endpoint_row("t7-state-jev", "system_one", "http://127.0.0.1:9/jev"),
+            ]),
+        );
+        let credential = oag_core::credential::SecretMaterial {
+            access_token: "t7-key".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        };
+        let asked = |provider: Provider| {
+            state
+                .system_one(provider)
+                .expect("a System One upstream")
+                .system_one(&credential, "{}")
+                .expect("builds")
+                .url()
+                .to_string()
+        };
+        assert_eq!(asked(decisions), "http://127.0.0.1:9/v1/decisions");
+        assert_eq!(
+            asked(jev_shaped),
+            "http://127.0.0.1:9/jev/v1/systemone",
+            "no path is Jev's own"
+        );
+        assert!(
+            state.adapter(decisions).is_err(),
+            "and no chat adapter: no chat request can be built for it"
+        );
+        assert_eq!(
+            registry.get("t7-state-decisions").map(Endpoint::dialect),
+            Some(Dialect::SystemOne),
+            "its name resolves"
+        );
+        assert_eq!(
+            state.system_one_providers(),
+            [Provider::Jev, decisions, jev_shaped],
+            "Jev first, then each endpoint by name"
+        );
+        assert!(state.providers().contains(&decisions), "and it is listed");
+
+        state.apply_endpoints(&registry, load_endpoints(&[]));
+        assert!(state.system_one(decisions).is_err(), "gone with its row");
+        assert_eq!(registry.get("t7-state-decisions"), None);
+        assert_eq!(state.system_one_providers(), [Provider::Jev]);
+        assert!(!state.providers().contains(&decisions));
+        assert!(
+            state
+                .system_one(Provider::Jev)
+                .is_ok_and(|jev| Arc::ptr_eq(&jev, &state.jev)),
+            "the built-in Jev is never rebuilt or dropped"
+        );
+    }
+
     /// Every row that breaks a rule, beside one that does not.
     fn bad_rows() -> Vec<(oag_store::EndpointRow, Reason)> {
         let mut region = endpoint_row("t4-bad-region", "openai", "http://127.0.0.1:9/v1");
@@ -609,6 +769,12 @@ mod tests {
         azure.auth = "api_key_header".to_owned();
         let mut header = endpoint_row("t4-bad-header", "openai", "http://127.0.0.1:9/v1");
         header.extra_headers = serde_json::json!({"Authorization": "Bearer not-here"});
+        let mut jev_header = endpoint_row("t7-bad-jev-header", "system_one", "http://127.0.0.1:9");
+        jev_header.extra_headers = serde_json::json!({"X-API-Key": "not-here"});
+        let mut jev_path = endpoint_row("t7-bad-jev-path", "system_one", "http://127.0.0.1:9");
+        jev_path.path = Some("/v1/./decisions".to_owned());
+        let mut chat_path = endpoint_row("t7-bad-chat-path", "openai", "http://127.0.0.1:9/v1");
+        chat_path.path = Some("/v1/decisions".to_owned());
         vec![
             (region, Reason::Region),
             (
@@ -633,19 +799,19 @@ mod tests {
                 Reason::Name,
             ),
             (header, Reason::Headers),
-            // Valid rows this build has no adapter for.
+            // A System One row is held to the same header rules as a chat one.
+            (jev_header, Reason::Headers),
+            (jev_path, Reason::Path),
+            (chat_path, Reason::Path),
+            // A valid row this build has no adapter for.
             (azure, Reason::Unsupported),
-            (
-                endpoint_row("t4-bad-jev", "system_one", "http://127.0.0.1:9"),
-                Reason::Unsupported,
-            ),
         ]
     }
 
     #[test]
     fn each_bad_row_is_refused_for_its_own_reason() {
         for (row, reason) in bad_rows() {
-            let refused = endpoint_adapter(&row).map(|_| ()).expect_err(&row.name);
+            let refused = endpoint_upstream(&row).map(|_| ()).expect_err(&row.name);
             assert_eq!(refused.reason, reason, "{}: {refused}", row.name);
             assert!(
                 !refused.message.contains("not-here"),
@@ -1028,6 +1194,7 @@ mod tests {
                 region: None,
                 project: None,
                 api_version: None,
+                path: None,
                 extra_headers: &serde_json::json!({}),
                 display_name: None,
                 discover_models: false,

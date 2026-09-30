@@ -4,15 +4,18 @@
 //! serves, so [`adapter`] hands that adapter the endpoint's name, base URL, the
 //! header its key goes in, and whatever headers the operator added. The key is
 //! not in an [`EndpointSpec`]: it stays in the endpoint's sealed `account` rows,
-//! as every provider's does, and reaches the adapter per request.
+//! as every provider's does, and reaches the adapter per request. A System One
+//! endpoint is not a chat upstream, so it gets the upstream the System One
+//! route calls instead, from [`system_one`].
 
 use crate::adapter::ProviderAdapter;
-use crate::{AnthropicAdapter, GeminiAdapter, OpenAICompatAdapter};
+use crate::{AnthropicAdapter, GeminiAdapter, JevUpstream, OpenAICompatAdapter};
 use oag_core::provider::{AuthStyle, Dialect, Endpoint, Platform};
 use oag_core::{Error, Provider, Result};
 use reqwest::RequestBuilder;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::sync::Arc;
+use typesafe_sdk::wire::SYSTEM_ONE_PATH;
 
 /// Everything an endpoint's adapter is built from: the endpoint, where it
 /// answers, how it takes its key, and the headers an operator added to every
@@ -170,16 +173,7 @@ pub(crate) fn authenticate(
 pub fn adapter(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
     let endpoint = spec.endpoint;
     let name = endpoint.name();
-    match endpoint.platform() {
-        Platform::Plain => {}
-        platform @ (Platform::Aws | Platform::Gcp | Platform::Azure) => {
-            return Err(Error::Config(format!(
-                "endpoint `{name}` is on the {} platform, which is not supported yet; \
-                 only plain endpoints are served",
-                platform.as_str()
-            )));
-        }
-    }
+    plain(endpoint)?;
 
     let base = spec.base_url.clone();
     let (auth, headers) = (spec.auth, spec.extra_headers.clone());
@@ -197,11 +191,8 @@ pub fn adapter(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
         }
         // Not a chat upstream, so no `ProviderAdapter` serves it: that trait
         // builds from a canonical conversation, and a System One question set
-        // is not one. The System One route calls Jev through a `JevUpstream`
-        // instead, which already takes its base URL, so serving an endpoint
-        // there means one `JevUpstream` per endpoint. `JevUpstream` sends its
-        // key as a bearer token, so an endpoint registered with any other auth
-        // style needs it to go through `authenticate` first.
+        // is not one. `system_one` below builds what the System One route
+        // calls instead.
         Dialect::SystemOne => {
             return Err(Error::Config(format!(
                 "endpoint `{name}`: System One endpoints are served by the System One \
@@ -215,6 +206,53 @@ pub fn adapter(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
         }
     };
     Ok(adapter)
+}
+
+/// The upstream that serves `spec`'s System One endpoint: Jev's two requests,
+/// at the endpoint's base URL, with its key where it was registered to go and
+/// its extra headers on both.
+///
+/// A question set is posted at `path` beneath the base URL, or at
+/// `/v1/systemone`, Jev's own, when the endpoint names none. `path` is used as
+/// given; a stored one has passed [`oag_core::endpoint::is_path`]. The listing
+/// is read from `{base}/v1/models` either way, which is where both Jev and
+/// Merge Gateway serve it.
+pub fn system_one(spec: &EndpointSpec, path: Option<&str>) -> Result<JevUpstream> {
+    let endpoint = spec.endpoint;
+    if endpoint.dialect() != Dialect::SystemOne {
+        return Err(Error::Config(format!(
+            "endpoint `{}` speaks {}, not System One",
+            endpoint.name(),
+            endpoint.dialect()
+        )));
+    }
+    plain(endpoint)?;
+    Ok(JevUpstream::for_endpoint(
+        spec.base_url.clone(),
+        path.unwrap_or(SYSTEM_ONE_PATH).to_owned(),
+        spec.auth,
+        spec.extra_headers.clone(),
+    ))
+}
+
+/// Refuses an endpoint on any platform but plain.
+///
+/// Only the plain platform is served so far. An endpoint on AWS, GCP or Azure
+/// is refused rather than sent a request built for a plain host, which its
+/// platform would reject for want of a signature, a minted token or a
+/// deployment path.
+fn plain(endpoint: Endpoint) -> Result<()> {
+    match endpoint.platform() {
+        Platform::Plain => Ok(()),
+        platform @ (Platform::Aws | Platform::Gcp | Platform::Azure) => {
+            Err(Error::Config(format!(
+                "endpoint `{}` is on the {} platform, which is not supported yet; \
+             only plain endpoints are served",
+                endpoint.name(),
+                platform.as_str()
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -584,5 +622,135 @@ mod tests {
         let err = adapter(&spec).expect_err("no adapter").to_string();
         assert!(err.contains("OpenAI Responses"), "{err}");
         assert!(err.contains("no adapter serves"), "{err}");
+    }
+
+    /// A System One endpoint's question set, through the real transport to a
+    /// mock that answers only `at`: what arrived there.
+    async fn ask(upstream: &JevUpstream, server: &MockServer, at: &str) -> wiremock::Request {
+        Mock::given(method("POST"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(server)
+            .await;
+        let transport =
+            HttpTransport::new(None, Duration::from_secs(5), Duration::from_secs(5)).unwrap();
+        let built = upstream
+            .system_one(&credential(), &br#"{"state":"x","questions":{}}"#[..])
+            .expect("builds");
+        let response = transport.execute(built).await.expect("the mock answers");
+        assert_eq!(response.status(), 200, "the question set missed {at}");
+        server.verify().await;
+        let mut received = server.received_requests().await.expect("recording is on");
+        assert_eq!(received.len(), 1);
+        received.remove(0)
+    }
+
+    /// Each auth style puts the key in its one header on a System One
+    /// endpoint too, and the operator's headers ride along, at the path the
+    /// endpoint names or at Jev's own.
+    #[tokio::test]
+    async fn a_system_one_endpoint_posts_at_its_path_with_its_key_where_it_says() {
+        for (auth, expected) in STYLES {
+            for (named, at) in [
+                (Some("/v1/decisions"), "/gw/v1/decisions"),
+                (None, "/gw/v1/systemone"),
+            ] {
+                let server = MockServer::start().await;
+                let name = format!("t7-jev-{}", auth.as_str());
+                let spec = plain_spec(
+                    endpoint(&name, Dialect::SystemOne, Platform::Plain),
+                    &format!("{}/gw", server.uri()),
+                    auth,
+                );
+                let upstream = system_one(&spec, named).expect("a System One upstream");
+                let received = ask(&upstream, &server, at).await;
+                for header in AUTH_HEADERS {
+                    let values: Vec<_> = received.headers.get_all(header).iter().collect();
+                    let wanted: Vec<&str> = expected
+                        .filter(|&(named, _)| named == header)
+                        .map(|(_, value)| value)
+                        .into_iter()
+                        .collect();
+                    assert_eq!(values, wanted, "{name} at {at}: {header}");
+                }
+                for (extra, value) in EXTRA {
+                    assert_eq!(
+                        received.headers.get(extra).map(|v| v.to_str().unwrap()),
+                        Some(value),
+                        "{name}: the operator's {extra} is sent"
+                    );
+                }
+                assert_eq!(received.body, br#"{"state":"x","questions":{}}"#);
+            }
+        }
+    }
+
+    /// The listing is read from `{base}/v1/models`, a page at a time, with the
+    /// same key and headers as a question set.
+    #[tokio::test]
+    async fn a_system_one_endpoint_lists_its_models_beneath_its_base_url() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/gw/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let spec = plain_spec(
+            endpoint("t7-jev-listing", Dialect::SystemOne, Platform::Plain),
+            &format!("{}/gw", server.uri()),
+            AuthStyle::XApiKey,
+        );
+        let upstream = system_one(&spec, Some("/v1/decisions")).expect("an upstream");
+        let transport =
+            HttpTransport::new(None, Duration::from_secs(5), Duration::from_secs(5)).unwrap();
+        let built = upstream
+            .models_page(&credential(), Some("next-one"))
+            .expect("builds");
+        assert_eq!(
+            transport.execute(built).await.expect("answers").status(),
+            200
+        );
+        server.verify().await;
+        let received = server.received_requests().await.expect("recording is on");
+        assert_eq!(received[0].url.query(), Some("limit=500&cursor=next-one"));
+        assert_eq!(received[0].headers["x-api-key"], KEY);
+        assert!(received[0].headers.get("authorization").is_none());
+        assert_eq!(received[0].headers["x-title"], "open-ai-gateway");
+    }
+
+    #[test]
+    fn only_a_plain_system_one_endpoint_gets_a_system_one_upstream() {
+        let chat = plain_spec(
+            endpoint(
+                "t7-not-jev",
+                Dialect::OpenAIChatCompletions,
+                Platform::Plain,
+            ),
+            "http://h",
+            AuthStyle::Bearer,
+        );
+        let err = system_one(&chat, None)
+            .expect_err("a chat endpoint")
+            .to_string();
+        assert!(
+            err.contains("speaks OpenAI Chat Completions, not System One"),
+            "{err}"
+        );
+        assert!(err.contains("t7-not-jev"), "{err}");
+
+        // The platform matrix never pairs System One with a cloud, and this
+        // does not take the matrix's word for it.
+        let cloud = plain_spec(
+            endpoint("t7-cloud-jev", Dialect::SystemOne, Platform::Aws),
+            "http://h",
+            AuthStyle::None,
+        );
+        let err = system_one(&cloud, None).expect_err("a cloud").to_string();
+        assert!(
+            err.contains("the aws platform, which is not supported yet"),
+            "{err}"
+        );
     }
 }

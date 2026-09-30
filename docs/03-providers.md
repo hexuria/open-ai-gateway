@@ -263,6 +263,10 @@ before it files a key under an endpoint's name:
 - a region (required on `aws` and `gcp`) and a project (required on `gcp`) are
   1 to 63 of `a-z`, `0-9` and `-`, because a platform puts them in a hostname or
   a path;
+- a path (migration 0021) is set only on a `system_one` endpoint, and is `/`
+  and then at most 127 of letters, digits, `/`, `.`, `_` and `-`, in segments
+  that are neither empty, `.` nor `..` (the schema checks the characters, the
+  gateway the segments too); see [System One hosts](#system-one-hosts);
 - extra headers are strings, and none of them is `authorization`, `x-api-key`,
   `x-goog-api-key`, `api-key`, `cookie`, `host`, `content-length` or `proxy-*`
   (`oag_core::endpoint` checks the strings; the names are checked where the
@@ -271,9 +275,10 @@ before it files a key under an endpoint's name:
 A row that breaks one is skipped, and the rest are served as before. Its keys
 and models serve nothing, a warning naming it is logged on every refresh, and
 `oag_endpoint_invalid_total{reason}` counts it. In this release only `plain`
-endpoints speaking `openai`, `anthropic` or `gemini` are served; an `azure`,
-`aws` or `gcp` endpoint, or a `plain` `system_one` one, is a valid row skipped
-with reason `unsupported` until its adapter lands.
+endpoints are served: one speaking `openai`, `anthropic` or `gemini` by the chat
+routes, and a `system_one` one by the System One route
+([System One hosts](#system-one-hosts)). An `azure`, `aws` or `gcp` endpoint is
+a valid row skipped with reason `unsupported` until its adapter lands.
 
 A request already sent when its endpoint's settings change is not moved: it was
 built for the old base URL and headers and is answered from there, and the next
@@ -298,7 +303,7 @@ conversation, so nothing translates into or out of it.
 | OpenAI Chat Completions | `/v1/chat/completions` | yes |
 | OpenAI Responses | `/v1/responses` | yes |
 | Gemini | `/v1beta/models/{model}:generateContent` | yes |
-| System One | `/jev/v1/systemone` | no — passed through to a Jev upstream, and only to one |
+| System One | `/jev/v1/systemone` | no — passed through to a System One upstream (Jev, or a System One host), and only to one |
 
 `Provider::OpenAI`'s registered adapter still speaks Chat Completions, so an
 API-key OpenAI seat takes the passthrough path when the client does too. A
@@ -348,7 +353,9 @@ told where System One is served.
 **There is no fallback.** No chat model can answer a System One question, so a
 route without a Jev key refuses with 503 `system_one_not_configured` rather than
 answering with a guess. A route whose Jev keys exist and are all disabled or
-cooling down gets the ordinary 503 `no_credential`.
+cooling down gets the ordinary 503 `no_credential`. The same holds for a
+[System One host](#system-one-hosts) a request names: the refusal then names
+the host whose key the route lacks.
 
 **What passes through.** The request is checked against the SDK's own wire
 types — a body the client would refuse to send is a 400 before any key is
@@ -372,6 +379,95 @@ its own cost. The route's rate limit admits a System One request as it admits a
 chat one. Of the spend caps only the hard stop applies: a budget in its last
 fifth (`Constrained`) moves a chat request to a cheaper rung, and System One has
 no cheaper rung, so it is served as normal until the cap is exhausted.
+
+### System One hosts
+
+Jev is not the only server that answers System One. An endpoint registered with
+the `system_one` dialect is any host that takes Jev's request and answers in
+Jev's shape, and it is served by the System One route beside the built-in Jev:
+its keys are leased, retried, failed over and metered exactly as Jev's are, and
+its models join System One's catalog, which no chat request can route over.
+Merge Gateway's Decisions API is one: the same `state`, `questions` and
+`answers`, at `POST /v1/decisions` rather than `/v1/systemone`.
+
+A question set is posted at the endpoint's base URL plus its `path`, which is
+`/v1/systemone`, Jev's own, when the row names none. The model listing is read
+from the base URL plus `/v1/models` either way. Only a `system_one` endpoint
+takes a path, and the column is checked as the rules above say.
+
+```sh
+# Merge's Decisions API: System One's shape, at a path of its own.
+oag admin endpoint add --name merge-decisions --dialect system_one \
+  --base-url https://api-gateway.merge.dev --path /v1/decisions --auth bearer
+# A Merge Gateway API key, filed under the endpoint's name.
+oag admin account add --name merge-1 --provider merge-decisions \
+  --secret <Merge Gateway API key> --route default
+```
+
+Until `oag admin endpoint` has a `--path` flag, the same row is one statement:
+
+```sql
+INSERT INTO endpoint (name, dialect, base_url, auth, path)
+VALUES ('merge-decisions', 'system_one', 'https://api-gateway.merge.dev',
+        'bearer', '/v1/decisions');
+```
+
+To price its answers, add a catalog row whose provider is `merge-decisions`,
+whose upstream name is Merge's model id, `typesafe/jev-1.13`, and whose id is
+the two joined: `merge-decisions/typesafe/jev-1.13`. An id may hold several
+`/`: the endpoint's name is what comes before the first, and everything after it
+is the host's own name for the model.
+
+**Which host answers** is the request's `model` to say, read in this order:
+
+1. none: Jev, which picks its own;
+2. an id in System One's catalog: that row's provider, sent the row's upstream
+   name — `merge-decisions/typesafe/jev-1.13` reaches Merge as
+   `typesafe/jev-1.13`, and `jev/jev-latest` reaches Jev as `jev-latest`;
+3. `<endpoint>/<name>` for a System One host this gateway serves: that host,
+   sent `<name>`, so a model its listing shows can be asked before anyone
+   prices it;
+4. a name with no provider in it (`jev-latest`), or Jev's (`jev/…`, or
+   `typesafe/…`, its alias and Merge's spelling of Jev's models): Jev, sent the
+   body as it arrived — everything this route took before hosts existed;
+5. anything else — a chat model, or a host that is not served, one removed or
+   one whose row stopped loading — is 400 `no_viable_model`. It is never sent to
+   Jev instead: a question set meant for one host is not another's to see.
+
+**The model is the one thing rewritten.** Where a host is sent a name other
+than the one the caller used, the body's `model` is replaced and every other
+member is copied as the bytes it arrived in, in its order; only the space
+between top-level members is not kept. Merge refuses fields it does not know
+with 422, which comes back to the caller under `error.upstream`, as any 422
+does: the caller's extra fields reach it as they reach Jev. `vendor` and
+`customer`, which Merge takes, pass through the same way. Neither Jev nor Merge
+streams an answer, and neither does this route.
+
+**Metering.** A host's answer is a ledger row like Jev's, under the model that
+answered when a catalog row names it, and otherwise under the row the request
+was resolved by: Merge, asked for `typesafe/jev-1.13`, answers as `jev-1.13.0`,
+the concrete version, and the row is priced as
+`merge-decisions/typesafe/jev-1.13`. The cost is the tokens the host reported
+times the catalog's price, as it is for every provider. Merge also reports what
+it charged, in `usage.cost`, and that figure is not the ledger's; it reaches the
+caller untouched in the answer, which is returned byte for byte, `object`,
+`vendor`, `usage.total_tokens` and all.
+
+**The listing.** `GET /jev/v1/models` lists every System One provider the
+caller's route holds a key for. A route whose only such keys are Jev's gets
+Jev's listing as it arrived, as it always has. Once a host is among them the
+gateway writes the listing, in the SDK's shape: Jev's models by their own
+names, then each host's, by endpoint name, as `<endpoint>/<name>` — the name
+rule 3 sends back to that host. A host's listing is read in either shape a host
+is known to use: Jev's `{"models": [...]}`, or Merge's paged
+`{"data": [...], "has_more", "next_cursor"}`, whose entries name themselves in
+`model`. Merge lists every model it routes, chat included, so an entry that
+says what it outputs (in `capabilities.output`, at its top level or under any
+vendor) is listed only if a `decision` is among it; an entry that says nothing
+is listed. A host is asked for pages of 500, the most Merge allows, and its
+cursor is followed until it says there are no more, repeats one, or eight pages
+have been read. A host whose listing fails fails the whole listing, as Jev's
+always has, rather than quietly leaving its models out.
 
 ## Framing
 

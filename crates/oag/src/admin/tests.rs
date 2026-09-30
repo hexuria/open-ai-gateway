@@ -321,6 +321,7 @@ async fn a_key_is_filed_under_an_endpoint_as_the_kind_its_platform_takes() {
                 region,
                 project: None,
                 api_version: None,
+                path: None,
                 extra_headers: &none,
                 display_name: None,
                 discover_models: false,

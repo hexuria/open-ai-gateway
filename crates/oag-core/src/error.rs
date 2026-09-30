@@ -192,25 +192,37 @@ pub enum Error {
     #[error("upstream sent no response within {after:?}")]
     UpstreamTimeout { after: Duration },
 
-    /// A System One request reached a route that holds no Jev credential.
+    /// A System One request reached a route that holds no credential for the
+    /// System One provider it names: Jev, unless its model names a System One
+    /// endpoint.
     ///
     /// Deliberately not [`Error::NoCredential`], which is also what `lease`
-    /// says of a route whose Jev keys all exist and are cooling down. Here
-    /// there is nothing to wait for and no fallback to name — no chat model
-    /// answers a System One question — so the refusal says what is missing and
-    /// how to add it, rather than answering with a guess.
+    /// says of a route whose keys for that provider all exist and are cooling
+    /// down. Here there is nothing to wait for and no fallback to name — no
+    /// chat model answers a System One question — so the refusal says what is
+    /// missing and how to add it, rather than answering with a guess.
     #[error(
-        "System One is not configured on this route: route '{route}' holds no Jev \
-         credential. Add one with `oag admin account add --name <name> --provider jev \
-         --secret <key> --route {route}`"
+        "System One is not configured on this route: route '{route}' holds no {} \
+         credential. Add one with `oag admin account add --name <name> --provider {provider} \
+         --secret <key> --route {route}`",
+        holder(*.provider)
     )]
-    SystemOneNotConfigured { route: String },
+    SystemOneNotConfigured { route: String, provider: Provider },
 
     #[error("serialisation: {0}")]
     Serde(#[from] serde_json::Error),
 
     #[error("{0}")]
     Internal(String),
+}
+
+/// Whose credential a System One route lacks, as a sentence names it: Jev by
+/// the product's name, an endpoint by its own.
+fn holder(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Jev => "Jev",
+        other => other.as_str(),
+    }
 }
 
 /// The qualifiers a model id may carry, as a client writes them.
@@ -416,6 +428,7 @@ pub fn every_variant() -> Vec<Error> {
         },
         Error::SystemOneNotConfigured {
             route: "default".to_owned(),
+            provider: Provider::Jev,
         },
         // `unwrap_err` on a value that is unconditionally an `Err`: the clippy
         // lint is about Results that might be `Ok`, and "not json" is not an i32
@@ -488,6 +501,39 @@ mod tests {
             all.iter()
                 .any(|e| matches!(e, Error::SystemOneNotConfigured { .. })),
             "the newest variant is in the list its catalogue is rendered from"
+        );
+    }
+
+    /// Jev's refusal reads as it always has; an endpoint's names the endpoint,
+    /// in the sentence and in the command that fixes it.
+    #[test]
+    fn a_system_one_route_without_a_key_names_whose_key_it_lacks() {
+        let jev = Error::SystemOneNotConfigured {
+            route: "r".to_owned(),
+            provider: Provider::Jev,
+        }
+        .to_string();
+        assert_eq!(
+            jev,
+            "System One is not configured on this route: route 'r' holds no Jev credential. \
+             Add one with `oag admin account add --name <name> --provider jev --secret <key> \
+             --route r`"
+        );
+        let endpoint = crate::provider::Endpoint::new(
+            "t7-err-decisions",
+            crate::provider::Dialect::SystemOne,
+            crate::provider::Platform::Plain,
+        )
+        .unwrap();
+        let hosted = Error::SystemOneNotConfigured {
+            route: "r".to_owned(),
+            provider: Provider::Custom(endpoint),
+        }
+        .to_string();
+        assert!(
+            hosted.contains("holds no t7-err-decisions credential")
+                && hosted.contains("--provider t7-err-decisions "),
+            "{hosted}"
         );
     }
 

@@ -1106,7 +1106,7 @@ async fn a_chat_request_can_never_reach_a_jev_key() {
                 .iter()
                 .filter_map(oag_store::ModelRow::to_spec)
                 .chain([
-                    priced(&Catalog::new(), "jev-latest"),
+                    priced(&Catalog::new(), Provider::Jev, "jev-latest", None),
                     ModelSpec {
                         id: ModelId::new("anthropic/claude-haiku-4.5"),
                         provider: Provider::Anthropic,
@@ -1203,11 +1203,14 @@ fn an_answer_is_priced_by_its_catalog_row_or_left_unpriced() {
         display_label: None,
     };
     let catalog = Catalog::from_entries([priced_row.clone()]);
-    assert_eq!(priced(&catalog, "jev-latest"), priced_row);
+    assert_eq!(
+        priced(&catalog, Provider::Jev, "jev-latest", None),
+        priced_row
+    );
 
     // A model the catalog has never seen — Jev answering with a dated name,
     // say — is still metered, under its own id, at no cost.
-    let stand_in = priced(&catalog, "jev-2026-08-01");
+    let stand_in = priced(&catalog, Provider::Jev, "jev-2026-08-01", None);
     assert_eq!(stand_in.id.as_str(), "jev/jev-2026-08-01");
     assert_eq!(stand_in.provider, Provider::Jev);
     assert_eq!(stand_in.upstream_name, "jev-2026-08-01");

@@ -147,6 +147,30 @@ pub fn is_location(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Whether `value` may be a System One endpoint's path: `/`, then at most 127
+/// of letters, digits, `/`, `.`, `_` and `-`, in segments that are neither
+/// empty, `.` nor `..`.
+///
+/// The characters are migration 0021's `endpoint_path_check`. The segments are
+/// this function's own. A path is appended to the base URL as written, and a
+/// URL parser resolves `.` and `..` before the request is sent, so a path
+/// holding one would post somewhere other than where it reads. An empty
+/// segment is a `//` or a trailing `/`, which most hosts tolerate and some do
+/// not: the reason a base URL loses its trailing slash.
+#[must_use]
+pub fn is_path(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('/') else {
+        return false;
+    };
+    rest.len() <= 127
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        && rest
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".."))
+}
+
 /// An endpoint row's columns, as stored: the store's `EndpointRow` lends
 /// them, and a writer can pass what it is about to insert.
 #[derive(Debug, Clone, Copy)]
@@ -159,6 +183,9 @@ pub struct Columns<'a> {
     pub region: Option<&'a str>,
     pub project: Option<&'a str>,
     pub api_version: Option<&'a str>,
+    /// Where a `system_one` endpoint takes a question set; see [`is_path`].
+    /// No other dialect takes one.
+    pub path: Option<&'a str>,
     /// Must be a JSON object whose values are strings.
     pub extra_headers: &'a serde_json::Value,
 }
@@ -176,6 +203,10 @@ pub struct EndpointConfig {
     /// Passed through as stored. What it may contain is the Azure platform's
     /// to say, and it has not said yet.
     pub api_version: Option<String>,
+    /// Checked by [`is_path`], and only ever set on a System One endpoint.
+    /// `None` there is Jev's own path, which whoever builds the upstream
+    /// supplies: this crate does not know it.
+    pub path: Option<String>,
     /// Header names and values, in the stored order. Only their being strings
     /// is checked here; whether each can be a header, and is one an endpoint
     /// may add, is checked where it becomes one
@@ -243,6 +274,7 @@ impl EndpointConfig {
             platform == Platform::Gcp,
             platform,
         )?;
+        let path = path(columns.path, dialect, columns.dialect)?;
         Ok(Self {
             endpoint,
             base_url,
@@ -250,9 +282,37 @@ impl EndpointConfig {
             region,
             project,
             api_version: columns.api_version.map(str::to_owned),
+            path,
             extra_headers: header_pairs(columns.extra_headers)?,
         })
     }
+}
+
+/// A path, if the row may have the one it names: a System One endpoint's, and
+/// one [`is_path`] accepts. `column` is the dialect as stored, for the message.
+fn path(value: Option<&str>, dialect: Dialect, column: &str) -> Result<Option<String>, Refusal> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if dialect != Dialect::SystemOne {
+        return Err(Refusal::new(
+            Reason::Path,
+            format!(
+                "only a system_one endpoint takes a path; the {column} dialect builds its own \
+                 from each request"
+            ),
+        ));
+    }
+    if !is_path(value) {
+        return Err(Refusal::new(
+            Reason::Path,
+            format!(
+                "path {value:?} must be `/` and then at most 127 of letters, digits, `/`, `.`, \
+                 `_` and `-`, in segments that are neither empty, `.` nor `..`"
+            ),
+        ));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 /// A region or a project, checked by [`is_location`] wherever it is given and
@@ -354,6 +414,8 @@ pub enum Reason {
     Compliance,
     Region,
     Project,
+    /// On a dialect that takes none, or not one [`is_path`] accepts.
+    Path,
     /// Not an object of strings, or a header an endpoint may not add.
     Headers,
     /// A valid row this build has no adapter for.
@@ -372,6 +434,7 @@ impl Reason {
             Self::Compliance => "compliance",
             Self::Region => "region",
             Self::Project => "project",
+            Self::Path => "path",
             Self::Headers => "headers",
             Self::Unsupported => "unsupported",
         }
@@ -446,6 +509,7 @@ mod tests {
             region: None,
             project: None,
             api_version: None,
+            path: None,
             extra_headers: headers,
         }
     }
@@ -463,6 +527,7 @@ mod tests {
             "normalised as a built-in's is"
         );
         assert_eq!(config.auth, AuthStyle::Bearer);
+        assert_eq!(config.path, None);
         assert_eq!(
             config.extra_headers,
             [
@@ -516,6 +581,29 @@ mod tests {
             azure.base_url.as_deref(),
             Some("https://res.openai.azure.com")
         );
+
+        // Merge Gateway's Decisions API: System One's wire shape at a path of
+        // its own.
+        let decisions = EndpointConfig::from_columns(&Columns {
+            name: "t7-core-decisions",
+            dialect: "system_one",
+            base_url: Some("https://api-gateway.merge.dev"),
+            path: Some("/v1/decisions"),
+            ..plain(&json!({}))
+        })
+        .expect("a System One row with a path");
+        assert_eq!(decisions.endpoint.dialect(), Dialect::SystemOne);
+        assert_eq!(decisions.path.as_deref(), Some("/v1/decisions"));
+        let jev_shaped = EndpointConfig::from_columns(&Columns {
+            name: "t7-core-jev",
+            dialect: "system_one",
+            ..plain(&json!({}))
+        })
+        .expect("a System One row without one");
+        assert_eq!(
+            jev_shaped.path, None,
+            "the default is the upstream's to supply"
+        );
     }
 
     // Long because it is a table: one row per rule, each a whole set of
@@ -527,7 +615,7 @@ mod tests {
         let base = plain(&object);
         let headers_not_object = json!(["x"]);
         let header_not_string = json!({"x-team": 7, "x-ok": "fine"});
-        let cases: [(Columns<'_>, Reason, &str); 17] = [
+        let cases: [(Columns<'_>, Reason, &str); 19] = [
             (
                 Columns {
                     name: "openai",
@@ -661,6 +749,23 @@ mod tests {
                 },
                 Reason::Project,
                 "the gcp platform needs a project",
+            ),
+            (
+                Columns {
+                    path: Some("/v1/chat/completions"),
+                    ..base
+                },
+                Reason::Path,
+                "only a system_one endpoint takes a path; the openai dialect",
+            ),
+            (
+                Columns {
+                    dialect: "system_one",
+                    path: Some("/v1/../admin"),
+                    ..base
+                },
+                Reason::Path,
+                "path \"/v1/../admin\" must be",
             ),
             (
                 Columns {
@@ -837,6 +942,44 @@ mod tests {
         }
     }
 
+    /// Migration 0021's characters, and segments a URL parser would leave as
+    /// written.
+    #[test]
+    fn a_path_is_segments_a_url_keeps_as_written() {
+        let longest = format!("/{}", "a".repeat(127));
+        for good in [
+            "/v1/systemone",
+            "/v1/decisions",
+            "/api/v2.1/System_One-x",
+            "/a",
+            "/..a/b..",
+            longest.as_str(),
+        ] {
+            assert!(is_path(good), "{good}");
+        }
+        let too_long = format!("/{}", "a".repeat(128));
+        for bad in [
+            "",
+            "/",
+            "v1/decisions",
+            "/v1/decisions/",
+            "/v1//decisions",
+            "/v1/./decisions",
+            "/v1/../admin",
+            "/..",
+            "/v1/decisions?x=1",
+            "/v1/decisions#top",
+            "/v1/déc",
+            "/v1/a b",
+            "/@evil.example",
+            "/v1:8080",
+            "/v1\\decisions",
+            too_long.as_str(),
+        ] {
+            assert!(!is_path(bad), "{bad:?}");
+        }
+    }
+
     #[test]
     fn every_reason_has_its_own_label() {
         let reasons = [
@@ -848,6 +991,7 @@ mod tests {
             Reason::Compliance,
             Reason::Region,
             Reason::Project,
+            Reason::Path,
             Reason::Headers,
             Reason::Unsupported,
         ];

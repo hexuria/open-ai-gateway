@@ -66,7 +66,9 @@ moka = { version = "0.12", features = ["future"] }
 
 # ── serialisation and core types ───────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# `raw_value`: the System One route renames a request's model and copies every
+# other member as the bytes it arrived in.
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 serde_yaml_ng = "0.10"
 thiserror = "2"
 async-trait = "0.1"

@@ -935,8 +935,9 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
 /// serves, by name.
 ///
 /// An endpoint is listed from `adapters` rather than from the registry: on
-/// this process an endpoint is registered only while it has an adapter, and a
-/// row the last reload skipped has neither, so it is not listed.
+/// this process an endpoint is registered only while it has an adapter (for a
+/// System One endpoint, the upstream the System One route calls), and a row
+/// the last reload skipped has neither, so it is not listed.
 fn provider_rows(
     adapters: &[oag_core::Provider],
     counts: &[ProviderCountTuple],

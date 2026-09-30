@@ -3426,6 +3426,7 @@ fn plain_endpoint<'a>(name: &'a str, headers: &'a serde_json::Value) -> NewEndpo
         region: None,
         project: None,
         api_version: None,
+        path: None,
         extra_headers: headers,
         display_name: None,
         discover_models: false,
@@ -3458,6 +3459,7 @@ async fn each_endpoint_check_refuses_what_the_matrix_does_not_serve() {
     let string = serde_json::json!("x-org: acme");
     let null = serde_json::Value::Null;
     let too_long = "a".repeat(33);
+    let long_path = format!("/{}", "a".repeat(128));
     let ok = plain_endpoint(&name, &object);
     let pair = "endpoint_platform_dialect_check";
     let base_url = "endpoint_base_url_check";
@@ -3679,6 +3681,42 @@ async fn each_endpoint_check_refuses_what_the_matrix_does_not_serve() {
             },
             headers,
         ),
+        // 0021.
+        (
+            "a path on a chat dialect",
+            NewEndpoint {
+                path: Some("/v1/decisions"),
+                ..ok.clone()
+            },
+            "endpoint_path_dialect_check",
+        ),
+        (
+            "a path without its leading slash",
+            NewEndpoint {
+                dialect: "system_one",
+                path: Some("v1/decisions"),
+                ..ok.clone()
+            },
+            "endpoint_path_check",
+        ),
+        (
+            "a path with a query",
+            NewEndpoint {
+                dialect: "system_one",
+                path: Some("/v1/decisions?x=1"),
+                ..ok.clone()
+            },
+            "endpoint_path_check",
+        ),
+        (
+            "a 129-character path",
+            NewEndpoint {
+                dialect: "system_one",
+                path: Some(&long_path),
+                ..ok.clone()
+            },
+            "endpoint_path_check",
+        ),
     ];
     for (what, row, constraint) in refused {
         match insert_endpoint(&db, &row).await {
@@ -3694,7 +3732,7 @@ async fn each_endpoint_check_refuses_what_the_matrix_does_not_serve() {
     // A full UUID is 32 characters, the most a name may have.
     let longest = Uuid::new_v4().simple().to_string();
     let marked = format!("{}_a-b", &Uuid::new_v4().simple().to_string()[..20]);
-    let names: Vec<String> = (0..7).map(|_| endpoint_name()).collect();
+    let names: Vec<String> = (0..8).map(|_| endpoint_name()).collect();
     let served = [
         NewEndpoint {
             name: &longest,
@@ -3717,6 +3755,13 @@ async fn each_endpoint_check_refuses_what_the_matrix_does_not_serve() {
             dialect: "system_one",
             base_url: Some("http://127.0.0.1:9"),
             auth: "none",
+            ..ok.clone()
+        },
+        NewEndpoint {
+            name: &names[7],
+            dialect: "system_one",
+            base_url: Some("https://api-gateway.merge.dev"),
+            path: Some("/v1/decisions"),
             ..ok.clone()
         },
         NewEndpoint {
@@ -3798,6 +3843,7 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
             region: Some("eu"),
             project: Some("acme"),
             api_version: Some("2023-06-01"),
+            path: None,
             extra_headers: &headers,
             display_name: Some("Example"),
             discover_models: true,
@@ -3864,6 +3910,7 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
         region: None,
         project: None,
         api_version: None,
+        path: None,
         extra_headers: &beta,
         display_name: None,
         discover_models: false,
@@ -3959,9 +4006,91 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
             defaults.auth.as_str(),
             &defaults.extra_headers,
             defaults.discover_models,
+            defaults.path.as_deref(),
         ),
-        ("plain", "bearer", &serde_json::json!({}), false)
+        ("plain", "bearer", &serde_json::json!({}), false, None)
     );
+}
+
+/// 0021: a System One endpoint's path is stored, read back, listed, moved and
+/// cleared like any other setting, and a write the path CHECKs refuse changes
+/// nothing.
+#[tokio::test]
+async fn a_system_one_path_round_trips_and_an_update_moves_or_clears_it() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let name = endpoint_name();
+    let headers = serde_json::json!({});
+    let row = insert_endpoint(
+        &db,
+        &NewEndpoint {
+            dialect: "system_one",
+            base_url: Some("https://decisions.example.test"),
+            path: Some("/v1/decisions"),
+            ..plain_endpoint(&name, &headers)
+        },
+    )
+    .await
+    .expect("insert");
+    assert_eq!(row.path.as_deref(), Some("/v1/decisions"));
+    assert_eq!(
+        get_endpoint(&db, &name).await.expect("get"),
+        Some(row.clone())
+    );
+    assert!(list_endpoints(&db).await.expect("list").contains(&row));
+
+    let settings = EndpointUpdate {
+        base_url: Some("https://decisions.example.test"),
+        auth: "bearer",
+        region: None,
+        project: None,
+        api_version: None,
+        path: Some("/v2/decide"),
+        extra_headers: &headers,
+        display_name: None,
+        discover_models: false,
+    };
+    let moved = update_endpoint(&db, &name, &settings)
+        .await
+        .expect("update")
+        .expect("exists");
+    assert_eq!(moved.path.as_deref(), Some("/v2/decide"));
+
+    let refused = update_endpoint(
+        &db,
+        &name,
+        &EndpointUpdate {
+            path: Some("/v2/decide#frag"),
+            ..settings.clone()
+        },
+    )
+    .await
+    .expect_err("a path with a fragment");
+    assert!(
+        matches!(&refused, Error::Config(m) if m.contains("endpoint_path_check")),
+        "{refused}"
+    );
+    assert_eq!(
+        get_endpoint(&db, &name).await.expect("get"),
+        Some(moved),
+        "a refused update changes nothing"
+    );
+
+    let cleared = update_endpoint(
+        &db,
+        &name,
+        &EndpointUpdate {
+            path: None,
+            ..settings
+        },
+    )
+    .await
+    .expect("update")
+    .expect("exists");
+    assert_eq!(cleared.path, None, "back to Jev's own path");
 }
 
 /// A credential or a catalog model that names an endpoint keeps it. The delete
