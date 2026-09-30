@@ -685,4 +685,82 @@ mod tests {
              this is what ignore_missing(true) buys",
         );
     }
+
+    /// 0020 applies over a database already at 0019 that holds a credential of
+    /// every kind 0019 admits. 0020 drops and re-adds `account_kind_check`, and
+    /// the re-add is checked against the rows already there. On an empty
+    /// database there is nothing to check, so a kind the new list forgot would
+    /// fail only here.
+    #[tokio::test]
+    async fn the_endpoint_migration_applies_over_a_database_at_0019() {
+        let Some((url, name)) = scratch_database().await else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        let result = async {
+            sqlx::migrate!("../../migrations")
+                .run_to(19, db.pool())
+                .await
+                .map_err(|e| format!("migrating to 0019: {e}"))?;
+            // A pooled key, an owned seat, a Bedrock credential, and a Claude
+            // plan that only books imported usage: what a deployment at 0019
+            // can hold.
+            sqlx::query(
+                "WITH owner AS (INSERT INTO principal (id, email) \
+                 VALUES (gen_random_uuid(), 'owner@example.invalid') RETURNING id) \
+                 INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+                 credentials_nonce, schedulable, owner_principal_id) \
+                 SELECT gen_random_uuid(), v.name, v.provider, v.kind, '\\x00', '\\x00', \
+                 v.schedulable, CASE WHEN v.kind = 'oauth' THEN owner.id END \
+                 FROM owner, (VALUES ('key', 'anthropic', 'api_key', true), \
+                 ('seat', 'xai', 'oauth', true), ('aws', 'bedrock', 'bedrock', true), \
+                 ('plan', 'anthropic', 'oauth', false)) AS v(name, provider, kind, schedulable)",
+            )
+            .execute(db.pool())
+            .await
+            .map_err(|e| format!("seeding 0019's rows: {e}"))?;
+            sqlx::query(
+                "INSERT INTO model_catalog (id, provider, upstream_name, input_per_mtok, \
+                 output_per_mtok, context_window, max_output_tokens) \
+                 VALUES ('anthropic/claude', 'anthropic', 'claude', 3, 15, 200000, 8192)",
+            )
+            .execute(db.pool())
+            .await
+            .map_err(|e| format!("seeding the catalog: {e}"))?;
+
+            db.migrate().await.map_err(|e| e.to_string())?;
+
+            let kinds: Vec<(String, String)> =
+                sqlx::query_as("SELECT name, kind FROM account ORDER BY name")
+                    .fetch_all(db.pool())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let endpoints: i64 = sqlx::query_scalar("SELECT count(*) FROM endpoint")
+                .fetch_one(db.pool())
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((kinds, endpoints))
+        }
+        .await;
+        drop(db);
+        drop_database(&name).await;
+
+        let (kinds, endpoints) = result.expect("0020 over a database at 0019");
+        let kinds: Vec<(&str, &str)> = kinds
+            .iter()
+            .map(|(n, k)| (n.as_str(), k.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("aws", "bedrock"),
+                ("key", "api_key"),
+                ("plan", "oauth"),
+                ("seat", "oauth"),
+            ],
+            "every credential 0019 held is still there, as it was"
+        );
+        assert_eq!(endpoints, 0, "and nothing is registered yet");
+    }
 }
