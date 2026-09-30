@@ -3,8 +3,9 @@
 //!
 //! The store persists what it is given. Parsing the dialect, platform and auth
 //! style, and refusing a built-in provider's name, is the caller's job. The
-//! schema's CHECKs (migration 0020) are the second line, and a write they refuse
-//! comes back as [`Error::Config`] naming the constraint that refused it.
+//! schema's CHECKs (migrations 0020 and 0021) are the second line, and a write
+//! they refuse comes back as [`Error::Config`] naming the constraint that
+//! refused it.
 
 use crate::Db;
 use crate::rows::EndpointRow;
@@ -12,30 +13,31 @@ use oag_core::{Error, Result};
 
 const LIST_ENDPOINTS_SQL: &str = concat!(
     "SELECT ",
-    "name, dialect, platform, base_url, auth, region, project, api_version, ",
+    "name, dialect, platform, base_url, auth, region, project, api_version, path, ",
     "extra_headers, display_name, discover_models, created_at, updated_at ",
     "FROM endpoint ORDER BY name"
 );
 const ENDPOINT_BY_NAME_SQL: &str = concat!(
     "SELECT ",
-    "name, dialect, platform, base_url, auth, region, project, api_version, ",
+    "name, dialect, platform, base_url, auth, region, project, api_version, path, ",
     "extra_headers, display_name, discover_models, created_at, updated_at ",
     "FROM endpoint WHERE name = $1"
 );
 const INSERT_ENDPOINT_SQL: &str = concat!(
     "INSERT INTO endpoint (",
     "name, dialect, platform, base_url, auth, region, project, api_version, ",
-    "extra_headers, display_name, discover_models",
-    ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING ",
-    "name, dialect, platform, base_url, auth, region, project, api_version, ",
+    "extra_headers, display_name, discover_models, path",
+    ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING ",
+    "name, dialect, platform, base_url, auth, region, project, api_version, path, ",
     "extra_headers, display_name, discover_models, created_at, updated_at"
 );
 const UPDATE_ENDPOINT_SQL: &str = concat!(
     "UPDATE endpoint SET ",
     "base_url = $2, auth = $3, region = $4, project = $5, api_version = $6, ",
-    "extra_headers = $7, display_name = $8, discover_models = $9, updated_at = now() ",
+    "extra_headers = $7, display_name = $8, discover_models = $9, path = $10, ",
+    "updated_at = now() ",
     "WHERE name = $1 RETURNING ",
-    "name, dialect, platform, base_url, auth, region, project, api_version, ",
+    "name, dialect, platform, base_url, auth, region, project, api_version, path, ",
     "extra_headers, display_name, discover_models, created_at, updated_at"
 );
 
@@ -50,6 +52,9 @@ pub struct NewEndpoint<'a> {
     pub region: Option<&'a str>,
     pub project: Option<&'a str>,
     pub api_version: Option<&'a str>,
+    /// Where a `system_one` endpoint takes a question set, beneath its base
+    /// URL. `None` is `/v1/systemone`; any other dialect must leave it `None`.
+    pub path: Option<&'a str>,
     /// A JSON object of headers that carry no authority. Never a key.
     pub extra_headers: &'a serde_json::Value,
     pub display_name: Option<&'a str>,
@@ -69,6 +74,9 @@ pub struct EndpointUpdate<'a> {
     pub region: Option<&'a str>,
     pub project: Option<&'a str>,
     pub api_version: Option<&'a str>,
+    /// A setting, not part of what the endpoint is: a System One host that
+    /// moves its path is the same host.
+    pub path: Option<&'a str>,
     pub extra_headers: &'a serde_json::Value,
     pub display_name: Option<&'a str>,
     pub discover_models: bool,
@@ -119,6 +127,7 @@ pub async fn insert_endpoint(db: &Db, e: &NewEndpoint<'_>) -> Result<EndpointRow
         .bind(e.extra_headers)
         .bind(e.display_name)
         .bind(e.discover_models)
+        .bind(e.path)
         .fetch_one(db.pool())
         .await
         .map_err(|err| endpoint_write_error("registering endpoint", e.name, &err))
@@ -141,6 +150,7 @@ pub async fn update_endpoint(
         .bind(e.extra_headers)
         .bind(e.display_name)
         .bind(e.discover_models)
+        .bind(e.path)
         .fetch_optional(db.pool())
         .await
         .map_err(|err| endpoint_write_error("updating endpoint", name, &err))

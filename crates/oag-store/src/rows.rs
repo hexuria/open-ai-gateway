@@ -325,6 +325,10 @@ pub struct EndpointRow {
     pub region: Option<String>,
     pub project: Option<String>,
     pub api_version: Option<String>,
+    /// Where a `system_one` endpoint takes a question set, beneath `base_url`
+    /// (migration 0021). `None` is `/v1/systemone`, Jev's own; no other
+    /// dialect has one.
+    pub path: Option<String>,
     /// A JSON object of headers that carry no authority. The schema promises
     /// only that it is an object; its values are for the caller to check.
     pub extra_headers: serde_json::Value,
@@ -353,6 +357,7 @@ impl EndpointRow {
             region: self.region.as_deref(),
             project: self.project.as_deref(),
             api_version: self.api_version.as_deref(),
+            path: self.path.as_deref(),
             extra_headers: &self.extra_headers,
         })
     }
@@ -412,11 +417,28 @@ mod tests {
             region: Some("us-east5".to_owned()),
             project: Some("acme-prod".to_owned()),
             api_version: Some("v1".to_owned()),
+            path: None,
             extra_headers: serde_json::json!({"x-goog-user-project": "acme-prod"}),
             display_name: Some("Vertex Claude".to_owned()),
             discover_models: true,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    /// The one row that takes a path: a System One host's.
+    fn decisions() -> EndpointRow {
+        EndpointRow {
+            name: "t7-rows-decisions".to_owned(),
+            dialect: "system_one".to_owned(),
+            platform: "plain".to_owned(),
+            base_url: Some("https://decisions.example.test".to_owned()),
+            region: None,
+            project: None,
+            api_version: None,
+            path: Some("/v1/decisions".to_owned()),
+            extra_headers: serde_json::json!({}),
+            ..row()
         }
     }
 
@@ -438,6 +460,11 @@ mod tests {
             config.extra_headers,
             [("x-goog-user-project".to_owned(), "acme-prod".to_owned())]
         );
+        assert_eq!(config.path, None);
+
+        let decisions = decisions().to_endpoint().expect("a System One row");
+        assert_eq!(decisions.endpoint.dialect(), Dialect::SystemOne);
+        assert_eq!(decisions.path.as_deref(), Some("/v1/decisions"));
     }
 
     #[test]
@@ -470,6 +497,20 @@ mod tests {
             plain.to_endpoint().map_err(|r| r.reason),
             Err(Reason::Compliance),
             "the same Google host is refused to a plain endpoint"
+        );
+
+        let mut path = row();
+        path.path = Some("/v1/decisions".to_owned());
+        assert_eq!(
+            path.to_endpoint().map_err(|r| r.reason),
+            Err(Reason::Path),
+            "a chat dialect takes no path"
+        );
+        let mut dotted = decisions();
+        dotted.path = Some("/v1/../admin".to_owned());
+        assert_eq!(
+            dotted.to_endpoint().map_err(|r| r.reason),
+            Err(Reason::Path)
         );
     }
 }

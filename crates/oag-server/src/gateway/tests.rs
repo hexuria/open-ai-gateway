@@ -1810,7 +1810,9 @@ async fn try_prepared(
         &EndpointRegistry::default(),
         vec![(
             endpoint,
-            Arc::clone(&adapter) as Arc<dyn oag_upstream::ProviderAdapter>,
+            crate::state::Served::Chat(
+                Arc::clone(&adapter) as Arc<dyn oag_upstream::ProviderAdapter>
+            ),
         )],
     );
 

@@ -41,7 +41,7 @@ when the body was truncated and no longer parses.
 | `authentication_error` | 401 | no key, unknown key, revoked key | re-auth; do not retry |
 | `budget_exhausted` | 402 | a key, route or principal cap is spent | stop; surface which scope from the message |
 | `invalid_request` | 400 | the body is not valid JSON for this dialect | fix the request |
-| `no_viable_model` | 400 | nothing on the route's ladder can serve it | fix the model, or the operator fixes the ladder |
+| `no_viable_model` | 400 | nothing on the route's ladder can serve it; on `/jev/v1/systemone`, a model no System One provider this gateway serves answers to | fix the model, or the operator fixes the ladder |
 | `invalid_model_qualifier` | 400 | `@something` is not a qualifier, or that provider cannot be reached that way | drop or correct the qualifier |
 | `unsupported_field` | 400 | a field the chosen upstream's dialect cannot express | drop the field, or pin to a provider that has it |
 | `not_found` | 404 | an action this gateway does not serve | — |
@@ -51,7 +51,7 @@ when the body was truncated and no longer parses.
 | `quota_reserve_held` | 503 | every credential is at its reserve floor | retry after the window resets |
 | `at_capacity` | 503 | every credential is at max concurrency | retry shortly — this one really is transient |
 | `overloaded` | 503 | this replica is at its in-flight ceiling; the request was shed, not queued | **honour `Retry-After`**; a balancer will land the retry on a replica with room |
-| `system_one_not_configured` | 503 | a System One request on a route that holds no Jev key. There is no chat fallback to offer instead | do not retry; the operator adds a Jev key to the route |
+| `system_one_not_configured` | 503 | a System One request on a route that holds no key for the provider its model names: Jev's, or a System One host's, which the message names. There is no chat fallback to offer instead | do not retry; the operator adds that provider's key to the route |
 | `stream_idle` | 504 | the upstream went quiet mid-stream | retry |
 | `upstream_timeout` | 504 | the upstream accepted the connection and never began a response | retry |
 | `upstream_error` | *see below* | the provider refused | depends on `upstream_status` |
