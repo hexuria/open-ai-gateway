@@ -9,6 +9,10 @@
 //! to and from one canonical representation, so adding a fifth dialect is two
 //! converters rather than eight.
 //!
+//! The fifth is AWS Bedrock Converse, and it needs only the upstream half: no
+//! client speaks it, so `converse` renders requests and reads responses and
+//! nothing else.
+//!
 //! Anthropic Messages is the hub's shape because it is the most expressive of
 //! the four: it has explicit content blocks, tool results as first-class
 //! content, and cache breakpoints. Lowering from it loses less than raising to
@@ -20,6 +24,7 @@
 
 pub mod anthropic;
 pub mod canonical;
+pub mod converse;
 pub mod function_names;
 pub mod gemini;
 pub mod openai;
