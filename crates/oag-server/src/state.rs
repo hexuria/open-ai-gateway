@@ -3,14 +3,31 @@
 use crate::breakers::Breakers;
 use crate::shutdown::Lifecycle;
 use oag_core::config::Config;
+use oag_core::endpoint::{Reason, Refusal, normalise_base_url};
+use oag_core::provider::{Endpoint, EndpointRegistry};
 use oag_core::{Error, Kek, Provider, Result};
 use oag_router::{Catalog, ModelSpec};
-use oag_store::{AuthCache, Cache, Db};
+use oag_store::{AuthCache, Cache, Db, EndpointRow};
+use oag_upstream::custom::EndpointSpec;
 use oag_upstream::{ProviderAdapter, TransportPool};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::sync::RwLock;
+
+/// Every adapter a request can be served by, keyed by provider.
+type AdapterMap = HashMap<Provider, Arc<dyn ProviderAdapter>>;
+
+/// Reloads, one at a time in this process.
+///
+/// A reload writes two things that must agree: the process-wide endpoint
+/// registry and this state's adapter map. Two reloads interleaved could leave
+/// the registry holding one's endpoints and the map the other's until the next
+/// reload, and an endpoint registered in the first and missing from the
+/// second would then resolve to a provider with no adapter for a whole
+/// interval. One at a time, a later reload reads later rows and writes all of
+/// them after the earlier one is done. Process-wide because the registry is.
+static RELOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 pub struct AppState {
@@ -25,7 +42,23 @@ pub struct AppState {
     /// One mutex per credential, so concurrent requests on this replica make at
     /// most one attempt at the fleet-wide refresh lock between them.
     refresh_gates: Arc<std::sync::Mutex<HashMap<oag_core::AccountId, Arc<tokio::sync::Mutex<()>>>>>,
-    adapters: Arc<HashMap<Provider, Arc<dyn ProviderAdapter>>>,
+    /// The built-in providers' adapters, built once from config and never
+    /// rebuilt. Every map `adapters` holds is these plus the endpoints the
+    /// last reload loaded.
+    builtins: Arc<AdapterMap>,
+    /// Swapped whole on every reload, like the catalog, and never edited in
+    /// place. A lookup clones the adapter it finds, and whoever holds the
+    /// clone keeps it whatever a reload does. A request looks its adapter up
+    /// more than once, though: to build and send, and again once the upstream
+    /// answers, for the dialect and framing it reads the answer in. An endpoint
+    /// whose settings changed in between answers the second lookup with a new
+    /// adapter of the same dialect and framing; one removed in between answers
+    /// it with an error, and that request fails.
+    ///
+    /// A std lock: it is held only to clone the `Arc` inside, never across an
+    /// `.await`. See [`AppState::apply_endpoints`] for the order the swaps
+    /// happen in.
+    adapters: Arc<std::sync::RwLock<Arc<AdapterMap>>>,
     /// The Codex/`ChatGPT` subscription adapter. Held apart from `adapters`
     /// because it shares OpenAI's provider key but not its dialect — it is
     /// selected per-account for an OpenAI OAuth seat, in the gateway.
@@ -57,44 +90,70 @@ pub struct AppState {
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
-            .field("providers", &self.adapters.keys().collect::<Vec<_>>())
+            .field("providers", &self.providers())
             .finish_non_exhaustive()
     }
 }
 
-/// A configured base URL, in the one shape every adapter's concatenation expects.
+/// The endpoints a reload will serve: one adapter for each row that passes
+/// every rule and that this build can serve.
 ///
-/// Trailing slashes go, because every adapter builds its request URL by
-/// appending a path: `https://host/` became `https://host//v1/messages`, which
-/// most upstreams tolerate and some do not — a configuration bug that works in
-/// the deployment where it was typed and fails in the next one.
-///
-/// A query or a fragment is refused rather than trimmed. Appending a path after
-/// either produces a URL that means something different — `https://host/?x=1`
-/// plus `/v1/messages` is a query string containing a path, not a path — and
-/// guessing which half the operator meant is worse than saying so. Refused at
-/// startup, where it is a config error, rather than surfacing later as a 404
-/// from an upstream that never received the request.
-fn normalise_base_url(provider: &str, raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(oag_core::Error::Config(format!(
-            "the base URL for {provider} is empty"
-        )));
+/// Every other row is skipped, and says why in the log and in
+/// `oag_endpoint_invalid_total`, on every reload for as long as it stays that
+/// way. Its credentials and models then serve nothing: the provider name they
+/// carry parses to nothing, as an unknown provider's always has.
+fn load_endpoints(rows: &[EndpointRow]) -> Vec<(Endpoint, Arc<dyn ProviderAdapter>)> {
+    let mut served = Vec::with_capacity(rows.len());
+    for row in rows {
+        match endpoint_adapter(row) {
+            Ok(loaded) => served.push(loaded),
+            Err(refusal) => {
+                metrics::counter!(
+                    "oag_endpoint_invalid_total",
+                    "reason" => refusal.reason.as_str(),
+                )
+                .increment(1);
+                // The refusal names the rule and at most the value that broke
+                // it, never an extra header's value.
+                tracing::warn!(
+                    endpoint = %row.name,
+                    reason = refusal.reason.as_str(),
+                    problem = %refusal,
+                    "endpoint not served; its credentials and models serve nothing until the row is fixed"
+                );
+            }
+        }
     }
-    if let Some(bad) = ['?', '#'].into_iter().find(|c| trimmed.contains(*c)) {
-        return Err(oag_core::Error::Config(format!(
-            "the base URL for {provider} contains '{bad}': {trimmed}. Every request path is \
-             appended to it, so a query or fragment here would silently change what the \
-             resulting URL means."
-        )));
+    served
+}
+
+/// The adapter for one endpoint row, or why it gets none.
+fn endpoint_adapter(
+    row: &EndpointRow,
+) -> std::result::Result<(Endpoint, Arc<dyn ProviderAdapter>), Refusal> {
+    let config = row.to_endpoint()?;
+    // Only aws and gcp may have no base URL, and `custom::adapter` refuses
+    // both platforms whatever it is given: the empty string is never sent.
+    let spec = EndpointSpec::new(
+        config.endpoint,
+        config.base_url.unwrap_or_default(),
+        config.auth,
+        config.extra_headers,
+    )
+    .map_err(|e| Refusal::new(Reason::Headers, e))?;
+    let adapter = oag_upstream::custom::adapter(&spec)
+        .map_err(|e| Refusal::new(Reason::Unsupported, e.to_string()))?;
+    Ok((config.endpoint, adapter))
+}
+
+/// Every adapter in `next`, and every one in `current` that `next` has no
+/// entry for: what the map holds while the registry is being replaced.
+fn bridge(next: &AdapterMap, current: &AdapterMap) -> AdapterMap {
+    let mut both = next.clone();
+    for (provider, adapter) in current {
+        both.entry(*provider).or_insert_with(|| Arc::clone(adapter));
     }
-    if !trimmed.contains("://") {
-        return Err(oag_core::Error::Config(format!(
-            "the base URL for {provider} has no scheme: {trimmed}"
-        )));
-    }
-    Ok(trimmed.trim_end_matches('/').to_owned())
+    both
 }
 
 impl AppState {
@@ -208,6 +267,8 @@ impl AppState {
             Provider::Jev,
             oag_upstream::jev::DEFAULT_BASE_URL,
         )?);
+        // No endpoint yet: the first reload loads them.
+        let builtins = Arc::new(adapters);
 
         Ok(Self {
             auth: AuthCache::new(
@@ -234,7 +295,8 @@ impl AppState {
             kek: Arc::new(kek),
             breakers: Arc::new(Breakers::new()),
             refresh_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            adapters: Arc::new(adapters),
+            adapters: Arc::new(std::sync::RwLock::new(Arc::clone(&builtins))),
+            builtins,
             codex,
             jev,
             catalog: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
@@ -243,21 +305,69 @@ impl AppState {
         })
     }
 
-    /// The adapter for a provider, or an error naming the provider we lack.
     /// This state with `provider`'s adapter taken out, so a test can reach the
     /// "leased a credential, then found no adapter" arm now that every provider
     /// in the enum has one.
     #[cfg(test)]
     pub(crate) fn without_adapter(mut self, provider: Provider) -> Self {
-        Arc::make_mut(&mut self.adapters).remove(&provider);
+        Arc::make_mut(&mut self.builtins).remove(&provider);
+        self.set_adapters(Arc::clone(&self.builtins));
         self
     }
 
+    /// The adapter for a provider, or an error naming the provider we lack.
     pub fn adapter(&self, provider: Provider) -> Result<Arc<dyn ProviderAdapter>> {
-        self.adapters
+        self.adapter_map()
             .get(&provider)
             .cloned()
             .ok_or_else(|| Error::Internal(format!("no adapter for provider {provider}")))
+    }
+
+    /// The adapter map as it stands. Cheap: one `Arc` clone.
+    fn adapter_map(&self) -> Arc<AdapterMap> {
+        Arc::clone(&self.adapters.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn set_adapters(&self, map: Arc<AdapterMap>) {
+        *self
+            .adapters
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = map;
+    }
+
+    /// Make `served` the endpoints this state serves and `registry` resolves.
+    ///
+    /// Three swaps, in an order that leaves no instant at which `registry`
+    /// resolves an endpoint that has no adapter here:
+    ///
+    /// 1. the map gains this reload's adapters and keeps every one it had;
+    /// 2. the registry is replaced with this reload's endpoints;
+    /// 3. the map drops what the registry no longer names.
+    ///
+    /// So a new endpoint's adapter is in place before its name parses, and a
+    /// removed one's name stops parsing before its adapter goes. Parsing is
+    /// what a request needs to reach an endpoint at all: a catalog row naming
+    /// it becomes a model only through [`Provider`]'s `FromStr`, and so does a
+    /// credential filed under it. An endpoint whose settings changed gets its
+    /// new adapter in the first swap, and a request the old one already built
+    /// goes where it was built to go.
+    ///
+    /// The built-in adapters are carried into every map as they are.
+    pub(crate) fn apply_endpoints(
+        &self,
+        registry: &EndpointRegistry,
+        served: Vec<(Endpoint, Arc<dyn ProviderAdapter>)>,
+    ) {
+        let mut next = (*self.builtins).clone();
+        let mut endpoints = Vec::with_capacity(served.len());
+        for (endpoint, adapter) in served {
+            next.insert(Provider::Custom(endpoint), adapter);
+            endpoints.push(endpoint);
+        }
+        let next = Arc::new(next);
+        self.set_adapters(Arc::new(bridge(&next, &self.adapter_map())));
+        registry.install(endpoints);
+        self.set_adapters(next);
     }
 
     /// The Codex adapter, for an OpenAI subscription seat. Selected in the
@@ -273,11 +383,12 @@ impl AppState {
         &self.jev
     }
 
-    /// Every provider this build can call: one per chat adapter, and Jev,
-    /// which the System One route serves without one.
+    /// Every provider this gateway can call: one per chat adapter, which
+    /// includes each endpoint the last reload loaded, and Jev, which the
+    /// System One route serves without one.
     #[must_use]
     pub fn providers(&self) -> Vec<Provider> {
-        self.adapters
+        self.adapter_map()
             .keys()
             .copied()
             .chain([Provider::Jev])
@@ -321,8 +432,26 @@ impl AppState {
         *self.catalog.write().await = Arc::new(Catalog::from_entries(chat));
     }
 
-    /// Load the catalog from the database into memory.
+    /// Load the endpoints, then the catalog, from the database into memory.
+    ///
+    /// Endpoints first, because a catalog row names its provider and a row
+    /// naming an endpoint nobody has registered parses as nothing and is
+    /// dropped. Loaded first, a model added with its endpoint is served on the
+    /// same reload rather than the one after. The returned count is the
+    /// catalog's.
+    ///
+    /// An endpoint table that cannot be read keeps the endpoints already
+    /// loaded, and the catalog loads anyway: the built-in providers must never
+    /// stop routing over a table only endpoints use.
     pub async fn reload_catalog(&self) -> Result<usize> {
+        let _one_at_a_time = RELOADS.lock().await;
+        match oag_store::repo::list_endpoints(&self.db).await {
+            Ok(rows) => self.apply_endpoints(EndpointRegistry::global(), load_endpoints(&rows)),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not read the endpoints; keeping the ones already loaded"
+            ),
+        }
         let rows = oag_store::repo::catalog(&self.db).await?;
         let specs: Vec<_> = rows
             .iter()
@@ -336,55 +465,317 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, normalise_base_url};
+    use super::{AppState, bridge, endpoint_adapter, load_endpoints};
+    use oag_core::Provider;
+    use oag_core::endpoint::Reason;
+    use oag_core::provider::{Dialect, Endpoint, EndpointRegistry, Platform};
+    use oag_upstream::ProviderAdapter;
+    use std::sync::Arc;
 
-    /// U5. A configured base URL is normalised once, or refused.
-    ///
-    /// Every adapter builds its request URL by concatenation, so a trailing
-    /// slash produced `https://host//v1/messages` — which most upstreams
-    /// tolerate and some do not. That is the worst kind of configuration bug:
-    /// it works in the deployment where it was typed.
-    #[test]
-    fn a_base_url_is_trimmed_or_refused_at_startup() {
-        for raw in [
-            "https://api.anthropic.com",
-            "https://api.anthropic.com/",
-            "https://api.anthropic.com///",
-            "  https://api.anthropic.com/  ",
-        ] {
-            assert_eq!(
-                normalise_base_url("anthropic", raw).expect("normalises"),
-                "https://api.anthropic.com",
-                "every spelling of the same endpoint has to reach the adapter \
-                 identically: {raw}"
-            );
+    /// A plain endpoint row. Nothing is ever sent to its base URL.
+    fn endpoint_row(name: &str, dialect: &str, base_url: &str) -> oag_store::EndpointRow {
+        oag_store::EndpointRow {
+            name: name.to_owned(),
+            dialect: dialect.to_owned(),
+            platform: "plain".to_owned(),
+            base_url: Some(base_url.to_owned()),
+            auth: "bearer".to_owned(),
+            region: None,
+            project: None,
+            api_version: None,
+            extra_headers: serde_json::json!({}),
+            display_name: None,
+            discover_models: false,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
         }
+    }
 
-        // A path is legitimate and kept: Gemini's own default carries one.
-        assert_eq!(
-            normalise_base_url(
-                "gemini",
-                "https://generativelanguage.googleapis.com/v1beta/"
-            )
-            .expect("normalises"),
-            "https://generativelanguage.googleapis.com/v1beta"
+    /// The provider an endpoint row of this name is served as. An endpoint is
+    /// its name, so the dialect here does not have to be the row's.
+    fn custom(name: &str) -> Provider {
+        Provider::Custom(
+            Endpoint::new(name, Dialect::OpenAIChatCompletions, Platform::Plain).expect("a name"),
+        )
+    }
+
+    /// Every built-in with a chat adapter: all but Jev.
+    fn chat_builtins() -> impl Iterator<Item = Provider> {
+        Provider::ALL
+            .iter()
+            .copied()
+            .filter(|p| *p != Provider::Jev)
+    }
+
+    /// Where an adapter sends a request: the URL it builds.
+    fn target(adapter: &Arc<dyn ProviderAdapter>) -> String {
+        let canonical = oag_proto::CanonicalRequest {
+            model: "m".to_owned(),
+            system: vec![],
+            messages: vec![oag_proto::Message {
+                role: oag_proto::Role::User,
+                content: vec![oag_proto::ContentBlock::Text {
+                    text: "hi".to_owned(),
+                    cache_control: None,
+                }],
+            }],
+            tools: vec![],
+            max_tokens: 16,
+            stream: false,
+            temperature: None,
+            thinking_budget: None,
+            thinking_effort: None,
+            client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
+            passthrough: None,
+        };
+        let model = spec("t4/m", adapter.provider(), "m");
+        let credential = oag_core::credential::SecretMaterial {
+            access_token: "t4-key".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        };
+        adapter
+            .build(&oag_upstream::UpstreamRequest {
+                canonical: &canonical,
+                model: &model,
+                credential: &credential,
+                session: None,
+            })
+            .expect("builds")
+            .url()
+            .to_string()
+    }
+
+    /// An endpoint row is served from the reload that loads it until the
+    /// reload that no longer finds it, and the built-ins never move.
+    #[tokio::test]
+    async fn an_endpoint_is_served_while_its_row_exists_and_not_after() {
+        let state = crate::testing::state("");
+        // A registry of its own: the global one is the whole process's.
+        let registry = EndpointRegistry::default();
+        let groq = custom("t4-state-groq");
+
+        state.apply_endpoints(
+            &registry,
+            load_endpoints(&[endpoint_row(
+                "t4-state-groq",
+                "anthropic",
+                "http://127.0.0.1:9/",
+            )]),
         );
+        let adapter = state.adapter(groq).expect("the endpoint has an adapter");
+        assert_eq!(adapter.provider(), groq);
+        assert_eq!(adapter.dialect(), Dialect::AnthropicMessages);
+        assert_eq!(target(&adapter), "http://127.0.0.1:9/v1/messages");
+        assert_eq!(
+            registry.get("t4-state-groq").map(Endpoint::dialect),
+            Some(Dialect::AnthropicMessages),
+            "and its name resolves"
+        );
+        assert!(state.providers().contains(&groq), "and it is listed");
 
-        // A query or fragment cannot be normalised away. Appending a path after
-        // either means something else entirely, and guessing which half the
-        // operator meant is worse than saying so.
-        for raw in ["https://host/?apikey=secret", "https://host/#anchor"] {
-            let err = normalise_base_url("openai", raw).expect_err("refused");
+        state.apply_endpoints(&registry, load_endpoints(&[]));
+        assert!(
+            state.adapter(groq).is_err(),
+            "its adapter went with its row"
+        );
+        assert_eq!(registry.get("t4-state-groq"), None, "and so did its name");
+        assert!(!state.providers().contains(&groq));
+        for provider in chat_builtins() {
+            state
+                .adapter(provider)
+                .expect("a built-in is never dropped");
+        }
+    }
+
+    /// Every row that breaks a rule, beside one that does not.
+    fn bad_rows() -> Vec<(oag_store::EndpointRow, Reason)> {
+        let mut region = endpoint_row("t4-bad-region", "openai", "http://127.0.0.1:9/v1");
+        region.region = Some("US_EAST_1".to_owned());
+        let mut converse = endpoint_row("t4-bad-converse", "bedrock_converse", "http://h");
+        converse.platform = "aws".to_owned();
+        converse.base_url = None;
+        converse.auth = "none".to_owned();
+        converse.region = Some("us-east-1".to_owned());
+        let mut azure = endpoint_row("t4-bad-azure", "openai", "https://res.openai.azure.com");
+        azure.platform = "azure".to_owned();
+        azure.auth = "api_key_header".to_owned();
+        let mut header = endpoint_row("t4-bad-header", "openai", "http://127.0.0.1:9/v1");
+        header.extra_headers = serde_json::json!({"Authorization": "Bearer not-here"});
+        vec![
+            (region, Reason::Region),
+            (
+                endpoint_row(
+                    "t4-bad-metadata",
+                    "openai",
+                    "http://169.254.169.254/latest/v1",
+                ),
+                Reason::BaseUrl,
+            ),
+            (
+                endpoint_row("t4-bad-openai", "openai", "https://api.openai.com/v1"),
+                Reason::Compliance,
+            ),
+            (
+                endpoint_row("t4-bad-dialect", "klingon", "http://127.0.0.1:9"),
+                Reason::Dialect,
+            ),
+            (converse, Reason::Dialect),
+            (
+                endpoint_row("anthropic", "anthropic", "http://127.0.0.1:9"),
+                Reason::Name,
+            ),
+            (header, Reason::Headers),
+            // Valid rows this build has no adapter for.
+            (azure, Reason::Unsupported),
+            (
+                endpoint_row("t4-bad-jev", "system_one", "http://127.0.0.1:9"),
+                Reason::Unsupported,
+            ),
+        ]
+    }
+
+    #[test]
+    fn each_bad_row_is_refused_for_its_own_reason() {
+        for (row, reason) in bad_rows() {
+            let refused = endpoint_adapter(&row).map(|_| ()).expect_err(&row.name);
+            assert_eq!(refused.reason, reason, "{}: {refused}", row.name);
             assert!(
-                err.to_string().contains(raw.trim()),
-                "the operator has to see which value was rejected: {err}"
+                !refused.message.contains("not-here"),
+                "a header value is never quoted: {refused}"
             );
         }
+    }
 
-        // And nonsense is refused at startup rather than becoming a 404 from an
-        // upstream that never received the request.
-        assert!(normalise_base_url("openai", "api.openai.com").is_err());
-        assert!(normalise_base_url("openai", "   ").is_err());
+    #[tokio::test]
+    async fn a_bad_row_is_skipped_and_everything_else_still_serves() {
+        let state = crate::testing::state("");
+        let registry = EndpointRegistry::default();
+        let (mut rows, _): (Vec<_>, Vec<_>) = bad_rows().into_iter().unzip();
+        rows.push(endpoint_row(
+            "t4-good",
+            "gemini",
+            "http://127.0.0.1:9/v1beta",
+        ));
+
+        let served = load_endpoints(&rows);
+        assert_eq!(
+            served.iter().map(|(e, _)| e.name()).collect::<Vec<_>>(),
+            ["t4-good"],
+            "only the good row is served"
+        );
+        state.apply_endpoints(&registry, served);
+
+        assert!(state.adapter(custom("t4-good")).is_ok());
+        assert!(registry.get("t4-good").is_some());
+        for row in &rows[..rows.len() - 1] {
+            assert_eq!(registry.get(&row.name), None, "{} registered", row.name);
+            if Endpoint::validate_name(&row.name).is_ok() {
+                assert!(
+                    state.adapter(custom(&row.name)).is_err(),
+                    "{} has an adapter",
+                    row.name
+                );
+            }
+        }
+        for provider in chat_builtins() {
+            state.adapter(provider).expect("the built-ins still serve");
+        }
+        assert!(
+            state
+                .adapter(Provider::Anthropic)
+                .is_ok_and(|a| a.provider() == Provider::Anthropic),
+            "an endpoint row spelt like a built-in changes nothing about it"
+        );
+    }
+
+    /// A reload that changes an endpoint's settings gives new requests a new
+    /// adapter, and leaves the old one with whoever already holds it.
+    #[tokio::test]
+    async fn a_changed_endpoint_gets_a_new_adapter_and_a_request_keeps_its_own() {
+        let state = crate::testing::state("");
+        let registry = EndpointRegistry::default();
+        let moved = custom("t4-state-moved");
+
+        state.apply_endpoints(
+            &registry,
+            load_endpoints(&[endpoint_row(
+                "t4-state-moved",
+                "openai",
+                "http://127.0.0.1:9/old/v1",
+            )]),
+        );
+        let in_flight = state.adapter(moved).expect("served");
+
+        state.apply_endpoints(
+            &registry,
+            load_endpoints(&[endpoint_row(
+                "t4-state-moved",
+                "openai",
+                "http://127.0.0.1:9/new/v1",
+            )]),
+        );
+        let next = state.adapter(moved).expect("still served");
+        assert!(!Arc::ptr_eq(&in_flight, &next), "rebuilt on reload");
+        assert_eq!(target(&next), "http://127.0.0.1:9/new/v1/chat/completions");
+        assert_eq!(
+            target(&in_flight),
+            "http://127.0.0.1:9/old/v1/chat/completions",
+            "the request that held the old adapter still has it"
+        );
+        let anthropic = state.adapter(Provider::Anthropic).expect("built-in");
+        state.apply_endpoints(&registry, load_endpoints(&[]));
+        assert!(
+            Arc::ptr_eq(
+                &anthropic,
+                &state.adapter(Provider::Anthropic).expect("built-in")
+            ),
+            "a built-in adapter is never rebuilt"
+        );
+    }
+
+    /// While the registry is replaced, the map holds the old set and the new,
+    /// with the new adapter wherever both name one.
+    #[test]
+    fn the_bridge_holds_both_sets_and_prefers_the_new_adapter() {
+        let adapter = |provider: Provider| -> Arc<dyn ProviderAdapter> {
+            Arc::new(oag_upstream::OpenAICompatAdapter::new(
+                provider,
+                "http://127.0.0.1:9".to_owned(),
+            ))
+        };
+        let (kept, changed, added, removed) = (
+            Provider::OpenAI,
+            custom("t4-bridge-changed"),
+            custom("t4-bridge-added"),
+            custom("t4-bridge-removed"),
+        );
+        let builtin = adapter(kept);
+        let (old, new) = (adapter(changed), adapter(changed));
+        let current = super::AdapterMap::from([
+            (kept, Arc::clone(&builtin)),
+            (changed, Arc::clone(&old)),
+            (removed, adapter(removed)),
+        ]);
+        let next = super::AdapterMap::from([
+            (kept, Arc::clone(&builtin)),
+            (changed, Arc::clone(&new)),
+            (added, adapter(added)),
+        ]);
+
+        let both = bridge(&next, &current);
+        assert_eq!(both.len(), 4, "{:?}", both.keys().collect::<Vec<_>>());
+        assert!(both.contains_key(&removed), "the outgoing endpoint stays");
+        assert!(both.contains_key(&added), "the incoming one is there");
+        assert!(Arc::ptr_eq(&both[&changed], &new), "the new adapter wins");
+        assert!(Arc::ptr_eq(&both[&kept], &builtin));
     }
 
     /// C3: every adapter goes through the normaliser, including this one.
@@ -597,6 +988,102 @@ mod tests {
             loaded,
             chat.len() + system_one.len(),
             "every row counted went to one catalog or the other"
+        );
+    }
+
+    /// Endpoints load before the catalog, so a model added with its endpoint
+    /// is served by the one reload that finds them both, and leaves with it.
+    ///
+    /// Gated, because both are Postgres rows. With the two loads the other way
+    /// round the model's provider would not parse yet and that reload would
+    /// drop it; the end-to-end test cannot tell, because it waits for the
+    /// next one.
+    #[tokio::test]
+    async fn a_model_added_with_its_endpoint_is_served_by_the_same_reload() {
+        let Ok(db_url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let config = oag_core::config::Config::from_yaml(&crate::testing::config_yaml(
+            &db_url,
+            "redis://127.0.0.1:1",
+            "",
+        ))
+        .expect("test config");
+        let db = oag_store::Db::connect(&config.database.url, 2).expect("pool");
+        db.migrate().await.expect("migrate");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        let state = AppState::new(config, db.clone(), cache).expect("state");
+
+        let name = format!("t4-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let model = oag_router::ModelId::new(format!("{name}/m"));
+        oag_store::repo::insert_endpoint(
+            &db,
+            &oag_store::NewEndpoint {
+                name: &name,
+                dialect: "openai",
+                platform: "plain",
+                base_url: Some("http://127.0.0.1:9/v1"),
+                auth: "bearer",
+                region: None,
+                project: None,
+                api_version: None,
+                extra_headers: &serde_json::json!({}),
+                display_name: None,
+                discover_models: false,
+            },
+        )
+        .await
+        .expect("an endpoint");
+        let row = oag_store::ModelRow {
+            id: model.as_str().to_owned(),
+            provider: name.clone(),
+            upstream_name: "m".to_owned(),
+            input_per_mtok: rust_decimal::Decimal::ONE,
+            output_per_mtok: rust_decimal::Decimal::TWO,
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: None,
+            context_window: 128_000,
+            max_output_tokens: 8_192,
+            supports_vision: false,
+            supports_tools: false,
+            supports_reasoning: false,
+            supports_prompt_cache: false,
+            display_label: None,
+        };
+        oag_store::repo::upsert_model(&db, &row, false)
+            .await
+            .expect("a catalog row");
+
+        let first = state.reload_catalog().await;
+        let served = state.catalog().await.get(&model).map(|m| m.provider);
+        let adapted = state.adapter(custom(&name)).is_ok();
+
+        // Cleaned up before asserting, so a failure leaves nothing behind.
+        sqlx::query("DELETE FROM model_catalog WHERE id = $1")
+            .bind(model.as_str())
+            .execute(db.pool())
+            .await
+            .expect("clean up");
+        let deleted = oag_store::repo::delete_endpoint(&db, &name).await;
+        let second = state.reload_catalog().await;
+
+        first.expect("reload");
+        assert_eq!(
+            served,
+            Some(custom(&name)),
+            "the reload that found the endpoint served its model"
+        );
+        assert!(adapted, "with the endpoint's adapter");
+        assert_eq!(
+            deleted.expect("delete"),
+            oag_store::EndpointDeletion::Deleted
+        );
+        second.expect("reload");
+        assert!(state.catalog().await.get(&model).is_none());
+        assert!(
+            state.adapter(custom(&name)).is_err(),
+            "and the adapter left with the row"
         );
     }
 

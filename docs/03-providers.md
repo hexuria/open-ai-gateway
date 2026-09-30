@@ -185,6 +185,8 @@ pub trait ProviderAdapter: Send + Sync + Debug {
     fn build(&self, req: &UpstreamRequest<'_>) -> Result<reqwest::Request>;
     fn parse_event(&self, raw: &str, acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>>;
     async fn refresh(&self, cred: &SecretMaterial) -> Result<Option<SecretMaterial>>;
+    async fn prepare_credential<'a>(&'a self, account: AccountId, stored: &'a SecretMaterial)
+        -> Result<Cow<'a, SecretMaterial>>;
 }
 ```
 
@@ -201,6 +203,13 @@ carry nothing.
 `refresh` defaults to "nothing to do", which is correct for every static API key,
 so only OAuth-style adapters implement it.
 
+`prepare_credential` turns the stored credential into the one a request is
+built with. It defaults to the stored one, unchanged and uncopied; an adapter
+overrides it where what is stored is not what goes on the wire, such as a
+service account's JSON key exchanged for a short-lived token. The request path
+calls it once per credential tried, after `refresh` and before `build`, and an
+error from it is that credential failing: the request moves to the next one.
+
 ## Most providers need no adapter
 
 `Provider::native_dialect` maps a provider to the wire format it speaks. OpenAI,
@@ -209,10 +218,9 @@ covers all five** — `OpenAICompatAdapter` — and they differ only in base URL
 catalog entries. Check the dialect before writing code.
 
 So for anything that speaks Chat Completions, the work is a catalog entry and a
-base URL rather than an adapter. The honest caveat: a vendor nobody has named
-yet still needs a `Provider` variant and its `support()` arm, because both are
-total matches the compiler enforces — but that is a few lines of data, not a
-protocol implementation.
+base URL rather than an adapter. A vendor nobody has named does not even need
+that much code: register it as an endpoint (below), and it is served by the
+adapter for its dialect under a name of your choosing.
 
 Point any of them somewhere else without a rebuild:
 
@@ -221,6 +229,57 @@ gateway:
   provider_base_urls:
     kimi: "https://your-proxy.internal/v1"
 ```
+
+## Registered endpoints
+
+An endpoint is an upstream you register instead of one built in. It has a name,
+which is also its models' prefix (`groq/llama-…`); a dialect (`openai`,
+`anthropic`, `gemini` or `system_one`); a platform (`plain`, `azure`, `aws` or
+`gcp`); and its settings, all in the `endpoint` table (migration 0020). Its keys
+are ordinary sealed credentials filed under its name
+(`oag admin account add --provider groq`, which files the one kind the
+endpoint's platform takes), and its models are catalog rows whose provider is
+its name.
+
+The gateway reads the table on every catalog refresh
+(`gateway.catalog_refresh_interval`, or `POST /admin/api/catalog/reload`), and
+reads it before the catalog, so an endpoint, its keys and its models written
+together are served within one refresh and without a restart. Each row has to
+pass these rules, which `account add` also applies (all but the header names)
+before it files a key under an endpoint's name:
+
+- the name is 1 to 32 of `a-z`, `0-9`, `_` and `-`, and is not a built-in
+  provider's name or alias, `oag` or `codex`;
+- the platform serves the dialect: `plain` all four, `azure` `openai`, `aws`
+  `anthropic`, `gcp` `gemini` and `anthropic`;
+- the auth style is how the platform takes a key: any of them on `plain`,
+  `api_key_header` on `azure`, `bearer` on `gcp` (a minted token) and `none` on
+  `aws` (the request is signed instead);
+- `plain` and `azure` have a base URL: http or https, with no credentials,
+  query or fragment in it, no link-local or cloud-metadata address, and on
+  `plain` none of the hosts [compliance.md](compliance.md#a-plain-endpoint-cannot-reach-a-providers-own-api)
+  lists. Loopback and private addresses are allowed, for a model server on your
+  own network;
+- a region (required on `aws` and `gcp`) and a project (required on `gcp`) are
+  1 to 63 of `a-z`, `0-9` and `-`, because a platform puts them in a hostname or
+  a path;
+- extra headers are strings, and none of them is `authorization`, `x-api-key`,
+  `x-goog-api-key`, `api-key`, `cookie`, `host`, `content-length` or `proxy-*`
+  (`oag_core::endpoint` checks the strings; the names are checked where the
+  gateway turns them into headers).
+
+A row that breaks one is skipped, and the rest are served as before. Its keys
+and models serve nothing, a warning naming it is logged on every refresh, and
+`oag_endpoint_invalid_total{reason}` counts it. In this release only `plain`
+endpoints speaking `openai`, `anthropic` or `gemini` are served; an `azure`,
+`aws` or `gcp` endpoint, or a `plain` `system_one` one, is a valid row skipped
+with reason `unsupported` until its adapter lands.
+
+A request already sent when its endpoint's settings change is not moved: it was
+built for the old base URL and headers and is answered from there, and the next
+request gets the new settings. A request in flight when its endpoint is removed
+can fail once its answer arrives, so remove an endpoint's keys, and let their
+requests finish, before the endpoint itself.
 
 ## Which dialect reaches which upstream
 

@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod credential;
+pub mod endpoint;
 pub mod error;
 pub mod id;
 pub mod provider;

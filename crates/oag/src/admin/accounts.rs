@@ -437,7 +437,11 @@ pub(super) async fn add_account(
 ) -> Result<()> {
     // Validate before storing, so a typo fails here rather than on the first
     // request with an opaque upstream 404.
-    let provider: oag_core::Provider = provider.parse()?;
+    let provider = parse_provider(db, provider).await?;
+    // The kind this provider takes a plain secret as: an API key everywhere
+    // but an endpoint on AWS (a packed Bedrock key) or on GCP (a service
+    // account's JSON).
+    let kind = provider.support().credential_kinds[0].to_string();
 
     let material = SecretMaterial {
         access_token: secret.to_owned(),
@@ -454,7 +458,7 @@ pub(super) async fn add_account(
         kek,
         name,
         provider,
-        "api_key",
+        &kind,
         &material,
         route,
         max_concurrency,
@@ -470,6 +474,50 @@ pub(super) async fn add_account(
         scope_of(owner_id)
     );
     Ok(())
+}
+
+/// `name` as a provider: a built-in, or an endpoint in the `endpoint` table.
+///
+/// An endpoint's name parses only once it is registered, and a CLI process
+/// registers nothing on its own. So a name no built-in answers to has the
+/// table read first, through the mapping the gateway's reload uses: a row
+/// that breaks one of its rules is not registered here either, and the refusal
+/// names the rule rather than calling the endpoint unknown. Two things the
+/// mapping cannot judge are left to the gateway when it loads the row: whether
+/// each extra header may be sent, and whether this build has an adapter for
+/// the endpoint's platform.
+async fn parse_provider(db: &Db, name: &str) -> Result<oag_core::Provider> {
+    if let Ok(provider) = name.parse() {
+        return Ok(provider);
+    }
+    if let Some((_, refusal)) = register_endpoints(db)
+        .await?
+        .into_iter()
+        .find(|(endpoint, _)| endpoint == name)
+    {
+        return Err(oag_core::Error::Config(format!(
+            "endpoint '{name}' is registered but not served, so no key can be filed \
+             under it: {refusal}"
+        )));
+    }
+    name.parse()
+}
+
+/// Register every endpoint row that passes the gateway's mapping, and return
+/// the name of each one that does not with the rule it breaks.
+pub(super) async fn register_endpoints(
+    db: &Db,
+) -> Result<Vec<(String, oag_core::endpoint::Refusal)>> {
+    let mut endpoints = Vec::new();
+    let mut refused = Vec::new();
+    for row in oag_store::repo::list_endpoints(db).await? {
+        match row.to_endpoint() {
+            Ok(config) => endpoints.push(config.endpoint),
+            Err(refusal) => refused.push((row.name, refusal)),
+        }
+    }
+    oag_core::provider::EndpointRegistry::global().install(endpoints);
+    Ok(refused)
 }
 
 /// Import every signed-in Grok CLI session as an xAI OAuth credential.
