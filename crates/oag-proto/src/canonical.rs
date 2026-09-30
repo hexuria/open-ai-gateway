@@ -122,9 +122,10 @@ pub struct Tool {
 
 /// How the client constrained the model's use of tools.
 ///
-/// Every dialect can express all four, but each spells them differently —
-/// `required` here is `any` in Anthropic and `ANY` in Gemini — which is exactly
-/// why it needs a canonical form rather than being forwarded verbatim.
+/// Every client dialect can express all four, but each spells them differently
+/// — `required` here is `any` in Anthropic and `ANY` in Gemini — which is
+/// exactly why it needs a canonical form rather than being forwarded verbatim.
+/// The upstream-only Converse dialect has no `None`, and refuses it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolChoice {

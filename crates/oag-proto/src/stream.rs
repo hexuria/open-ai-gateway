@@ -122,6 +122,15 @@ pub struct StreamAccumulator {
     /// chunk, and because the distinction is lost the moment refusal text is
     /// emitted as an ordinary `TextDelta`, which is what every dialect does.
     saw_refusal: bool,
+    /// A stop the upstream announced ahead of the usage that belongs on it.
+    ///
+    /// Bedrock's `ConverseStream` sends `messageStop` and only then
+    /// `metadata`, which is where the bill is. Every renderer writes its
+    /// terminal frame on the stop and folds a later usage update in without
+    /// emitting it, so a stop passed on the moment it arrived would put zero
+    /// tokens in front of every client. Held here, it goes out with the usage
+    /// as one event, the way Anthropic's own `message_delta` carries both.
+    held_stop: Option<StopReason>,
     /// Original ↔ wire function names for this request, when the upstream
     /// speaks an OpenAI dialect that required sanitisation. Empty (identity)
     /// for every other dialect, and for OpenAI when every name was already
@@ -261,6 +270,20 @@ impl StreamAccumulator {
     #[must_use]
     pub const fn saw_refusal(&self) -> bool {
         self.saw_refusal
+    }
+
+    /// Hold a stop reason until the usage it belongs with arrives.
+    ///
+    /// Held, not observed: [`Self::stop_reason`] stays unset until the stop
+    /// is actually emitted, so a stream that ends between the two still reads
+    /// as incomplete — which it is, because its bill never arrived.
+    pub const fn hold_stop(&mut self, reason: StopReason) {
+        self.held_stop = Some(reason);
+    }
+
+    /// The held stop reason, taken so that it is emitted once.
+    pub const fn take_held_stop(&mut self) -> Option<StopReason> {
+        self.held_stop.take()
     }
 
     /// Whether any tool call has opened in this response so far.
