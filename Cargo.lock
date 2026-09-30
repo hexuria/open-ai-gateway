@@ -1597,6 +1597,7 @@ dependencies = [
  "typesafe-sdk",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

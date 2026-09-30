@@ -371,6 +371,47 @@ impl Dialect {
     pub const fn is_chat(self) -> bool {
         !matches!(self, Self::SystemOne)
     }
+
+    /// The spelling the `endpoint.dialect` column stores for this dialect, or
+    /// `None` for one no endpoint can speak.
+    ///
+    /// Written out rather than taken from serde, whose spelling splits
+    /// `OpenAI` into `open_a_i` and which names the dialect rather than the
+    /// vendor an operator thinks of. A total match, so a dialect added later
+    /// has to say whether an endpoint can speak it.
+    #[must_use]
+    pub const fn endpoint_column(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAIChatCompletions => Some("openai"),
+            Self::AnthropicMessages => Some("anthropic"),
+            Self::GeminiGenerateContent => Some("gemini"),
+            Self::SystemOne => Some("system_one"),
+            // Chat Completions is the OpenAI dialect an endpoint speaks; no
+            // adapter sends a Responses request to anything but a Codex seat.
+            Self::OpenAIResponses => None,
+        }
+    }
+
+    /// The dialect an `endpoint.dialect` value names.
+    ///
+    /// `bedrock_converse` is refused with its own message: the schema admits
+    /// it, and this build has no codec for it yet, so a row that names it is
+    /// one this build cannot serve rather than one that is misspelt.
+    pub fn from_endpoint_column(column: &str) -> Result<Self, String> {
+        match column {
+            "openai" => Ok(Self::OpenAIChatCompletions),
+            "anthropic" => Ok(Self::AnthropicMessages),
+            "gemini" => Ok(Self::GeminiGenerateContent),
+            "system_one" => Ok(Self::SystemOne),
+            "bedrock_converse" => Err(
+                "dialect `bedrock_converse` is not served by this build: it has no Converse codec"
+                    .to_owned(),
+            ),
+            other => Err(format!(
+                "unknown dialect `{other}`: use openai, anthropic, gemini or system_one"
+            )),
+        }
+    }
 }
 
 impl fmt::Display for Dialect {
@@ -505,6 +546,28 @@ impl Platform {
             Self::Azure => "azure",
         }
     }
+
+    /// Whether an endpoint on this platform can speak `dialect`: the platform
+    /// matrix, which migration 0020's `endpoint_platform_dialect_check` holds
+    /// in the schema as well.
+    #[must_use]
+    pub const fn speaks(self, dialect: Dialect) -> bool {
+        matches!(
+            (self, dialect),
+            (
+                Self::Plain,
+                Dialect::OpenAIChatCompletions
+                    | Dialect::AnthropicMessages
+                    | Dialect::GeminiGenerateContent
+                    | Dialect::SystemOne
+            ) | (Self::Azure, Dialect::OpenAIChatCompletions)
+                | (Self::Aws, Dialect::AnthropicMessages)
+                | (
+                    Self::Gcp,
+                    Dialect::GeminiGenerateContent | Dialect::AnthropicMessages
+                )
+        )
+    }
 }
 
 impl FromStr for Platform {
@@ -553,6 +616,24 @@ impl AuthStyle {
             Self::XGoogApiKey => "x_goog_api_key",
             Self::ApiKeyHeader => "api_key_header",
             Self::None => "none",
+        }
+    }
+
+    /// Whether a key can reach an endpoint on `platform` this way.
+    ///
+    /// A plain host takes a key however it was registered to. Every other
+    /// platform decides for itself, and exactly one style says what it does:
+    /// Azure reads the `api-key` header, Vertex a bearer token minted from the
+    /// service account, and Bedrock no key header at all, because `SigV4`
+    /// signs the request instead. A row naming any other style is a row whose
+    /// author expected something the platform will not do.
+    #[must_use]
+    pub const fn suits(self, platform: Platform) -> bool {
+        match platform {
+            Platform::Plain => true,
+            Platform::Azure => matches!(self, Self::ApiKeyHeader),
+            Platform::Gcp => matches!(self, Self::Bearer),
+            Platform::Aws => matches!(self, Self::None),
         }
     }
 }
@@ -1279,5 +1360,97 @@ mod tests {
                 .parse::<AuthStyle>()
                 .is_err_and(|e| e.contains("`api-key`"))
         );
+    }
+
+    #[test]
+    fn an_endpoint_dialect_has_one_column_spelling_and_reads_back() {
+        for (dialect, column) in [
+            (Dialect::OpenAIChatCompletions, "openai"),
+            (Dialect::AnthropicMessages, "anthropic"),
+            (Dialect::GeminiGenerateContent, "gemini"),
+            (Dialect::SystemOne, "system_one"),
+        ] {
+            assert_eq!(dialect.endpoint_column(), Some(column));
+            assert_eq!(Dialect::from_endpoint_column(column), Ok(dialect));
+        }
+        assert_eq!(
+            Dialect::OpenAIResponses.endpoint_column(),
+            None,
+            "no endpoint speaks Responses"
+        );
+        // In the schema, and not in this build: refused as such, not as a typo.
+        let converse = Dialect::from_endpoint_column("bedrock_converse").unwrap_err();
+        assert!(converse.contains("not served by this build"), "{converse}");
+        // serde's spelling is not the column's.
+        for bad in ["open_a_i_chat_completions", "OpenAI", "responses", ""] {
+            let err = Dialect::from_endpoint_column(bad).unwrap_err();
+            assert!(err.contains("unknown dialect"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_platform_matrix_admits_exactly_its_pairs() {
+        use Dialect::{
+            AnthropicMessages, GeminiGenerateContent, OpenAIChatCompletions, OpenAIResponses,
+            SystemOne,
+        };
+        let served = [
+            (Platform::Plain, OpenAIChatCompletions),
+            (Platform::Plain, AnthropicMessages),
+            (Platform::Plain, GeminiGenerateContent),
+            (Platform::Plain, SystemOne),
+            (Platform::Azure, OpenAIChatCompletions),
+            (Platform::Aws, AnthropicMessages),
+            (Platform::Gcp, GeminiGenerateContent),
+            (Platform::Gcp, AnthropicMessages),
+        ];
+        for platform in [
+            Platform::Plain,
+            Platform::Aws,
+            Platform::Gcp,
+            Platform::Azure,
+        ] {
+            for dialect in [
+                OpenAIChatCompletions,
+                AnthropicMessages,
+                OpenAIResponses,
+                GeminiGenerateContent,
+                SystemOne,
+            ] {
+                assert_eq!(
+                    platform.speaks(dialect),
+                    served.contains(&(platform, dialect)),
+                    "{platform:?} {dialect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_plain_host_takes_any_auth_style_and_every_other_platform_one() {
+        for auth in [
+            AuthStyle::Bearer,
+            AuthStyle::XApiKey,
+            AuthStyle::XGoogApiKey,
+            AuthStyle::ApiKeyHeader,
+            AuthStyle::None,
+        ] {
+            assert!(auth.suits(Platform::Plain), "{auth:?}");
+            assert_eq!(
+                auth.suits(Platform::Azure),
+                auth == AuthStyle::ApiKeyHeader,
+                "{auth:?}"
+            );
+            assert_eq!(
+                auth.suits(Platform::Gcp),
+                auth == AuthStyle::Bearer,
+                "{auth:?}"
+            );
+            assert_eq!(
+                auth.suits(Platform::Aws),
+                auth == AuthStyle::None,
+                "{auth:?}"
+            );
+        }
     }
 }

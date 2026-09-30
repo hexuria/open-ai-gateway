@@ -471,10 +471,17 @@ pub(super) async fn try_credential(
     note_dropped_vendor_fields(canonical, adapter.dialect(), request_id);
     // Refreshes first if the token is close to expiry. A credential that is
     // merely expiring must not be treated as a credential that is broken.
-    let credential = match refresh::ensure_fresh(state, &lease.account).await {
+    let stored = match refresh::ensure_fresh(state, &lease.account).await {
         Ok(c) => c,
         // Broken for everyone, not just this request — but another credential
         // may well work, so switch rather than fail the request outright.
+        Err(e) => return Outcome::Switch(e),
+    };
+    // What the request is built with, which is not always what is stored: a
+    // service account's JSON key is exchanged for a token. Failing to make one
+    // is this credential failing, so it is answered as a failed refresh is.
+    let credential = match adapter.prepare_credential(account, &stored).await {
+        Ok(c) => c,
         Err(e) => return Outcome::Switch(e),
     };
 
