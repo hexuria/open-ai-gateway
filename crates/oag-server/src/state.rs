@@ -128,7 +128,7 @@ fn load_endpoints(rows: &[EndpointRow]) -> Vec<(Endpoint, Arc<dyn ProviderAdapte
 }
 
 /// The adapter for one endpoint row, or why it gets none.
-fn endpoint_adapter(
+pub(crate) fn endpoint_adapter(
     row: &EndpointRow,
 ) -> std::result::Result<(Endpoint, Arc<dyn ProviderAdapter>), Refusal> {
     let config = row.to_endpoint()?;
@@ -141,8 +141,15 @@ fn endpoint_adapter(
         config.extra_headers,
     )
     .map_err(|e| Refusal::new(Reason::Headers, e))?;
-    let adapter = oag_upstream::custom::adapter(&spec)
-        .map_err(|e| Refusal::new(Reason::Unsupported, e.to_string()))?;
+    // The words, not the `Display`, whose `configuration: ` would lead every
+    // reason `oag admin endpoint list` and the console print.
+    let adapter = oag_upstream::custom::adapter(&spec).map_err(|e| {
+        let message = match e {
+            Error::Config(message) => message,
+            other => other.to_string(),
+        };
+        Refusal::new(Reason::Unsupported, message)
+    })?;
     Ok((config.endpoint, adapter))
 }
 

@@ -13,6 +13,11 @@ use clap::Parser;
 use oag_store::repo;
 use uuid::Uuid;
 
+/// Held by every test in this binary that registers an endpoint, and by the
+/// doctor tests that count them: `doctor` asks every endpoint in the database,
+/// so one registered mid-count would be counted by a test that never made it.
+pub(crate) static ENDPOINT_ROWS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// C13. "No xai models" and "no models" are different answers.
 ///
 /// `catalog list --provider xai` against a catalog full of Anthropic models
@@ -276,6 +281,7 @@ async fn a_key_is_filed_under_an_endpoint_as_the_kind_its_platform_takes() {
     db.migrate().await.expect("migrate");
     let kek =
         oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=").expect("kek");
+    let _endpoints = ENDPOINT_ROWS.lock().await;
 
     let tag = Uuid::new_v4().simple().to_string()[..10].to_owned();
     let route = format!("t4-{tag}");
@@ -1632,4 +1638,369 @@ fn a_seat_defaults_to_two_requests_in_flight_and_a_key_to_eight() {
     };
     assert_eq!(parsed(&[]), None, "no flag, so the default decides");
     assert_eq!(parsed(&["--max-concurrency", "5"]), Some(5));
+}
+
+/// `endpoint add` takes every setting as a flag; the dialect, platform and
+/// auth are the column spellings, with the hyphenated ones as aliases.
+#[test]
+fn endpoint_add_parses_every_setting() {
+    match parse(&[
+        "endpoint",
+        "add",
+        "--name",
+        "merge",
+        "--dialect",
+        "openai",
+        "--platform",
+        "plain",
+        "--base-url",
+        "https://api-gateway.merge.dev/v1/openai",
+        "--header",
+        "X-Project-Id=p-1",
+        "--header",
+        "X-Title=oag",
+        "--display-name",
+        "Merge Gateway",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"))
+    {
+        AdminCommand::Endpoint(EndpointCommand::Add { args }) => {
+            assert_eq!(args.name, "merge");
+            assert_eq!(args.dialect, DialectArg::Openai);
+            assert_eq!(args.platform, PlatformArg::Plain);
+            assert_eq!(args.auth, None, "the platform's default decides");
+            assert_eq!(args.headers, ["X-Project-Id=p-1", "X-Title=oag"]);
+            assert!(!args.discover);
+        }
+        other => panic!("expected endpoint add, got {other:?}"),
+    }
+    for (spelt, dialect) in [
+        ("system_one", DialectArg::SystemOne),
+        ("system-one", DialectArg::SystemOne),
+        ("anthropic", DialectArg::Anthropic),
+        ("gemini", DialectArg::Gemini),
+    ] {
+        match parse(&[
+            "endpoint",
+            "add",
+            "--name",
+            "e",
+            "--dialect",
+            spelt,
+            "--platform",
+            "aws",
+            "--auth",
+            "x-api-key",
+        ])
+        .unwrap_or_else(|e| panic!("{spelt}: {e}"))
+        {
+            AdminCommand::Endpoint(EndpointCommand::Add { args }) => {
+                assert_eq!(args.dialect, dialect, "{spelt}");
+                assert_eq!(args.auth, Some(AuthArg::XApiKey));
+            }
+            other => panic!("expected endpoint add, got {other:?}"),
+        }
+    }
+    // Each spelling names the column value the shared rules read.
+    for dialect in [
+        DialectArg::Openai,
+        DialectArg::Anthropic,
+        DialectArg::Gemini,
+        DialectArg::SystemOne,
+    ] {
+        let parsed = oag_core::provider::Dialect::from_endpoint_column(dialect.column())
+            .unwrap_or_else(|e| panic!("{dialect:?}: {e}"));
+        assert_eq!(parsed.endpoint_column(), Some(dialect.column()));
+    }
+    for (auth, style) in [
+        (AuthArg::Bearer, "bearer"),
+        (AuthArg::XApiKey, "x_api_key"),
+        (AuthArg::XGoogApiKey, "x_goog_api_key"),
+        (AuthArg::ApiKeyHeader, "api_key_header"),
+        (AuthArg::None, "none"),
+    ] {
+        assert_eq!(auth.style().as_str(), style);
+    }
+    for (platform, spelt) in [
+        (PlatformArg::Plain, "plain"),
+        (PlatformArg::Aws, "aws"),
+        (PlatformArg::Gcp, "gcp"),
+        (PlatformArg::Azure, "azure"),
+    ] {
+        assert_eq!(platform.platform().as_str(), spelt);
+    }
+    // No build serves Converse yet, and the platform is not optional.
+    assert!(
+        parse(&[
+            "endpoint",
+            "add",
+            "--name",
+            "e",
+            "--dialect",
+            "bedrock_converse",
+            "--platform",
+            "aws",
+        ])
+        .is_err()
+    );
+    assert!(parse(&["endpoint", "add", "--name", "e", "--dialect", "openai"]).is_err());
+}
+
+/// `endpoint set` has no `--dialect` and no `--platform`: clap refuses both,
+/// because changing either makes it a different endpoint.
+#[test]
+fn endpoint_set_refuses_the_dialect_and_the_platform() {
+    for flag in [["--dialect", "anthropic"], ["--platform", "azure"]] {
+        let err = parse(&["endpoint", "set", "merge", flag[0], flag[1]])
+            .expect_err("not a setting that changes");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "{flag:?}: {err}"
+        );
+    }
+    match parse(&[
+        "endpoint",
+        "set",
+        "merge",
+        "--base-url",
+        "",
+        "--unset-header",
+        "X-Old",
+        "--discover",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"))
+    {
+        AdminCommand::Endpoint(EndpointCommand::Set { args }) => {
+            assert_eq!(args.name, "merge");
+            assert_eq!(args.base_url.as_deref(), Some(""), "an empty value clears");
+            assert_eq!(args.unset_headers, ["X-Old"]);
+            assert_eq!(args.discover, Some(true));
+        }
+        other => panic!("expected endpoint set, got {other:?}"),
+    }
+    for (given, discover) in [(&["--discover", "false"][..], Some(false)), (&[][..], None)] {
+        let mut argv = vec!["endpoint", "set", "merge"];
+        argv.extend_from_slice(given);
+        match parse(&argv).unwrap_or_else(|e| panic!("{e}")) {
+            AdminCommand::Endpoint(EndpointCommand::Set { args }) => {
+                assert_eq!(args.discover, discover, "{given:?}");
+            }
+            other => panic!("expected endpoint set, got {other:?}"),
+        }
+    }
+    for verb in ["show", "remove", "check"] {
+        assert!(
+            parse(&["endpoint", verb, "merge"]).is_ok(),
+            "{verb} takes the name positionally"
+        );
+        assert!(parse(&["endpoint", verb]).is_err(), "{verb} needs a name");
+    }
+    assert!(matches!(
+        parse(&["endpoint", "list"]).unwrap_or_else(|e| panic!("{e}")),
+        AdminCommand::Endpoint(EndpointCommand::List)
+    ));
+}
+
+fn catalog_add(extra: &[&str]) -> std::result::Result<CatalogAddArgs, clap::Error> {
+    let mut argv = vec![
+        "catalog",
+        "add",
+        "--id",
+        "merge/zai/glm-5.3-flash",
+        "--upstream",
+        "zai/glm-5.3-flash",
+        "--context",
+        "128000",
+        "--max-output",
+        "8192",
+    ];
+    argv.extend_from_slice(extra);
+    match parse(&argv)? {
+        AdminCommand::Catalog(CatalogCommand::Add { args }) => Ok(args),
+        other => panic!("expected catalog add, got {other:?}"),
+    }
+}
+
+/// `catalog add` needs both prices unless the model is `--free`, and a window
+/// and an output limit of at least one token.
+#[test]
+fn catalog_add_parses_prices_limits_and_capabilities() {
+    let args = catalog_add(&[
+        "--input-per-mtok",
+        "0.10",
+        "--output-per-mtok",
+        "0.40",
+        "--cache-read-per-mtok",
+        "0.01",
+        "--tools",
+        "--reasoning",
+        "--display-label",
+        "GLM Flash",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(args.id, "merge/zai/glm-5.3-flash");
+    assert_eq!(args.upstream, "zai/glm-5.3-flash");
+    assert_eq!(
+        (args.input_per_mtok, args.output_per_mtok),
+        (
+            Some(Decimal::from_str_exact("0.10").expect("decimal")),
+            Some(Decimal::from_str_exact("0.40").expect("decimal"))
+        )
+    );
+    assert_eq!(args.cache_write_per_mtok, None);
+    assert_eq!((args.context, args.max_output), (128_000, 8_192));
+    assert!(args.tools && args.reasoning && !args.vision && !args.prompt_cache);
+    assert!(!args.free);
+
+    assert!(
+        catalog_add(&["--input-per-mtok", "1"]).is_err(),
+        "no output price"
+    );
+    assert!(catalog_add(&[]).is_err(), "no prices and not free");
+    let free = catalog_add(&["--free"]).expect("free needs no prices");
+    assert_eq!((free.input_per_mtok, free.output_per_mtok), (None, None));
+    assert!(
+        parse(&[
+            "catalog",
+            "add",
+            "--id",
+            "a/b",
+            "--upstream",
+            "b",
+            "--free",
+            "--context",
+            "0",
+            "--max-output",
+            "1",
+        ])
+        .is_err(),
+        "a window of no tokens fits no request"
+    );
+}
+
+/// A model id's provider is everything before the FIRST slash: an endpoint
+/// that fronts other vendors names its models `vendor/model`.
+#[test]
+fn a_model_id_splits_at_its_first_slash() {
+    assert_eq!(
+        super::catalog::split_model_id("merge/zai/glm-5.3-flash").expect("split"),
+        ("merge", "zai/glm-5.3-flash")
+    );
+    assert_eq!(
+        super::catalog::split_model_id("xai/grok-4.6").expect("split"),
+        ("xai", "grok-4.6")
+    );
+    for bad in ["merge", "/glm", "merge/", "merge/glm 5", "", "merge/\tglm"] {
+        let err = super::catalog::split_model_id(bad).expect_err(bad);
+        assert!(
+            err.to_string().contains("<provider>/<model>"),
+            "{bad:?}: {err}"
+        );
+    }
+}
+
+/// `catalog add`'s row: a zero price needs `--free`, `--free` needs a zero
+/// price, and the id names its provider as the provider spells itself.
+#[test]
+fn catalog_add_refuses_a_zero_price_unless_it_is_free() {
+    use oag_core::Provider;
+    use oag_core::provider::{Dialect, Endpoint, Platform};
+    let merge = Provider::Custom(
+        Endpoint::new("merge", Dialect::OpenAIChatCompletions, Platform::Plain).expect("merge"),
+    );
+    // `=`, so a negative price is a value rather than a flag.
+    let priced = |input: &str, output: &str| {
+        let (input, output) = (
+            format!("--input-per-mtok={input}"),
+            format!("--output-per-mtok={output}"),
+        );
+        catalog_add(&[&input, &output]).unwrap_or_else(|e| panic!("{e}"))
+    };
+
+    let row = super::catalog::model_row(&priced("0.1", "0.4"), merge).expect("a row");
+    assert_eq!(row.id, "merge/zai/glm-5.3-flash");
+    assert_eq!(row.provider, "merge");
+    assert_eq!(row.upstream_name, "zai/glm-5.3-flash");
+    assert_eq!(row.context_window, 128_000);
+
+    let zero = super::catalog::model_row(&priced("0", "0.000"), merge)
+        .expect_err("zero without --free")
+        .to_string();
+    assert!(zero.contains("wins every cost comparison"), "{zero}");
+    assert!(zero.contains("--free"), "{zero}");
+
+    let free = catalog_add(&["--free"]).expect("free");
+    let row = super::catalog::model_row(&free, merge).expect("free on purpose");
+    assert!(row.input_per_mtok.is_zero() && row.output_per_mtok.is_zero());
+    let lines = super::catalog::added_model_lines(&row).join("\n");
+    assert!(lines.contains("free on purpose"), "{lines}");
+    assert!(lines.contains("an operator override"), "{lines}");
+    let paid = super::catalog::model_row(&priced("0.1", "0.4"), merge).expect("a row");
+    assert!(
+        !super::catalog::added_model_lines(&paid)
+            .join("\n")
+            .contains("free on purpose")
+    );
+
+    let both = catalog_add(&["--free", "--input-per-mtok", "1", "--output-per-mtok", "0"])
+        .expect("clap takes both");
+    let err = super::catalog::model_row(&both, merge)
+        .expect_err("free with a price")
+        .to_string();
+    assert!(err.contains("--free says the model costs nothing"), "{err}");
+
+    // One side free is a price, not a free model.
+    super::catalog::model_row(&priced("0", "2"), merge).expect("free input only");
+
+    for (input, says) in [
+        ("-1", "cannot be negative"),
+        ("1000000", "must be under 1000000"),
+    ] {
+        let err = super::catalog::model_row(&priced(input, "1"), merge)
+            .expect_err(input)
+            .to_string();
+        assert!(err.contains(says), "{input}: {err}");
+    }
+    super::catalog::model_row(&priced("999999.999999", "1"), merge).expect("the most it holds");
+    let cached = catalog_add(&[
+        "--input-per-mtok",
+        "1",
+        "--output-per-mtok",
+        "1",
+        "--cache-write-per-mtok=-0.5",
+    ])
+    .expect("clap takes it");
+    let err = super::catalog::model_row(&cached, merge)
+        .expect_err("a negative cache price")
+        .to_string();
+    assert!(
+        err.contains("--cache-write-per-mtok cannot be negative"),
+        "{err}"
+    );
+
+    let err = super::catalog::model_row(
+        &CatalogAddArgs {
+            id: "grok/grok-4.6".to_owned(),
+            ..catalog_add(&["--free"]).expect("free")
+        },
+        Provider::XAI,
+    )
+    .expect_err("an alias in the id")
+    .to_string();
+    assert!(err.contains("use --id xai/grok-4.6"), "{err}");
+
+    let blank = CatalogAddArgs {
+        upstream: "  ".to_owned(),
+        ..catalog_add(&["--free"]).expect("free")
+    };
+    assert!(
+        super::catalog::model_row(&blank, merge).is_err(),
+        "no upstream name"
+    );
+    let labelled = CatalogAddArgs {
+        display_label: Some("two\nlines".to_owned()),
+        ..catalog_add(&["--free"]).expect("free")
+    };
+    assert!(super::catalog::model_row(&labelled, merge).is_err());
 }

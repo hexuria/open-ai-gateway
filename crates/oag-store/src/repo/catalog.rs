@@ -268,6 +268,65 @@ pub async fn upsert_model(db: &Db, m: &ModelRow, is_override: bool) -> Result<()
     Ok(())
 }
 
+/// The write an operator's own catalog row goes through, as a named constant
+/// so a test can read that its conflict branch sets the flag and has no guard.
+pub(super) const OVERRIDE_MODEL_SQL: &str = r"
+        INSERT INTO model_catalog (
+            id, provider, upstream_name, input_per_mtok, output_per_mtok,
+            cache_read_per_mtok, cache_write_per_mtok, context_window, max_output_tokens,
+            supports_vision, supports_tools, supports_reasoning, supports_prompt_cache,
+            is_override, display_label
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true,$14)
+        ON CONFLICT (id) DO UPDATE SET
+            provider = EXCLUDED.provider,
+            upstream_name = EXCLUDED.upstream_name,
+            input_per_mtok = EXCLUDED.input_per_mtok,
+            output_per_mtok = EXCLUDED.output_per_mtok,
+            cache_read_per_mtok = EXCLUDED.cache_read_per_mtok,
+            cache_write_per_mtok = EXCLUDED.cache_write_per_mtok,
+            context_window = EXCLUDED.context_window,
+            max_output_tokens = EXCLUDED.max_output_tokens,
+            supports_vision = EXCLUDED.supports_vision,
+            supports_tools = EXCLUDED.supports_tools,
+            supports_reasoning = EXCLUDED.supports_reasoning,
+            supports_prompt_cache = EXCLUDED.supports_prompt_cache,
+            is_override = true,
+            display_label = COALESCE(EXCLUDED.display_label, model_catalog.display_label),
+            updated_at = now()
+        ";
+
+/// Write a catalog entry exactly as an operator states it, and mark it theirs.
+///
+/// Not [`upsert_model`] with `is_override` set. That write protects an
+/// operator's row from a refresh: its conflict branch skips a row already
+/// overridden and never sets the flag on one that was not. Through it, an
+/// operator correcting their own row would be skipped as somebody's override,
+/// and a seeded row they repriced would stay a seeded row for the next
+/// `catalog seed` to write back over. Here the operator is the writer that
+/// guard exists for, so there is no guard: every column is replaced, the flag
+/// is set, and a label they already gave survives unless they give another.
+pub async fn override_model(db: &Db, m: &ModelRow) -> Result<()> {
+    sqlx::query(OVERRIDE_MODEL_SQL)
+        .bind(&m.id)
+        .bind(&m.provider)
+        .bind(&m.upstream_name)
+        .bind(m.input_per_mtok)
+        .bind(m.output_per_mtok)
+        .bind(m.cache_read_per_mtok)
+        .bind(m.cache_write_per_mtok)
+        .bind(m.context_window)
+        .bind(m.max_output_tokens)
+        .bind(m.supports_vision)
+        .bind(m.supports_tools)
+        .bind(m.supports_reasoning)
+        .bind(m.supports_prompt_cache)
+        .bind(m.display_label.as_deref())
+        .execute(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("writing the operator's model: {e}")))?;
+    Ok(())
+}
+
 /// Refresh only the prices of an existing catalog entry.
 ///
 /// Deliberately not `upsert_model` with a rebuilt row. A provider's own price
