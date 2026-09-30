@@ -139,11 +139,13 @@ registered. A server of your own reachable only at a cloud's hostname under one
 of these domains (an AWS load balancer's `*.elb.amazonaws.com`, say) needs a DNS
 name of its own to be registered as a plain endpoint.
 
-The gateway applies the list every time it loads endpoints, not only when one is
-written: the schema does not know it, so a row written by hand is refused when it
-is loaded. A refused row serves nothing, is logged with the reason on every
-refresh and counted in `oag_endpoint_invalid_total{reason="compliance"}`, and
-`oag admin account add` will not file a key under it.
+The list is applied when an endpoint is written: `oag admin endpoint add` and
+`set` refuse such a URL, and `/admin/api/endpoints` answers 400. The gateway
+applies it again every time it loads endpoints, because the schema does not know
+it, so a row written by hand is refused when it is loaded. A refused row serves
+nothing, is logged with the reason on every refresh and counted in
+`oag_endpoint_invalid_total{reason="compliance"}`, and `oag admin account add`
+will not file a key under it.
 
 What no URL check can see is a proxy you run that forwards to one of these
 hosts. Traffic through it is yours to keep within the rules above.

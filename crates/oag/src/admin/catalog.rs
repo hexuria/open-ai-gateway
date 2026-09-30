@@ -1,12 +1,14 @@
 //! `oag admin catalog` and `providers`: the model catalog, its prices, and the provider matrix.
 
-use super::CatalogCommand;
-use super::accounts::price_account;
-use oag_core::{Kek, Result, credential::SecretMaterial};
-use oag_store::{Db, repo};
+use super::accounts::{parse_provider, price_account, register_endpoints};
+use super::{CatalogAddArgs, CatalogCommand};
+use oag_core::{Kek, Provider, Result, credential::SecretMaterial};
+use oag_store::{Db, ModelRow, repo};
+use rust_decimal::Decimal;
 
 pub(super) async fn catalog_cmd(db: &Db, kek: &Kek, cmd: CatalogCommand) -> Result<()> {
     match cmd {
+        CatalogCommand::Add { args } => add_model(db, &args).await,
         CatalogCommand::Seed { from } => seed_catalog(db, from.as_deref()).await,
         CatalogCommand::SyncPrices { provider, account } => {
             sync_prices(db, kek, &provider, account.as_deref()).await
@@ -142,7 +144,15 @@ pub(super) async fn print_providers(db: &Db) -> Result<()> {
 
 pub(super) async fn seed_catalog(db: &Db, from: Option<&str>) -> Result<()> {
     let entries = match from {
-        Some(source) => crate::catalog::from_litellm(source).await?,
+        Some(source) => {
+            // A LiteLLM file keeps only the providers that parse, and an
+            // endpoint's name parses once it is registered: an endpoint named
+            // for a LiteLLM provider (`groq`, `openrouter`) takes its models.
+            // One the gateway would not serve is not registered, so its
+            // models stay out, as they would from the gateway's catalog.
+            let _not_served = register_endpoints(db).await?;
+            crate::catalog::from_litellm(source).await?
+        }
         None => crate::catalog::builtin(),
     };
     let n = entries.len();
@@ -151,6 +161,155 @@ pub(super) async fn seed_catalog(db: &Db, from: Option<&str>) -> Result<()> {
     }
     println!("catalog: {n} models");
     Ok(())
+}
+
+/// A catalog id's provider and model, split at the first `/`: the model half
+/// may hold more of them (`merge/zai/glm-5.3-flash` is endpoint merge's
+/// `zai/glm-5.3-flash`), and a provider's name never does.
+pub(super) fn split_model_id(id: &str) -> Result<(&str, &str)> {
+    match id.split_once('/') {
+        Some((provider, model))
+            if !provider.is_empty()
+                && !model.is_empty()
+                && !id.chars().any(|c| c.is_whitespace() || c.is_control()) =>
+        {
+            Ok((provider, model))
+        }
+        _ => Err(oag_core::Error::Config(format!(
+            "model id `{id}` is not `<provider>/<model>`"
+        ))),
+    }
+}
+
+/// One more than the most a price column holds: they are `numeric(12,6)`.
+const PRICE_CEILING: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
+
+/// A price the catalog can hold, or why not.
+fn price(flag: &str, value: Decimal) -> Result<Decimal> {
+    if value < Decimal::ZERO {
+        return Err(oag_core::Error::Config(format!(
+            "--{flag} cannot be negative"
+        )));
+    }
+    if value >= PRICE_CEILING {
+        return Err(oag_core::Error::Config(format!(
+            "--{flag} must be under {PRICE_CEILING} USD per million tokens"
+        )));
+    }
+    Ok(value)
+}
+
+/// The row `catalog add` writes for `provider`, or the first flag that cannot
+/// be stored.
+///
+/// A price of zero in and zero out needs `--free`. The router ranks by cost,
+/// so a model that costs nothing wins every comparison on every ladder it is
+/// on (`crate::catalog` skips LiteLLM's zero-priced rows for the same reason):
+/// a zero typed by mistake would quietly take all the traffic it can.
+pub(super) fn model_row(args: &CatalogAddArgs, provider: Provider) -> Result<ModelRow> {
+    let (prefix, model) = split_model_id(&args.id)?;
+    if provider.as_str() != prefix {
+        return Err(oag_core::Error::Config(format!(
+            "model id `{}` names its provider as `{prefix}`, which is spelt `{provider}`: \
+             use --id {provider}/{model}",
+            args.id
+        )));
+    }
+    let upstream = args.upstream.trim();
+    if upstream.is_empty() {
+        return Err(oag_core::Error::Config(
+            "--upstream is the name the provider knows the model by, and cannot be empty"
+                .to_owned(),
+        ));
+    }
+    let input = price("input-per-mtok", args.input_per_mtok.unwrap_or_default())?;
+    let output = price("output-per-mtok", args.output_per_mtok.unwrap_or_default())?;
+    let costs_nothing = input.is_zero() && output.is_zero();
+    if costs_nothing && !args.free {
+        return Err(oag_core::Error::Config(
+            "a model priced at zero in and zero out wins every cost comparison, so it would \
+             take every request its ladder can give it. Pass --free if it really costs nothing"
+                .to_owned(),
+        ));
+    }
+    if args.free && !costs_nothing {
+        return Err(oag_core::Error::Config(
+            "--free says the model costs nothing, but a price was given: drop one or the other"
+                .to_owned(),
+        ));
+    }
+    let display_label = match args.display_label.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(label) if label.chars().any(char::is_control) => {
+            return Err(oag_core::Error::Config(
+                "--display-label must not contain control characters".to_owned(),
+            ));
+        }
+        Some(label) => Some(label.to_owned()),
+    };
+    Ok(ModelRow {
+        id: args.id.clone(),
+        provider: provider.as_str().to_owned(),
+        upstream_name: upstream.to_owned(),
+        input_per_mtok: input,
+        output_per_mtok: output,
+        cache_read_per_mtok: args
+            .cache_read_per_mtok
+            .map(|p| price("cache-read-per-mtok", p))
+            .transpose()?,
+        cache_write_per_mtok: args
+            .cache_write_per_mtok
+            .map(|p| price("cache-write-per-mtok", p))
+            .transpose()?,
+        context_window: args.context,
+        max_output_tokens: args.max_output,
+        supports_vision: args.vision,
+        supports_tools: args.tools,
+        supports_reasoning: args.reasoning,
+        supports_prompt_cache: args.prompt_cache,
+        display_label,
+    })
+}
+
+/// `catalog add`: one model, as the operator states it, marked theirs.
+pub(super) async fn add_model(db: &Db, args: &CatalogAddArgs) -> Result<()> {
+    let (prefix, _) = split_model_id(&args.id)?;
+    let provider = parse_provider(db, prefix).await?;
+    let row = model_row(args, provider)?;
+    repo::override_model(db, &row).await?;
+    for line in added_model_lines(&row) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What `catalog add` prints.
+pub(super) fn added_model_lines(row: &ModelRow) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "catalog: {} ({}, upstream {}) at ${} in, ${} out per Mtok; {} context, {} max output",
+            row.id,
+            row.provider,
+            row.upstream_name,
+            row.input_per_mtok,
+            row.output_per_mtok,
+            row.context_window,
+            row.max_output_tokens
+        ),
+        "  an operator override: `catalog seed` and `catalog sync-prices` leave it alone"
+            .to_owned(),
+    ];
+    if row.input_per_mtok.is_zero() && row.output_per_mtok.is_zero() {
+        lines.push(
+            "  free on purpose: it wins every cost comparison on a ladder that names it".to_owned(),
+        );
+    }
+    lines.push(
+        "  a running gateway routes it from its next catalog refresh; put it on a ladder \
+         with `oag admin route tiers`"
+            .to_owned(),
+    );
+    lines
 }
 
 pub(super) async fn sync_prices(

@@ -89,6 +89,55 @@ impl EndpointSpec {
             headers: &self.extra_headers,
         }
     }
+
+    /// A `GET` for the models this endpoint lists, where its dialect's vendor
+    /// lists them: `{base}/models` for Chat Completions and `generateContent`,
+    /// `{base}/v1/models` for the Messages API and System One. Each sits
+    /// beside the path the dialect's adapter posts to, so a base URL that
+    /// serves requests is the one asked.
+    ///
+    /// With `secret`, the key rides in the one header the endpoint's auth
+    /// style names, as it does on every request; without one, in no header at
+    /// all. The operator's headers go either way, and an Anthropic-dialect
+    /// endpoint is told the API version its adapter speaks.
+    ///
+    /// Only a plain endpoint is asked. The other platforms list models on
+    /// hosts, and with signatures, of their own: Bedrock's control plane, a
+    /// token minted for Vertex, an Azure resource's deployments.
+    pub fn models_request(&self, secret: Option<&str>) -> Result<reqwest::Request> {
+        let name = self.endpoint.name();
+        let platform = self.endpoint.platform();
+        if platform != Platform::Plain {
+            return Err(Error::Config(format!(
+                "endpoint `{name}` is on the {} platform, whose model list is not asked yet; \
+                 only plain endpoints are",
+                platform.as_str()
+            )));
+        }
+        let dialect = self.endpoint.dialect();
+        let path = match dialect {
+            Dialect::OpenAIChatCompletions | Dialect::GeminiGenerateContent => "/models",
+            Dialect::AnthropicMessages => "/v1/models",
+            Dialect::SystemOne => typesafe_sdk::wire::MODELS_PATH,
+            other => {
+                return Err(Error::Config(format!(
+                    "endpoint `{name}` speaks {other}, which lists no models"
+                )));
+            }
+        };
+        let mut builder = crate::builder_client()?
+            .get(format!("{}{path}", self.base_url))
+            .header(reqwest::header::ACCEPT, "application/json");
+        if dialect == Dialect::AnthropicMessages {
+            builder = builder.header("anthropic-version", oag_proto::anthropic::API_VERSION);
+        }
+        if let Some(secret) = secret {
+            builder = authenticate(builder, self.auth, secret);
+        }
+        self.extra_headers.apply(builder).build().map_err(|e| {
+            Error::Internal(format!("building the model list request for `{name}`: {e}"))
+        })
+    }
 }
 
 /// Headers an operator adds to every request one endpoint is sent: what a
@@ -714,6 +763,111 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("t3-jev"), "{err}");
+    }
+
+    /// Each dialect's list is asked where its vendor serves one, beside the
+    /// path its adapter posts to, and a key goes with it only when one is
+    /// given, in the one header the endpoint names.
+    #[test]
+    fn the_model_list_is_asked_where_each_dialect_lists_it() {
+        for (name, dialect, base_path, list_path) in [
+            (
+                "t5-list-openai",
+                Dialect::OpenAIChatCompletions,
+                "/v1",
+                "/v1/models",
+            ),
+            (
+                "t5-list-anthropic",
+                Dialect::AnthropicMessages,
+                "",
+                "/v1/models",
+            ),
+            (
+                "t5-list-gemini",
+                Dialect::GeminiGenerateContent,
+                "/v1beta",
+                "/v1beta/models",
+            ),
+            ("t5-list-jev", Dialect::SystemOne, "/jev", "/jev/v1/models"),
+        ] {
+            let spec = EndpointSpec::new(
+                endpoint(name, dialect, Platform::Plain),
+                format!("http://h.example{base_path}"),
+                AuthStyle::XGoogApiKey,
+                EXTRA,
+            )
+            .unwrap();
+
+            let bare = spec.models_request(None).unwrap();
+            assert_eq!(bare.method(), reqwest::Method::GET, "{name}");
+            assert_eq!(bare.url().path(), list_path, "{name}");
+            assert_eq!(bare.url().query(), None, "{name}");
+            for header in AUTH_HEADERS {
+                assert!(
+                    bare.headers().get(header).is_none(),
+                    "{name}: no key was given, so none rides in {header}"
+                );
+            }
+            for (extra, value) in EXTRA {
+                assert_eq!(bare.headers()[extra], value, "{name}: {extra}");
+            }
+            assert_eq!(
+                bare.headers()
+                    .get("anthropic-version")
+                    .map(|v| v.to_str().unwrap()),
+                (dialect == Dialect::AnthropicMessages)
+                    .then_some(oag_proto::anthropic::API_VERSION),
+                "{name}: only the Messages API is told its version"
+            );
+
+            let keyed = spec.models_request(Some(KEY)).unwrap();
+            for header in AUTH_HEADERS {
+                let wanted = (header == "x-goog-api-key").then_some(KEY);
+                assert_eq!(
+                    keyed.headers().get(header).map(|v| v.to_str().unwrap()),
+                    wanted,
+                    "{name}: {header}"
+                );
+            }
+            assert_eq!(keyed.url().path(), list_path, "{name}");
+        }
+    }
+
+    #[test]
+    fn only_a_plain_endpoint_is_asked_for_its_models() {
+        for (platform, dialect) in [
+            (Platform::Aws, Dialect::AnthropicMessages),
+            (Platform::Gcp, Dialect::GeminiGenerateContent),
+            (Platform::Azure, Dialect::OpenAIChatCompletions),
+        ] {
+            let name = format!("t5-list-{}", platform.as_str());
+            let spec = plain_spec(
+                endpoint(&name, dialect, platform),
+                "http://h.example",
+                AuthStyle::Bearer,
+            );
+            let err = spec.models_request(None).expect_err(&name).to_string();
+            assert!(
+                err.contains(&format!("the {} platform", platform.as_str())),
+                "{err}"
+            );
+            assert!(err.contains("only plain endpoints are"), "{err}");
+        }
+        let spec = plain_spec(
+            endpoint(
+                "t5-list-responses",
+                Dialect::OpenAIResponses,
+                Platform::Plain,
+            ),
+            "http://h.example",
+            AuthStyle::Bearer,
+        );
+        let err = spec.models_request(None).expect_err("no list").to_string();
+        assert!(
+            err.contains("OpenAI Responses, which lists no models"),
+            "{err}"
+        );
     }
 
     #[test]

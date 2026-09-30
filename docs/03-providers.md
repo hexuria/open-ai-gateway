@@ -244,8 +244,85 @@ its name.
 The gateway reads the table on every catalog refresh
 (`gateway.catalog_refresh_interval`, or `POST /admin/api/catalog/reload`), and
 reads it before the catalog, so an endpoint, its keys and its models written
-together are served within one refresh and without a restart. Each row has to
-pass these rules, which `account add` also applies (all but the header names)
+together are served within one refresh and without a restart.
+
+### Registering one
+
+A worked example: [Merge Gateway](https://merge.dev), which serves many vendors'
+models behind one OpenAI-compatible surface and takes a Bearer key.
+
+```sh
+# The endpoint. --auth defaults to the platform's style, bearer on plain.
+# A header is optional and stored in the clear: never a key.
+oag admin endpoint add --name merge --dialect openai --platform plain \
+  --base-url https://api-gateway.merge.dev/v1/openai \
+  --header X-Project-Id=<project uuid>
+
+# Its key, sealed like any other: `api_key`, the kind a plain endpoint takes.
+# From the environment, so it stays out of shell history.
+OAG_ACCOUNT_SECRET=<merge key> oag admin account add --name merge-1 --provider merge
+
+# Is it there, and does the key work? Without a key most hosts answer 401,
+# which still says the host is there; --account sends that credential's key.
+oag admin endpoint check merge
+oag admin endpoint check merge --account merge-1
+
+# Its models, at your contract's prices per million tokens. The provider is
+# everything before the FIRST `/`, so a vendor/model name stays whole.
+oag admin catalog add --id merge/zai/glm-5.3-flash --upstream zai/glm-5.3-flash \
+  --input-per-mtok <usd> --output-per-mtok <usd> --context 128000 --max-output 8192 --tools
+
+# A ladder that uses it. This sets the route's whole ladder; `oag admin route
+# show` prints the one it has.
+oag admin route tiers --route default cheap=merge/zai/glm-5.3-flash balanced=xai/grok-4.6
+
+oag admin doctor
+```
+
+The rest of the verbs: `endpoint list` (every endpoint, with how many
+credentials, models and ladder places name it), `endpoint show <name>`,
+`endpoint set <name>` (only the flags given change; an empty value clears one;
+`--header` adds or replaces and `--unset-header` drops), and `endpoint remove
+<name>`, which refuses while a credential or a catalog model still names the
+endpoint and prints how to clear each. There is no `--dialect` or `--platform`
+on `set`: they are what the endpoint is, so changing either is a remove and an
+add. `doctor` asks every endpoint whether this build serves it, whether it has a
+credential in rotation and a model in the catalog (each a failure when
+missing), and whether a ladder names one of its models (a warning: a request
+naming the model still reaches it).
+
+`catalog add` writes a row as an operator override, so a later `catalog seed`
+or `catalog sync-prices` leaves it alone, and it works for a built-in
+provider's model too. A price of zero in and zero out needs `--free`: the router
+ranks by cost, and a model that costs nothing wins every comparison on every
+ladder that names it. `catalog seed --from <litellm file>` takes a LiteLLM
+provider's models for an endpoint registered under that provider's name
+(`groq`, `openrouter`).
+
+The same writes are on the admin API, and the console's Endpoints table sits on
+them:
+
+| Route | What |
+|---|---|
+| `GET /admin/api/endpoints` | List, with the counts and whether this build serves each. |
+| `POST /admin/api/endpoints` | Register. The body is the columns; `auth` defaults to the platform's style. |
+| `GET /admin/api/endpoints/{name}` | One endpoint. |
+| `PATCH /admin/api/endpoints/{name}` | Change settings. A field left out is kept, `null` clears; `dialect`, `platform` and `name` are a 400. |
+| `DELETE /admin/api/endpoints/{name}` | Remove. 409, with the counts, while anything names it. |
+| `POST /admin/api/endpoints/{name}/check` | Ask it for its models, with no key. 200 whatever it answered. |
+
+A write from the CLI is served from each replica's next refresh. One through the
+admin API is served at once by the replica that took it, which reloads, and by
+the others from their next refresh.
+
+### The rules a row must pass
+
+Each row has to pass these rules. `endpoint add` and `endpoint set`, and the
+admin API, refuse a row that breaks one before it is written, and also resolve
+the base URL's name and refuse one that resolves to a link-local or cloud
+metadata address. The name is resolved where the write happens, so register a
+name only a cluster can resolve (`vllm.models.svc`) from inside it, or through
+the admin API. `account add` applies the rules (all but the header names)
 before it files a key under an endpoint's name:
 
 - the name is 1 to 32 of `a-z`, `0-9`, `_` and `-`, and is not a built-in
@@ -278,7 +355,11 @@ and models serve nothing, a warning naming it is logged on every refresh, and
 endpoints are served: one speaking `openai`, `anthropic` or `gemini` by the chat
 routes, and a `system_one` one by the System One route
 ([System One hosts](#system-one-hosts)). An `azure`, `aws` or `gcp` endpoint is
-a valid row skipped with reason `unsupported` until its adapter lands.
+a valid row skipped with reason `unsupported` until its adapter lands. Such a
+row can still be registered, and `endpoint add`, `list`, `show`, `doctor` and
+the console all say it is not served, so it is in place for the build that
+serves it. `check` asks only a `plain` endpoint: the clouds list their models on
+hosts, and with signatures, of their own.
 
 A request already sent when its endpoint's settings change is not moved: it was
 built for the old base URL and headers and is answered from there, and the next

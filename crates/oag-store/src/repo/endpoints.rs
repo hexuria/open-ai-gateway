@@ -10,6 +10,7 @@
 use crate::Db;
 use crate::rows::EndpointRow;
 use oag_core::{Error, Result};
+use std::collections::HashMap;
 
 const LIST_ENDPOINTS_SQL: &str = concat!(
     "SELECT ",
@@ -80,6 +81,69 @@ pub struct EndpointUpdate<'a> {
     pub extra_headers: &'a serde_json::Value,
     pub display_name: Option<&'a str>,
     pub discover_models: bool,
+}
+
+/// What names one endpoint: its credentials, its catalog models, and the places
+/// those models hold on a ladder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EndpointReferences {
+    /// Credentials filed under the endpoint's name.
+    pub accounts: i64,
+    /// Of those, the ones in rotation.
+    pub schedulable: i64,
+    /// Catalog models whose provider is the endpoint.
+    pub models: i64,
+    /// Of those, the ones some active route's ladder names.
+    pub on_ladder: i64,
+}
+
+/// Every model id an active route's ladder names, and each endpoint's four
+/// counts against it. A route's `tiers` is JSON a hand-written row can shape
+/// any way, so anything that is not a list of rungs holding a list of models
+/// counts as naming nothing rather than failing the read.
+const ENDPOINT_REFERENCES_SQL: &str = r"
+    WITH laddered AS (
+        SELECT jsonb_array_elements_text(
+                   CASE WHEN jsonb_typeof(rung -> 'models') = 'array'
+                        THEN rung -> 'models' ELSE '[]'::jsonb END
+               ) AS id
+        FROM route r,
+             jsonb_array_elements(
+                 CASE WHEN jsonb_typeof(r.tiers) = 'array'
+                      THEN r.tiers ELSE '[]'::jsonb END
+             ) AS rung
+        WHERE r.active
+    )
+    SELECT e.name,
+           (SELECT count(*) FROM account a WHERE a.provider = e.name),
+           (SELECT count(*) FROM account a WHERE a.provider = e.name AND a.schedulable),
+           (SELECT count(*) FROM model_catalog m WHERE m.provider = e.name),
+           (SELECT count(*) FROM model_catalog m
+             WHERE m.provider = e.name AND m.id IN (SELECT id FROM laddered))
+    FROM endpoint e
+";
+
+/// Each endpoint's [`EndpointReferences`], by name. One read for all of them:
+/// a listing shows every endpoint's counts, and there are few endpoints.
+pub async fn endpoint_references(db: &Db) -> Result<HashMap<String, EndpointReferences>> {
+    let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(ENDPOINT_REFERENCES_SQL)
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("counting what names each endpoint: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, accounts, schedulable, models, on_ladder)| {
+            (
+                name,
+                EndpointReferences {
+                    accounts,
+                    schedulable,
+                    models,
+                    on_ladder,
+                },
+            )
+        })
+        .collect())
 }
 
 /// What [`delete_endpoint`] did.

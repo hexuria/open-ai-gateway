@@ -208,6 +208,45 @@ render as `internal_error` with the same redacted message, because those can
 carry connection strings and file paths. That is why each entry records its
 `variant` — otherwise the file shows three identical rows and no reason why.
 
+## The admin API's errors
+
+Everything above is the inference envelope. `/admin/api` is not a dialect and
+does not use it: a failure there is `{"error": "<human sentence>"}`, sometimes
+with a `hint` beside it, and the status is the contract.
+
+| status | means |
+|---|---|
+| 400 | the body breaks a rule; `error` names the rule |
+| 401 / 403 | no key, or a key that is not an admin key |
+| 404 | nothing by that id or name |
+| 409 | the write conflicts with what is already there |
+| 415 / 422 | not JSON, or JSON of the wrong shape: a missing field, or one the route does not take (axum's own answer, as plain text) |
+| 500 | the query failed |
+
+The endpoint routes, `/admin/api/endpoints`, use each of them:
+
+- **400** for a registration the gateway would refuse to serve: a link-local or
+  cloud-metadata base URL, as written or as its name resolves now; a host a
+  `plain` endpoint may not name (see `docs/compliance.md`); a header that carries
+  a key; a dialect the platform does not serve. And for a `PATCH` naming
+  `dialect`, `platform` or `name`, which never change: remove the endpoint and
+  register it again.
+- **409** for a name already registered, and for a `DELETE` of an endpoint that
+  credentials or catalog models still name. That one carries the counts:
+
+  ```json
+  { "error": "endpoint merge is still named by 2 credential(s) and 3 catalog model(s), so nothing was removed",
+    "accounts": 2, "models": 3,
+    "hint": "remove its credentials and its catalog models first, and take its models off every ladder" }
+  ```
+
+- `POST /admin/api/endpoints/{name}/check` is **200 whatever the endpoint
+  answered**, with `ok`, `status`, `models` and `error` saying what that was. A
+  redirect is reported and never followed. Only a name nobody registered is 404.
+
+`errors.json` does not list these. It is generated from `oag_core::Error`, the
+inference path's errors, and no admin answer is one of its variants.
+
 ## Do not branch on the message
 
 Worth repeating, because it is the mistake that survives review. `error.message`

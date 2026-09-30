@@ -486,7 +486,7 @@ pub(super) async fn add_account(
 /// mapping cannot judge are left to the gateway when it loads the row: whether
 /// each extra header may be sent, and whether this build has an adapter for
 /// the endpoint's platform.
-async fn parse_provider(db: &Db, name: &str) -> Result<oag_core::Provider> {
+pub(super) async fn parse_provider(db: &Db, name: &str) -> Result<oag_core::Provider> {
     if let Ok(provider) = name.parse() {
         return Ok(provider);
     }
@@ -960,7 +960,8 @@ pub(super) async fn price_account(
         SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
                token_version, token_expires_at, owner_principal_id, proxy_url,
                priority, max_concurrency, schedulable, cooldown_until,
-               rate_limited_until, window_resets_at, last_used_at
+               rate_limited_until, window_resets_at,
+               usage_remaining_pct, usage_reserve_pct, last_used_at
         FROM account
         WHERE provider = $1 AND ($2::text IS NULL OR name = $2)
         ORDER BY schedulable DESC, priority DESC, name

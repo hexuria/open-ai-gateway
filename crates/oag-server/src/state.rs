@@ -151,7 +151,9 @@ fn load_endpoints(rows: &[EndpointRow]) -> Vec<(Endpoint, Served)> {
 /// names or Jev's own, and every other row its dialect's adapter from
 /// `custom::adapter`. Both come from the one factory, so a row is judged by the
 /// same rules whichever it is.
-fn endpoint_upstream(row: &EndpointRow) -> std::result::Result<(Endpoint, Served), Refusal> {
+pub(crate) fn endpoint_upstream(
+    row: &EndpointRow,
+) -> std::result::Result<(Endpoint, Served), Refusal> {
     let config = row.to_endpoint()?;
     // Only aws and gcp may have no base URL, and the factory refuses both
     // platforms whatever it is given: the empty string is never sent.
@@ -163,7 +165,15 @@ fn endpoint_upstream(row: &EndpointRow) -> std::result::Result<(Endpoint, Served
     )
     .map_err(|e| Refusal::new(Reason::Headers, e))?
     .with_discovery(row.discover_models);
-    let unsupported = |e: Error| Refusal::new(Reason::Unsupported, e.to_string());
+    // The words, not the `Display`, whose `configuration: ` would lead every
+    // reason `oag admin endpoint list` and the console print.
+    let unsupported = |e: Error| {
+        let message = match e {
+            Error::Config(message) => message,
+            other => other.to_string(),
+        };
+        Refusal::new(Reason::Unsupported, message)
+    };
     let served = if config.endpoint.dialect() == Dialect::SystemOne {
         Served::SystemOne(Arc::new(
             oag_upstream::custom::system_one(&spec, config.path.as_deref()).map_err(unsupported)?,

@@ -14,9 +14,10 @@
 //! [`crate::admin_routes`] rather than by a call inside each handler, because a
 //! handler that forgets the call is silently public and nothing about it looks
 //! wrong. Reads live here; incident writes are in [`write`]; the service
-//! catalog is in [`services`].
+//! catalog is in [`services`]; registered upstreams are in [`endpoints`].
 
 pub mod auth;
+pub mod endpoints;
 pub mod models;
 pub mod period;
 pub mod points;
@@ -24,6 +25,9 @@ pub mod services;
 pub mod write;
 
 pub use auth::{AdminActor, require_admin_layer};
+pub use endpoints::{
+    check_endpoint, create_endpoint, delete_endpoint, get_endpoint, list_endpoints, update_endpoint,
+};
 pub use models::{list_models, update_model};
 pub use period::{Window, WindowView};
 pub use points::{

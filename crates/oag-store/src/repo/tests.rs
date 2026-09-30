@@ -4401,3 +4401,212 @@ async fn a_service_account_credential_needs_no_owner() {
         ("service_account", None)
     );
 }
+
+/// One catalog row, read the way the gateway reads them all.
+async fn catalog_row(db: &Db, id: &str) -> ModelRow {
+    catalog(db)
+        .await
+        .expect("catalog")
+        .into_iter()
+        .find(|m| m.id == id)
+        .expect("the row")
+}
+
+/// Whether the catalog row `id` is marked as an operator's.
+async fn is_override(db: &Db, id: &str) -> bool {
+    sqlx::query_scalar("SELECT is_override FROM model_catalog WHERE id = $1")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .expect("the row")
+}
+
+/// `override_model` writes the operator's row whole and marks it theirs, over
+/// a seeded row and over their own earlier write alike, and a seed after it
+/// leaves it alone. `upsert_model(.., true)` did neither: it skipped a row
+/// already overridden and never set the flag on a seeded one.
+#[tokio::test]
+async fn an_operators_model_is_written_whole_and_a_seed_leaves_it() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+
+    // A seeded row, which the operator has named.
+    let seeded = format!("xai/grok-{}", Uuid::new_v4());
+    upsert_model(&db, &seed_model(&seeded, dec!(3)), false)
+        .await
+        .expect("seed");
+    set_model_label(&db, &seeded, Some("Grok, as named"))
+        .await
+        .expect("label");
+
+    // The operator reprices it, saying nothing about the label.
+    let mut theirs = seed_model(&seeded, dec!(9));
+    theirs.context_window = 64_000;
+    theirs.supports_tools = true;
+    override_model(&db, &theirs).await.expect("override");
+    let written = catalog_row(&db, &seeded).await;
+    assert_eq!(
+        (
+            written.input_per_mtok,
+            written.context_window,
+            written.supports_tools
+        ),
+        (dec!(9), 64_000, true),
+        "every column is the operator's"
+    );
+    assert_eq!(written.display_label.as_deref(), Some("Grok, as named"));
+    assert!(
+        is_override(&db, &seeded).await,
+        "and the row is marked theirs"
+    );
+
+    // A seed after that leaves it where the operator put it.
+    upsert_model(&db, &seed_model(&seeded, dec!(5)), false)
+        .await
+        .expect("reseed");
+    assert_eq!(catalog_row(&db, &seeded).await.input_per_mtok, dec!(9));
+
+    // A second write of theirs is not skipped as somebody's override, and a
+    // label they give replaces the one before.
+    let mut again = seed_model(&seeded, dec!(11));
+    again.display_label = Some("Grok, renamed".to_owned());
+    override_model(&db, &again).await.expect("override again");
+    let written = catalog_row(&db, &seeded).await;
+    assert_eq!(written.input_per_mtok, dec!(11));
+    assert_eq!(written.display_label.as_deref(), Some("Grok, renamed"));
+
+    // A model nobody seeded is inserted as the operator's.
+    let fresh = format!("xai/grok-{}", Uuid::new_v4());
+    override_model(&db, &seed_model(&fresh, dec!(2)))
+        .await
+        .expect("insert");
+    assert!(is_override(&db, &fresh).await);
+    assert_eq!(catalog_row(&db, &fresh).await.output_per_mtok, dec!(8));
+
+    sqlx::query("DELETE FROM model_catalog WHERE id = ANY($1)")
+        .bind(vec![seeded, fresh])
+        .execute(db.pool())
+        .await
+        .expect("clean up");
+}
+
+/// Each endpoint is counted by what names it: its credentials and the ones in
+/// rotation, its catalog models and the ones an active route's ladder names. A
+/// ladder shaped wrong by hand counts as naming nothing, and an endpoint
+/// nothing names counts zero everywhere.
+// Long for its fixture: two endpoints, three routes, two credentials and three
+// models, all removed again before asserting.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn each_endpoint_is_counted_by_what_names_it() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let object = serde_json::json!({});
+    let (named, idle) = (endpoint_name(), endpoint_name());
+    for name in [&named, &idle] {
+        insert_endpoint(&db, &plain_endpoint(name, &object))
+            .await
+            .expect("an endpoint");
+    }
+
+    let models: Vec<String> = ["laddered", "benched", "unlisted"]
+        .iter()
+        .map(|m| format!("{named}/{m}"))
+        .collect();
+    for id in &models {
+        let mut model = seed_model(id, dec!(1));
+        model.provider.clone_from(&named);
+        upsert_model(&db, &model, false).await.expect("a model");
+    }
+    let routes: Vec<String> = (0..3)
+        .map(|i| format!("t5-refs-{i}-{}", Uuid::new_v4()))
+        .collect();
+    for (route, tiers, active) in [
+        (
+            &routes[0],
+            serde_json::json!([
+                {"name": "cheap", "models": ["xai/grok-4.6", models[0]]},
+                {"name": "odd", "models": "not a list"},
+                "not a rung",
+            ]),
+            true,
+        ),
+        // An inactive route's ladder serves nothing.
+        (
+            &routes[1],
+            serde_json::json!([{"name": "cheap", "models": [models[1]]}]),
+            false,
+        ),
+        // Not a list of rungs at all.
+        (&routes[2], serde_json::json!({"cheap": [models[1]]}), true),
+    ] {
+        sqlx::query(
+            "INSERT INTO route (id, name, tiers, active) VALUES (gen_random_uuid(), $1, $2, $3)",
+        )
+        .bind(route)
+        .bind(tiers)
+        .bind(active)
+        .execute(db.pool())
+        .await
+        .expect("a route");
+    }
+    for (key, schedulable) in [("on", true), ("off", false)] {
+        sqlx::query(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce, schedulable) \
+             VALUES (gen_random_uuid(), $1, $2, 'api_key', '\\x00', '\\x00', $3)",
+        )
+        .bind(format!("{named}-{key}"))
+        .bind(&named)
+        .bind(schedulable)
+        .execute(db.pool())
+        .await
+        .expect("a credential");
+    }
+
+    let counted = endpoint_references(&db).await;
+
+    sqlx::query("DELETE FROM account WHERE provider = $1")
+        .bind(&named)
+        .execute(db.pool())
+        .await
+        .expect("clean up credentials");
+    sqlx::query("DELETE FROM model_catalog WHERE provider = $1")
+        .bind(&named)
+        .execute(db.pool())
+        .await
+        .expect("clean up models");
+    sqlx::query("DELETE FROM route WHERE name = ANY($1)")
+        .bind(&routes)
+        .execute(db.pool())
+        .await
+        .expect("clean up routes");
+    for name in [&named, &idle] {
+        assert_eq!(
+            delete_endpoint(&db, name).await.expect("delete"),
+            EndpointDeletion::Deleted
+        );
+    }
+
+    let counted = counted.expect("the read");
+    assert_eq!(
+        counted.get(&named).copied(),
+        Some(EndpointReferences {
+            accounts: 2,
+            schedulable: 1,
+            models: 3,
+            on_ladder: 1,
+        })
+    );
+    assert_eq!(
+        counted.get(&idle).copied(),
+        Some(EndpointReferences::default()),
+        "an endpoint nothing names is listed, at zero"
+    );
+}

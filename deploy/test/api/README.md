@@ -54,7 +54,7 @@ between poking an API and testing one.
 
 ## Layout
 
-Safe — run by `just api`, 83 requests:
+Safe — run by `just api`, 84 requests:
 
 | file | reqs | what it covers |
 |---|---|---|
@@ -66,14 +66,15 @@ Safe — run by `just api`, 83 requests:
 | `gemini.hurl` | 6 | model and action in one path segment, `generationConfig` |
 | `systemone.hurl` | 5 | System One under `/jev`: each question type, Jev's listing, the 400 and 401. Needs a Jev key on the route |
 | `errors.hurl` | 14 | 401/403/400/404/503 — every one observed, not guessed |
-| `admin-read.hurl` | 17 | every admin GET, ids captured rather than hardcoded |
+| `admin-read.hurl` | 18 | every admin GET, ids captured rather than hardcoded |
 | `admin-points.hurl` | 8 | reference price, multipliers, the pool batch read |
 
-State-changing — opt-in only, 49 requests:
+State-changing — opt-in only, 61 requests:
 
 | file | reqs | notes |
 |---|---|---|
 | `mutating/keys.hurl` | 9 | mint → use → quota → revoke → prove it is dead. **Self-cleaning** |
+| `mutating/endpoints.hurl` | 12 | register → the 400s and 409 → change → check → remove. **Self-cleaning** |
 | `mutating/catalog.hurl` | 7 | label a model and put it back. **Reversible** |
 | `mutating/points-reference.hurl` | 9 | writes the same value back. **No-op by design** |
 | `mutating/principals.hurl` | 6 | leaves one principal |

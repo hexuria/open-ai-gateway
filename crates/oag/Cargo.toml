@@ -29,5 +29,10 @@ rust_decimal.workspace = true
 serde_json.workspace = true
 time.workspace = true
 
+[dev-dependencies]
+# A stand-in endpoint for `oag admin endpoint check --account`: nobody holds a
+# key for the hosts it stands in for.
+wiremock.workspace = true
+
 [lints]
 workspace = true
