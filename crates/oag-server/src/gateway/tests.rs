@@ -1739,3 +1739,150 @@ fn a_conversation_id_is_stable_and_names_only_its_conversation() {
     assert_ne!(one, conversation_id(&key("bob", "conv-1")));
     assert_eq!(one.get_version_num(), 5, "derived, not random");
 }
+
+/// An endpoint's adapter whose credential is not the one stored: it swaps the
+/// stored key for `prepared`, or fails to, and records what `build` is handed.
+#[derive(Debug)]
+struct Preparing {
+    endpoint: oag_core::provider::Endpoint,
+    prepared: std::result::Result<&'static str, &'static str>,
+    built_with: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl oag_upstream::ProviderAdapter for Preparing {
+    fn provider(&self) -> oag_core::Provider {
+        oag_core::Provider::Custom(self.endpoint)
+    }
+
+    fn build(&self, req: &oag_upstream::UpstreamRequest<'_>) -> Result<reqwest::Request> {
+        self.built_with
+            .lock()
+            .expect("unpoisoned")
+            .push(req.credential.access_token.clone());
+        Err(Error::Internal("built; nothing to send".to_owned()))
+    }
+
+    fn parse_event(
+        &self,
+        _raw: &str,
+        _acc: &mut oag_proto::StreamAccumulator,
+    ) -> Result<Vec<oag_proto::StreamEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn prepare_credential<'a>(
+        &'a self,
+        _account: AccountId,
+        stored: &'a oag_core::credential::SecretMaterial,
+    ) -> Result<std::borrow::Cow<'a, oag_core::credential::SecretMaterial>> {
+        match self.prepared {
+            Ok(token) => {
+                let mut minted = stored.clone();
+                minted.access_token = token.to_owned();
+                Ok(std::borrow::Cow::Owned(minted))
+            }
+            Err(why) => Err(Error::Internal(why.to_owned())),
+        }
+    }
+}
+
+/// One `try_credential` over a sealed `stored-key` credential for an endpoint
+/// served by a [`Preparing`] adapter; what came of it, and every credential
+/// `build` was handed.
+async fn try_prepared(
+    prepared: std::result::Result<&'static str, &'static str>,
+) -> (Outcome, Vec<String>) {
+    use oag_core::provider::{Endpoint, EndpointRegistry, Platform};
+    let endpoint = Endpoint::new(
+        "t4-prepare",
+        Dialect::OpenAIChatCompletions,
+        Platform::Plain,
+    )
+    .expect("a name");
+    let adapter = Arc::new(Preparing {
+        endpoint,
+        prepared,
+        built_with: std::sync::Mutex::default(),
+    });
+    let state = state();
+    state.apply_endpoints(
+        &EndpointRegistry::default(),
+        vec![(
+            endpoint,
+            Arc::clone(&adapter) as Arc<dyn oag_upstream::ProviderAdapter>,
+        )],
+    );
+
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let mut lease = select::testing::lease(&slots);
+    let sealed = state
+        .kek
+        .seal_json(&oag_core::credential::SecretMaterial {
+            access_token: "stored-key".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        })
+        .expect("seals");
+    lease.account.provider = endpoint.name().to_owned();
+    lease.account.credentials_sealed = sealed.ciphertext;
+    lease.account.credentials_nonce = sealed.nonce;
+
+    let canonical = oag_proto::CanonicalRequest {
+        model: "t4-prepare/m".to_owned(),
+        system: vec![],
+        messages: vec![],
+        tools: vec![],
+        max_tokens: 16,
+        stream: false,
+        temperature: None,
+        thinking_budget: None,
+        thinking_effort: None,
+        client_session: None,
+        tool_choice: None,
+        response_format: None,
+        stop: Vec::new(),
+        previous_response_id: None,
+        passthrough: None,
+    };
+    let outcome = super::failover::try_credential(
+        &state,
+        &decision_for(oag_core::Provider::Custom(endpoint)),
+        &canonical,
+        &lease,
+        RequestId::new(),
+        0,
+        uuid::Uuid::nil(),
+    )
+    .await;
+    let built_with = adapter.built_with.lock().expect("unpoisoned").clone();
+    (outcome, built_with)
+}
+
+/// The request is built with the credential the adapter prepared, not the
+/// one stored: what a Vertex endpoint needs, a minted token in place of the
+/// service account's key.
+#[tokio::test]
+async fn a_request_is_built_with_the_credential_its_adapter_prepared() {
+    let (outcome, built_with) = try_prepared(Ok("minted-token")).await;
+    assert_eq!(built_with, ["minted-token"]);
+    assert!(
+        matches!(outcome, Outcome::Fatal(Error::Internal(ref m)) if m == "built; nothing to send"),
+        "the build's own error, so it was the build that stopped it"
+    );
+}
+
+/// A credential that cannot be prepared is a credential that failed: the
+/// request moves on to the next one, and nothing is built with this one.
+#[tokio::test]
+async fn a_credential_that_cannot_be_prepared_fails_over_to_the_next() {
+    let (outcome, built_with) = try_prepared(Err("token mint refused")).await;
+    assert!(built_with.is_empty(), "built with {built_with:?}");
+    assert!(
+        matches!(outcome, Outcome::Switch(Error::Internal(ref m)) if m == "token mint refused"),
+        "a failed preparation switches credentials, carrying its own error"
+    );
+}

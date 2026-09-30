@@ -256,6 +256,150 @@ async fn a_duplicate_credential_name_is_refused_and_renaming_is_the_way_out() {
     );
 }
 
+/// `account add --provider <endpoint>` files the key under the endpoint, as
+/// the one kind its platform takes, and refuses an endpoint the gateway would
+/// not serve with the reason it would not.
+///
+/// Gated on Postgres: the endpoints are rows, read through the same mapping
+/// the gateway's reload uses. The process-wide registry is only ever
+/// installed from the table here, and every row this test writes is in it.
+// Long for its setup: three endpoint rows, a route, and cleaning all of it up
+// before asserting.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_key_is_filed_under_an_endpoint_as_the_kind_its_platform_takes() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 2).expect("connect");
+    db.migrate().await.expect("migrate");
+    let kek =
+        oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=").expect("kek");
+
+    let tag = Uuid::new_v4().simple().to_string()[..10].to_owned();
+    let route = format!("t4-{tag}");
+    sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]')")
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("route");
+    let (plain, aws, refused) = (
+        format!("t4p-{tag}"),
+        format!("t4a-{tag}"),
+        format!("t4r-{tag}"),
+    );
+    let none = serde_json::json!({});
+    for (name, dialect, platform, base_url, auth, region) in [
+        (
+            &plain,
+            "openai",
+            "plain",
+            Some("http://127.0.0.1:9/v1"),
+            "bearer",
+            None,
+        ),
+        (&aws, "anthropic", "aws", None, "none", Some("us-east-1")),
+        // The schema takes it; the compliance guard does not.
+        (
+            &refused,
+            "openai",
+            "plain",
+            Some("https://api.openai.com/v1"),
+            "bearer",
+            None,
+        ),
+    ] {
+        repo::insert_endpoint(
+            &db,
+            &oag_store::NewEndpoint {
+                name,
+                dialect,
+                platform,
+                base_url,
+                auth,
+                region,
+                project: None,
+                api_version: None,
+                extra_headers: &none,
+                display_name: None,
+                discover_models: false,
+            },
+        )
+        .await
+        .expect("the schema admits every one of these");
+    }
+
+    let add = |endpoint: &str, secret: &str| {
+        let (db, kek, route) = (db.clone(), kek.clone(), route.clone());
+        let (name, endpoint, secret) = (
+            format!("{endpoint}-key"),
+            endpoint.to_owned(),
+            secret.to_owned(),
+        );
+        async move {
+            add_account(
+                &db, &kek, &name, &endpoint, &secret, &route, 4, 0, None, None,
+            )
+            .await
+        }
+    };
+    let outcome = async {
+        add(&plain, "t4-not-a-real-key").await?;
+        add(&aws, "AKIDEXAMPLE:not-a-real-secret").await?;
+        let err = add(&refused, "t4-not-a-real-key")
+            .await
+            .expect_err("the gateway would never serve it");
+        let kinds: Vec<(String, String)> = sqlx::query_as(
+            "SELECT provider, kind FROM account WHERE provider = ANY($1) ORDER BY provider",
+        )
+        .bind(vec![plain.clone(), aws.clone(), refused.clone()])
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(e.to_string()))?;
+        Ok::<_, oag_core::Error>((err, kinds))
+    }
+    .await;
+
+    // Cleaned up before asserting, so a failure leaves nothing behind.
+    sqlx::query("DELETE FROM account WHERE provider = ANY($1)")
+        .bind(vec![plain.clone(), aws.clone(), refused.clone()])
+        .execute(db.pool())
+        .await
+        .expect("remove the keys");
+    for name in [&plain, &aws, &refused] {
+        assert_eq!(
+            repo::delete_endpoint(&db, name).await.expect("delete"),
+            oag_store::EndpointDeletion::Deleted,
+            "{name}"
+        );
+    }
+    sqlx::query("DELETE FROM route WHERE name = $1")
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("remove the route");
+
+    let (err, kinds) = outcome.expect("both served endpoints take a key");
+    assert_eq!(
+        kinds,
+        [
+            (aws.clone(), "bedrock".to_owned()),
+            (plain, "api_key".to_owned())
+        ],
+        "each key is the kind its endpoint's platform signs with, and none was \
+         filed under the refused one"
+    );
+    let err = err.to_string();
+    assert!(
+        err.contains(&format!(
+            "endpoint '{refused}' is registered but not served"
+        )),
+        "{err}"
+    );
+    assert!(err.contains("openai.com"), "and it says which rule: {err}");
+}
+
 /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.
 ///
 /// clap treats an env-supplied value as explicitly present when it

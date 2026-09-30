@@ -334,6 +334,30 @@ pub struct EndpointRow {
     pub updated_at: OffsetDateTime,
 }
 
+impl EndpointRow {
+    /// This row as an endpoint, or the first rule it breaks.
+    ///
+    /// The one reading of an endpoint row. The gateway's reload serves what
+    /// passes and skips what does not, and the CLI registers what passes
+    /// before it parses `--provider`, so a row that breaks a rule is one the
+    /// CLI will not file a key under either.
+    pub fn to_endpoint(
+        &self,
+    ) -> Result<oag_core::endpoint::EndpointConfig, oag_core::endpoint::Refusal> {
+        oag_core::endpoint::EndpointConfig::from_columns(&oag_core::endpoint::Columns {
+            name: &self.name,
+            dialect: &self.dialect,
+            platform: &self.platform,
+            base_url: self.base_url.as_deref(),
+            auth: &self.auth,
+            region: self.region.as_deref(),
+            project: self.project.as_deref(),
+            api_version: self.api_version.as_deref(),
+            extra_headers: &self.extra_headers,
+        })
+    }
+}
+
 /// A row to append to the ledger.
 #[derive(Debug, Clone)]
 pub struct UsageWrite {
@@ -368,4 +392,84 @@ pub struct UsageWrite {
     pub latency_ms: Option<i32>,
     pub ttft_ms: Option<i32>,
     pub streamed: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EndpointRow;
+    use oag_core::endpoint::Reason;
+    use oag_core::provider::{AuthStyle, Dialect, Platform};
+
+    /// A Vertex row: the platform that uses every optional column but the API
+    /// version, which is given anyway.
+    fn row() -> EndpointRow {
+        EndpointRow {
+            name: "t4-rows-vertex".to_owned(),
+            dialect: "anthropic".to_owned(),
+            platform: "gcp".to_owned(),
+            base_url: Some("https://us-east5-aiplatform.googleapis.com/".to_owned()),
+            auth: "bearer".to_owned(),
+            region: Some("us-east5".to_owned()),
+            project: Some("acme-prod".to_owned()),
+            api_version: Some("v1".to_owned()),
+            extra_headers: serde_json::json!({"x-goog-user-project": "acme-prod"}),
+            display_name: Some("Vertex Claude".to_owned()),
+            discover_models: true,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn an_endpoint_row_lends_every_column_to_the_one_mapping() {
+        let config = row().to_endpoint().expect("a valid row");
+        assert_eq!(config.endpoint.name(), "t4-rows-vertex");
+        assert_eq!(config.endpoint.dialect(), Dialect::AnthropicMessages);
+        assert_eq!(config.endpoint.platform(), Platform::Gcp);
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://us-east5-aiplatform.googleapis.com")
+        );
+        assert_eq!(config.auth, AuthStyle::Bearer);
+        assert_eq!(config.region.as_deref(), Some("us-east5"));
+        assert_eq!(config.project.as_deref(), Some("acme-prod"));
+        assert_eq!(config.api_version.as_deref(), Some("v1"));
+        assert_eq!(
+            config.extra_headers,
+            [("x-goog-user-project".to_owned(), "acme-prod".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_row_the_mapping_refuses_comes_back_with_its_reason() {
+        let mut region = row();
+        region.region = Some("us east5".to_owned());
+        assert_eq!(
+            region.to_endpoint().map_err(|r| r.reason),
+            Err(Reason::Region)
+        );
+
+        let mut project = row();
+        project.project = None;
+        assert_eq!(
+            project.to_endpoint().map_err(|r| r.reason),
+            Err(Reason::Project)
+        );
+
+        let mut auth = row();
+        auth.auth = "x_goog_api_key".to_owned();
+        assert_eq!(
+            auth.to_endpoint().map_err(|r| r.reason),
+            Err(Reason::Auth),
+            "a minted token rides as a bearer, so a gcp row says so"
+        );
+
+        let mut plain = row();
+        plain.platform = "plain".to_owned();
+        assert_eq!(
+            plain.to_endpoint().map_err(|r| r.reason),
+            Err(Reason::Compliance),
+            "the same Google host is refused to a plain endpoint"
+        );
+    }
 }

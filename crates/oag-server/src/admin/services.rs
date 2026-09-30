@@ -12,19 +12,18 @@
 use super::auth::AdminActor;
 use super::{failed, invalid, not_found};
 use crate::AppState;
+use crate::egress::deny_resolved_target;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use oag_core::{ServiceKind, catalog_url, health_url, ip_is_denied};
+use oag_core::{ServiceKind, catalog_url, health_url};
 use oag_store::ServiceRow;
 use oag_store::repo::{self, NewService, ServiceUpdate};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
@@ -302,35 +301,6 @@ pub(crate) async fn probe_health(base_url: &str, health_path: &str) -> Result<()
     } else {
         Err(format!("health returned HTTP {status}"))
     }
-}
-
-async fn deny_resolved_target(url: &Url) -> Result<(), String> {
-    let host = url
-        .host_str()
-        .ok_or_else(|| "URL is missing a host".to_owned())?;
-    if host.parse::<IpAddr>().is_ok() {
-        return Ok(());
-    }
-    let port = url.port_or_known_default().unwrap_or(80);
-    let lookup = host.to_owned();
-    let resolved = tokio::task::spawn_blocking(move || (lookup.as_str(), port).to_socket_addrs())
-        .await
-        .map_err(|e| format!("resolving host: {e}"))?
-        .map_err(|e| format!("resolving {host}: {e}"))?;
-
-    let mut any = false;
-    for addr in resolved {
-        any = true;
-        if ip_is_denied(addr.ip()) {
-            return Err(format!(
-                "refusing to probe {host}: it resolves to a link-local or metadata address"
-            ));
-        }
-    }
-    if !any {
-        return Err(format!("resolving {host}: no addresses"));
-    }
-    Ok(())
 }
 
 fn view(row: &ServiceRow) -> ServiceView {
