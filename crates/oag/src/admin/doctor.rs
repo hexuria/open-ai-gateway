@@ -11,12 +11,13 @@ use oag_store::Db;
 /// which the reporting queries group on and the importer writes. 0017 re-keys
 /// the rows a Claude Code import already wrote, so a binary on the old schema
 /// re-imports the whole corpus the first time anybody runs `usage import`.
+/// 0020 adds the `endpoint` table that `repo::endpoints` reads and writes.
 ///
 /// Raise this with every migration that existing queries depend on. The test
 /// below counts the files rather than trusting this line, because the number
 /// that matters is the one on disk and a constant is exactly the thing that
 /// gets forgotten.
-const EXPECTED_MIGRATIONS: usize = 19;
+const EXPECTED_MIGRATIONS: usize = 20;
 
 pub async fn run(db: &Db, config: &Config, route: &str) -> Result<()> {
     conclude(problems(db, config, route).await?)
