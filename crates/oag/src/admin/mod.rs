@@ -55,10 +55,6 @@ pub enum AdminCommand {
     },
     /// Print the provider support matrix.
     Providers,
-    /// Upstreams you register: any host that speaks a dialect this gateway
-    /// serves, under a name of your choosing.
-    #[command(subcommand)]
-    Endpoint(EndpointCommand),
     /// Upstream credentials.
     #[command(subcommand)]
     Account(AccountCommand),
@@ -73,6 +69,9 @@ pub enum AdminCommand {
     /// Model catalog: seed, overlay prices, list.
     #[command(subcommand)]
     Catalog(CatalogCommand),
+    /// Operator-registered endpoints.
+    #[command(subcommand)]
+    Endpoint(EndpointCommand),
     /// The usage ledger: import traffic that bypassed the gateway.
     #[command(subcommand)]
     Usage(UsageCommand),
@@ -129,53 +128,6 @@ pub enum AdminCommand {
     /// Drop the shared auth cache.
     #[command(hide = true)]
     FlushCache,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum EndpointCommand {
-    /// Register an upstream: a name, the dialect it speaks, the platform it
-    /// runs on.
-    ///
-    /// Its keys are credentials filed under the name (`account add --provider
-    /// <name>`) and its models are catalog rows (`catalog add --id
-    /// <name>/<model>`). The gateway serves it from its next catalog refresh,
-    /// with no restart.
-    Add {
-        #[command(flatten)]
-        args: EndpointAddArgs,
-    },
-    /// List registered endpoints, and what names each one.
-    List,
-    /// Show one endpoint.
-    Show {
-        #[arg(value_name = "NAME")]
-        name: String,
-    },
-    /// Change an endpoint's settings.
-    ///
-    /// Only the flags given change anything. Its dialect and platform are what
-    /// it is, and are not flags here: to change either, remove the endpoint and
-    /// add it again.
-    Set {
-        #[command(flatten)]
-        args: EndpointSetArgs,
-    },
-    /// Remove an endpoint that no credential and no catalog model names.
-    Remove {
-        #[arg(value_name = "NAME")]
-        name: String,
-    },
-    /// Ask an endpoint which models it lists.
-    ///
-    /// Sends no key, which is enough to see the host answer at that path;
-    /// most will answer 401. `--account` sends the key of one of the
-    /// endpoint's credentials instead. The key is never printed.
-    Check {
-        #[arg(value_name = "NAME")]
-        name: String,
-        #[arg(long, value_name = "CREDENTIAL")]
-        account: Option<String>,
-    },
 }
 
 /// The wire format an endpoint speaks, as `endpoint.dialect` spells it.
@@ -286,6 +238,7 @@ pub struct EndpointAddArgs {
     /// Required on gcp.
     #[arg(long)]
     project: Option<String>,
+    /// The API version an azure endpoint's URLs name. Stored as given.
     #[arg(long)]
     api_version: Option<String>,
     /// A name for people. The endpoint's name stays its identity.
@@ -643,6 +596,54 @@ pub enum CatalogCommand {
     },
 }
 
+/// `oag admin endpoint`.
+#[derive(Subcommand, Debug)]
+pub enum EndpointCommand {
+    /// Register an upstream: a name, the dialect it speaks, the platform it
+    /// runs on.
+    ///
+    /// Its keys are credentials filed under the name (`account add --provider
+    /// <name>`) and its models are catalog rows (`catalog add --id
+    /// <name>/<model>`). The gateway serves it from its next catalog refresh,
+    /// with no restart.
+    Add {
+        #[command(flatten)]
+        args: EndpointAddArgs,
+    },
+    /// List registered endpoints, and what names each one.
+    List,
+    /// Show one endpoint.
+    Show {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Change an endpoint's settings.
+    ///
+    /// Only the flags given change anything. Its dialect and platform are what
+    /// it is, and are not flags here: to change either, remove the endpoint and
+    /// add it again.
+    Set {
+        #[command(flatten)]
+        args: EndpointSetArgs,
+    },
+    /// Remove an endpoint that no credential and no catalog model names.
+    Remove {
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+    /// Ask an endpoint which models it lists.
+    ///
+    /// Sends no key, which is enough to see the host answer at that path;
+    /// most will answer 401. `--account` sends the key of one of the
+    /// endpoint's credentials instead. The key is never printed.
+    Check {
+        #[arg(value_name = "NAME")]
+        name: String,
+        #[arg(long, value_name = "CREDENTIAL")]
+        account: Option<String>,
+    },
+}
+
 // Four capability flags, one per catalog column; an enum would only be unfolded
 // again when the row is written.
 #[allow(clippy::struct_excessive_bools)]
@@ -799,7 +800,6 @@ pub async fn run(
         AdminCommand::Status => status(db).await,
         AdminCommand::Doctor { route } => doctor::run(db, config, &route).await,
         AdminCommand::Providers => print_providers(db).await,
-        AdminCommand::Endpoint(cmd) => endpoint_cmd(db, kek, cmd).await,
         AdminCommand::Account(cmd) => account_cmd(db, kek, cmd, redis_url).await,
         AdminCommand::Key(cli) => key_cmd(db, redis_url, cli).await,
         AdminCommand::Route(cmd) => route_cmd(db, cmd).await,
@@ -807,6 +807,7 @@ pub async fn run(
             promote_principal(db, &email).await
         }
         AdminCommand::Catalog(cmd) => catalog_cmd(db, kek, cmd).await,
+        AdminCommand::Endpoint(cmd) => endpoint_cmd(db, kek, cmd).await,
         AdminCommand::Usage(cmd) => usage_cmd(db, cmd).await,
         AdminCommand::Cache(CacheCommand::Flush) | AdminCommand::FlushCache => {
             flush_cache(redis_url).await
