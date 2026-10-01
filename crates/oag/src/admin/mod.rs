@@ -239,6 +239,7 @@ pub struct EndpointAddArgs {
     /// Required on gcp.
     #[arg(long)]
     project: Option<String>,
+    /// The API version an azure endpoint's URLs name. Stored as given.
     #[arg(long)]
     api_version: Option<String>,
     /// A name for people. The endpoint's name stays its identity.

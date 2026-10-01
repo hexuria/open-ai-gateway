@@ -740,6 +740,59 @@ async fn an_endpoint_is_added_changed_and_removed_from_the_cli() {
         (name.as_str(), "zai/glm-5.3-flash", true, true)
     );
 
+    // The same id again rewrites the row, override and all: the operator
+    // correcting their own row is not skipped as somebody else's override.
+    run(
+        &db,
+        &[
+            "catalog",
+            "add",
+            "--id",
+            &model,
+            "--upstream",
+            "zai/glm-5.3-flash-0925",
+            "--input-per-mtok",
+            "0.2",
+            "--output-per-mtok",
+            "0.8",
+            "--context",
+            "64000",
+            "--max-output",
+            "4096",
+            "--display-label",
+            "GLM Flash",
+        ],
+    )
+    .await
+    .expect("the model restated");
+    let restated: (
+        String,
+        rust_decimal::Decimal,
+        i32,
+        bool,
+        Option<String>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT upstream_name, input_per_mtok, context_window, supports_tools, \
+             display_label, is_override FROM model_catalog WHERE id = $1",
+    )
+    .bind(&model)
+    .fetch_one(db.pool())
+    .await
+    .expect("the model");
+    assert_eq!(
+        restated,
+        (
+            "zai/glm-5.3-flash-0925".to_owned(),
+            rust_decimal::Decimal::new(2, 1),
+            64_000,
+            false,
+            Some("GLM Flash".to_owned()),
+            true
+        ),
+        "every column is the second write's"
+    );
+
     let in_use = run(&db, &["endpoint", "remove", &name])
         .await
         .expect_err("a model names it");
