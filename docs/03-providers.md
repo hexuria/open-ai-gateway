@@ -361,9 +361,11 @@ before it files a key under an endpoint's name:
   `api-version`; no other platform reads the column, and the schema does not
   check it;
 - extra headers are strings, and none of them is `authorization`, `x-api-key`,
-  `x-goog-api-key`, `api-key`, `cookie`, `host`, `content-length` or `proxy-*`
-  (`oag_core::endpoint` checks the strings; the names are checked where the
-  gateway turns them into headers).
+  `x-goog-api-key`, `api-key`, `cookie`, `host`, `content-length`,
+  `transfer-encoding`, `connection`, `te`, `upgrade`, `expect`,
+  `metadata-flavor` or `proxy-*`, nor, on `aws`, any `x-amz-*`, which `SigV4`
+  sets and signs (`oag_core::endpoint` checks the strings; the names are
+  checked where the gateway turns them into headers).
 
 A row that breaks one is skipped, and the rest are served as before. Its keys
 and models serve nothing, a warning naming it is logged on every refresh, and

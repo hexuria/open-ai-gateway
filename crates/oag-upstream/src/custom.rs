@@ -86,7 +86,7 @@ impl EndpointSpec {
         K: AsRef<str>,
         V: AsRef<str>,
     {
-        let extra_headers = ExtraHeaders::parse(extra_headers)
+        let extra_headers = ExtraHeaders::parse(extra_headers, endpoint.platform())
             .map_err(|e| format!("endpoint `{}`: {e}", endpoint.name()))?;
         Ok(Self {
             endpoint,
@@ -231,9 +231,16 @@ impl EndpointSpec {
 ///   the headers a key or a session rides in. That leaves a key in only the
 ///   header its [`AuthStyle`] names, and keeps a credential out of a setting
 ///   stored in the clear.
-/// - `host`, `content-length` and every `proxy-*`: where the request goes,
-///   where its body ends and what a proxy is told. The transport sets those,
-///   and one set here would make a different request from the one built.
+/// - `host`, `content-length`, `transfer-encoding`, `connection`, `te`,
+///   `upgrade`, `expect` and every `proxy-*`: where the request goes, how its
+///   body is framed and where it ends, what becomes of the connection, and
+///   what a proxy is told. The transport sets those, and one set here would
+///   make a different request from the one built, or a different connection.
+/// - `metadata-flavor`, the header a cloud's metadata server takes as proof a
+///   request was meant for it. No model host asks for it.
+/// - on an `aws` endpoint, every `x-amz-*`: `SigV4` sets and signs those, and
+///   one set here would replace a header the signature covers, or add one it
+///   does not.
 ///
 /// Any other header the adapter sets itself (`content-type`,
 /// `anthropic-version`) is replaced by an extra one of the same name, so an
@@ -247,7 +254,7 @@ pub struct ExtraHeaders(HeaderMap);
 impl ExtraHeaders {
     /// Names refused outright. Lowercase, which is how a parsed [`HeaderName`]
     /// spells every name; `proxy-*` is checked beside them.
-    const REFUSED: [&'static str; 7] = [
+    const REFUSED: [&'static str; 13] = [
         "authorization",
         "x-api-key",
         "x-goog-api-key",
@@ -255,10 +262,19 @@ impl ExtraHeaders {
         "host",
         "cookie",
         "content-length",
+        "transfer-encoding",
+        "connection",
+        "te",
+        "upgrade",
+        "expect",
+        "metadata-flavor",
     ];
 
+    /// `pairs` as the headers an endpoint on `platform` adds, or the first
+    /// one it may not.
     pub(crate) fn parse<K, V>(
         pairs: impl IntoIterator<Item = (K, V)>,
+        platform: Platform,
     ) -> std::result::Result<Self, String>
     where
         K: AsRef<str>,
@@ -272,8 +288,15 @@ impl ExtraHeaders {
             if Self::refused(&name) {
                 return Err(format!(
                     "extra header `{name}` is not allowed: a key or a session goes in the \
-                     endpoint's account, never in a header, and host, content-length and \
-                     proxy-* are the transport's to set"
+                     endpoint's account, never in a header; host, content-length, \
+                     transfer-encoding, connection, te, upgrade, expect and proxy-* are the \
+                     transport's to set; and metadata-flavor is for a cloud's metadata server"
+                ));
+            }
+            if platform == Platform::Aws && name.as_str().starts_with("x-amz-") {
+                return Err(format!(
+                    "extra header `{name}` is not allowed on an aws endpoint: SigV4 sets and \
+                     signs the x-amz-* headers itself"
                 ));
             }
             // The value is left out of the message: it is refused for holding a
@@ -304,17 +327,30 @@ impl ExtraHeaders {
 /// their key with this: a built-in with the one style its provider takes, an
 /// endpoint with the one it was registered with. So one function decides which
 /// header a key goes in.
+///
+/// The header is marked sensitive, so a request printed with `{:?}`, in a log
+/// line or a panic message, shows the header's name and never the key, and an
+/// HTTP/2 connection keeps the value out of its compression table. A value no
+/// header can carry is handed to the builder as it was, for the builder to
+/// refuse as it always has.
 pub(crate) fn authenticate(
     builder: RequestBuilder,
     auth: AuthStyle,
     secret: &str,
 ) -> RequestBuilder {
-    match auth {
-        AuthStyle::Bearer => builder.header("authorization", format!("Bearer {secret}")),
-        AuthStyle::XApiKey => builder.header("x-api-key", secret),
-        AuthStyle::XGoogApiKey => builder.header("x-goog-api-key", secret),
-        AuthStyle::ApiKeyHeader => builder.header("api-key", secret),
-        AuthStyle::None => builder,
+    let (name, value) = match auth {
+        AuthStyle::Bearer => ("authorization", format!("Bearer {secret}")),
+        AuthStyle::XApiKey => ("x-api-key", secret.to_owned()),
+        AuthStyle::XGoogApiKey => ("x-goog-api-key", secret.to_owned()),
+        AuthStyle::ApiKeyHeader => ("api-key", secret.to_owned()),
+        AuthStyle::None => return builder,
+    };
+    match HeaderValue::from_str(&value) {
+        Ok(mut sensitive) => {
+            sensitive.set_sensitive(true);
+            builder.header(name, sensitive)
+        }
+        Err(_) => builder.header(name, value),
     }
 }
 
@@ -844,6 +880,87 @@ mod tests {
         let spec = EndpointSpec::new(endpoint, "http://h", AuthStyle::Bearer, lookalikes).unwrap();
         for (name, value) in lookalikes {
             assert_eq!(spec.extra_headers.0[name], value, "{name}");
+        }
+    }
+
+    /// The headers that steer the connection rather than the request, and the
+    /// one a cloud metadata server answers to, are refused on every platform;
+    /// `x-amz-*` on an aws endpoint, whose signature sets and signs them.
+    #[test]
+    fn an_extra_header_may_not_steer_the_transport_or_speak_for_the_platform() {
+        let plain = endpoint(
+            "t3-transport",
+            Dialect::OpenAIChatCompletions,
+            Platform::Plain,
+        );
+        for name in [
+            "Transfer-Encoding",
+            "connection",
+            "TE",
+            "Upgrade",
+            "expect",
+            "Metadata-Flavor",
+        ] {
+            let err = EndpointSpec::new(plain, "http://h", AuthStyle::Bearer, [(name, "v")])
+                .expect_err(name);
+            assert!(
+                err.contains(&format!("`{}` is not allowed", name.to_ascii_lowercase())),
+                "{name}: {err}"
+            );
+        }
+
+        let aws = endpoint("t3-amz", Dialect::AnthropicMessages, Platform::Aws);
+        for name in [
+            "x-amz-security-token",
+            "X-Amz-Date",
+            "x-amz-content-sha256",
+            "x-amz-target",
+        ] {
+            let err = EndpointSpec::new(aws, "", AuthStyle::None, [(name, "v")]).expect_err(name);
+            assert!(
+                err.contains(&format!(
+                    "`{}` is not allowed on an aws endpoint",
+                    name.to_ascii_lowercase()
+                )),
+                "{name}: {err}"
+            );
+        }
+        // Anywhere else an `x-amz-` header is the operator's to send.
+        let spec = EndpointSpec::new(
+            plain,
+            "http://h",
+            AuthStyle::Bearer,
+            [("x-amz-meta-team", "t3")],
+        )
+        .expect("not an aws endpoint");
+        assert_eq!(spec.extra_headers.0["x-amz-meta-team"], "t3");
+        EndpointSpec::new(aws, "", AuthStyle::None, [("x-team", "t3")])
+            .expect("an aws endpoint keeps every other header");
+    }
+
+    /// The key's header is marked sensitive, whichever header it rides in: a
+    /// request printed for a log names the header and never shows the key.
+    #[test]
+    fn the_header_a_key_rides_in_is_marked_sensitive() {
+        for (auth, expected) in STYLES {
+            let request = authenticate(reqwest::Client::new().get("http://h/v1/models"), auth, KEY)
+                .build()
+                .expect("builds");
+            let printed = format!("{request:?}");
+            assert!(!printed.contains(KEY), "{}: {printed}", auth.as_str());
+            match expected {
+                Some((name, value)) => {
+                    let sent = &request.headers()[name];
+                    assert!(sent.is_sensitive(), "{name}");
+                    assert_eq!(sent, value, "{name}: still the key");
+                }
+                None => assert!(
+                    AUTH_HEADERS
+                        .iter()
+                        .all(|name| request.headers().get(*name).is_none()),
+                    "no key, no header"
+                ),
+            }
         }
     }
 

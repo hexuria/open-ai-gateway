@@ -1226,7 +1226,8 @@ mod tests {
     #[tokio::test]
     async fn discovery_reads_every_page_with_the_endpoints_key_and_headers() {
         let server = MockServer::start().await;
-        let headers = ExtraHeaders::parse([("x-team", "t6")]).unwrap();
+        let headers =
+            ExtraHeaders::parse([("x-team", "t6")], oag_core::provider::Platform::Plain).unwrap();
         Mock::given(method("GET"))
             .and(path("/v1/models"))
             .and(query_param_is_missing("after_id"))
