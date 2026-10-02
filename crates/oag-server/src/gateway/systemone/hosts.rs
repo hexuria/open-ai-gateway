@@ -191,6 +191,43 @@ fn a_body_with_two_models_never_reaches_a_rename() {
     );
 }
 
+/// A body that is not a JSON object is not renamed, and the refusal says what
+/// was expected instead: the exact 400 `invalid_request` the route would
+/// answer with, rendered by the same `error_response` every refusal goes
+/// through.
+///
+/// No client reaches this today, because the SDK's decoder refuses such a
+/// body before a model is resolved, so it is held here rather than end to
+/// end. The text is the visitor's `expecting`, which serde puts after
+/// "expected"; without it, the operator reads "expected" followed by nothing.
+#[tokio::test]
+async fn a_body_that_is_not_an_object_is_refused_naming_what_was_expected() {
+    for (body, says) in [
+        (
+            &b"[]"[..],
+            "serialisation: invalid type: sequence, expected a JSON object at line 1 column 0",
+        ),
+        (
+            &b"7"[..],
+            "serialisation: invalid type: integer `7`, expected a JSON object at line 1 column 1",
+        ),
+    ] {
+        let refused = renamed(body, "typesafe/jev-1.13").expect_err("not an object");
+        assert_eq!(refused.to_string(), says);
+
+        let response = error_response(&refused);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let rendered: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .expect("a body"),
+        )
+        .expect("a JSON envelope");
+        assert_eq!(rendered["error"]["type"], "invalid_request");
+        assert_eq!(rendered["error"]["message"], says);
+    }
+}
+
 /// What answered is priced first; a name no row spells falls back to the row
 /// the request was resolved by, and then to an unpriced stand-in under the
 /// provider that answered.
