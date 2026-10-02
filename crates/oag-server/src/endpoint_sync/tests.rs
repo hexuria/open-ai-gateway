@@ -90,6 +90,8 @@ fn a_glob_is_runs_and_single_characters() {
         ("a?c", "ac"),
         ("", "a"),
         ("zai", GLM),
+        ("*a", "ab"),
+        ("a*", "ba"),
     ] {
         assert!(!glob(pattern, text), "{pattern} does not match {text}");
     }
@@ -267,12 +269,47 @@ fn a_stale_row_a_ladder_names_is_planned_to_stay() {
         &listed(),
         &existing,
         &laddered,
-        &SyncOptions::default(),
+        &SyncOptions {
+            price: PriceChoice::First,
+            dry_run: true,
+            ..SyncOptions::default()
+        },
     )
     .expect("the list offers three");
     assert_eq!(p.report.kept_on_ladder, [format!("{e}/gone/a")]);
     assert_eq!(p.remove, [format!("{e}/gone/b")]);
     assert_eq!(p.report.removed, p.remove);
+    // And the report says whose sync it is, and how it was asked for.
+    assert_eq!(p.report.endpoint, e);
+    assert_eq!(p.report.price, PriceChoice::First);
+    assert!(p.report.dry_run);
+}
+
+/// What the write found overrides what the plan saw: an id another
+/// provider's row came to hold is held, neither added nor updated, and a
+/// stale row a ladder came to name is kept rather than removed.
+#[test]
+fn the_write_has_the_last_word_on_what_was_written_and_removed() {
+    let mut report = SyncReport {
+        added: vec!["e/a".to_owned(), "e/b".to_owned()],
+        updated: vec!["e/c".to_owned(), "e/d".to_owned()],
+        kept_on_ladder: vec!["e/k".to_owned()],
+        ..SyncReport::default()
+    };
+    settle(
+        &mut report,
+        EndpointSync {
+            written: vec!["e/a".to_owned(), "e/d".to_owned()],
+            held: vec!["e/b".to_owned(), "e/c".to_owned()],
+            removed: vec!["e/x".to_owned()],
+        },
+        vec!["e/x".to_owned(), "e/y".to_owned()],
+    );
+    assert_eq!(report.added, ["e/a"]);
+    assert_eq!(report.updated, ["e/d"]);
+    assert_eq!(report.held, ["e/b", "e/c"]);
+    assert_eq!(report.removed, ["e/x"]);
+    assert_eq!(report.kept_on_ladder, ["e/k", "e/y"]);
 }
 
 /// A stand-in Merge on a mock server, an endpoint registered for it, and one
@@ -282,12 +319,14 @@ struct Merge {
     kek: Kek,
     server: MockServer,
     endpoint: String,
-    key: String,
+    /// The credential filed under the endpoint, by name, if one is.
+    key: Option<String>,
 }
 
 impl Merge {
-    /// `None` when `OAG_TEST_DATABASE_URL` is unset.
-    async fn start(base_path: &str) -> Option<Self> {
+    /// `None` when `OAG_TEST_DATABASE_URL` is unset. The endpoint takes its key
+    /// as `auth` says, and has one filed under it only when `keyed`.
+    async fn start(base_path: &str, auth: &str, keyed: bool) -> Option<Self> {
         let url = std::env::var("OAG_TEST_DATABASE_URL").ok()?;
         let db = Db::connect(&url, 2).expect("connect");
         db.migrate().await.expect("migrate");
@@ -302,7 +341,7 @@ impl Merge {
                 dialect: "openai",
                 platform: "plain",
                 base_url: Some(&format!("{}{base_path}", server.uri())),
-                auth: "bearer",
+                auth,
                 region: None,
                 project: None,
                 api_version: None,
@@ -313,6 +352,15 @@ impl Merge {
         )
         .await
         .expect("an endpoint");
+        if !keyed {
+            return Some(Self {
+                db,
+                kek,
+                server,
+                endpoint,
+                key: None,
+            });
+        }
         let key = format!("{endpoint}-key");
         let sealed = kek
             .seal_json(&SecretMaterial {
@@ -340,7 +388,7 @@ impl Merge {
             kek,
             server,
             endpoint,
-            key,
+            key: Some(key),
         })
     }
 
@@ -406,14 +454,24 @@ impl Merge {
     }
 }
 
-/// Run `test` against a fresh [`Merge`], and remove what it wrote whether or
-/// not the test passed.
+/// Run `test` against a fresh [`Merge`] that takes a bearer key and has one,
+/// and remove what it wrote whether or not the test passed.
 async fn with_merge<F, Fut>(base_path: &str, test: F)
 where
     F: FnOnce(Arc<Merge>) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let Some(merge) = Merge::start(base_path).await else {
+    with_merge_as(base_path, "bearer", true, test).await;
+}
+
+/// [`with_merge`], for an endpoint that takes its key as `auth` says, with one
+/// filed under it only when `keyed`.
+async fn with_merge_as<F, Fut>(base_path: &str, auth: &str, keyed: bool, test: F)
+where
+    F: FnOnce(Arc<Merge>) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let Some(merge) = Merge::start(base_path, auth, keyed).await else {
         eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
         return;
     };
@@ -546,7 +604,7 @@ async fn a_merge_list_becomes_exact_catalog_rows_and_a_second_sync_changes_nothi
             "found at the origin, not at {{base}}/models"
         );
         assert_eq!(first.pages, 2);
-        assert_eq!(first.account.as_deref(), Some(m.key.as_str()));
+        assert_eq!(first.account.as_deref(), m.key.as_deref());
         assert_eq!(first.price, PriceChoice::Cheapest);
         assert!(!first.dry_run);
         assert_eq!(first.added, [m.id(GLM), m.id(SONNET), m.id(DEEPSEEK)]);
@@ -756,7 +814,7 @@ async fn the_list_discovery_reads_is_reported_beside_the_catalog() {
         assert_eq!(report.url, format!("{}/v1/openai/models", m.server.uri()));
         assert_eq!(report.pages, 1);
         assert!(!report.discover);
-        assert_eq!(report.account.as_deref(), Some(m.key.as_str()));
+        assert_eq!(report.account.as_deref(), m.key.as_deref());
         assert_eq!(
             report.listed,
             [
@@ -765,6 +823,97 @@ async fn the_list_discovery_reads_is_reported_beside_the_catalog() {
             ]
         );
         assert_eq!(report.unlisted, [m.id(SONNET), m.id(DEEPSEEK)]);
+    })
+    .await;
+}
+
+/// Every header a key can ride in.
+const KEY_HEADERS: [&str; 4] = ["authorization", "x-api-key", "x-goog-api-key", "api-key"];
+
+/// An endpoint that takes no key is synced and listed with none filed: the
+/// sync and the list discovery reads both reach it, and no request carries a
+/// key header.
+#[tokio::test]
+async fn an_endpoint_that_takes_no_key_is_read_without_one() {
+    with_merge_as("/v1/openai", "none", false, |m| async move {
+        Mock::given(method("GET"))
+            .and(path("/v1/openai/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list", "data": [{"id": GLM}]
+            })))
+            .mount(&m.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(query_param_is_missing("cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(PAGE_1)))
+            .mount(&m.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .and(query_param("cursor", CURSOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(PAGE_2)))
+            .mount(&m.server)
+            .await;
+
+        let synced = m
+            .sync(SyncOptions::default())
+            .await
+            .expect("synced without a key");
+        assert_eq!(synced.account, None);
+        assert_eq!(synced.added, [m.id(GLM), m.id(SONNET), m.id(DEEPSEEK)]);
+        let listed = super::models(&m.db, &m.kek, &m.endpoint, None)
+            .await
+            .expect("listed without a key");
+        assert_eq!(listed.account, None);
+        assert_eq!(listed.listed, [(GLM.to_owned(), Some(m.id(GLM)))]);
+
+        let sent = m.server.received_requests().await.expect("recording");
+        assert_eq!(
+            sent.len(),
+            4,
+            "the sync's look at {{base}}/models, its two pages, and the list discovery reads"
+        );
+        for request in &sent {
+            for name in KEY_HEADERS {
+                assert!(
+                    request.headers.get(name).is_none(),
+                    "{name} on {}",
+                    request.url
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// An endpoint that takes a key and has none filed is refused, by the sync
+/// and by the list both, before anything is sent to it.
+#[tokio::test]
+async fn an_endpoint_that_takes_a_key_and_has_none_is_refused_before_anything_is_sent() {
+    with_merge_as("/v1/openai", "bearer", false, |m| async move {
+        let refusal = format!(
+            "configuration: endpoint '{0}' has no schedulable credential to read its model list \
+             with; add one with `oag admin account add --provider {0}`, or name one with \
+             --account",
+            m.endpoint
+        );
+        let synced = m
+            .sync(SyncOptions::default())
+            .await
+            .expect_err("no key to read with");
+        assert_eq!(synced.to_string(), refusal);
+        let listed = super::models(&m.db, &m.kek, &m.endpoint, None)
+            .await
+            .expect_err("no key to read with");
+        assert_eq!(listed.to_string(), refusal);
+        assert!(
+            m.server
+                .received_requests()
+                .await
+                .expect("recording")
+                .is_empty()
+        );
     })
     .await;
 }

@@ -311,7 +311,9 @@ impl fmt::Display for Skip {
             Self::Unavailable(status) => write!(f, "the list marks it {status}"),
             Self::NoVendor => f.write_str("no vendor serves it"),
             Self::NotChat(output) => write!(f, "not a chat model: it gives {output}"),
-            Self::NoCallableVendor => f.write_str("every vendor that serves it is unavailable"),
+            Self::NoCallableVendor => {
+                f.write_str("every vendor that serves it for chat is unavailable or needs access")
+            }
             Self::NoPrice => f.write_str("no vendor states a per-token price for it"),
             Self::Free => f.write_str(
                 "listed at zero, which would win every cost comparison; add it with \
@@ -639,16 +641,17 @@ async fn bounded_body(response: &mut reqwest::Response, url: &Url) -> Result<Vec
     Ok(body)
 }
 
+/// The first 300 characters of `body`, marked when it is cut: enough of an
+/// answer to say what sent it, and never a whole page of one in a log line.
 fn snippet(body: &str) -> String {
     const MAX: usize = 300;
-    if body.len() <= MAX {
-        return body.to_owned();
+    let mut chars = body.chars();
+    let head: String = chars.by_ref().take(MAX).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
     }
-    let mut end = MAX;
-    while !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &body[..end])
 }
 
 /// A page's entries: `data` (`OpenAI`, Anthropic, Merge), `models` (Gemini),
@@ -1148,7 +1151,38 @@ mod tests {
             let err = on_origin(&merge, elsewhere).expect_err(elsewhere);
             assert!(err.to_string().contains("origin"), "{elsewhere}: {err}");
         }
-        assert!(on_origin(&merge, "https://u:p@api-gateway.merge.dev/v1/models").is_err());
+        // Each on its own: a user name, a password, a fragment.
+        for carrying in [
+            "https://u@api-gateway.merge.dev/v1/models",
+            "https://:p@api-gateway.merge.dev/v1/models",
+            "https://api-gateway.merge.dev/v1/models#top",
+        ] {
+            assert_eq!(
+                on_origin(&merge, carrying).expect_err(carrying).to_string(),
+                "configuration: the listing URL may not carry credentials or a fragment",
+                "{carrying}"
+            );
+        }
+    }
+
+    /// A URL that names a limit keeps its own, and one that names anything
+    /// else still gets the default beside it.
+    #[test]
+    fn a_default_is_added_only_where_the_url_names_none() {
+        let with = |raw: &str| {
+            with_default(&Url::parse(raw).unwrap(), "limit", "500")
+                .as_str()
+                .to_owned()
+        };
+        assert_eq!(
+            with("https://h.example/m?limit=7"),
+            "https://h.example/m?limit=7"
+        );
+        assert_eq!(
+            with("https://h.example/m?team=a"),
+            "https://h.example/m?team=a&limit=500"
+        );
+        assert_eq!(with("https://h.example/m"), "https://h.example/m?limit=500");
     }
 
     #[test]
@@ -1416,8 +1450,239 @@ mod tests {
         )
         .await
         .expect("read where it was pointed");
+        assert_eq!(
+            listing.url,
+            format!("{}/catalog?limit=7", server.uri()),
+            "its own limit, and no second one"
+        );
         assert_eq!(listing.pages, 1);
         assert_eq!(listing.models.len(), 4);
         server.verify().await;
+    }
+
+    /// An empty list is empty: not a list without prices, which would send
+    /// the operator off to add models one at a time.
+    #[tokio::test]
+    async fn an_empty_list_is_said_to_be_empty() {
+        assert!(matches!(
+            shape(&serde_json::json!({"data": []})),
+            Shape::Empty
+        ));
+        assert!(matches!(
+            shape(&serde_json::json!({"data": [{"id": "m"}]})),
+            Shape::Unpriced
+        ));
+        assert!(matches!(
+            shape(&serde_json::json!({"error": "no"})),
+            Shape::NotAList
+        ));
+
+        let server = MockServer::start().await;
+        let headers = ExtraHeaders::default();
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .mount(&server)
+            .await;
+        let base = format!("{}/v1", server.uri());
+        let err = priced(
+            &source(Dialect::OpenAIChatCompletions, &base, &headers),
+            None,
+            KEY,
+            None,
+        )
+        .await
+        .expect_err("nothing to sync");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "configuration: the model list at {}/v1/models?limit=500 is empty, so nothing \
+                 was written",
+                server.uri()
+            )
+        );
+    }
+
+    /// The cap on one page, to the byte: a page of exactly the cap is read,
+    /// and one byte more is not.
+    #[tokio::test]
+    async fn a_page_is_read_up_to_its_cap_and_not_a_byte_past_it() {
+        let server = MockServer::start().await;
+        for (at, size) in [
+            ("/under", MAX_PAGE_BYTES - 1),
+            ("/at", MAX_PAGE_BYTES),
+            ("/over", MAX_PAGE_BYTES + 1),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(at))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; size]))
+                .mount(&server)
+                .await;
+        }
+        let client = crate::side_channel_client(None, TIMEOUT).unwrap();
+        let read = |at: &'static str| {
+            let url = Url::parse(&format!("{}{at}", server.uri())).unwrap();
+            let request = client.get(url.clone());
+            async move {
+                let mut response = request.send().await.expect("the mock answers");
+                bounded_body(&mut response, &url).await
+            }
+        };
+
+        assert_eq!(read("/under").await.unwrap().len(), MAX_PAGE_BYTES - 1);
+        assert_eq!(read("/at").await.unwrap().len(), MAX_PAGE_BYTES);
+        assert_eq!(
+            read("/over")
+                .await
+                .expect_err("a byte past the cap")
+                .to_string(),
+            format!(
+                "model list {}/over sent a page over 8 MiB; not read",
+                server.uri()
+            )
+        );
+    }
+
+    /// An error carries the head of what came back, cut at a character and
+    /// marked when cut, so a log line names the answer without holding it.
+    #[test]
+    fn a_snippet_is_the_head_of_an_answer_marked_where_it_was_cut() {
+        assert_eq!(snippet(""), "");
+        assert_eq!(snippet("upstream fell over"), "upstream fell over");
+        let exactly = "x".repeat(300);
+        assert_eq!(snippet(&exactly), exactly, "300 is not cut");
+        assert_eq!(snippet(&"x".repeat(301)), format!("{exactly}…"));
+        // Characters, not bytes: a cut never lands inside one.
+        let accented = "é".repeat(301);
+        assert_eq!(snippet(&accented), format!("{}…", "é".repeat(300)));
+    }
+
+    /// The words an operator reads for each skip and each choice, exactly.
+    #[test]
+    fn every_reason_and_every_choice_has_its_own_words() {
+        for (skip, label, says) in [
+            (Skip::Unnamed, "unnamed", "the entry names no model"),
+            (
+                Skip::AccessRequired,
+                "access required",
+                "the list says it needs access this key lacks",
+            ),
+            (
+                Skip::Unavailable("deprecated".to_owned()),
+                "deprecated or unavailable",
+                "the list marks it deprecated",
+            ),
+            (Skip::NoVendor, "no vendor", "no vendor serves it"),
+            (
+                Skip::NotChat("audio".to_owned()),
+                "not a chat model",
+                "not a chat model: it gives audio",
+            ),
+            (
+                Skip::NoCallableVendor,
+                "no available vendor",
+                "every vendor that serves it for chat is unavailable or needs access",
+            ),
+            (
+                Skip::NoPrice,
+                "no per-token price",
+                "no vendor states a per-token price for it",
+            ),
+            (
+                Skip::Free,
+                "listed free",
+                "listed at zero, which would win every cost comparison; add it with \
+                 `oag admin catalog add --free` if that is meant",
+            ),
+        ] {
+            assert_eq!(skip.label(), label, "{skip:?}");
+            assert_eq!(skip.to_string(), says, "{skip:?}");
+        }
+        assert_eq!(PriceChoice::Cheapest.as_str(), "cheapest");
+        assert_eq!(PriceChoice::First.as_str(), "first");
+        assert_eq!(PriceChoice::default(), PriceChoice::Cheapest);
+    }
+
+    /// One vendor offering text in and out at the given prices.
+    fn priced_at(input: f64, output: f64) -> serde_json::Value {
+        serde_json::json!({
+            "capabilities": {"input": ["text"], "output": ["text"]},
+            "pricing": {"input_per_million": input, "output_per_million": output}
+        })
+    }
+
+    /// Zero on one side is a price. Only zero on both is free, and only that
+    /// is kept out of the catalog.
+    #[test]
+    fn a_price_of_zero_on_one_side_is_still_a_price() {
+        for (input, output) in [(0.0, 0.5), (0.5, 0.0)] {
+            let model = listed_model(&serde_json::json!({
+                "model": "t/m", "vendors": {"v": priced_at(input, output)}
+            }));
+            let offer = choose(&model, PriceChoice::Cheapest)
+                .unwrap_or_else(|skip| panic!("{input}/{output}: {skip}"));
+            assert_eq!(
+                (offer.price.input, offer.price.output),
+                (
+                    Decimal::from_str(&input.to_string()).unwrap(),
+                    Decimal::from_str(&output.to_string()).unwrap()
+                )
+            );
+        }
+        let free = listed_model(&serde_json::json!({
+            "model": "t/m", "vendors": {"v": priced_at(0.0, 0.0)}
+        }));
+        assert_eq!(choose(&free, PriceChoice::Cheapest), Err(Skip::Free));
+    }
+
+    /// Cheapest is by what a request costs, input plus output, which is not
+    /// the order their product would give.
+    #[test]
+    fn the_cheapest_vendor_is_the_lowest_total_not_the_lowest_product() {
+        let model = listed_model(&serde_json::json!({
+            "model": "t/m",
+            "vendors": {
+                // Total 10.1, product 1.
+                "lopsided": priced_at(0.1, 10.0),
+                // Total 4, product 4.
+                "even": priced_at(2.0, 2.0)
+            }
+        }));
+        let offer = choose(&model, PriceChoice::Cheapest).expect("priced");
+        assert_eq!(offer.vendor, "even");
+        assert_eq!(
+            choose(&model, PriceChoice::First).expect("priced").vendor,
+            "lopsided"
+        );
+    }
+
+    /// A window is a positive whole number, written as a number or as a
+    /// string of one; anything else is no window, which the sync understates.
+    #[test]
+    fn a_window_is_a_positive_whole_number() {
+        for (value, window) in [
+            (serde_json::json!(131_072), Some(131_072)),
+            (serde_json::json!("200000"), Some(200_000)),
+            (serde_json::json!(" 64000 "), Some(64_000)),
+            (serde_json::json!(1), Some(1)),
+            (serde_json::json!(0), None),
+            (serde_json::json!("0"), None),
+            (serde_json::json!(-5), None),
+            (serde_json::json!(1.5), None),
+            (serde_json::json!(3_000_000_000_u64), None),
+            (serde_json::json!("lots"), None),
+            (serde_json::json!(null), None),
+        ] {
+            assert_eq!(positive(&value), window, "{value}");
+        }
+    }
+
+    /// A bare array is a list too, of names or of entries.
+    #[test]
+    fn a_bare_array_names_models_as_a_list_does() {
+        assert_eq!(
+            page_ids(&serde_json::json!(["m-1", {"id": "m-2"}, "two words"])).unwrap(),
+            ["m-1", "m-2"]
+        );
     }
 }

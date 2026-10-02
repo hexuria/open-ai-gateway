@@ -568,9 +568,10 @@ mod tests {
     }
 
     /// With discovery on, each dialect's adapter answers `served_models` from
-    /// the endpoint's own list, read with the key where the endpoint takes it
-    /// and with the operator's headers. With it off, the adapter answers that
-    /// it cannot be asked, and sends nothing.
+    /// the endpoint's own list, read with the key where the endpoint takes it,
+    /// or with no key at all where it takes none, and with the operator's
+    /// headers. With it off, the adapter answers that it cannot be asked, and
+    /// sends nothing.
     #[tokio::test]
     async fn an_endpoint_that_discovers_reads_its_own_list_and_one_that_does_not_sends_nothing() {
         for (dialect, base_path, list_path, listed) in [
@@ -593,35 +594,49 @@ mod tests {
                 serde_json::json!({"models": [{"name": "models/some-model"}]}),
             ),
         ] {
-            let server = MockServer::start().await;
-            Mock::given(method("GET"))
-                .and(path(list_path))
-                .and(header("x-goog-api-key", KEY))
-                .and(header("x-title", "open-ai-gateway"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(listed))
-                .expect(1)
-                .mount(&server)
-                .await;
-            let name = format!("t6-discover-{}", base_name(dialect));
-            let spec = plain_spec(
-                endpoint(&name, dialect, Platform::Plain),
-                &format!("{}{base_path}", server.uri()),
-                AuthStyle::XGoogApiKey,
-            );
+            for (auth, carrier) in [
+                (AuthStyle::XGoogApiKey, Some("x-goog-api-key")),
+                (AuthStyle::None, None),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path(list_path))
+                    .and(header("x-title", "open-ai-gateway"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(listed.clone()))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let name = format!("t6-d-{}-{}", base_name(dialect), auth.as_str());
+                let spec = plain_spec(
+                    endpoint(&name, dialect, Platform::Plain),
+                    &format!("{}{base_path}", server.uri()),
+                    auth,
+                );
 
-            let off = adapter(&spec.clone()).unwrap();
-            assert_eq!(
-                off.served_models(&credential(), None).await.unwrap(),
-                None,
-                "{name}: not asked to discover"
-            );
-            let on = adapter(&spec.with_discovery(true)).unwrap();
-            assert_eq!(
-                on.served_models(&credential(), None).await.unwrap(),
-                Some(vec!["some-model".to_owned()]),
-                "{name}"
-            );
-            server.verify().await;
+                let off = adapter(&spec.clone()).unwrap();
+                assert_eq!(
+                    off.served_models(&credential(), None).await.unwrap(),
+                    None,
+                    "{name}: not asked to discover"
+                );
+                let on = adapter(&spec.with_discovery(true)).unwrap();
+                assert_eq!(
+                    on.served_models(&credential(), None).await.unwrap(),
+                    Some(vec!["some-model".to_owned()]),
+                    "{name}"
+                );
+                server.verify().await;
+                let sent = server.received_requests().await.expect("recording is on");
+                for key_header in AUTH_HEADERS {
+                    let values: Vec<_> = sent[0].headers.get_all(key_header).iter().collect();
+                    let wanted: Vec<&str> = carrier
+                        .filter(|&c| c == key_header)
+                        .map(|_| KEY)
+                        .into_iter()
+                        .collect();
+                    assert_eq!(values, wanted, "{name}: {key_header}");
+                }
+            }
         }
     }
 
