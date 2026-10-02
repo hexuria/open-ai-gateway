@@ -414,6 +414,55 @@ impl EndpointConfig {
     ///
     /// A refusal's message never quotes an extra header's value: headers are
     /// not for secrets, which is no reason to print one that was put there.
+    ///
+    /// The [`Endpoint`] is made last, once every rule has passed: making one
+    /// keeps its name for the life of the process (see [`Endpoint::new`]), so
+    /// a row refused for any rule must not have made one on the way.
+    pub fn from_columns(columns: &Columns<'_>) -> Result<Self, Refusal> {
+        let checked = CheckedColumns::from_columns(columns)?;
+        let endpoint = Endpoint::new(columns.name, checked.dialect, checked.platform)
+            .map_err(|m| Refusal::new(Reason::Name, m))?;
+        Ok(Self {
+            endpoint,
+            base_url: checked.base_url,
+            auth: checked.auth,
+            region: checked.region,
+            project: checked.project,
+            api_version: checked.api_version,
+            path: checked.path,
+            extra_headers: checked.extra_headers,
+        })
+    }
+}
+
+/// An endpoint row's columns that passed every rule here: an
+/// [`EndpointConfig`] but for its [`Endpoint`], whose name is still the row's
+/// own text.
+///
+/// What a writer checks a row with. Making an `Endpoint` interns its name for
+/// the life of the process, and a row a writer is about to store can still be
+/// refused after these rules, by its headers, by what its base URL resolves
+/// to, or by the database. Each refusal would leave a name behind, and a
+/// caller sending a fresh name with every refused write could grow the
+/// process without bound. Only a row the gateway serves needs an `Endpoint`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedColumns {
+    pub dialect: Dialect,
+    pub platform: Platform,
+    /// As [`EndpointConfig::base_url`].
+    pub base_url: Option<String>,
+    pub auth: AuthStyle,
+    pub region: Option<String>,
+    pub project: Option<String>,
+    pub api_version: Option<String>,
+    pub path: Option<String>,
+    pub extra_headers: Vec<(String, String)>,
+}
+
+impl CheckedColumns {
+    /// `columns`, if they pass every rule [`EndpointConfig::from_columns`]
+    /// applies, which is every one but the interning; or the first they
+    /// break.
     pub fn from_columns(columns: &Columns<'_>) -> Result<Self, Refusal> {
         let dialect = Dialect::from_endpoint_column(columns.dialect)
             .map_err(|m| Refusal::new(Reason::Dialect, m))?;
@@ -431,8 +480,7 @@ impl EndpointConfig {
                 ),
             ));
         }
-        let endpoint = Endpoint::new(columns.name, dialect, platform)
-            .map_err(|m| Refusal::new(Reason::Name, m))?;
+        Endpoint::validate_name(columns.name).map_err(|m| Refusal::new(Reason::Name, m))?;
         let auth: AuthStyle = columns
             .auth
             .parse()
@@ -484,7 +532,8 @@ impl EndpointConfig {
         let path = path(columns.path, dialect, columns.dialect)?;
         let api_version = api_version(columns.api_version, platform)?;
         Ok(Self {
-            endpoint,
+            dialect,
+            platform,
             base_url,
             auth,
             region,
@@ -1574,5 +1623,76 @@ mod tests {
         assert_eq!(Reason::BaseUrl.as_str(), "base_url");
         assert_eq!(Reason::ApiVersion.as_str(), "api_version");
         assert_eq!(Reason::Unsupported.as_str(), "unsupported");
+    }
+
+    /// C14. A row refused for any rule leaves its name out of the interner,
+    /// which keeps every name it is given for the life of the process: a
+    /// caller sending a fresh name with each refused row would otherwise grow
+    /// the process by a name a refusal, for as long as it ran. Only a row that
+    /// passes every rule is interned, and checking one interns nothing.
+    #[test]
+    fn a_refused_row_leaves_no_name_behind() {
+        let headers = json!({"X-Title": "t14"});
+        let not_strings = json!({"X-Title": 7});
+        let good = |name: &'static str| Columns {
+            name,
+            ..plain(&headers)
+        };
+        let refused = [
+            Columns {
+                auth: "nope",
+                ..good("t14-refused-auth")
+            },
+            Columns {
+                base_url: Some("http://169.254.169.254/latest"),
+                ..good("t14-refused-metadata")
+            },
+            Columns {
+                base_url: Some("https://api.openai.com/v1"),
+                ..good("t14-refused-compliance")
+            },
+            Columns {
+                base_url: None,
+                ..good("t14-refused-no-base-url")
+            },
+            Columns {
+                region: Some("Not A Region"),
+                ..good("t14-refused-region")
+            },
+            Columns {
+                path: Some("/v1/decisions"),
+                ..good("t14-refused-path")
+            },
+            Columns {
+                extra_headers: &not_strings,
+                ..good("t14-refused-headers")
+            },
+        ];
+        for columns in &refused {
+            let refusal = EndpointConfig::from_columns(columns).expect_err(columns.name);
+            assert_ne!(refusal.reason, Reason::Name, "{}: {refusal}", columns.name);
+            assert!(
+                !crate::provider::is_interned(columns.name),
+                "{} was refused for its {}, and its name was kept anyway",
+                columns.name,
+                refusal.reason.as_str()
+            );
+        }
+
+        let checked = CheckedColumns::from_columns(&good("t14-checked-only")).expect("a good row");
+        assert_eq!(checked.platform, Platform::Plain);
+        assert!(
+            !crate::provider::is_interned("t14-checked-only"),
+            "checking a row interns nothing"
+        );
+
+        let served = good("t14-served");
+        assert!(!crate::provider::is_interned(served.name));
+        let config = EndpointConfig::from_columns(&served).expect("a good row");
+        assert_eq!(config.endpoint.name(), "t14-served");
+        assert!(
+            crate::provider::is_interned("t14-served"),
+            "a served row is"
+        );
     }
 }

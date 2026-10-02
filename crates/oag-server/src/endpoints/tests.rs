@@ -260,6 +260,37 @@ async fn a_registration_is_refused_before_the_store_unless_every_rule_passes() {
     }
 }
 
+/// C14. A registration refused for any reason leaves no name behind: not
+/// for a rule, not for a header, not for what its base URL resolves to, and
+/// not by the store. The writer checks a row without making it an
+/// `Endpoint`, whose name the process would keep for as long as it ran.
+#[tokio::test]
+async fn a_refused_registration_leaves_no_name_behind() {
+    for refused in [
+        Draft {
+            auth: "nope".to_owned(),
+            ..draft("t14-write-rule")
+        },
+        Draft {
+            extra_headers: json!({"Authorization": "Bearer t14"}),
+            ..draft("t14-write-header")
+        },
+        Draft {
+            base_url: Some("https://t14-no-such-host.invalid/v1".to_owned()),
+            ..draft("t14-write-lookup")
+        },
+        // Every rule passes; the store, a closed port here, refuses it.
+        draft("t14-write-store"),
+    ] {
+        let name = refused.name.clone();
+        let err = register(&nowhere(), refused).await.expect_err(&name);
+        assert!(
+            !oag_core::provider::is_interned(&name),
+            "{name} was refused ({err:?}), and its name was kept anyway"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_change_keeps_what_the_endpoint_is_and_resolves_only_a_new_url() {
     let db = nowhere();

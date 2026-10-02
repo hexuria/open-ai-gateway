@@ -777,14 +777,19 @@ impl Ord for Endpoint {
     }
 }
 
+/// Every name [`intern`] has leaked, once each.
+static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+
 /// One leaked copy of `name`, and the same copy for every call that passes it.
 ///
 /// Leaked so an [`Endpoint`] can be `Copy` and hand out a `&'static str` as
 /// the built-ins do. Bounded because [`Endpoint::new`] is the only caller,
 /// and only with a name it has validated: one copy per distinct endpoint name
-/// this process has ever seen, each at most 32 bytes.
+/// this process has ever seen, each at most 32 bytes. Those are the names of
+/// rows that passed every rule (`EndpointConfig::from_columns` makes the
+/// `Endpoint` last), so a caller cannot grow the set by sending rows that are
+/// refused.
 fn intern(name: &str) -> &'static str {
-    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     let mut names = NAMES
         .get_or_init(Mutex::default)
         .lock()
@@ -795,6 +800,19 @@ fn intern(name: &str) -> &'static str {
     let leaked: &'static str = Box::leak(Box::from(name));
     names.insert(leaked);
     leaked
+}
+
+/// TEST-ONLY: whether this process has interned `name`, so a test can see
+/// that a refused row left nothing behind.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[must_use]
+pub fn is_interned(name: &str) -> bool {
+    NAMES.get().is_some_and(|names| {
+        names
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(name)
+    })
 }
 
 /// The endpoints this process resolves by name: one snapshot, replaced whole.

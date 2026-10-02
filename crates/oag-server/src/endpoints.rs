@@ -3,7 +3,7 @@
 //!
 //! Shared by `oag admin endpoint` and `/admin/api/endpoints`, so the two refuse
 //! the same rows for the same reasons. A write passes every rule the gateway's
-//! reload applies to a row ([`EndpointConfig::from_columns`], then the header
+//! reload applies to a row ([`CheckedColumns::from_columns`], then the header
 //! names [`EndpointSpec::new`] checks) and one the reload cannot: what the base
 //! URL's name resolves to now ([`crate::egress`]). So a row either writer
 //! stores is one the next reload serves, unless this build has no adapter for
@@ -12,7 +12,7 @@
 //! asks one row the reload's own question.
 
 use crate::egress::{deny_resolved_target, validate_endpoint_base_url};
-use oag_core::endpoint::{Columns, EndpointConfig, Reason, Refusal};
+use oag_core::endpoint::{CheckedColumns, Columns, Reason, Refusal};
 use oag_core::provider::{AuthStyle, Platform};
 use oag_store::repo::{self, EndpointUpdate, NewEndpoint};
 use oag_store::{Db, EndpointRow};
@@ -214,6 +214,11 @@ pub async fn change(
 /// Blank optional text is no value at all, the base URL is stored in the
 /// normalised form the reload would give it, and the headers must be ones
 /// the adapter will send.
+///
+/// Checked without making the row an `Endpoint`, which would intern its name
+/// for the life of the process: a write refused here, by the lookup after
+/// this, or by the database leaves nothing behind. The reload makes the
+/// `Endpoint` once the row is stored and served.
 fn checked(mut draft: Draft) -> Result<(Draft, Platform), String> {
     for field in [
         &mut draft.base_url,
@@ -225,19 +230,18 @@ fn checked(mut draft: Draft) -> Result<(Draft, Platform), String> {
         *field = present(field.as_deref());
     }
     draft.display_name = display_name(draft.display_name.as_deref())?;
-    let config =
-        EndpointConfig::from_columns(&draft.columns()).map_err(|refusal| refusal.message)?;
-    EndpointSpec::new(
-        config.endpoint,
-        config.base_url.clone().unwrap_or_default(),
-        config.auth,
-        config
+    let checked =
+        CheckedColumns::from_columns(&draft.columns()).map_err(|refusal| refusal.message)?;
+    EndpointSpec::check_extra_headers(
+        &draft.name,
+        checked.platform,
+        checked
             .extra_headers
             .iter()
             .map(|(name, value)| (name, value)),
     )?;
-    draft.base_url = config.base_url;
-    Ok((draft, config.endpoint.platform()))
+    draft.base_url = checked.base_url;
+    Ok((draft, checked.platform))
 }
 
 /// What `value` says once trimmed, if it says anything.

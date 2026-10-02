@@ -101,6 +101,28 @@ impl EndpointSpec {
         })
     }
 
+    /// Whether `pairs` are headers an endpoint named `name` on `platform` may
+    /// add: judged as [`EndpointSpec::new`] judges them, refused in the same
+    /// words, and with no [`Endpoint`] to build a spec for.
+    ///
+    /// For a writer checking a row it has not stored yet. Making an `Endpoint`
+    /// interns its name for the life of the process, and a write refused after
+    /// this, by the address its base URL resolves to or by the database, must
+    /// leave nothing behind (see `oag_core::endpoint::CheckedColumns`).
+    pub fn check_extra_headers<K, V>(
+        name: &str,
+        platform: Platform,
+        pairs: impl IntoIterator<Item = (K, V)>,
+    ) -> std::result::Result<(), String>
+    where
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        ExtraHeaders::parse(pairs, platform)
+            .map(|_| ())
+            .map_err(|e| format!("endpoint `{name}`: {e}"))
+    }
+
     /// This spec, with its adapter asked for the models each key serves when
     /// `discover` is set: see [`crate::listing::served`]. Off by default, so an
     /// endpoint whose operator did not ask is never sent a request the gateway
