@@ -2945,7 +2945,9 @@ async fn the_catalog_select_matches_the_schema() {
 /// 0018: the database refuses a Claude subscription that could serve, and the
 /// kinds no adapter ever served, whatever wrote the row. Each refusal names the
 /// constraint it trips, so a constraint dropped by a later migration fails here
-/// by name rather than by a count.
+/// by name rather than by a count. 0020 took `service_account` back for Vertex,
+/// which leaves `vertex` as the dead kind. Every kind the column admits is
+/// written once at the end, so a later migration that drops one fails here.
 #[tokio::test]
 async fn the_schema_refuses_a_claude_subscription_that_can_serve_and_a_dead_kind() {
     let Some(db) = test_db() else {
@@ -2983,7 +2985,6 @@ async fn the_schema_refuses_a_claude_subscription_that_can_serve_and_a_dead_kind
             "account_claude_subscription_never_serves",
         ),
         ("gemini", "vertex", "account_kind_check"),
-        ("openai", "service_account", "account_kind_check"),
     ] {
         let refused = insert(provider, kind, true)
             .await
@@ -3011,7 +3012,12 @@ async fn the_schema_refuses_a_claude_subscription_that_can_serve_and_a_dead_kind
         "{switched_on}"
     );
 
-    for (provider, kind) in [("anthropic", "api_key"), ("xai", "oauth")] {
+    for (provider, kind) in [
+        ("anthropic", "api_key"),
+        ("xai", "oauth"),
+        ("bedrock", "bedrock"),
+        ("vertex-eu", "service_account"),
+    ] {
         insert(provider, kind, true)
             .await
             .unwrap_or_else(|e| panic!("{provider}/{kind}: {e}"));
@@ -3364,4 +3370,868 @@ async fn the_usage_sweep_holds_owned_enabled_seats() {
         .collect();
     assert!(swept.contains(&live), "an owned, enabled seat is polled");
     assert!(!swept.contains(&off), "a disabled seat is not");
+}
+
+/// A fresh endpoint name that fits 0020's pattern.
+fn endpoint_name() -> String {
+    format!("t{}", &Uuid::new_v4().simple().to_string()[..20])
+}
+
+/// A `plain` OpenAI-shaped endpoint that every CHECK accepts. Each refusal case
+/// starts from it and breaks one rule.
+fn plain_endpoint<'a>(name: &'a str, headers: &'a serde_json::Value) -> NewEndpoint<'a> {
+    NewEndpoint {
+        name,
+        dialect: "openai",
+        platform: "plain",
+        base_url: Some("https://llm.example.test/v1"),
+        auth: "bearer",
+        region: None,
+        project: None,
+        api_version: None,
+        extra_headers: headers,
+        display_name: None,
+        discover_models: false,
+    }
+}
+
+/// 0020: each CHECK on `endpoint` refuses what it exists to refuse, and the
+/// refusal says which check it was. Each case breaks one rule and keeps the
+/// rest, and the assertion is on the constraint's name, so a CHECK that stopped
+/// refusing shows up as another name or as an insert that went through. Where
+/// one bad value breaks two rules (an unknown dialect is outside the matrix
+/// too), Postgres runs CHECKs in name order and reports the first failure,
+/// which is the column's own check.
+///
+/// The second half inserts every pair the matrix serves. Without it, a CHECK
+/// that refused everything would pass the first half.
+// Long because it is a table of cases; split, each half would repeat the
+// fixture the other needs.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn each_endpoint_check_refuses_what_the_matrix_does_not_serve() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let name = endpoint_name();
+    let object = serde_json::json!({});
+    let array = serde_json::json!(["x-org", "acme"]);
+    let string = serde_json::json!("x-org: acme");
+    let null = serde_json::Value::Null;
+    let too_long = "a".repeat(33);
+    let ok = plain_endpoint(&name, &object);
+    let pair = "endpoint_platform_dialect_check";
+    let base_url = "endpoint_base_url_check";
+    let headers = "endpoint_extra_headers_check";
+
+    let refused = [
+        (
+            "an upper-case name",
+            NewEndpoint {
+                name: "Groq",
+                ..ok.clone()
+            },
+            "endpoint_name_check",
+        ),
+        (
+            "a name led by a hyphen",
+            NewEndpoint {
+                name: "-groq",
+                ..ok.clone()
+            },
+            "endpoint_name_check",
+        ),
+        (
+            "a name with a slash in it",
+            NewEndpoint {
+                name: "groq/eu",
+                ..ok.clone()
+            },
+            "endpoint_name_check",
+        ),
+        (
+            "a 33-character name",
+            NewEndpoint {
+                name: &too_long,
+                ..ok.clone()
+            },
+            "endpoint_name_check",
+        ),
+        (
+            "an empty name",
+            NewEndpoint {
+                name: "",
+                ..ok.clone()
+            },
+            "endpoint_name_check",
+        ),
+        (
+            "an unknown dialect",
+            NewEndpoint {
+                dialect: "cohere",
+                ..ok.clone()
+            },
+            "endpoint_dialect_check",
+        ),
+        (
+            "an unknown platform",
+            NewEndpoint {
+                platform: "oracle",
+                ..ok.clone()
+            },
+            "endpoint_platform_check",
+        ),
+        (
+            "an unknown auth style",
+            NewEndpoint {
+                auth: "basic",
+                ..ok.clone()
+            },
+            "endpoint_auth_check",
+        ),
+        (
+            "azure serving gemini",
+            NewEndpoint {
+                platform: "azure",
+                dialect: "gemini",
+                ..ok.clone()
+            },
+            pair,
+        ),
+        (
+            "azure serving anthropic",
+            NewEndpoint {
+                platform: "azure",
+                dialect: "anthropic",
+                ..ok.clone()
+            },
+            pair,
+        ),
+        (
+            "plain serving bedrock_converse",
+            NewEndpoint {
+                dialect: "bedrock_converse",
+                ..ok.clone()
+            },
+            pair,
+        ),
+        (
+            "aws serving openai",
+            NewEndpoint {
+                platform: "aws",
+                region: Some("us-east-1"),
+                ..ok.clone()
+            },
+            pair,
+        ),
+        (
+            "gcp serving system_one",
+            NewEndpoint {
+                platform: "gcp",
+                dialect: "system_one",
+                region: Some("us-central1"),
+                project: Some("acme"),
+                ..ok.clone()
+            },
+            pair,
+        ),
+        (
+            "plain without a base_url",
+            NewEndpoint {
+                base_url: None,
+                ..ok.clone()
+            },
+            base_url,
+        ),
+        (
+            "azure without a base_url",
+            NewEndpoint {
+                platform: "azure",
+                base_url: None,
+                ..ok.clone()
+            },
+            base_url,
+        ),
+        (
+            "a base_url with a query",
+            NewEndpoint {
+                base_url: Some("https://llm.example.test/v1?api-version=1"),
+                ..ok.clone()
+            },
+            base_url,
+        ),
+        (
+            "a base_url with a fragment",
+            NewEndpoint {
+                base_url: Some("https://llm.example.test/v1#top"),
+                ..ok.clone()
+            },
+            base_url,
+        ),
+        (
+            "a base_url that is not http",
+            NewEndpoint {
+                base_url: Some("ftp://llm.example.test/v1"),
+                ..ok.clone()
+            },
+            base_url,
+        ),
+        (
+            "a base_url with no scheme",
+            NewEndpoint {
+                base_url: Some("llm.example.test/v1"),
+                ..ok.clone()
+            },
+            base_url,
+        ),
+        (
+            "aws without a region",
+            NewEndpoint {
+                platform: "aws",
+                dialect: "anthropic",
+                base_url: None,
+                ..ok.clone()
+            },
+            "endpoint_region_check",
+        ),
+        (
+            "gcp without a region",
+            NewEndpoint {
+                platform: "gcp",
+                dialect: "gemini",
+                base_url: None,
+                project: Some("acme"),
+                ..ok.clone()
+            },
+            "endpoint_region_check",
+        ),
+        (
+            "gcp without a project",
+            NewEndpoint {
+                platform: "gcp",
+                dialect: "gemini",
+                base_url: None,
+                region: Some("us-central1"),
+                ..ok.clone()
+            },
+            "endpoint_project_check",
+        ),
+        (
+            "headers as an array",
+            NewEndpoint {
+                extra_headers: &array,
+                ..ok.clone()
+            },
+            headers,
+        ),
+        (
+            "headers as a string",
+            NewEndpoint {
+                extra_headers: &string,
+                ..ok.clone()
+            },
+            headers,
+        ),
+        (
+            "headers as JSON null",
+            NewEndpoint {
+                extra_headers: &null,
+                ..ok.clone()
+            },
+            headers,
+        ),
+    ];
+    for (what, row, constraint) in refused {
+        match insert_endpoint(&db, &row).await {
+            Err(Error::Config(message)) => assert!(
+                message.contains(constraint),
+                "{what} tripped the wrong thing: {message}"
+            ),
+            Err(other) => panic!("{what} must be a Config error: {other}"),
+            Ok(_) => panic!("{what} was stored"),
+        }
+    }
+
+    // A full UUID is 32 characters, the most a name may have.
+    let longest = Uuid::new_v4().simple().to_string();
+    let marked = format!("{}_a-b", &Uuid::new_v4().simple().to_string()[..20]);
+    let names: Vec<String> = (0..7).map(|_| endpoint_name()).collect();
+    let served = [
+        NewEndpoint {
+            name: &longest,
+            ..ok.clone()
+        },
+        NewEndpoint {
+            name: &marked,
+            dialect: "anthropic",
+            auth: "x_api_key",
+            ..ok.clone()
+        },
+        NewEndpoint {
+            name: &names[0],
+            dialect: "gemini",
+            auth: "x_goog_api_key",
+            ..ok.clone()
+        },
+        NewEndpoint {
+            name: &names[1],
+            dialect: "system_one",
+            base_url: Some("http://127.0.0.1:9"),
+            auth: "none",
+            ..ok.clone()
+        },
+        NewEndpoint {
+            name: &names[2],
+            platform: "azure",
+            base_url: Some("https://acme.openai.azure.com"),
+            auth: "api_key_header",
+            api_version: Some("2024-10-21"),
+            ..ok.clone()
+        },
+        NewEndpoint {
+            name: &names[3],
+            platform: "aws",
+            dialect: "anthropic",
+            base_url: None,
+            region: Some("us-east-1"),
+            ..ok.clone()
+        },
+        NewEndpoint {
+            name: &names[4],
+            platform: "aws",
+            dialect: "bedrock_converse",
+            region: Some("eu-west-1"),
+            ..ok.clone()
+        },
+        NewEndpoint {
+            name: &names[5],
+            platform: "gcp",
+            dialect: "gemini",
+            base_url: None,
+            region: Some("global"),
+            project: Some("acme-prod"),
+            ..ok.clone()
+        },
+        NewEndpoint {
+            name: &names[6],
+            platform: "gcp",
+            dialect: "anthropic",
+            base_url: None,
+            region: Some("us-east5"),
+            project: Some("acme-prod"),
+            ..ok.clone()
+        },
+    ];
+    for row in served {
+        insert_endpoint(&db, &row).await.unwrap_or_else(|e| {
+            panic!(
+                "{} ({} on {}) must be stored: {e}",
+                row.name, row.dialect, row.platform
+            )
+        });
+    }
+}
+
+/// Insert, read back, list and update. Every column survives the trip. An
+/// update replaces the settings and stamps `updated_at`, and the dialect and
+/// platform stay what they were, because `EndpointUpdate` has no field for
+/// either. A hand-written row gets the schema's defaults.
+// Long because it walks one endpoint through its whole life; split, every
+// part would need the insert that the first part makes.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let name = endpoint_name();
+    let headers = serde_json::json!({ "x-org": "acme" });
+    let row = insert_endpoint(
+        &db,
+        &NewEndpoint {
+            name: &name,
+            dialect: "anthropic",
+            platform: "plain",
+            base_url: Some("https://llm.example.test/v1"),
+            auth: "x_api_key",
+            region: Some("eu"),
+            project: Some("acme"),
+            api_version: Some("2023-06-01"),
+            extra_headers: &headers,
+            display_name: Some("Example"),
+            discover_models: true,
+        },
+    )
+    .await
+    .expect("insert");
+    assert_eq!(
+        (
+            row.name.as_str(),
+            row.dialect.as_str(),
+            row.platform.as_str(),
+            row.base_url.as_deref(),
+            row.auth.as_str(),
+            row.region.as_deref(),
+            row.project.as_deref(),
+            row.api_version.as_deref(),
+            &row.extra_headers,
+            row.display_name.as_deref(),
+            row.discover_models,
+        ),
+        (
+            name.as_str(),
+            "anthropic",
+            "plain",
+            Some("https://llm.example.test/v1"),
+            "x_api_key",
+            Some("eu"),
+            Some("acme"),
+            Some("2023-06-01"),
+            &headers,
+            Some("Example"),
+            true,
+        )
+    );
+    assert_eq!(
+        get_endpoint(&db, &name).await.expect("get"),
+        Some(row.clone())
+    );
+    assert!(
+        list_endpoints(&db).await.expect("list").contains(&row),
+        "a registered endpoint is listed"
+    );
+
+    let taken = insert_endpoint(&db, &plain_endpoint(&name, &headers))
+        .await
+        .expect_err("a second endpoint under a taken name");
+    assert!(
+        matches!(&taken, Error::Config(m) if m.contains("already exists")),
+        "{taken}"
+    );
+
+    // Backdated, so the stamp the update writes shows whatever the clock's
+    // resolution.
+    sqlx::query("UPDATE endpoint SET updated_at = '2000-01-01T00:00:00Z' WHERE name = $1")
+        .bind(&name)
+        .execute(db.pool())
+        .await
+        .expect("backdate");
+    let beta = serde_json::json!({ "anthropic-beta": "tools-2024-04-04" });
+    let settings = EndpointUpdate {
+        base_url: Some("https://eu.llm.example.test"),
+        auth: "bearer",
+        region: None,
+        project: None,
+        api_version: None,
+        extra_headers: &beta,
+        display_name: None,
+        discover_models: false,
+    };
+    let updated = update_endpoint(&db, &name, &settings)
+        .await
+        .expect("update")
+        .expect("exists");
+    assert_eq!(
+        (updated.dialect.as_str(), updated.platform.as_str()),
+        ("anthropic", "plain"),
+        "an update never changes what the endpoint is"
+    );
+    assert_eq!(
+        (
+            updated.base_url.as_deref(),
+            updated.auth.as_str(),
+            updated.region.as_deref(),
+            updated.project.as_deref(),
+            updated.api_version.as_deref(),
+            &updated.extra_headers,
+            updated.display_name.as_deref(),
+            updated.discover_models,
+        ),
+        (
+            Some("https://eu.llm.example.test"),
+            "bearer",
+            None,
+            None,
+            None,
+            &beta,
+            None,
+            false,
+        ),
+        "every setting is replaced, the cleared ones included"
+    );
+    assert_eq!(updated.created_at, row.created_at);
+    assert!(
+        updated.updated_at >= row.created_at,
+        "the update stamps updated_at: {}",
+        updated.updated_at
+    );
+    assert_eq!(
+        get_endpoint(&db, &name).await.expect("get"),
+        Some(updated.clone())
+    );
+
+    let refused = update_endpoint(
+        &db,
+        &name,
+        &EndpointUpdate {
+            base_url: None,
+            ..settings.clone()
+        },
+    )
+    .await
+    .expect_err("a plain endpoint without a base_url");
+    assert!(
+        matches!(&refused, Error::Config(m) if m.contains("endpoint_base_url_check")),
+        "{refused}"
+    );
+    assert_eq!(
+        get_endpoint(&db, &name).await.expect("get"),
+        Some(updated),
+        "a refused update changes nothing"
+    );
+
+    let nobody = endpoint_name();
+    assert_eq!(
+        update_endpoint(&db, &nobody, &settings)
+            .await
+            .expect("update"),
+        None
+    );
+    assert_eq!(get_endpoint(&db, &nobody).await.expect("get"), None);
+
+    let bare = endpoint_name();
+    sqlx::query(
+        "INSERT INTO endpoint (name, dialect, base_url) \
+         VALUES ($1, 'openai', 'https://llm.example.test')",
+    )
+    .bind(&bare)
+    .execute(db.pool())
+    .await
+    .expect("a row with only the columns that have no default");
+    let defaults = get_endpoint(&db, &bare)
+        .await
+        .expect("get")
+        .expect("exists");
+    assert_eq!(
+        (
+            defaults.platform.as_str(),
+            defaults.auth.as_str(),
+            &defaults.extra_headers,
+            defaults.discover_models,
+        ),
+        ("plain", "bearer", &serde_json::json!({}), false)
+    );
+}
+
+/// A credential or a catalog model that names an endpoint keeps it. The delete
+/// is refused, reports what holds the endpoint, and removes nothing. Once
+/// both are gone the endpoint goes, and a second delete finds nothing.
+#[tokio::test]
+async fn an_endpoint_that_a_credential_or_a_model_names_is_not_deleted() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let name = endpoint_name();
+    let headers = serde_json::json!({});
+    insert_endpoint(&db, &plain_endpoint(&name, &headers))
+        .await
+        .expect("insert");
+
+    let account: Uuid = sqlx::query_scalar(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+         VALUES (gen_random_uuid(), $1, $2, 'api_key', '\\x00', '\\x00') RETURNING id",
+    )
+    .bind(format!("key-{name}"))
+    .bind(&name)
+    .fetch_one(db.pool())
+    .await
+    .expect("a key for it");
+    assert_eq!(
+        delete_endpoint(&db, &name).await.expect("delete"),
+        EndpointDeletion::InUse {
+            accounts: 1,
+            models: 0
+        }
+    );
+    assert!(
+        get_endpoint(&db, &name).await.expect("get").is_some(),
+        "a refused delete removes nothing"
+    );
+
+    let model = format!("{name}/llama");
+    upsert_model(
+        &db,
+        &ModelRow {
+            provider: name.clone(),
+            ..seed_model(&model, dec!(0.10))
+        },
+        true,
+    )
+    .await
+    .expect("a model on it");
+    assert_eq!(
+        delete_endpoint(&db, &name).await.expect("delete"),
+        EndpointDeletion::InUse {
+            accounts: 1,
+            models: 1
+        }
+    );
+
+    sqlx::query("DELETE FROM account WHERE id = $1")
+        .bind(account)
+        .execute(db.pool())
+        .await
+        .expect("remove the key");
+    assert_eq!(
+        delete_endpoint(&db, &name).await.expect("delete"),
+        EndpointDeletion::InUse {
+            accounts: 0,
+            models: 1
+        },
+        "a model alone holds it"
+    );
+
+    sqlx::query("DELETE FROM model_catalog WHERE id = $1")
+        .bind(&model)
+        .execute(db.pool())
+        .await
+        .expect("remove the model");
+    assert_eq!(
+        delete_endpoint(&db, &name).await.expect("delete"),
+        EndpointDeletion::Deleted
+    );
+    assert_eq!(get_endpoint(&db, &name).await.expect("get"), None);
+    assert_eq!(
+        delete_endpoint(&db, &name).await.expect("delete"),
+        EndpointDeletion::NotFound
+    );
+}
+
+/// The two tables whose `provider` can name an endpoint, and a write to each.
+const WRITES_NAMING_AN_ENDPOINT: [(&str, &str); 2] = [
+    (
+        "account",
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+         VALUES (gen_random_uuid(), 'race-' || gen_random_uuid(), $1, 'api_key', '\\x00', '\\x00')",
+    ),
+    (
+        "model_catalog",
+        "INSERT INTO model_catalog (id, provider, upstream_name, input_per_mtok, \
+         output_per_mtok, context_window, max_output_tokens) \
+         VALUES ($1 || '/race-' || gen_random_uuid(), $1, 'race', 0, 0, 1, 1)",
+    ),
+];
+
+/// Wait until backend `waiter` is blocked by backend `holder`. Returns false if
+/// it never is, and the caller turns that into a failure: a race test whose
+/// interleaving never happened has proved nothing.
+///
+/// Blocked by that backend in particular, not merely waiting on some lock. A
+/// sibling test that holds `account` locked (the legacy-seat test disables a
+/// trigger inside its transaction) would otherwise count as the wait this is
+/// looking for.
+async fn blocked_by(db: &Db, waiter: i32, holder: i32) -> bool {
+    for _ in 0..400 {
+        let blocked: bool = sqlx::query_scalar("SELECT $2 = ANY (pg_blocking_pids($1))")
+            .bind(waiter)
+            .bind(holder)
+            .fetch_one(db.pool())
+            .await
+            .expect("pg_blocking_pids");
+        if blocked {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// 0020's `endpoint_reference_holds`, with the delete first. A credential or a
+/// model written while `delete_endpoint` holds the endpoint's row waits for
+/// the delete to finish, and is then refused, because the row it names is
+/// gone. Without the trigger, the write would not wait, and would land naming
+/// nothing.
+///
+/// The delete is done by hand and stopped between its lock and its commit,
+/// because what is being tested is a write that arrives in that gap.
+#[tokio::test]
+async fn a_write_naming_an_endpoint_being_deleted_waits_and_is_refused() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 4).expect("connect");
+    db.migrate().await.expect("migrate");
+    for (table, write) in WRITES_NAMING_AN_ENDPOINT {
+        let name = endpoint_name();
+        let headers = serde_json::json!({});
+        insert_endpoint(&db, &plain_endpoint(&name, &headers))
+            .await
+            .expect("insert");
+
+        // What `delete_endpoint` takes first, held open.
+        let mut deleter = db.pool().begin().await.expect("begin");
+        let deleter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *deleter)
+            .await
+            .expect("pid");
+        sqlx::query("SELECT name FROM endpoint WHERE name = $1 FOR UPDATE")
+            .bind(&name)
+            .execute(&mut *deleter)
+            .await
+            .expect("lock");
+
+        let mut writer = db.pool().acquire().await.expect("a connection");
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *writer)
+            .await
+            .expect("pid");
+        let written = tokio::spawn({
+            let name = name.clone();
+            async move {
+                sqlx::query(write)
+                    .bind(&name)
+                    .execute(&mut *writer)
+                    .await
+                    .map(|_| ())
+            }
+        });
+        assert!(
+            blocked_by(&db, writer_pid, deleter_pid).await,
+            "the {table} write never waited for the delete, so this run proved nothing"
+        );
+
+        sqlx::query("DELETE FROM endpoint WHERE name = $1")
+            .bind(&name)
+            .execute(&mut *deleter)
+            .await
+            .expect("delete");
+        deleter.commit().await.expect("commit");
+
+        let refused = written
+            .await
+            .expect("task")
+            .expect_err(&format!("a {table} row naming a deleted endpoint"));
+        assert!(
+            refused.to_string().contains("endpoint_reference_holds"),
+            "{table}: {refused}"
+        );
+        let stranded: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM account WHERE provider = $1) \
+                  + (SELECT count(*) FROM model_catalog WHERE provider = $1)",
+        )
+        .bind(&name)
+        .fetch_one(db.pool())
+        .await
+        .expect("count");
+        assert_eq!(stranded, 0, "{table}: nothing names the deleted endpoint");
+    }
+}
+
+/// The same race with the write first. `delete_endpoint` waits for a write that
+/// named the endpoint before the delete arrived, and then counts it and
+/// refuses. If either the trigger's lock or the delete's `FOR UPDATE` were
+/// missing, the delete would not wait. It would read the uncommitted row as
+/// absent and remove an endpoint that a row committed a moment later still
+/// names.
+#[tokio::test]
+async fn a_delete_waits_for_a_write_naming_the_endpoint_and_then_refuses() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 4).expect("connect");
+    db.migrate().await.expect("migrate");
+    for (table, write) in WRITES_NAMING_AN_ENDPOINT {
+        let name = endpoint_name();
+        let headers = serde_json::json!({});
+        insert_endpoint(&db, &plain_endpoint(&name, &headers))
+            .await
+            .expect("insert");
+
+        let mut writer = db.pool().begin().await.expect("begin");
+        let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *writer)
+            .await
+            .expect("pid");
+        sqlx::query(write)
+            .bind(&name)
+            .execute(&mut *writer)
+            .await
+            .expect("the write, not yet committed");
+
+        // One connection, so the backend asked here is the one the delete
+        // runs on.
+        let deleter = Db::connect(&url, 1).expect("connect");
+        let deleter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(deleter.pool())
+            .await
+            .expect("pid");
+        let deletion = tokio::spawn({
+            let name = name.clone();
+            async move { delete_endpoint(&deleter, &name).await }
+        });
+        assert!(
+            blocked_by(&db, deleter_pid, writer_pid).await,
+            "the delete never waited for the {table} write, so this run proved nothing"
+        );
+
+        writer.commit().await.expect("commit");
+        let held = if table == "account" {
+            EndpointDeletion::InUse {
+                accounts: 1,
+                models: 0,
+            }
+        } else {
+            EndpointDeletion::InUse {
+                accounts: 0,
+                models: 1,
+            }
+        };
+        assert_eq!(
+            deletion.await.expect("task").expect("delete"),
+            held,
+            "{table}"
+        );
+        assert!(
+            get_endpoint(&db, &name).await.expect("get").is_some(),
+            "{table}: an endpoint a committed row names is still there"
+        );
+    }
+}
+
+/// 0019 and 0020 together: a `service_account` credential can be written again,
+/// with no owner. It is an organisation's credential, pooled the way an API key
+/// is, so 0019's seat trigger, which asks only `oauth` rows for an owner, does
+/// not stop it.
+#[tokio::test]
+async fn a_service_account_credential_needs_no_owner() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+         VALUES (gen_random_uuid(), $1, 'vertex-eu', 'service_account', '\\x00', '\\x00') \
+         RETURNING id",
+    )
+    .bind(format!("sa-{}", Uuid::new_v4()))
+    .fetch_one(db.pool())
+    .await
+    .expect("a pooled service account");
+    let row = account_by_id(&db, AccountId::from_uuid(id))
+        .await
+        .expect("load")
+        .expect("exists");
+    assert_eq!(
+        (row.kind.as_str(), row.owner_principal_id),
+        ("service_account", None)
+    );
 }
