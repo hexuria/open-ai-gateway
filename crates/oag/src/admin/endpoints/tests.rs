@@ -169,6 +169,27 @@ fn a_header_is_its_name_and_everything_after_the_first_equals_sign() {
     }
 }
 
+/// Any one setting, given alone, is a change: none of them is read only in
+/// company with another.
+#[test]
+fn each_setting_alone_is_a_change() {
+    for one in [
+        &["--base-url", "http://127.0.0.1:10/v1"][..],
+        &["--auth", "none"],
+        &["--header", "x-team=core"],
+        &["--unset-header", "X-Project-Id"],
+        &["--region", "us-central1"],
+        &["--project", "oag-test"],
+        &["--api-version", "2024-10-21"],
+        &["--path", "/v1/decisions"],
+        &["--display-name", "Merge EU"],
+        &["--discover", "true"],
+    ] {
+        let mut draft = Draft::from_row(&stored());
+        apply(&mut draft, set_args(one)).unwrap_or_else(|e| panic!("{one:?} alone: {e}"));
+    }
+}
+
 #[test]
 fn a_set_changes_only_what_it_names() {
     let mut draft = Draft::from_row(&stored());
