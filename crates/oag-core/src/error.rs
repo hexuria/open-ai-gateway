@@ -192,6 +192,22 @@ pub enum Error {
     #[error("upstream sent no response within {after:?}")]
     UpstreamTimeout { after: Duration },
 
+    /// The credential could not be made into one a request can carry: the
+    /// exchange that turns what is stored into what is sent failed. Today
+    /// that is a Vertex service account whose key Google's token endpoint
+    /// would not trade for an access token, or a token endpoint that could
+    /// not be reached.
+    ///
+    /// Not [`Error::Internal`]: nothing in the gateway is broken, so the
+    /// client is told the upstream is unavailable (503), not that the gateway
+    /// failed (500). `lasting` says whether the credential itself is at fault
+    /// (a key that cannot be read, or one Google refused) or only the way to
+    /// it, and so how long the credential sits out: see
+    /// [`Error::disposition`]. `reason` holds no secret: whoever builds this
+    /// keeps the key, the assertion and any token out of it.
+    #[error("the upstream is unavailable: {reason}")]
+    UpstreamUnavailable { reason: String, lasting: bool },
+
     /// A System One request reached a route that holds no credential for the
     /// System One provider it names: Jev, unless its model names a System One
     /// endpoint.
@@ -314,10 +330,19 @@ impl Error {
             },
             // A provider that accepts and then says nothing is behaving like
             // a 5xx that never arrived: try another credential, and give this
-            // one the same short cooldown a 503 would earn.
-            Self::UpstreamTimeout { .. } => Disposition::FailoverAccount {
-                cooldown: Duration::from_secs(30),
-            },
+            // one the same short cooldown a 503 would earn. So is a token
+            // endpoint that did not answer for a credential.
+            Self::UpstreamTimeout { .. } | Self::UpstreamUnavailable { lasting: false, .. } => {
+                Disposition::FailoverAccount {
+                    cooldown: Duration::from_secs(30),
+                }
+            }
+            // A credential that cannot be made ready to send because it is
+            // itself at fault, a key Google refuses, sits out as long as a 401
+            // earns.
+            Self::UpstreamUnavailable { lasting: true, .. } => {
+                Disposition::FailoverAccount { cooldown: COOLDOWN }
+            }
             // A reserved-out provider is out for as long as its window lasts,
             // so the only thing that can still serve this request is a rung
             // naming a different one — the same reasoning as an empty pool.
@@ -426,6 +451,10 @@ pub fn every_variant() -> Vec<Error> {
         Error::UpstreamTimeout {
             after: Duration::from_secs(90),
         },
+        Error::UpstreamUnavailable {
+            reason: "the Google token endpoint answered 503 Service Unavailable".to_owned(),
+            lasting: false,
+        },
         Error::SystemOneNotConfigured {
             route: "default".to_owned(),
             provider: Provider::Jev,
@@ -461,6 +490,7 @@ pub fn every_variant() -> Vec<Error> {
             | Error::Upstream { .. }
             | Error::StreamIdle(_)
             | Error::UpstreamTimeout { .. }
+            | Error::UpstreamUnavailable { .. }
             | Error::SystemOneNotConfigured { .. }
             | Error::Serde(_)
             | Error::Internal(_) => {}
@@ -485,6 +515,33 @@ mod tests {
             body: body.to_owned(),
             retry_after: None,
         }
+    }
+
+    /// A credential that cannot be made ready sits out ten minutes when it is
+    /// at fault, and thirty seconds when only the way to its token endpoint
+    /// is: the cooldowns a 401 and a 5xx earn.
+    #[test]
+    fn an_unavailable_upstream_cools_its_credential_down_for_as_long_as_it_says() {
+        let unavailable = |lasting| Error::UpstreamUnavailable {
+            reason: "the Google token endpoint answered 400 Bad Request (invalid_grant)".to_owned(),
+            lasting,
+        };
+        assert_eq!(
+            unavailable(true).disposition(),
+            upstream(401).disposition(),
+            "a refused key"
+        );
+        assert_eq!(
+            unavailable(false).disposition(),
+            upstream(503).disposition(),
+            "an unreachable token endpoint"
+        );
+        assert_eq!(
+            unavailable(true).disposition(),
+            Disposition::FailoverAccount {
+                cooldown: Duration::from_mins(10)
+            }
+        );
     }
 
     /// The match inside `every_variant` proves no variant is missing from its

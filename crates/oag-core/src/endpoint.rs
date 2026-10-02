@@ -122,8 +122,9 @@ pub fn plain_refused_host(url: &Url, platform: Platform) -> Option<&'static str>
 /// on the operator's own network can be registered. Then the compliance
 /// guard, [`plain_refused_host`], and then [`normalise_base_url`]: no query,
 /// no fragment. An azure endpoint's must then be an Azure resource's and
-/// nothing more ([`AZURE_HOSTS`]), so no address of any kind passes there.
-/// No DNS; see the module.
+/// nothing more ([`AZURE_HOSTS`]), so no address of any kind passes there. A
+/// gcp endpoint's must be https, or http only to this machine's loopback
+/// ([`is_https_or_loopback`]). No DNS; see the module.
 ///
 /// What comes back is the URL the parser read, which is the one every rule
 /// judged: scheme and host in lowercase, no default port, the path
@@ -155,7 +156,42 @@ pub fn endpoint_base_url(raw: &str, platform: Platform) -> Result<String, Refusa
     if platform == Platform::Azure {
         return azure_base_url(&url);
     }
+    // Every request a gcp endpoint is sent carries a bearer token minted from
+    // a service account, good for an hour against whatever that account may
+    // reach; over plain http every hop on the way could read it.
+    if platform == Platform::Gcp && !is_https_or_loopback(&url) {
+        return Err(Refusal::new(
+            Reason::BaseUrl,
+            format!(
+                "the base URL is {}, not https: a gcp endpoint's requests carry a bearer \
+                 token minted from a service account, which plain http would show to every \
+                 hop on the way; http is allowed only to this machine's loopback \
+                 (127.0.0.0/8, [::1] or localhost), for a stand-in or a local proxy",
+                url.scheme()
+            ),
+        ));
+    }
     Ok(url.as_str().trim_end_matches('/').to_owned())
+}
+
+/// Whether `url` is https, or http to this machine's own loopback: where a
+/// bearer token, or a signed assertion, may be sent.
+///
+/// Loopback by what the URL says, as every rule here judges a URL: an IPv4
+/// address in `127.0.0.0/8`, `[::1]`, or `localhost`, the name RFC 6761
+/// reserves for it. Nothing is resolved.
+#[must_use]
+pub fn is_https_or_loopback(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => match url.host() {
+            Some(Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(Host::Domain(name)) => name == "localhost",
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 /// The hosts an `azure` endpoint's base URL may name, each with one resource's
@@ -381,6 +417,12 @@ pub fn is_api_version(value: &str) -> bool {
         })
 }
 
+/// The Vertex locations that are multi-regions, each served at a host of its
+/// own, `https://aiplatform.{location}.rep.googleapis.com`, rather than at the
+/// `{region}-aiplatform.googleapis.com` the adapter builds from a region:
+/// <https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations>.
+pub const VERTEX_MULTI_REGIONS: [&str; 2] = ["us", "eu"];
+
 /// An endpoint row's columns, as stored: the store's `EndpointRow` lends
 /// them, and a writer can pass what it is about to insert.
 #[derive(Debug, Clone, Copy)]
@@ -537,6 +579,24 @@ impl CheckedColumns {
                 format!(
                     "region {region:?} is not an AWS region: one is shaped like us-east-1, \
                      two letters, then words, then one digit, each after a `-`"
+                ),
+            ));
+        }
+        // A Vertex multi-region is served at a host of its own, which nothing
+        // builds from the region: without it as the base URL, every request
+        // would go to a host that does not exist.
+        if platform == Platform::Gcp
+            && base_url.is_none()
+            && let Some(location) = region
+                .as_deref()
+                .filter(|region| VERTEX_MULTI_REGIONS.contains(region))
+        {
+            return Err(Refusal::new(
+                Reason::Region,
+                format!(
+                    "region {location:?} is a Vertex multi-region, served at \
+                     https://aiplatform.{location}.rep.googleapis.com rather than at a host \
+                     built from the region: set that as the endpoint's base URL"
                 ),
             ));
         }
@@ -919,6 +979,97 @@ mod tests {
             jev_shaped.path, None,
             "the default is the upstream's to supply"
         );
+    }
+
+    /// A gcp endpoint's every request carries a bearer token minted from a
+    /// service account, so its base URL is https, or http only to this
+    /// machine's own loopback (a stand-in, a local proxy). Judged by what the
+    /// URL says: no DNS.
+    #[test]
+    fn a_gcp_base_url_is_https_or_on_loopback() {
+        let headers = json!({});
+        let gcp = |base_url| Columns {
+            name: "t10-core-gcp-base",
+            dialect: "gemini",
+            platform: "gcp",
+            base_url: Some(base_url),
+            auth: "bearer",
+            region: Some("us-central1"),
+            project: Some("my-project-1"),
+            ..plain(&headers)
+        };
+        for refused in [
+            "http://vertex-proxy.internal",
+            "http://10.0.0.7:8443",
+            "http://us-central1-aiplatform.googleapis.com",
+            "http://localhost.example.test",
+        ] {
+            let refusal = EndpointConfig::from_columns(&gcp(refused)).expect_err(refused);
+            assert_eq!(refusal.reason, Reason::BaseUrl, "{refused}: {refusal}");
+            assert!(refusal.message.contains("https"), "{refusal}");
+        }
+        for served in [
+            "https://psc-vertex.p.googleapis.com",
+            "https://10.0.0.7:8443",
+            "http://127.0.0.1:9",
+            "http://127.8.9.10:9/vertex",
+            "http://[::1]:9",
+            "http://localhost:9",
+        ] {
+            EndpointConfig::from_columns(&gcp(served)).expect(served);
+        }
+        // The other platforms' rules are their own.
+        EndpointConfig::from_columns(&Columns {
+            base_url: Some("http://vertex-proxy.internal"),
+            ..plain(&headers)
+        })
+        .expect("a plain endpoint may be http");
+    }
+
+    /// Vertex serves its `us` and `eu` multi-regions at hosts of their own,
+    /// `aiplatform.{location}.rep.googleapis.com`, and the host the adapter
+    /// builds from a region does not exist for either. A gcp row naming one
+    /// is refused without that host as its base URL, and the refusal names
+    /// it; with it, the row is served.
+    #[test]
+    fn a_vertex_multi_region_needs_its_host_as_the_base_url() {
+        let headers = json!({});
+        for location in ["us", "eu"] {
+            let columns = Columns {
+                name: "t10-core-multi",
+                dialect: "anthropic",
+                platform: "gcp",
+                base_url: None,
+                auth: "bearer",
+                region: Some(location),
+                project: Some("my-project-1"),
+                ..plain(&headers)
+            };
+            let refusal = EndpointConfig::from_columns(&columns).expect_err(location);
+            assert_eq!(refusal.reason, Reason::Region, "{refusal}");
+            let host = format!("https://aiplatform.{location}.rep.googleapis.com");
+            assert!(refusal.message.contains(&host), "{refusal}");
+
+            let config = EndpointConfig::from_columns(&Columns {
+                base_url: Some(&host),
+                ..columns
+            })
+            .expect("with its host");
+            assert_eq!(config.base_url.as_deref(), Some(host.as_str()));
+            assert_eq!(config.region.as_deref(), Some(location));
+        }
+        // A region is a region, and builds its own host.
+        EndpointConfig::from_columns(&Columns {
+            name: "t10-core-region",
+            dialect: "gemini",
+            platform: "gcp",
+            base_url: None,
+            auth: "bearer",
+            region: Some("us-east5"),
+            project: Some("my-project-1"),
+            ..plain(&headers)
+        })
+        .expect("a region");
     }
 
     // Long because it is a table: one row per rule, each a whole set of

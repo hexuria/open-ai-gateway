@@ -165,9 +165,9 @@ async fn a_mint_posts_a_jwt_bearer_grant_signed_by_the_key() {
         json!({
             "iss": EMAIL,
             "scope": "https://www.googleapis.com/auth/cloud-platform",
-            "aud": token_url(&server),
-            "iat": T0,
-            "exp": T0 + 3600,
+            "aud": "https://oauth2.googleapis.com/token",
+            "iat": T0 - 30,
+            "exp": T0 - 30 + 3600,
         })
     );
     assert_eq!(
@@ -256,7 +256,7 @@ async fn a_token_within_five_minutes_of_expiry_is_minted_again() {
     assert_eq!(grants.len(), 2);
     assert_eq!(
         claims(&grants[1])["iat"],
-        T0 + 3300,
+        T0 + 3300 - 30,
         "signed at the new time"
     );
     server.verify().await;
@@ -324,7 +324,10 @@ async fn a_credential_that_is_not_a_service_account_key_is_refused() {
         .token(AccountId::new(), &key.to_string(), None)
         .await
         .expect_err("refused");
-    assert!(matches!(err, Error::Config(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::UpstreamUnavailable { lasting: true, .. }),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("service_account"), "{err}");
     assert_quotes_nothing(&err.to_string(), &[]);
     server.verify().await;
@@ -379,7 +382,10 @@ async fn a_malformed_key_is_refused_without_being_quoted() {
             .token(AccountId::new(), &sa_json, None)
             .await
             .expect_err(case);
-        assert!(matches!(err, Error::Config(_)), "{case}: {err:?}");
+        assert!(
+            matches!(err, Error::UpstreamUnavailable { lasting: true, .. }),
+            "{case}: {err:?}"
+        );
         assert_quotes_nothing(&err.to_string(), &[]);
     }
     server.verify().await;
@@ -399,11 +405,14 @@ async fn a_refused_grant_is_an_error_that_names_the_code() {
         .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect_err("refused");
-    assert!(matches!(err, Error::Internal(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::UpstreamUnavailable { lasting: true, .. }),
+        "Google refused the key: {err:?}"
+    );
     let message = err.to_string();
     assert!(
-        message.contains("400") && message.contains("(invalid_grant)"),
-        "{message}"
+        message.contains("400") && message.contains("(invalid_grant: Invalid JWT Signature.)"),
+        "Google's own words for why: {message}"
     );
     let sent = grants(&server).await;
     assert_quotes_nothing(&message, &[sent[0]["assertion"].as_str()]);
@@ -428,7 +437,10 @@ async fn a_refusal_that_echoes_the_assertion_does_not_get_it_into_the_error() {
         .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect_err("refused");
-    assert!(matches!(err, Error::Internal(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::UpstreamUnavailable { lasting: true, .. }),
+        "{err:?}"
+    );
     let message = err.to_string();
     assert!(message.contains("401"), "{message}");
     let sent = grants(&server).await;
@@ -448,7 +460,10 @@ async fn a_redirect_from_the_token_endpoint_is_not_followed() {
         .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect_err("not followed");
-    assert!(matches!(err, Error::Internal(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::UpstreamUnavailable { lasting: false, .. }),
+        "the way to Google, not the key: {err:?}"
+    );
     let message = err.to_string();
     assert!(
         message.contains("307") && message.contains("not followed"),
@@ -485,14 +500,17 @@ async fn an_answer_that_is_not_a_bearer_token_is_refused_without_quoting_it() {
             .token(AccountId::new(), &key_json().to_string(), None)
             .await
             .expect_err(case);
-        assert!(matches!(err, Error::Internal(_)), "{case}: {err:?}");
+        assert!(
+            matches!(err, Error::UpstreamUnavailable { lasting: false, .. }),
+            "{case}: {err:?}"
+        );
         assert_quotes_nothing(&err.to_string(), &[TOKEN]);
         server.verify().await;
     }
 }
 
 /// The key's own `token_uri` is where whoever wrote the file wants the grant
-/// to go. It goes to the configured endpoint, addressed to it.
+/// to go. It goes to the configured endpoint, addressed to Google's.
 #[tokio::test]
 async fn the_keys_own_token_uri_is_never_used() {
     let theirs = token_endpoint(granted("ya29.theirs"), 0).await;
@@ -505,7 +523,10 @@ async fn the_keys_own_token_uri_is_never_used() {
         .await
         .expect("a token");
     assert_eq!(token, "ya29.ours");
-    assert_eq!(claims(&grants(&ours).await[0])["aud"], token_url(&ours));
+    assert_eq!(
+        claims(&grants(&ours).await[0])["aud"],
+        "https://oauth2.googleapis.com/token"
+    );
     theirs.verify().await;
     ours.verify().await;
 }
@@ -544,8 +565,8 @@ async fn the_default_clock_is_the_system_clock() {
         .as_i64()
         .expect("iat");
     assert!(
-        (before..=after).contains(&iat),
-        "{before} <= {iat} <= {after}"
+        (before - 30..=after - 30).contains(&iat),
+        "{before} - 30 <= {iat} <= {after} - 30"
     );
 }
 
@@ -565,7 +586,10 @@ async fn a_mint_goes_through_the_accounts_proxy() {
         .token(AccountId::new(), &key, None)
         .await
         .expect_err("nothing listens there");
-    assert!(matches!(direct, Error::Internal(_)), "{direct:?}");
+    assert!(
+        matches!(direct, Error::UpstreamUnavailable { lasting: false, .. }),
+        "{direct:?}"
+    );
 
     let token = cache
         .token(AccountId::new(), &key, Some(&proxy.uri()))
@@ -578,7 +602,10 @@ async fn a_mint_goes_through_the_accounts_proxy() {
         CLOSED,
         "the proxy is asked for the token URL itself"
     );
-    assert_eq!(claims(&grants(&proxy).await[0])["aud"], CLOSED);
+    assert_eq!(
+        claims(&grants(&proxy).await[0])["aud"],
+        "https://oauth2.googleapis.com/token"
+    );
     proxy.verify().await;
 }
 
@@ -641,4 +668,299 @@ fn a_key_is_checked_as_the_mint_reads_it_and_names_its_account() {
         assert!(matches!(err, Error::Config(_)), "{case}: {err:?}");
         assert_quotes_nothing(&err.to_string(), &["AIzaSy-not-a-service-account"]);
     }
+}
+
+/// Google's documentation fixes an access token request's audience: "When
+/// making an access token request this value is always
+/// `https://oauth2.googleapis.com/token`". Wherever the grant is posted (a
+/// stand-in here, an egress proxy or a private name for the endpoint in a
+/// deployment), the assertion is addressed to Google's token endpoint, or
+/// Google refuses it.
+#[tokio::test]
+async fn the_assertion_is_addressed_to_google_wherever_it_is_posted() {
+    let server = token_endpoint(granted("ya29.addressed"), 1).await;
+    cache(&server)
+        .token(AccountId::new(), &key_json().to_string(), None)
+        .await
+        .expect("a token");
+    assert_eq!(
+        claims(&grants(&server).await[0])["aud"],
+        "https://oauth2.googleapis.com/token"
+    );
+    server.verify().await;
+}
+
+/// A signed assertion is as good as the key for the hour it is valid, so it
+/// crosses no network in the clear: the token URL is https, or http only to
+/// this machine's own loopback, where a stand-in or a local proxy listens.
+#[test]
+fn a_token_url_off_loopback_must_be_https() {
+    for bad in [
+        "http://oauth2.googleapis.com/token",
+        "http://token-proxy.internal/token",
+        "http://10.0.0.7/token",
+    ] {
+        let err = GcpTokenCache::new(bad).expect_err(bad);
+        assert!(matches!(err, Error::Config(_)), "{bad:?}: {err:?}");
+        assert!(err.to_string().contains("Google token URL"), "{err}");
+    }
+    for good in [
+        DEFAULT_TOKEN_URL,
+        "https://token-proxy.internal/token",
+        "http://127.0.0.1:9/token",
+        "http://[::1]:9/token",
+        "http://localhost:9/token",
+    ] {
+        GcpTokenCache::new(good).expect(good);
+    }
+}
+
+/// A host whose clock runs a little ahead of Google's would sign an `iat`
+/// Google reads as the future, and be refused `invalid_grant`. The assertion
+/// is dated thirty seconds back, and lives the full hour from then.
+#[tokio::test]
+async fn an_assertion_is_dated_thirty_seconds_back_for_an_hour() {
+    let server = token_endpoint(granted("ya29.dated"), 1).await;
+    cache(&server)
+        .token(AccountId::new(), &key_json().to_string(), None)
+        .await
+        .expect("a token");
+    let claims = claims(&grants(&server).await[0]);
+    assert_eq!(claims["iat"], T0 - 30);
+    assert_eq!(claims["exp"], T0 - 30 + 3600);
+    server.verify().await;
+}
+
+/// What a token endpoint writes in `error_description` reaches the error
+/// only when it can do no harm there: a known code's, within RFC 6749's
+/// characters and a line long, and holding no part of the assertion just
+/// sent. An endpoint that echoes the grant back has it dropped.
+#[tokio::test]
+async fn a_description_that_echoes_the_assertion_or_breaks_the_rfc_is_dropped() {
+    type Describe = fn(&str) -> String;
+    let cases: [(&str, Describe); 4] = [
+        ("the whole assertion", |assertion| assertion.to_owned()),
+        ("a piece of it", |assertion| {
+            format!("Invalid JWT {}", &assertion[assertion.len() - 40..])
+        }),
+        ("a quote", |_| "the \"key\" is bad".to_owned()),
+        ("a page of it", |_| "x".repeat(201)),
+    ];
+    for (case, describe) in cases {
+        let echo = move |request: &Request| {
+            let form: HashMap<String, String> = url::form_urlencoded::parse(&request.body)
+                .into_owned()
+                .collect();
+            ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_grant",
+                "error_description": describe(&form["assertion"]),
+            }))
+        };
+        let server = token_endpoint(echo, 1).await;
+        let err = cache(&server)
+            .token(AccountId::new(), &key_json().to_string(), None)
+            .await
+            .expect_err(case);
+        let message = err.to_string();
+        assert!(message.ends_with("(invalid_grant)"), "{case}: {message}");
+        let sent = grants(&server).await;
+        assert_quotes_nothing(&message, &[sent[0]["assertion"].as_str()]);
+        server.verify().await;
+    }
+}
+
+/// Google's refusal of a key it no longer honours.
+fn refused_grant() -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(json!({
+        "error": "invalid_grant",
+        "error_description": "Invalid JWT Signature.",
+    }))
+}
+
+/// Ten callers arriving at once for one account, while the one mint in
+/// flight is refused: every caller is told the refusal, and Google is asked
+/// once. Without the memo each waiter made an attempt of its own in turn,
+/// each up to the mint timeout, so ten callers were ten grants.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn waiters_behind_a_failed_mint_share_its_failure() {
+    const CALLERS: usize = 10;
+    // Slow enough that every caller arrives while the first mint is in flight.
+    let server = token_endpoint(refused_grant().set_delay(Duration::from_millis(300)), 1).await;
+    let cache = Arc::new(cache(&server));
+    let (account, key) = (AccountId::new(), key_json().to_string());
+    let start = Arc::new(tokio::sync::Barrier::new(CALLERS));
+
+    let callers: Vec<_> = (0..CALLERS)
+        .map(|_| {
+            let (cache, key, start) = (Arc::clone(&cache), key.clone(), Arc::clone(&start));
+            tokio::spawn(async move {
+                start.wait().await;
+                cache.token(account, &key, None).await
+            })
+        })
+        .collect();
+    for caller in callers {
+        let err = caller
+            .await
+            .expect("the caller ran")
+            .expect_err("the mint was refused");
+        assert!(err.to_string().contains("invalid_grant"), "{err}");
+        assert!(
+            matches!(err, Error::UpstreamUnavailable { lasting: true, .. }),
+            "{err:?}"
+        );
+    }
+    server.verify().await;
+}
+
+/// A refused mint is remembered for fifteen seconds: a caller inside them is
+/// told the refusal without asking Google, and the first one after them asks
+/// again.
+#[tokio::test]
+async fn a_failed_mint_is_remembered_for_fifteen_seconds() {
+    static NOW: AtomicI64 = AtomicI64::new(T0);
+    fn now() -> i64 {
+        NOW.load(Ordering::SeqCst)
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(refused_grant())
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(granted("ya29.after"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cache = GcpTokenCache::new(token_url(&server))
+        .expect("a client")
+        .with_clock(now);
+    let (account, key) = (AccountId::new(), key_json().to_string());
+
+    let first = cache.token(account, &key, None).await.expect_err("refused");
+    NOW.store(T0 + 14, Ordering::SeqCst);
+    let remembered = cache
+        .token(account, &key, None)
+        .await
+        .expect_err("still refused, without asking");
+    assert_eq!(remembered.to_string(), first.to_string());
+    assert_eq!(grants(&server).await.len(), 1, "Google was asked once");
+
+    NOW.store(T0 + 15, Ordering::SeqCst);
+    assert_eq!(
+        cache.token(account, &key, None).await.expect("asked again"),
+        "ya29.after"
+    );
+    server.verify().await;
+}
+
+/// A token past the point it is replaced is still a token. When the mint
+/// that should replace it fails, it is handed out while it has more than
+/// thirty seconds left; inside those, the failure is the caller's.
+#[tokio::test]
+async fn a_token_outlives_a_failed_refresh_until_its_last_thirty_seconds() {
+    static NOW: AtomicI64 = AtomicI64::new(T0);
+    fn now() -> i64 {
+        NOW.load(Ordering::SeqCst)
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(granted("ya29.first"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Google, briefly unreachable from here on.
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let cache = GcpTokenCache::new(token_url(&server))
+        .expect("a client")
+        .with_clock(now);
+    let (account, key) = (AccountId::new(), key_json().to_string());
+
+    assert_eq!(
+        cache.token(account, &key, None).await.expect("minted"),
+        "ya29.first"
+    );
+    // Two hundred seconds left: due to be replaced, and the replacement fails.
+    NOW.store(T0 + 3400, Ordering::SeqCst);
+    assert_eq!(
+        cache
+            .token(account, &key, None)
+            .await
+            .expect("the token in hand"),
+        "ya29.first"
+    );
+    assert_eq!(grants(&server).await.len(), 2, "the refresh was tried");
+    // Thirty-one seconds left, and the refresh still fails.
+    NOW.store(T0 + 3569, Ordering::SeqCst);
+    assert_eq!(
+        cache
+            .token(account, &key, None)
+            .await
+            .expect("still the token in hand"),
+        "ya29.first"
+    );
+    // Twenty-nine left: too few to set out with.
+    NOW.store(T0 + 3571, Ordering::SeqCst);
+    let err = cache
+        .token(account, &key, None)
+        .await
+        .expect_err("too close to its expiry");
+    assert!(err.to_string().contains("503"), "{err}");
+    server.verify().await;
+}
+
+/// A token the upstream refused is dropped, so the next caller mints a new
+/// one; but only if it is still the one refused, so a token another request
+/// minted in the meantime is kept.
+#[tokio::test]
+async fn forgetting_a_token_keeps_a_newer_one() {
+    static NOW: AtomicI64 = AtomicI64::new(T0);
+    fn now() -> i64 {
+        NOW.load(Ordering::SeqCst)
+    }
+    let server = MockServer::start().await;
+    for (token, once) in [("ya29.refused", true), ("ya29.fresh", false)] {
+        let mock = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(granted(token))
+            .expect(1);
+        let mock = if once { mock.up_to_n_times(1) } else { mock };
+        mock.mount(&server).await;
+    }
+    let cache = GcpTokenCache::new(token_url(&server))
+        .expect("a client")
+        .with_clock(now);
+    let (account, key) = (AccountId::new(), key_json().to_string());
+
+    assert_eq!(
+        cache.token(account, &key, None).await.expect("minted"),
+        "ya29.refused"
+    );
+    cache.forget(account, "ya29.refused").await;
+    assert_eq!(
+        cache
+            .token(account, &key, None)
+            .await
+            .expect("minted again"),
+        "ya29.fresh"
+    );
+    // A late word about the old token leaves the new one where it is.
+    cache.forget(account, "ya29.refused").await;
+    assert_eq!(
+        cache.token(account, &key, None).await.expect("kept"),
+        "ya29.fresh"
+    );
+    server.verify().await;
 }

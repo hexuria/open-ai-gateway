@@ -3,7 +3,7 @@
 //! behind two endpoints on the `gcp` platform, registered while the gateway
 //! runs. `vertex-gem` serves Gemini in `us-central1` with one key;
 //! `vertex-claude` serves Claude in the `global` region with two, and Google
-//! refuses to mint for the first.
+//! refuses to mint for the first, and later with a third it refuses too.
 //!
 //! Every key is a service-account key around the committed test-only RSA key
 //! (`crates/oag-upstream/tests/fixtures`), which has never been attached to a
@@ -55,6 +55,8 @@ const CLAUDE_AT: &str = "/v1/projects/oag-test/locations/global/publishers/anthr
 const GEM_ACCOUNT: &str = "t10-gem@oag-test.invalid";
 const CLAUDE_ACCOUNT: &str = "t10-claude@oag-test.invalid";
 const REVOKED_ACCOUNT: &str = "t10-revoked@oag-test.invalid";
+/// A second key Google refuses, filed only once the first has been refused.
+const LATE_ACCOUNT: &str = "t10-revoked-late@oag-test.invalid";
 const GEM_TOKEN: &str = "ya29.t10-gem";
 const CLAUDE_TOKEN: &str = "ya29.t10-claude";
 
@@ -97,15 +99,17 @@ async fn scenario(db_url: String, redis_url: String) {
             .mount(&google)
             .await;
     }
-    Mock::given(method("POST"))
-        .and(path("/token"))
-        .and(IssuedBy(REVOKED_ACCOUNT))
-        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
-            "error": "invalid_grant",
-            "error_description": "Invalid JWT Signature.",
-        })))
-        .mount(&google)
-        .await;
+    for refused in [REVOKED_ACCOUNT, LATE_ACCOUNT] {
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(IssuedBy(refused))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_grant",
+                "error_description": "Invalid JWT Signature.",
+            })))
+            .mount(&google)
+            .await;
+    }
 
     let gw = Gateway::start(&db_url, &redis_url, &format!("{}/token", google.uri())).await;
 
@@ -133,7 +137,7 @@ async fn scenario(db_url: String, redis_url: String) {
     gemini_streamed_on_the_same_token(&gw, &google, &vertex).await;
     claude_past_a_key_that_cannot_mint(&gw, &google, &vertex, claude_key, revoked_key).await;
     claude_streamed(&gw, &google, &vertex).await;
-    no_key_and_no_token_reaches_a_client(&gw, &google, claude_key).await;
+    no_key_and_no_token_reaches_a_client(&gw, &google, claude_key, revoked_key).await;
 
     google.verify().await;
 }
@@ -193,9 +197,9 @@ async fn gemini_for_an_openai_client(
     let claims = claims(&grant["assertion"]);
     assert_eq!(claims["iss"], GEM_ACCOUNT);
     assert_eq!(
-        claims["aud"],
-        format!("{}/token", google.uri()),
-        "addressed to the configured token URL, not the key's token_uri"
+        claims["aud"], "https://oauth2.googleapis.com/token",
+        "addressed to Google's token endpoint, as Google requires, though it was posted to \
+         the configured stand-in and not to the key's token_uri"
     );
 
     let sent = only_request(&mock).await;
@@ -440,37 +444,57 @@ async fn claude_streamed(gw: &Gateway, google: &MockServer, vertex: &MockServer)
 }
 
 /// With the key that can mint taken out of service, the request has only the
-/// one Google refuses. The client is told 500 `internal_error`, as for any
-/// credential that fails to refresh, and nothing it is told holds a key, an
-/// assertion or a token.
-async fn no_key_and_no_token_reaches_a_client(gw: &Gateway, google: &MockServer, claude_key: Uuid) {
+/// one Google refused two steps ago, and that one has sat out since: a key
+/// Google refuses cools down for ten minutes, so it is not tried, nothing is
+/// sent to Google, and the client is told 503 `no_credential`. A second key
+/// that cannot mint, never tried before, is tried once and cooled down in
+/// turn, and the client is told 503 `upstream_unavailable`: the upstream is
+/// out of reach with every key it has, which is not the 500 of a gateway that
+/// broke. Neither answer holds a key, an assertion or a token.
+async fn no_key_and_no_token_reaches_a_client(
+    gw: &Gateway,
+    google: &MockServer,
+    claude_key: Uuid,
+    revoked_key: Uuid,
+) {
     sqlx::query("UPDATE account SET schedulable = false WHERE id = $1")
         .bind(claude_key)
         .execute(gw.db.pool())
         .await
         .expect("disable the key that mints");
-    let before = issuers(google).await;
-    let res = gw
-        .post(
-            "/v1/messages",
-            &json!({"model": "vertex-claude/sonnet", "max_tokens": 64,
-                    "messages": [{"role": "user", "content": "Anyone there?"}]}),
-        )
-        .await;
-    let status = res.status();
-    let headers = format!("{:?}", res.headers());
-    let raw = res.text().await.expect("a body");
-    assert_eq!(status, 500, "{raw}");
-    let body: Value = serde_json::from_str(&raw).expect("a JSON error");
-    assert_eq!(body["error"]["type"], "internal_error", "{raw}");
-    assert_holds_no_secret(&raw);
-    assert_holds_no_secret(&headers);
+    assert!(
+        gw.cooling_for_minutes(revoked_key).await,
+        "the key Google refused sits out ten minutes"
+    );
 
-    let after = issuers(google).await;
+    let before = issuers(google).await;
+    let (status, body) = gw.refused("Anyone there?").await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"]["type"], "no_credential", "{body}");
     assert_eq!(
-        &after[before.len()..],
-        [REVOKED_ACCOUNT],
-        "the one key left was tried, once"
+        issuers(google).await,
+        before,
+        "the cooling key was not tried, so nothing went to Google"
+    );
+
+    let late_key = gw.account("vertex-claude", LATE_ACCOUNT, 2).await;
+    let (status, body) = gw.refused("Anyone there now?").await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(body["error"]["type"], "upstream_unavailable", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("invalid_grant")),
+        "the client is told why: {body}"
+    );
+    assert_eq!(
+        &issuers(google).await[before.len()..],
+        [LATE_ACCOUNT],
+        "the key never tried was tried, once"
+    );
+    assert!(
+        gw.cooling_for_minutes(late_key).await,
+        "and sits out ten minutes in turn"
     );
 }
 
@@ -750,6 +774,39 @@ gateway:
             .send()
             .await
             .expect("the gateway answers")
+    }
+
+    /// A chat request for the Claude endpoint that is refused: its status and
+    /// body, once neither the body nor the headers are found to hold a key,
+    /// an assertion or a token.
+    async fn refused(&self, question: &str) -> (u16, Value) {
+        let res = self
+            .post(
+                "/v1/messages",
+                &json!({"model": "vertex-claude/sonnet", "max_tokens": 64,
+                        "messages": [{"role": "user", "content": question}]}),
+            )
+            .await;
+        let status = res.status().as_u16();
+        let headers = format!("{:?}", res.headers());
+        let raw = res.text().await.expect("a body");
+        assert_holds_no_secret(&raw);
+        assert_holds_no_secret(&headers);
+        let body = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{e}: {raw}"));
+        (status, body)
+    }
+
+    /// Whether `account` is cooling down for at least nine more minutes:
+    /// the ten a key Google refuses earns, less a slow machine's margin.
+    async fn cooling_for_minutes(&self, account: Uuid) -> bool {
+        sqlx::query_scalar::<_, Option<bool>>(
+            "SELECT cooldown_until > now() + interval '9 minutes' FROM account WHERE id = $1",
+        )
+        .bind(account)
+        .fetch_one(self.db.pool())
+        .await
+        .expect("the account")
+        .unwrap_or(false)
     }
 
     async fn model_ids(&self) -> Vec<String> {

@@ -29,6 +29,20 @@
 //! **The key** goes in `api-key`, the one header Azure reads an API key from.
 //! A Microsoft Entra ID token, which Azure reads as a bearer instead, is not
 //! served.
+//!
+//! **The ceiling** goes as `max_completion_tokens` wherever Azure takes it: on
+//! the v1 API, and on every deployments-API version from `2024-09-01-preview`,
+//! the one that added it. A reasoning model refuses `max_tokens`, every model
+//! takes `max_completion_tokens`, and a deployment's name does not say which
+//! model it holds. A version from before it has only `max_tokens`, and is sent
+//! that.
+//!
+//! **A stream's usage** is asked for with `stream_options`, as on every Chat
+//! Completions upstream, wherever Azure takes it: the v1 API and every
+//! deployments-API version from `2024-09-01-preview`, the one that added it.
+//! A version from before it refuses a request that names the field, so there
+//! it is left out, and a stream through such a version reports no usage: its
+//! tokens are not metered (`docs/03-providers.md` says so to the operator).
 
 use crate::adapter::{ProviderAdapter, UpstreamRequest};
 use crate::custom::{ExtraHeaders, authenticate};
@@ -36,6 +50,16 @@ use async_trait::async_trait;
 use oag_core::provider::{AuthStyle, Endpoint};
 use oag_core::{Error, Provider, Result};
 use oag_proto::{StreamAccumulator, StreamEvent, openai};
+
+/// The date of the first API version that takes `max_completion_tokens`:
+/// Azure's API changelog lists it among the changes from `2024-08-01-preview`
+/// to `2024-09-01-preview`.
+const MAX_COMPLETION_TOKENS_SINCE: &str = "2024-09-01";
+
+/// The date of the first API version that takes `stream_options`: Azure's
+/// API changelog lists `stream_options` and `include_usage` among the changes
+/// from `2024-08-01-preview` to `2024-09-01-preview`.
+const STREAM_OPTIONS_SINCE: &str = "2024-09-01";
 
 /// Talks Chat Completions to one `azure` endpoint's resource.
 #[derive(Debug, Clone)]
@@ -93,6 +117,62 @@ impl AzureOpenAIAdapter {
             path_segment(deployment)
         ))
     }
+
+    /// Whether this endpoint's API takes `max_completion_tokens`: the v1 API
+    /// does, and so does every deployments-API version dated
+    /// [`MAX_COMPLETION_TOKENS_SINCE`] or later.
+    fn takes_max_completion_tokens(&self) -> bool {
+        self.api_version
+            .as_deref()
+            .is_none_or(|version| dated_on_or_after(version, MAX_COMPLETION_TOKENS_SINCE))
+    }
+
+    /// Whether this endpoint's API takes `stream_options`: the v1 API does,
+    /// and so does every deployments-API version dated
+    /// [`STREAM_OPTIONS_SINCE`] or later.
+    fn takes_stream_options(&self) -> bool {
+        self.api_version
+            .as_deref()
+            .is_none_or(|version| dated_on_or_after(version, STREAM_OPTIONS_SINCE))
+    }
+
+    /// `body` with its output ceiling under the one name this endpoint's API
+    /// reads.
+    ///
+    /// The codec chooses between `max_tokens` and `max_completion_tokens` by
+    /// the model's name, and on Azure that name is a deployment's: whatever an
+    /// operator called it, which says nothing of the model behind it. A
+    /// reasoning model deployed as `reasoning-prod` was sent `max_tokens`,
+    /// which it refuses with a 400, on every request. So the name is not asked
+    /// here. Every model takes `max_completion_tokens` where the API has it,
+    /// reasoning or not, and an API version from before it is sent the
+    /// `max_tokens` that is all it knows.
+    fn name_the_ceiling(&self, body: &mut serde_json::Value) {
+        let Some(object) = body.as_object_mut() else {
+            return;
+        };
+        let ceiling = object
+            .remove("max_tokens")
+            .or_else(|| object.remove("max_completion_tokens"));
+        if let Some(ceiling) = ceiling {
+            let name = if self.takes_max_completion_tokens() {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            object.insert(name.to_owned(), ceiling);
+        }
+    }
+}
+
+/// Whether `version`, an API version as Azure names one (`2024-10-21`,
+/// `2025-04-01-preview`), is dated `since` or later.
+///
+/// A stored version has passed `oag_core::endpoint::is_api_version`, so its
+/// first ten bytes are a `YYYY-MM-DD` date, and dates in that form sort as
+/// strings do.
+fn dated_on_or_after(version: &str, since: &str) -> bool {
+    version.get(..10).is_some_and(|date| date >= since)
 }
 
 /// `name` as one URL path segment: every byte but an unreserved one (RFC
@@ -125,7 +205,16 @@ impl ProviderAdapter for AzureOpenAIAdapter {
     fn build(&self, req: &UpstreamRequest<'_>) -> Result<reqwest::Request> {
         let deployment = &req.model.upstream_name;
         let url = self.url(deployment)?;
-        let body = openai::render_request(req.canonical, deployment)?;
+        let mut body = openai::render_request(req.canonical, deployment)?;
+        self.name_the_ceiling(&mut body);
+        // The codec asks every stream for its usage. A version from before
+        // `stream_options` refuses a request that names it, every streamed one,
+        // so there the stream goes without, and reports no usage.
+        if !self.takes_stream_options()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.remove("stream_options");
+        }
 
         let mut builder = crate::builder_client()?
             .post(url)
@@ -457,6 +546,108 @@ mod tests {
         assert_eq!(path_segment("é"), "%C3%A9", "each byte of a character");
         assert_eq!(path_segment("Gpt-4o_mini.2~"), "Gpt-4o_mini.2~");
         assert_eq!(path_segment("a/b?c#d"), "a%2Fb%3Fc%23d");
+    }
+
+    /// The body a built request carries.
+    fn built_body(built: &reqwest::Request) -> serde_json::Value {
+        serde_json::from_slice(
+            built
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .expect("a body"),
+        )
+        .expect("JSON")
+    }
+
+    /// The ceiling is `max_completion_tokens` whatever a deployment is called,
+    /// on the v1 API and on every deployments-API version that has the field:
+    /// for `reasoning-prod`, a reasoning model whose name does not say so and
+    /// which refuses `max_tokens`, and for `gpt-4o`, which takes either.
+    #[test]
+    fn the_ceiling_is_max_completion_tokens_whatever_the_deployment_is_called() {
+        for api_version in [
+            None,
+            Some("2024-09-01-preview"),
+            Some(VERSION),
+            Some("2025-04-01-preview"),
+        ] {
+            let spec = spec(
+                "t8-azure-ceiling",
+                "https://res.openai.azure.com",
+                api_version,
+            );
+            for deployment in ["reasoning-prod", "gpt-4o"] {
+                let body = built_body(&build(&spec, deployment, false).expect("builds"));
+                assert_eq!(
+                    body["max_completion_tokens"], 256,
+                    "{api_version:?}, {deployment}: {body}"
+                );
+                assert!(
+                    body.get("max_tokens").is_none(),
+                    "{api_version:?}, {deployment}: {body}"
+                );
+            }
+        }
+    }
+
+    /// A deployments-API version from before `max_completion_tokens` has only
+    /// `max_tokens`, and is sent that whatever a deployment is called, a name
+    /// that reads as a reasoning model's included.
+    #[test]
+    fn an_api_version_without_max_completion_tokens_is_sent_max_tokens() {
+        for api_version in ["2024-06-01", "2024-08-01-preview"] {
+            let spec = spec(
+                "t8-azure-old-ceiling",
+                "https://res.openai.azure.com",
+                Some(api_version),
+            );
+            for deployment in ["gpt-5-prod", "o3-mini", "gpt-4o"] {
+                let body = built_body(&build(&spec, deployment, false).expect("builds"));
+                assert_eq!(
+                    body["max_tokens"], 256,
+                    "{api_version}, {deployment}: {body}"
+                );
+                assert!(
+                    body.get("max_completion_tokens").is_none(),
+                    "{api_version}, {deployment}: {body}"
+                );
+            }
+        }
+    }
+
+    /// A deployments-API version from before `stream_options` refuses a
+    /// request that names it, so a stream there is not asked for its usage;
+    /// on the v1 API and on every version that has the field, it is.
+    #[test]
+    fn stream_options_go_only_where_the_api_version_takes_them() {
+        for (api_version, asked) in [
+            (None, true),
+            (Some("2024-09-01-preview"), true),
+            (Some(VERSION), true),
+            (Some("2025-04-01-preview"), true),
+            (Some("2024-06-01"), false),
+            (Some("2024-08-01-preview"), false),
+        ] {
+            let spec = spec(
+                "t8-azure-usage",
+                "https://res.openai.azure.com",
+                api_version,
+            );
+            let body = built_body(&build(&spec, "gpt-4o", true).expect("builds"));
+            assert_eq!(body["stream"], true, "{api_version:?}");
+            if asked {
+                assert_eq!(
+                    body["stream_options"],
+                    serde_json::json!({ "include_usage": true }),
+                    "{api_version:?}"
+                );
+            } else {
+                assert!(
+                    body.get("stream_options").is_none(),
+                    "{api_version:?}: {body}"
+                );
+            }
+        }
     }
 
     /// Streamed, the request asks for the stream's usage as every Chat

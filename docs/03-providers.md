@@ -364,6 +364,9 @@ before it files a key under an endpoint's name:
   nothing more, `https://{resource}.openai.azure.com` or
   `https://{resource}.services.ai.azure.com`, with no path or port; see
   [Azure OpenAI](#azure-openai);
+- a base URL on `gcp`, which is optional, is https, or http only to this
+  machine's loopback (`127.0.0.0/8`, `[::1]` or `localhost`): every request it
+  is sent carries a bearer token minted from a service account;
 - a region (required on `aws` and `gcp`) and a project (required on `gcp`) are
   1 to 63 of `a-z`, `0-9` and `-`, because a platform puts them in a hostname or
   a path; and an `aws` region is shaped like one, two letters, then words, then
@@ -518,7 +521,9 @@ built-in is unchanged by any of them, and none of them reads its settings.
   token is signed, not merely attached.
 - **Model ids.** A catalog row's upstream name is Bedrock's model id, or an
   inference profile's (`us.meta.llama3-1-70b-instruct-v1:0`). It goes in the
-  path, colon and all, and is signed as it is sent.
+  path, colon and all, and is signed as it is sent. An ARN works too (an
+  application inference profile's, a provisioned throughput's): it stays one
+  path segment, its `/` sent as `%2F`.
 - **Extra headers** are sent on every request, outside the signature, which
   covers `host`, `x-amz-date`, `x-amz-content-sha256` and the session token.
 
@@ -549,14 +554,32 @@ replayed from an earlier turn, which only the model that wrote it can take
 back. Tool names are held to the OpenAI pattern, as on Chat Completions, and a
 client's own names come back on the calls the model makes.
 
+Converse refuses a conversation it would otherwise take, for a few shapes
+clients send all the time, and the codec reshapes each rather than pass the 400
+on. A request that declares no tools but whose history called some (a summary,
+a compaction) declares a stand-in for each tool called: its name, and a schema
+that takes any object. A tool call's id outside Converse's pattern,
+`[a-zA-Z0-9_.:-]{1,64}` (Gemini's `read_file#1`, an id past 64 bytes), is
+respelled the same way in the call and in its result, and the client's own id
+comes back on anything Converse answers with. A conversation that opens with
+the model (a prefill, a transcript resumed part way) is sent a `(continued)`
+user turn in front of it. Blank text, which Converse refuses wherever it
+appears, is left out (the empty `content` a Chat Completions client sends with
+its tool calls is one), and a tool result with nothing in it says
+`(no output)`. A temperature past 1 is sent as 1, the most Converse takes where
+Chat Completions takes 2, and an empty stop sequence is dropped.
+
 **Streams.** `ConverseStream` sends AWS event-stream messages whose payload is
 the event itself, named by a header (see [Framing](#framing)). It announces the
 stop before the usage, so the stop is held until the usage arrives, and a client
 is shown the bill on the frame that ends the answer. An exception inside the
 stream (`throttlingException`, `modelStreamErrorException`, …) reaches the
 client as an error frame in its own dialect, naming the exception, and the
-ledger records it; a 429 before the stream starts moves to the endpoint's next
-key, as any provider's does.
+ledger records it. So does an event-stream error message, the kind AWS does not
+model (`:message-type: error`), named by its `:error-code` and in its
+`:error-message`'s words, on Converse and on `InvokeModel` streams alike. A 429
+before the stream starts moves to the endpoint's next key, as any provider's
+does.
 
 ### Azure OpenAI
 
@@ -594,6 +617,13 @@ from the path, and the OpenAI SDK's Azure client sends the same body. The
 `api-version` query is built from the row, never from the base URL, which may
 not hold a `?`.
 
+**The output ceiling** is sent as `max_completion_tokens`, whatever the
+deployment is called, on the v1 API and on every deployments-API version from
+`2024-09-01-preview`, the one that added it: a reasoning model refuses
+`max_tokens`, every model takes `max_completion_tokens`, and a deployment's
+name says nothing of the model behind it. A version from before it has no such
+field, and is sent `max_tokens`.
+
 ```sh
 # Azure's v1 API.
 oag admin endpoint add --name azure-eu --dialect openai --platform azure \
@@ -614,9 +644,13 @@ named `gpt-4o-prod`, priced from Azure's price list.
 **Streams** are Chat Completions streams: passed through to an OpenAI-shaped
 client byte for byte, Azure's filter results and all, and translated for any
 other. The gateway asks every Chat Completions upstream for the stream's usage
-(`stream_options.include_usage`), Azure included, and bills what Azure
-reports. An API version older than that field may refuse a streamed request
-with a 400 naming it; if one does, name a later version.
+(`stream_options.include_usage`), and Azure too wherever it takes the field: on
+the v1 API and on every deployments-API version from `2024-09-01-preview`, the
+one that added it, and bills what Azure reports. A version from before it
+refuses a request that names the field, so a stream through one is sent without
+it and reports no usage: **its tokens are not metered**. Name
+`2024-09-01-preview` or later, or leave `api_version` unset for the v1 API, to
+have Azure streams billed.
 
 **Content filtering.** An answer Azure's filter stops ends with
 `finish_reason: "content_filter"`, which reads as a refusal, as OpenAI's does:
@@ -652,9 +686,11 @@ that.
   `https://aiplatform.googleapis.com` for the `global` region.
 - **Base URL**, optional, replaces the host: a Private Service Connect
   endpoint, a proxy, or a stand-in. The path beneath it still names the project
-  and the region. A multi-region location (`us`, `eu`) has a host of its own,
+  and the region. It is https, or http only to this machine's loopback (a
+  stand-in, a local proxy), because every request carries a bearer token. A
+  multi-region location (`us`, `eu`) has a host of its own,
   `https://aiplatform.{location}.rep.googleapis.com`, so give it as the base
-  URL.
+  URL; a row naming one without it is refused (reason `region`).
 - **Auth** is `bearer`: the minted token goes in `Authorization`, and no other
   header carries anything of the credential. There is no `anthropic-version`
   header either; the body carries the version, as Google's own requests do.
@@ -711,9 +747,12 @@ page walks through, and which regions serve which model is Google's
 page to say.
 
 **The token.** A credential's key signs a JWT (RS256, scope
-`https://www.googleapis.com/auth/cloud-platform`, valid for an hour), which the
+`https://www.googleapis.com/auth/cloud-platform`, dated thirty seconds back to
+allow for a host clock a little ahead of Google's, valid for an hour), which the
 gateway trades at `gateway.gcp_token_url`, Google's
-`https://oauth2.googleapis.com/token` unless it is set, for an access token. The
+`https://oauth2.googleapis.com/token` unless it is set, for an access token:
+https, or http only to this machine's loopback, and the assertion is addressed
+to Google's token endpoint whichever URL it is posted to. The
 token is kept until five minutes before it expires, in one cache per gateway
 process that every `gcp` endpoint shares and that outlives every reload. So a
 credential is minted for at most once at a time, and about once an hour, on
@@ -725,16 +764,25 @@ credential's `proxy_url` when it has one, as its requests do.
 
 The mint happens on the request path, just before the request is built, while
 the request holds its slot on that credential; one takes at most ten seconds.
+A token Vertex answers 401 (revoked, or its service account's key disabled) is
+dropped, and the next request on that credential mints a new one.
 
 **When a mint fails.** A key Google refuses (`invalid_grant`: the key or its
 service account was deleted or disabled, or this host's clock is far enough off
 to make the assertion look wrong), a token endpoint that cannot be reached, or
 an answer that is not a token, is that credential failing. The request moves to
 the endpoint's next credential, as it does when a refresh fails, and the log
-names the status and the OAuth error code. A failure is not remembered, so the
-next request tries that key again. When no credential can mint, the client is
-answered 500 `internal_error`. No log line and no answer holds the key, the
-signed assertion or a token.
+names the status, the OAuth error code and Google's description of it. The
+failure is remembered for fifteen seconds, so the requests waiting on that
+mint, and those that arrive just after it, are told the same without asking
+Google again; and the credential cools down as one an upstream refused does:
+ten minutes for a key Google refuses or one that cannot be read, thirty seconds
+for a token endpoint that failed to answer. When no credential can mint, the
+client is answered 503 `upstream_unavailable`, its message naming Google's
+refusal. A token already in hand is used instead while it has more than thirty
+seconds left: a mint that fails is the one replacing it five minutes early,
+and the log says so. No log line and no answer holds the key, the signed
+assertion or a token.
 
 ## Which dialect reaches which upstream
 

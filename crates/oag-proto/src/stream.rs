@@ -166,6 +166,12 @@ impl StreamAccumulator {
         self.function_names.original(wire).to_owned()
     }
 
+    /// The tool-call id the client sent, for one the upstream answers with.
+    #[must_use]
+    pub fn restore_tool_use_id(&self, wire: &str) -> String {
+        self.function_names.original_tool_use_id(wire).to_owned()
+    }
+
     /// Fold an event in.
     pub fn observe(&mut self, event: &StreamEvent) {
         match event {

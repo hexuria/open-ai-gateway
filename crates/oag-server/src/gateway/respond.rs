@@ -433,6 +433,16 @@ pub(crate) fn error_response(e: &Error) -> Response {
             "upstream_timeout",
             e.to_string(),
         ),
+        // 503, not the 500 of `internal_error`: nothing here broke, and no
+        // credential the route holds could be made ready to send. Its own
+        // kind, because its fix is not another's: a key replaced, or a token
+        // endpoint back. The message names Google's refusal and nothing of
+        // the key.
+        Error::UpstreamUnavailable { .. } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            e.to_string(),
+        ),
         // Its own kind, not `no_credential`: that one is also what a route
         // whose Jev keys are all cooling down gets, and a client that branches
         // on the kind should not wait out a key nobody has added.

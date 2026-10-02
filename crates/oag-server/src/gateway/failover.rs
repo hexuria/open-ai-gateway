@@ -143,15 +143,20 @@ pub(crate) fn adapter_for(
 /// Bedrock Converse rewrite, because those are the dialects that hold a name
 /// to the OpenAI function-name pattern and refuse one outside it with a 400.
 /// Converse's codec sanitises the same way, so this map is the one that puts
-/// the client's names back. Other dialects keep identity, so same-dialect
-/// passthrough is undisturbed.
+/// the client's names back; and it respells a tool call's id its own pattern
+/// refuses, which the map puts back too. Other dialects keep identity, so
+/// same-dialect passthrough is undisturbed.
 pub(super) fn openai_function_names(
     canonical: &oag_proto::CanonicalRequest,
     upstream: Dialect,
 ) -> FunctionNameMap {
     match upstream {
         Dialect::OpenAIChatCompletions | Dialect::OpenAIResponses | Dialect::BedrockConverse => {
-            let names = FunctionNameMap::from_request(canonical);
+            let mut names = FunctionNameMap::from_request(canonical);
+            if upstream == Dialect::BedrockConverse {
+                names = names
+                    .with_tool_use_ids(oag_proto::converse::ToolUseIds::from_request(canonical));
+            }
             if names.rewrites() {
                 for (original, wire) in names.rewritten() {
                     tracing::debug!(original, wire, "sanitized OpenAI function name");
@@ -345,7 +350,8 @@ pub(super) enum Outcome {
     Switch(Error),
     /// Try a different credential, and meter what this one generated first:
     /// the answer was read far enough to cost something before it was lost.
-    Lost(Error, oag_proto::StreamAccumulator),
+    /// Boxed for the same reason `Ok` is.
+    Lost(Error, Box<oag_proto::StreamAccumulator>),
     /// Another request took this credential's half-open probe between
     /// selection and dispatch. Nothing was sent and nothing failed: try a
     /// different credential, and say nothing about this one.
@@ -500,7 +506,7 @@ pub(super) async fn try_credential(
         .await
     {
         Ok(c) => c,
-        Err(e) => return Outcome::Switch(e),
+        Err(e) => return unprepared(state, account, e).await,
     };
 
     let mut last = Error::NoCredential { provider };
@@ -558,6 +564,11 @@ pub(super) async fn try_credential(
 
             Ok(response) => {
                 let status = response.status().as_u16();
+                // A credential the adapter prepared and the upstream refused
+                // (a minted token, revoked) is not to be handed out again.
+                if status == 401 {
+                    adapter.credential_refused(account, &credential).await;
+                }
                 // Read before the body is consumed: `text()` takes the whole
                 // response, headers included.
                 let retry_after = upstream_retry_after(response.headers());
@@ -641,6 +652,22 @@ pub(super) async fn try_credential(
     }
 
     Outcome::Switch(last)
+}
+
+/// A credential whose preparation failed: a service account whose key
+/// Google would not exchange for a token, or a token endpoint that did not
+/// answer.
+///
+/// The request moves on to the next credential, as it always has, and this
+/// one sits out the cooldown its error asks for, through the same
+/// `apply_disposition` an upstream's refusal goes through: ten minutes for a
+/// key Google refuses, thirty seconds for a token endpoint out of reach. So
+/// the requests after this one go to another credential first, instead of
+/// each finding the same thing out. An error that asks for nothing
+/// (`Disposition::Fatal`) writes nothing.
+async fn unprepared(state: &AppState, account: AccountId, e: Error) -> Outcome {
+    apply_disposition(state, account, e.disposition()).await;
+    Outcome::Switch(e)
 }
 
 /// Turn a successful response into the attempt the caller returns.
@@ -732,7 +759,7 @@ pub(super) async fn succeeded(
 pub(super) fn collect_failed(failure: sse::StreamFailure) -> Outcome {
     let (e, accumulator) = *failure;
     if accumulator.usage().output_tokens > 0 {
-        Outcome::Lost(e, accumulator)
+        Outcome::Lost(e, Box::new(accumulator))
     } else {
         Outcome::Switch(e)
     }

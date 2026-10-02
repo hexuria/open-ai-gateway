@@ -18,9 +18,12 @@
 //!   `inferenceConfig`, tools under `toolConfig`, structured output under
 //!   `outputConfig`. The model, and whether to stream, are in the URL.
 //! - Roles must alternate, so turns the canonical form keeps apart — a tool
-//!   result and the user's next words, say — are merged into one.
+//!   result and the user's next words, say — are merged into one. And the
+//!   first turn must be the user's, so a conversation that opens with the
+//!   model is sent a minimal user turn in front.
 //! - Tool names are held to the OpenAI function-name pattern, and sanitised
-//!   the same way.
+//!   the same way. A tool call's id is held to a pattern of its own, and one
+//!   outside it is respelled ([`ToolUseIds`]) and restored on the way back.
 //! - Usage is Anthropic-shaped: `inputTokens` excludes the cached prefix,
 //!   which is reported beside it rather than inside it.
 //! - A stream announces its stop reason before its usage.
@@ -42,9 +45,18 @@ use oag_core::provider::Dialect;
 use oag_core::{Error, Result};
 use oag_router::Usage;
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 
 /// The dialect a refusal names.
 const DIALECT: Dialect = Dialect::BedrockConverse;
+
+/// The name `oag_upstream::eventstream::converse_event` gives an event
+/// stream's unmodeled error (`:message-type: error`): a failure the stream
+/// reports in its `:error-code` and `:error-message` headers rather than as
+/// one of Converse's exception events, so no member of the union describes
+/// it. No member's name begins with a colon, so this one cannot be mistaken
+/// for anything AWS sends.
+pub const STREAM_ERROR: &str = ":error";
 
 fn refused(field: &'static str) -> Error {
     Error::UnsupportedField {
@@ -80,28 +92,35 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
     }
 
     let names = FunctionNameMap::from_request(req);
+    let ids = ToolUseIds::from_request(req);
 
     let mut inference = json!({ "maxTokens": req.max_tokens });
     if let Some(t) = req.temperature {
-        inference["temperature"] = json!(t);
+        // Converse takes 0 to 1, where Chat Completions takes 0 to 2, and
+        // refuses the rest with a 400. A client past 1 asked for as much
+        // randomness as it could have, and 1 is the most there is here.
+        inference["temperature"] = json!(t.clamp(0.0, 1.0));
     }
-    if !req.stop.is_empty() {
-        inference["stopSequences"] = json!(req.stop);
+    // A stop sequence holds at least one character, and an empty one could
+    // stop nothing anyway.
+    let stop: Vec<&String> = req.stop.iter().filter(|s| !s.is_empty()).collect();
+    if !stop.is_empty() {
+        inference["stopSequences"] = json!(stop);
     }
 
     let mut body = json!({
-        "messages": render_messages(&req.messages, &names),
+        "messages": render_messages(&req.messages, &names, &ids),
         "inferenceConfig": inference,
     });
 
     // Text only, one block each: a `SystemContentBlock` holds nothing else
-    // canonical could put here. An empty one is left out rather than sent,
-    // because the field refuses an empty string and the block says nothing.
+    // canonical could put here. A blank one is left out rather than sent,
+    // because the field refuses one and the block says nothing.
     let system: Vec<Value> = req
         .system
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text, .. } if !text.is_empty() => Some(json!({ "text": text })),
+            ContentBlock::Text { text, .. } if !is_blank(text) => Some(json!({ "text": text })),
             _ => None,
         })
         .collect();
@@ -128,6 +147,11 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
     Ok(body)
 }
 
+/// What the user turn in front of a conversation that opens with the model
+/// says: that the conversation was under way, and nothing the model could
+/// take for a question.
+const CONTINUED: &str = "(continued)";
+
 /// The canonical turns as Converse messages.
 ///
 /// Turns whose role would repeat are merged, because Converse refuses a
@@ -137,7 +161,15 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
 /// left with no block this dialect carries is dropped, since an empty
 /// `content` is refused too — and dropping it can leave its neighbours
 /// adjacent, which the merge then settles.
-fn render_messages(messages: &[Message], names: &FunctionNameMap) -> Vec<Value> {
+///
+/// And the first turn must be the user's ("A conversation must start with a
+/// user message"), which a client's need not be: a prefill with no question,
+/// a transcript resumed part way, history trimmed from the front, or a first
+/// user turn that held nothing this dialect carries. Such a conversation is
+/// sent a minimal user turn in front, [`CONTINUED`], judged after the drops
+/// and the merge so it is judged on what is sent, and keeping every word the
+/// client sent.
+fn render_messages(messages: &[Message], names: &FunctionNameMap, ids: &ToolUseIds) -> Vec<Value> {
     let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
     for m in messages {
         // No `system` or `tool` role on the wire: the system prompt is its own
@@ -150,7 +182,7 @@ fn render_messages(messages: &[Message], names: &FunctionNameMap) -> Vec<Value> 
         let blocks: Vec<Value> = m
             .content
             .iter()
-            .filter_map(|b| render_block(b, names))
+            .filter_map(|b| render_block(b, names, ids))
             .collect();
         if blocks.is_empty() {
             continue;
@@ -160,23 +192,40 @@ fn render_messages(messages: &[Message], names: &FunctionNameMap) -> Vec<Value> 
             _ => turns.push((role, blocks)),
         }
     }
+    if turns.first().is_some_and(|(role, _)| *role == "assistant") {
+        turns.insert(0, ("user", vec![json!({ "text": CONTINUED })]));
+    }
     turns
         .into_iter()
         .map(|(role, content)| json!({ "role": role, "content": content }))
         .collect()
 }
 
-fn render_block(b: &ContentBlock, names: &FunctionNameMap) -> Option<Value> {
+/// What a tool result that came back with nothing says, where Converse needs
+/// it to say something.
+const NO_OUTPUT: &str = "(no output)";
+
+/// Whether `text` is nothing but whitespace, which Converse refuses as a text
+/// block's content ("text content blocks must be non-empty") wherever one
+/// appears: a turn, the system prompt, a tool result.
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+fn render_block(b: &ContentBlock, names: &FunctionNameMap, ids: &ToolUseIds) -> Option<Value> {
     match b {
         // A cache breakpoint is dropped. Converse spells one as a `cachePoint`
         // block, but only the models the prompt-caching guide lists take it,
         // and for any other it is at best ignored. Losing the breakpoint costs
         // money, not the answer — as it does on the Chat Completions and
         // Gemini wires, which have nowhere to put one.
-        ContentBlock::Text { text, .. } => Some(json!({ "text": text })),
+        //
+        // A blank one is left out: Converse refuses it, and it says nothing.
+        // A Chat Completions client sends one beside its tool calls.
+        ContentBlock::Text { text, .. } => (!is_blank(text)).then(|| json!({ "text": text })),
         ContentBlock::Image { media_type, data } => Some(image(media_type, data)),
         ContentBlock::ToolUse { id, name, input } => Some(json!({
-            "toolUse": { "toolUseId": id, "name": names.wire(name), "input": input }
+            "toolUse": { "toolUseId": ids.wire(id), "name": names.wire(name), "input": input }
         })),
         ContentBlock::ToolResult {
             tool_use_id,
@@ -184,7 +233,7 @@ fn render_block(b: &ContentBlock, names: &FunctionNameMap) -> Option<Value> {
             is_error,
         } => {
             let mut result = json!({
-                "toolUseId": tool_use_id,
+                "toolUseId": ids.wire(tool_use_id),
                 "content": tool_result_content(content),
             });
             // Only a failure says so. `status` is documented for Nova and
@@ -211,18 +260,32 @@ fn render_block(b: &ContentBlock, names: &FunctionNameMap) -> Option<Value> {
 /// changes what the model is shown. Blocks keep their shape where Converse has
 /// one — text, and the image a screenshot tool hands back, which the
 /// string-only dialects have to flatten away.
+///
+/// Blank text is left out, as in a turn. A result left with nothing — a tool
+/// that printed nothing — says [`NO_OUTPUT`] instead: Converse needs content
+/// in a result, and the call still needs its answer.
 fn tool_result_content(content: &ToolResultContent) -> Vec<Value> {
-    match content {
-        ToolResultContent::Text(text) => vec![json!({ "text": text })],
+    let blocks: Vec<Value> = match content {
+        ToolResultContent::Text(text) => (!is_blank(text))
+            .then(|| json!({ "text": text }))
+            .into_iter()
+            .collect(),
         ToolResultContent::Blocks(blocks) => blocks
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(json!({ "text": text })),
+                ContentBlock::Text { text, .. } => {
+                    (!is_blank(text)).then(|| json!({ "text": text }))
+                }
                 ContentBlock::Image { media_type, data } => Some(image(media_type, data)),
                 // A result cannot hold a call, another result, or reasoning.
                 _ => None,
             })
             .collect(),
+    };
+    if blocks.is_empty() {
+        vec![json!({ "text": NO_OUTPUT })]
+    } else {
+        blocks
     }
 }
 
@@ -239,17 +302,160 @@ fn image(media_type: &str, data: &str) -> Value {
     }})
 }
 
-/// `toolConfig`, or `None` when the request defines no tools.
+/// Tool-call ids as Converse must see them, and the way back.
+///
+/// Converse holds a `toolUseId` to `[a-zA-Z0-9_.:-]{1,64}`, in a `toolUse`
+/// and in the `toolResult` that answers it. Canonical keeps whatever id the
+/// client's own upstream issued, and not every upstream issues ids in that
+/// pattern: Gemini's are a function's name and a counter (`read_file#1`),
+/// and an agent's own can run past 64 bytes. One outside it anywhere in the
+/// history fails the whole turn.
+///
+/// Each such id is respelled, the same way wherever it appears, so a call
+/// and its result still pair. An id inside the pattern is sent as it is, and
+/// keeps its seat: a respelling never takes another id's. The map is a
+/// function of the request, so a conversation's ids are spelled the same on
+/// every turn, and a cached prompt prefix stays a prefix.
+///
+/// `oag_server`'s failover hands it to the stream accumulator, through
+/// [`FunctionNameMap::with_tool_use_ids`], so an id Converse answers with is
+/// put back as the client sent it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolUseIds {
+    to_wire: HashMap<String, String>,
+    from_wire: HashMap<String, String>,
+}
+
+impl ToolUseIds {
+    /// Every id `req`'s history uses that Converse would refuse, respelled.
+    #[must_use]
+    pub fn from_request(req: &CanonicalRequest) -> Self {
+        let mut ids: Vec<&str> = Vec::new();
+        let mut seen = HashSet::new();
+        for block in req.messages.iter().flat_map(|m| &m.content) {
+            let id = match block {
+                ContentBlock::ToolUse { id, .. } => id,
+                ContentBlock::ToolResult { tool_use_id, .. } => tool_use_id,
+                _ => continue,
+            };
+            if seen.insert(id.as_str()) {
+                ids.push(id);
+            }
+        }
+        // The ones already legal claim their spellings first.
+        let mut taken: HashSet<String> = ids
+            .iter()
+            .filter(|id| is_tool_use_id(id))
+            .map(|id| (*id).to_owned())
+            .collect();
+        let mut map = Self::default();
+        for id in ids.into_iter().filter(|id| !is_tool_use_id(id)) {
+            let wire = respell_tool_use_id(id, &taken);
+            taken.insert(wire.clone());
+            map.from_wire.insert(wire.clone(), id.to_owned());
+            map.to_wire.insert(id.to_owned(), wire);
+        }
+        map
+    }
+
+    /// The id to send for `id`.
+    #[must_use]
+    pub fn wire<'a>(&'a self, id: &'a str) -> &'a str {
+        self.to_wire.get(id).map_or(id, String::as_str)
+    }
+
+    /// The id the client sent, for one Converse was sent or answers with.
+    #[must_use]
+    pub fn original<'a>(&'a self, wire: &'a str) -> &'a str {
+        self.from_wire.get(wire).map_or(wire, String::as_str)
+    }
+
+    /// Whether every id is sent as it is.
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        self.to_wire.is_empty()
+    }
+}
+
+/// The longest `toolUseId` Converse takes.
+const TOOL_USE_ID_MAX: usize = 64;
+
+/// Whether Converse takes `id` as a `toolUseId`: `[a-zA-Z0-9_.:-]{1,64}`.
+fn is_tool_use_id(id: &str) -> bool {
+    (1..=TOOL_USE_ID_MAX).contains(&id.len()) && id.bytes().all(tool_use_id_byte)
+}
+
+fn tool_use_id_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-')
+}
+
+/// `id`, which Converse would refuse, as one it takes that is not `taken`.
+///
+/// Each byte the pattern refuses becomes `_`. When that runs past 64 bytes,
+/// is empty, or is taken, it is cut to its first 47 bytes and followed by
+/// `_` and a 64-bit hash of the whole id, so two ids that differ only past
+/// the cut, or only in what was replaced, are still told apart. FNV-1a: not
+/// for secrecy, only a stable spread that is the same on every replica and
+/// every turn. Should even that be taken, the hash is taken again, salted.
+fn respell_tool_use_id(id: &str, taken: &HashSet<String>) -> String {
+    let plain: String = id
+        .bytes()
+        .map(|b| {
+            if tool_use_id_byte(b) {
+                char::from(b)
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if (1..=TOOL_USE_ID_MAX).contains(&plain.len()) && !taken.contains(&plain) {
+        return plain;
+    }
+    // ASCII by construction, so any byte offset is a character boundary.
+    let stem = &plain[..plain.len().min(TOOL_USE_ID_MAX - 17)];
+    let mut salt = 0u64;
+    loop {
+        let candidate = format!("{stem}_{:016x}", fnv1a(id.as_bytes(), salt));
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+        salt = salt.wrapping_add(1);
+    }
+}
+
+/// 64-bit FNV-1a over `bytes`, then `salt`'s.
+fn fnv1a(bytes: &[u8], salt: u64) -> u64 {
+    bytes
+        .iter()
+        .chain(&salt.to_le_bytes())
+        .fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
+            (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+/// `toolConfig`, or `None` when there is no tool to declare.
+///
+/// The request's own tools; or, for a request that declares none, a stand-in
+/// for each tool its history called ([`called_in_history`]), because Converse
+/// refuses `toolUse` and `toolResult` blocks without a `toolConfig`.
 ///
 /// `toolChoice` lives inside `toolConfig`, and `toolConfig` needs at least one
 /// tool — so with none there is nothing for a choice to constrain, and `none`
-/// in particular is already true.
+/// in particular is already true. A stand-in is a tool the model could call,
+/// so with one `none` is refused as it is with a tool the client declared.
 fn render_tool_config(req: &CanonicalRequest, names: &FunctionNameMap) -> Result<Option<Value>> {
-    if req.tools.is_empty() {
+    let stand_ins;
+    let tools: &[Tool] = if req.tools.is_empty() {
+        stand_ins = called_in_history(&req.messages);
+        &stand_ins
+    } else {
+        &req.tools
+    };
+    if tools.is_empty() {
         return Ok(None);
     }
     let mut config = json!({
-        "tools": req.tools.iter().map(|t| render_tool(t, names)).collect::<Vec<_>>(),
+        "tools": tools.iter().map(|t| render_tool(t, names)).collect::<Vec<_>>(),
     });
     if let Some(choice) = &req.tool_choice {
         config["toolChoice"] = match choice {
@@ -263,6 +469,34 @@ fn render_tool_config(req: &CanonicalRequest, names: &FunctionNameMap) -> Result
         };
     }
     Ok(Some(config))
+}
+
+/// A stand-in for each tool `messages` called, in the order each was first
+/// called: its name, no description, and a schema that takes any object.
+///
+/// For a request that declares no tools but whose history still holds calls
+/// and their results: a summary, a compaction, a follow-up the client wants
+/// answered in text. Converse refuses those blocks without a `toolConfig`
+/// ("The toolConfig field must be defined when using toolUse and toolResult
+/// content blocks"), and the client's own definitions are not here to send.
+/// No description, because an empty one is refused and there is nothing to
+/// say; the name is the client's, which [`render_tool`] spells as the calls
+/// in the history are spelled.
+fn called_in_history(messages: &[Message]) -> Vec<Tool> {
+    let mut seen = HashSet::new();
+    messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { name, .. } if seen.insert(name.as_str()) => Some(Tool {
+                name: name.clone(),
+                description: String::new(),
+                input_schema: json!({ "type": "object" }),
+                cache_control: None,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 fn render_tool(t: &Tool, names: &FunctionNameMap) -> Value {
@@ -308,9 +542,9 @@ fn render_output_config(format: Option<&ResponseFormat>) -> Result<Option<Value>
 /// a reader that takes only usage leaves every non-streamed answer looking
 /// empty.
 ///
-/// Tool names come back as the wire spelled them. The caller restores the
-/// client's own with `FunctionNameMap::restore_in_events`, as it does for a
-/// Chat Completions body.
+/// Tool names and ids come back as the wire spelled them. The caller restores
+/// the client's own with `FunctionNameMap::restore_in_events`, as it does for
+/// a Chat Completions body.
 #[must_use]
 pub fn parse_response(body: &Value) -> Vec<StreamEvent> {
     let usage = parse_usage(&body["usage"]);
@@ -392,7 +626,7 @@ fn parse_stream_event(kind: &str, event: &Value, acc: &mut StreamAccumulator) ->
                 .as_str()
                 .map(|id| {
                     vec![StreamEvent::ToolUseStart {
-                        id: id.to_owned(),
+                        id: acc.restore_tool_use_id(id),
                         name: acc.restore_function_name(call["name"].as_str().unwrap_or_default()),
                     }]
                 })
@@ -429,6 +663,15 @@ fn parse_stream_event(kind: &str, event: &Value, acc: &mut StreamAccumulator) ->
                     }),
             ]
         }
+
+        // An unmodeled error, named as `STREAM_ERROR` says: its code and its
+        // words, already one line.
+        STREAM_ERROR => vec![StreamEvent::Error {
+            message: event["message"]
+                .as_str()
+                .unwrap_or("the upstream's event stream reported an error")
+                .to_owned(),
+        }],
 
         // `throttlingException`, `modelStreamErrorException` and the rest: an
         // error inside a 200 stream. The kind goes into the message because
@@ -1453,6 +1696,317 @@ mod tests {
             vec![StreamEvent::Error {
                 message: "modelStreamErrorException".to_owned()
             }]
+        );
+    }
+
+    #[test]
+    fn an_event_stream_error_is_an_error_event() {
+        // What `oag_upstream::eventstream` makes of a stream's unmodeled
+        // error, under a name no union member can have.
+        assert_eq!(STREAM_ERROR, ":error");
+        let mut acc = StreamAccumulator::new();
+        let events = parse_event(
+            r#"{":error":{"message":"InternalError: An internal server error occurred."}}"#,
+            &mut acc,
+        )
+        .expect("parses");
+        assert_eq!(
+            events,
+            vec![StreamEvent::Error {
+                message: "InternalError: An internal server error occurred.".to_owned()
+            }]
+        );
+    }
+
+    /// A client that called tools earlier in a conversation and declares
+    /// none this turn (a summary, a compaction, a follow-up it wants as text)
+    /// still sends those calls and their results, and Converse refuses
+    /// `toolUse` and `toolResult` blocks without a `toolConfig`. Each tool the
+    /// history called is declared with a stand-in: its name as the call names
+    /// it, a schema that takes any object, and no description, which may not
+    /// be empty.
+    #[test]
+    fn tools_called_in_history_are_declared_when_the_request_declares_none() {
+        let history = |tools: serde_json::Value| {
+            crate::openai::parse_request(&json!({
+                "model": "m",
+                "messages": [
+                    { "role": "user", "content": "read a.rs and b.rs, then the issue" },
+                    { "role": "assistant", "content": null, "tool_calls": [
+                        { "id": "call_1", "type": "function", "function": {
+                            "name": "read_file", "arguments": "{\"path\":\"a.rs\"}" } },
+                        { "id": "call_2", "type": "function", "function": {
+                            "name": "read_file", "arguments": "{\"path\":\"b.rs\"}" } },
+                        { "id": "call_3", "type": "function", "function": {
+                            "name": "user-Github.get_issue", "arguments": "{}" } },
+                    ]},
+                    { "role": "tool", "tool_call_id": "call_1", "content": "fn a() {}" },
+                    { "role": "tool", "tool_call_id": "call_2", "content": "fn b() {}" },
+                    { "role": "tool", "tool_call_id": "call_3", "content": "{}" },
+                    { "role": "user", "content": "now summarise all of it" },
+                ],
+                "tools": tools,
+            }))
+            .expect("parses")
+        };
+
+        let c = history(json!([]));
+        assert!(c.tools.is_empty(), "the premise: no tool declared");
+        let body = render_request(&c).expect("renders");
+        let stand_in = |name: &str| json!({ "toolSpec": { "name": name, "inputSchema": { "json": { "type": "object" } } } });
+        assert_eq!(
+            body["toolConfig"],
+            json!({ "tools": [stand_in("read_file"), stand_in("user-Github_get_issue")] }),
+            "one each, in the order first called, named as the calls are"
+        );
+        assert_eq!(
+            body["messages"][1]["content"][2]["toolUse"]["name"],
+            "user-Github_get_issue"
+        );
+
+        // A request that declares its own tools is sent those, and only those.
+        let c = history(json!([{ "type": "function", "function": {
+            "name": "search", "parameters": { "type": "object" } } }]));
+        let body = render_request(&c).expect("renders");
+        assert_eq!(
+            body["toolConfig"]["tools"].as_array().map(|tools| tools
+                .iter()
+                .map(|t| t["toolSpec"]["name"].clone())
+                .collect::<Vec<_>>()),
+            Some(vec![json!("search")])
+        );
+
+        // And a conversation that never called one declares none.
+        let c = crate::openai::parse_request(&json!({
+            "model": "m", "messages": [{ "role": "user", "content": "hi" }],
+        }))
+        .expect("parses");
+        assert!(
+            render_request(&c)
+                .expect("renders")
+                .get("toolConfig")
+                .is_none()
+        );
+    }
+
+    /// Converse holds a `toolUseId` to `[a-zA-Z0-9_.:-]{1,64}`, and ids from
+    /// other upstreams break it: Gemini's are a function's name and a counter
+    /// (`read_file#1`), an agent's own can run past 64 bytes, and some send
+    /// none at all. One such id anywhere in the history fails the whole turn.
+    /// Each is respelled, the same in the call and in its result, so the two
+    /// still pair; an id inside the pattern is sent as it is, and a
+    /// respelling never takes its place.
+    #[test]
+    fn tool_use_ids_converse_refuses_are_respelled_in_call_and_result() {
+        let long = format!("call_{}", "x".repeat(100));
+        let ids = [
+            "read_file#1",
+            long.as_str(),
+            "",
+            "read_file_1",
+            "tooluse_ok:1.a-b",
+        ];
+        let req = request(|r| {
+            r.messages = vec![
+                turn(Role::User, vec![text("read them")]),
+                turn(
+                    Role::Assistant,
+                    ids.iter()
+                        .map(|id| ContentBlock::ToolUse {
+                            id: (*id).to_owned(),
+                            name: "read_file".to_owned(),
+                            input: json!({}),
+                        })
+                        .collect(),
+                ),
+                turn(
+                    Role::User,
+                    ids.iter()
+                        .map(|id| ContentBlock::ToolResult {
+                            tool_use_id: (*id).to_owned(),
+                            content: ToolResultContent::Text("ok".to_owned()),
+                            is_error: false,
+                        })
+                        .collect(),
+                ),
+            ];
+        });
+        let body = render_request(&req).expect("renders");
+        let sent = |turn: usize, block: &str| -> Vec<String> {
+            body["messages"][turn]["content"]
+                .as_array()
+                .expect("blocks")
+                .iter()
+                .map(|b| b[block]["toolUseId"].as_str().expect("an id").to_owned())
+                .collect()
+        };
+        let (calls, results) = (sent(1, "toolUse"), sent(2, "toolResult"));
+        assert_eq!(calls, results, "each call still pairs with its result");
+        for id in &calls {
+            assert!(
+                (1..=64).contains(&id.len())
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b)),
+                "{id:?} is not a toolUseId Converse takes"
+            );
+        }
+        let distinct: std::collections::HashSet<&String> = calls.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "{calls:?}");
+        assert_eq!(calls[3], "read_file_1", "a legal id is sent as it is");
+        assert_eq!(calls[4], "tooluse_ok:1.a-b");
+        assert!(
+            calls[0].starts_with("read_file_1_"),
+            "kept readable, and kept off the legal id it would collide with: {}",
+            calls[0]
+        );
+        assert_eq!(
+            render_request(&req).expect("renders"),
+            body,
+            "the same every turn"
+        );
+    }
+
+    /// Converse refuses a conversation that opens with the model ("A
+    /// conversation must start with a user message"), and a client can send
+    /// one: a prefill with no question, a transcript resumed part way, or a
+    /// first user turn that held nothing this dialect carries. A minimal user
+    /// turn goes in front, judged on what is sent once turns are dropped and
+    /// merged; every word the client sent is kept.
+    #[test]
+    fn a_conversation_that_opens_with_the_model_is_sent_a_user_turn_first() {
+        let continued = json!({ "role": "user", "content": [{ "text": "(continued)" }] });
+        let req = request(|r| {
+            r.messages = vec![
+                turn(Role::Assistant, vec![text("As I was saying,")]),
+                turn(Role::User, vec![text("go on")]),
+            ];
+        });
+        assert_eq!(
+            render_request(&req).expect("renders")["messages"],
+            json!([
+                continued,
+                { "role": "assistant", "content": [{ "text": "As I was saying," }] },
+                { "role": "user", "content": [{ "text": "go on" }] },
+            ])
+        );
+
+        // The first user turn carried only reasoning, which is not sent.
+        let req = request(|r| {
+            r.messages = vec![
+                turn(
+                    Role::User,
+                    vec![ContentBlock::Thinking {
+                        text: "hmm".to_owned(),
+                        signature: None,
+                    }],
+                ),
+                turn(Role::Assistant, vec![text("Prefilled")]),
+            ];
+        });
+        assert_eq!(
+            render_request(&req).expect("renders")["messages"],
+            json!([
+                continued,
+                { "role": "assistant", "content": [{ "text": "Prefilled" }] },
+            ])
+        );
+
+        // One that opens with the user is sent as it is.
+        let req = request(|r| r.messages = vec![turn(Role::User, vec![text("hi")])]);
+        assert_eq!(
+            render_request(&req).expect("renders")["messages"],
+            json!([{ "role": "user", "content": [{ "text": "hi" }] }])
+        );
+    }
+
+    /// Converse refuses a text block with nothing in it, in a turn, in the
+    /// system prompt and in a tool result ("text content blocks must be
+    /// non-empty"), and a tool result needs content. Blank text is left out,
+    /// and a result left with nothing says so.
+    #[test]
+    fn blank_text_is_left_out_and_an_empty_tool_result_says_so() {
+        let call = |id: &str| ContentBlock::ToolUse {
+            id: id.to_owned(),
+            name: "run".to_owned(),
+            input: json!({}),
+        };
+        let result = |id: &str, content: ToolResultContent| ContentBlock::ToolResult {
+            tool_use_id: id.to_owned(),
+            content,
+            is_error: false,
+        };
+        let req = request(|r| {
+            r.system = vec![text(" \n ")];
+            r.messages = vec![
+                turn(Role::User, vec![text("run them"), text("")]),
+                // What a Chat Completions client sends with its calls.
+                turn(
+                    Role::Assistant,
+                    vec![text(""), call("t1"), call("t2"), call("t3")],
+                ),
+                turn(
+                    Role::User,
+                    vec![
+                        result("t1", ToolResultContent::Text(String::new())),
+                        result("t2", ToolResultContent::Text(" \t\n".to_owned())),
+                        result("t3", ToolResultContent::Blocks(vec![text(""), text("  ")])),
+                    ],
+                ),
+                turn(Role::User, vec![text("   ")]),
+            ];
+        });
+        let body = render_request(&req).expect("renders");
+        assert!(body.get("system").is_none(), "{body}");
+        let no_output = |id: &str| json!({ "toolResult": { "toolUseId": id, "content": [{ "text": "(no output)" }] } });
+        assert_eq!(
+            body["messages"],
+            json!([
+                { "role": "user", "content": [{ "text": "run them" }] },
+                { "role": "assistant", "content": [
+                    { "toolUse": { "toolUseId": "t1", "name": "run", "input": {} } },
+                    { "toolUse": { "toolUseId": "t2", "name": "run", "input": {} } },
+                    { "toolUse": { "toolUseId": "t3", "name": "run", "input": {} } },
+                ]},
+                { "role": "user", "content": [no_output("t1"), no_output("t2"), no_output("t3")] },
+            ])
+        );
+    }
+
+    /// Converse takes a temperature of 0 to 1, where Chat Completions takes
+    /// 0 to 2, and each stop sequence must hold at least one character.
+    #[test]
+    fn temperature_is_kept_within_converses_range_and_empty_stops_are_dropped() {
+        for (asked, sent) in [
+            (1.7_f32, 1.0),
+            (2.0, 1.0),
+            (1.0, 1.0),
+            (0.5, 0.5),
+            (0.0, 0.0),
+            (-0.5, 0.0),
+        ] {
+            let body = render_request(&request(|r| r.temperature = Some(asked))).expect("renders");
+            assert_eq!(
+                body["inferenceConfig"]["temperature"],
+                json!(sent),
+                "{asked}"
+            );
+        }
+
+        let stops = |stop: &[&str]| {
+            render_request(&request(|r| {
+                r.stop = stop.iter().map(|s| (*s).to_owned()).collect();
+            }))
+            .expect("renders")
+        };
+        assert_eq!(
+            stops(&["", "END", ""])["inferenceConfig"]["stopSequences"],
+            json!(["END"])
+        );
+        let body = stops(&[""]);
+        assert!(
+            body["inferenceConfig"].get("stopSequences").is_none(),
+            "{body}"
         );
     }
 

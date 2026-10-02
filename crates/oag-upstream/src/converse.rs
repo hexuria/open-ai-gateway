@@ -302,6 +302,33 @@ mod tests {
     }
 
     #[test]
+    fn an_arn_is_one_path_segment_on_converse_too() {
+        // An application inference profile's ARN, whose resource follows a
+        // `/`. Converse posts through the Bedrock adapter's `signed_post`, so
+        // it is sent as one segment the same way.
+        let adapter = adapter("t9-conv-arn", "us-east-1", None);
+        let canonical = canonical(false);
+        let mut model = model(endpoint("t9-conv-arn"));
+        model.upstream_name =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4e5f6"
+                .to_owned();
+        let credential = credential(KEY);
+        let request = adapter
+            .build(&UpstreamRequest {
+                canonical: &canonical,
+                model: &model,
+                credential: &credential,
+                session: None,
+            })
+            .unwrap();
+        assert_eq!(
+            request.url().path(),
+            "/model/arn:aws:bedrock:us-east-1:123456789012:\
+             application-inference-profile%2Fa1b2c3d4e5f6/converse"
+        );
+    }
+
+    #[test]
     fn the_signature_is_computed_over_the_exact_wire_path() {
         let adapter = adapter("t9-conv-wire", "eu-central-1", None);
         let request = build(&adapter, &canonical(false));

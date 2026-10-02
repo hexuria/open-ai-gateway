@@ -211,6 +211,13 @@ impl ProviderAdapter for VertexAdapter {
         }
     }
 
+    /// A token Vertex refused (revoked, or its service account's key
+    /// disabled under it) is not handed out again: it goes from the cache, if
+    /// it is still the one there, and the next request mints a new one.
+    async fn credential_refused(&self, account: AccountId, refused: &SecretMaterial) {
+        self.tokens.forget(account, &refused.access_token).await;
+    }
+
     /// The token minted from the stored key: the cached one while it has more
     /// than five minutes left, a new one otherwise. A new copy of the
     /// credential, holding the token and nothing of the key.
