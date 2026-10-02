@@ -563,6 +563,13 @@ from the path, and the OpenAI SDK's Azure client sends the same body. The
 `api-version` query is built from the row, never from the base URL, which may
 not hold a `?`.
 
+**The output ceiling** is sent as `max_completion_tokens`, whatever the
+deployment is called, on the v1 API and on every deployments-API version from
+`2024-09-01-preview`, the one that added it: a reasoning model refuses
+`max_tokens`, every model takes `max_completion_tokens`, and a deployment's
+name says nothing of the model behind it. A version from before it has no such
+field, and is sent `max_tokens`.
+
 ```sh
 # Azure's v1 API.
 oag admin endpoint add --name azure-eu --dialect openai --platform azure \
