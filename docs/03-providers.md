@@ -659,7 +659,7 @@ that.
   stand-in, a local proxy), because every request carries a bearer token. A
   multi-region location (`us`, `eu`) has a host of its own,
   `https://aiplatform.{location}.rep.googleapis.com`, so give it as the base
-  URL.
+  URL; a row naming one without it is refused (reason `region`).
 - **Auth** is `bearer`: the minted token goes in `Authorization`, and no other
   header carries anything of the credential. There is no `anthropic-version`
   header either; the body carries the version, as Google's own requests do.

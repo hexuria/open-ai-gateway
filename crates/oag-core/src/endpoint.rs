@@ -400,6 +400,12 @@ pub fn is_api_version(value: &str) -> bool {
         })
 }
 
+/// The Vertex locations that are multi-regions, each served at a host of its
+/// own, `https://aiplatform.{location}.rep.googleapis.com`, rather than at the
+/// `{region}-aiplatform.googleapis.com` the adapter builds from a region:
+/// <https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations>.
+pub const VERTEX_MULTI_REGIONS: [&str; 2] = ["us", "eu"];
+
 /// An endpoint row's columns, as stored: the store's `EndpointRow` lends
 /// them, and a writer can pass what it is about to insert.
 #[derive(Debug, Clone, Copy)]
@@ -508,6 +514,24 @@ impl EndpointConfig {
                 format!(
                     "region {region:?} is not an AWS region: one is shaped like us-east-1, \
                      two letters, then words, then one digit, each after a `-`"
+                ),
+            ));
+        }
+        // A Vertex multi-region is served at a host of its own, which nothing
+        // builds from the region: without it as the base URL, every request
+        // would go to a host that does not exist.
+        if platform == Platform::Gcp
+            && base_url.is_none()
+            && let Some(location) = region
+                .as_deref()
+                .filter(|region| VERTEX_MULTI_REGIONS.contains(region))
+        {
+            return Err(Refusal::new(
+                Reason::Region,
+                format!(
+                    "region {location:?} is a Vertex multi-region, served at \
+                     https://aiplatform.{location}.rep.googleapis.com rather than at a host \
+                     built from the region: set that as the endpoint's base URL"
                 ),
             ));
         }
@@ -934,6 +958,52 @@ mod tests {
             ..plain(&headers)
         })
         .expect("a plain endpoint may be http");
+    }
+
+    /// Vertex serves its `us` and `eu` multi-regions at hosts of their own,
+    /// `aiplatform.{location}.rep.googleapis.com`, and the host the adapter
+    /// builds from a region does not exist for either. A gcp row naming one
+    /// is refused without that host as its base URL, and the refusal names
+    /// it; with it, the row is served.
+    #[test]
+    fn a_vertex_multi_region_needs_its_host_as_the_base_url() {
+        let headers = json!({});
+        for location in ["us", "eu"] {
+            let columns = Columns {
+                name: "t10-core-multi",
+                dialect: "anthropic",
+                platform: "gcp",
+                base_url: None,
+                auth: "bearer",
+                region: Some(location),
+                project: Some("my-project-1"),
+                ..plain(&headers)
+            };
+            let refusal = EndpointConfig::from_columns(&columns).expect_err(location);
+            assert_eq!(refusal.reason, Reason::Region, "{refusal}");
+            let host = format!("https://aiplatform.{location}.rep.googleapis.com");
+            assert!(refusal.message.contains(&host), "{refusal}");
+
+            let config = EndpointConfig::from_columns(&Columns {
+                base_url: Some(&host),
+                ..columns
+            })
+            .expect("with its host");
+            assert_eq!(config.base_url.as_deref(), Some(host.as_str()));
+            assert_eq!(config.region.as_deref(), Some(location));
+        }
+        // A region is a region, and builds its own host.
+        EndpointConfig::from_columns(&Columns {
+            name: "t10-core-region",
+            dialect: "gemini",
+            platform: "gcp",
+            base_url: None,
+            auth: "bearer",
+            region: Some("us-east5"),
+            project: Some("my-project-1"),
+            ..plain(&headers)
+        })
+        .expect("a region");
     }
 
     // Long because it is a table: one row per rule, each a whole set of
