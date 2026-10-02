@@ -24,6 +24,13 @@
 //! `ConverseStream` frames its events the same way and wraps them in nothing:
 //! the payload is the event's JSON, and which event it is is the message's
 //! `:event-type` header. [`converse_event`] puts the two back together.
+//!
+//! A message is one of three kinds, by its `:message-type`: an `event`; an
+//! `exception`, a failure the API models, named by `:exception-type`; or an
+//! `error`, one it does not, which says what failed in its `:error-code` and
+//! `:error-message` headers and nothing in its payload
+//! (<https://smithy.io/2.0/aws/amazon-eventstream.html>). Both readers turn
+//! the last two into an error the client is told.
 
 use base64::Engine as _;
 
@@ -47,6 +54,13 @@ pub struct Headers {
     pub event_type: Option<String>,
     /// `:exception-type`, when the frame reports a failure rather than content.
     pub exception_type: Option<String>,
+    /// `:message-type`: `event`, `exception`, or `error` for a failure the
+    /// API does not model, which the two headers below describe.
+    pub message_type: Option<String>,
+    /// `:error-code`, on an `error` message: what failed, by name.
+    pub error_code: Option<String>,
+    /// `:error-message`, on an `error` message: what failed, in words.
+    pub error_message: Option<String>,
 }
 
 /// One decoded message.
@@ -101,7 +115,7 @@ pub fn take_messages(buf: &mut Vec<u8>) -> Vec<Message> {
     out
 }
 
-/// Parse the header block, keeping only the two headers that matter.
+/// Parse the header block, keeping only the headers that matter.
 ///
 /// Header values come in nine types; only string (7) carries anything we read,
 /// but every type has to be *skipped* correctly or the parse desynchronises and
@@ -178,6 +192,9 @@ fn parse_headers(mut b: &[u8]) -> Headers {
         match name.as_str() {
             ":event-type" => headers.event_type = value,
             ":exception-type" => headers.exception_type = value,
+            ":message-type" => headers.message_type = value,
+            ":error-code" => headers.error_code = value,
+            ":error-message" => headers.error_message = value,
             _ => {}
         }
     }
@@ -270,6 +287,39 @@ fn exception_event(kind: &str, payload: &[u8]) -> String {
     .to_string()
 }
 
+/// What an `error` message says failed, as one line, `{code}: {words}`
+/// (`InternalError: An internal server error occurred.`), or `None` for a
+/// message of any other kind.
+///
+/// Both headers are required of an `error` message. One that arrives without
+/// them is still a stream failing, so what is missing is taken from the
+/// payload's text, or left out, rather than the message dropped.
+fn stream_error(msg: &Message) -> Option<String> {
+    if msg.headers.message_type.as_deref() != Some("error") {
+        return None;
+    }
+    let code = msg
+        .headers
+        .error_code
+        .as_deref()
+        .filter(|code| !code.is_empty());
+    let words = msg
+        .headers
+        .error_message
+        .clone()
+        .filter(|words| !words.is_empty())
+        .or_else(|| {
+            Some(String::from_utf8_lossy(&msg.payload).trim().to_owned())
+                .filter(|words| !words.is_empty())
+        });
+    Some(match (code, words) {
+        (Some(code), Some(words)) => format!("{code}: {words}"),
+        (Some(code), None) => code.to_owned(),
+        (None, Some(words)) => words,
+        (None, None) => "the upstream's event stream reported an error and named none".to_owned(),
+    })
+}
+
 /// The provider's own event JSON, unwrapped from Bedrock's envelope.
 ///
 /// Returns `None` for a frame that carries no inner event — a heartbeat, or a
@@ -285,6 +335,16 @@ pub fn inner_event(msg: &Message) -> Option<String> {
     // prevent.
     if let Some(kind) = msg.headers.exception_type.as_deref() {
         return Some(exception_event(kind, &msg.payload));
+    }
+    // An unmodeled error has no payload to parse at all: the headers say it.
+    if let Some(error) = stream_error(msg) {
+        return Some(
+            serde_json::json!({
+                "type": "error",
+                "error": { "type": "error", "message": error },
+            })
+            .to_string(),
+        );
     }
 
     let v: serde_json::Value = serde_json::from_slice(&msg.payload).ok()?;
@@ -316,6 +376,16 @@ pub fn inner_event(msg: &Message) -> Option<String> {
 /// `None` for a frame that names no event, or whose event payload is not JSON.
 #[must_use]
 pub fn converse_event(msg: &Message) -> Option<String> {
+    // Not a member of the union, so it goes under a name no member can have,
+    // which `oag_proto::converse` reads as an error.
+    if let Some(error) = stream_error(msg) {
+        let mut union = serde_json::Map::new();
+        union.insert(
+            oag_proto::converse::STREAM_ERROR.to_owned(),
+            serde_json::json!({ "message": error }),
+        );
+        return Some(serde_json::Value::Object(union).to_string());
+    }
     let (kind, payload) = if let Some(kind) = msg.headers.exception_type.as_deref() {
         let body = String::from_utf8_lossy(&msg.payload);
         let payload = serde_json::from_str::<serde_json::Value>(&body)
@@ -463,8 +533,8 @@ mod tests {
         // So the assertion is the round trip, not the substring.
         let msg = Message {
             headers: Headers {
-                event_type: None,
                 exception_type: Some("throttlingException".to_owned()),
+                ..Headers::default()
             },
             payload: br#"{"message":"Too many requests"}"#.to_vec(),
         };
@@ -497,8 +567,8 @@ mod tests {
         let exception = |payload: Vec<u8>| {
             inner_event(&Message {
                 headers: Headers {
-                    event_type: None,
                     exception_type: Some("modelStreamErrorException".to_owned()),
+                    ..Headers::default()
                 },
                 payload,
             })
@@ -659,6 +729,50 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    /// The third kind of message, beside events and exceptions: a failure the
+    /// API does not model, `:message-type: error`, which says what failed in
+    /// its `:error-code` and `:error-message` headers and carries nothing in
+    /// its payload. Neither reader knew it, so each dropped it, and a stream
+    /// that failed this way ended as though the answer had. Both now tell the
+    /// client the code and the words.
+    #[test]
+    fn an_error_message_is_an_error_naming_its_code_and_words() {
+        let msg = only(
+            &encode(
+                &[
+                    (":message-type", "error"),
+                    (":error-code", "InternalError"),
+                    (":error-message", "An internal server error occurred."),
+                ],
+                b"",
+            )
+            .expect("a short message"),
+        );
+        let said = vec![oag_proto::StreamEvent::Error {
+            message: "InternalError: An internal server error occurred.".to_owned(),
+        }];
+
+        let named = converse_event(&msg).expect("an error is never dropped");
+        assert_eq!(parsed(&named), said, "Converse: {named}");
+
+        let raw = inner_event(&msg).expect("an error is never dropped");
+        let events =
+            oag_proto::anthropic::parse_event(&raw, &mut oag_proto::StreamAccumulator::new())
+                .expect("parses");
+        assert_eq!(events, said, "InvokeModel: {raw}");
+
+        // Its headers are required. Without them it is still an error, in
+        // whatever words its payload has.
+        let bare = only(&encode(&[(":message-type", "error")], b"stream reset").expect("short"));
+        let named = converse_event(&bare).expect("an error is never dropped");
+        assert_eq!(
+            parsed(&named),
+            vec![oag_proto::StreamEvent::Error {
+                message: "stream reset".to_owned()
+            }]
+        );
     }
 
     #[test]

@@ -46,6 +46,14 @@ use serde_json::{Value, json};
 /// The dialect a refusal names.
 const DIALECT: Dialect = Dialect::BedrockConverse;
 
+/// The name `oag_upstream::eventstream::converse_event` gives an event
+/// stream's unmodeled error (`:message-type: error`): a failure the stream
+/// reports in its `:error-code` and `:error-message` headers rather than as
+/// one of Converse's exception events, so no member of the union describes
+/// it. No member's name begins with a colon, so this one cannot be mistaken
+/// for anything AWS sends.
+pub const STREAM_ERROR: &str = ":error";
+
 fn refused(field: &'static str) -> Error {
     Error::UnsupportedField {
         field,
@@ -429,6 +437,15 @@ fn parse_stream_event(kind: &str, event: &Value, acc: &mut StreamAccumulator) ->
                     }),
             ]
         }
+
+        // An unmodeled error, named as `STREAM_ERROR` says: its code and its
+        // words, already one line.
+        STREAM_ERROR => vec![StreamEvent::Error {
+            message: event["message"]
+                .as_str()
+                .unwrap_or("the upstream's event stream reported an error")
+                .to_owned(),
+        }],
 
         // `throttlingException`, `modelStreamErrorException` and the rest: an
         // error inside a 200 stream. The kind goes into the message because
@@ -1452,6 +1469,25 @@ mod tests {
             events,
             vec![StreamEvent::Error {
                 message: "modelStreamErrorException".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn an_event_stream_error_is_an_error_event() {
+        // What `oag_upstream::eventstream` makes of a stream's unmodeled
+        // error, under a name no union member can have.
+        assert_eq!(STREAM_ERROR, ":error");
+        let mut acc = StreamAccumulator::new();
+        let events = parse_event(
+            r#"{":error":{"message":"InternalError: An internal server error occurred."}}"#,
+            &mut acc,
+        )
+        .expect("parses");
+        assert_eq!(
+            events,
+            vec![StreamEvent::Error {
+                message: "InternalError: An internal server error occurred.".to_owned()
             }]
         );
     }

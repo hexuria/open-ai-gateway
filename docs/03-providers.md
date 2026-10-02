@@ -526,8 +526,11 @@ stop before the usage, so the stop is held until the usage arrives, and a client
 is shown the bill on the frame that ends the answer. An exception inside the
 stream (`throttlingException`, `modelStreamErrorException`, …) reaches the
 client as an error frame in its own dialect, naming the exception, and the
-ledger records it; a 429 before the stream starts moves to the endpoint's next
-key, as any provider's does.
+ledger records it. So does an event-stream error message, the kind AWS does not
+model (`:message-type: error`), named by its `:error-code` and in its
+`:error-message`'s words, on Converse and on `InvokeModel` streams alike. A 429
+before the stream starts moves to the endpoint's next key, as any provider's
+does.
 
 ### Azure OpenAI
 
