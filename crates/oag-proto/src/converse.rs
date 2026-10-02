@@ -42,6 +42,7 @@ use oag_core::provider::Dialect;
 use oag_core::{Error, Result};
 use oag_router::Usage;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 /// The dialect a refusal names.
 const DIALECT: Dialect = Dialect::BedrockConverse;
@@ -247,17 +248,29 @@ fn image(media_type: &str, data: &str) -> Value {
     }})
 }
 
-/// `toolConfig`, or `None` when the request defines no tools.
+/// `toolConfig`, or `None` when there is no tool to declare.
+///
+/// The request's own tools; or, for a request that declares none, a stand-in
+/// for each tool its history called ([`called_in_history`]), because Converse
+/// refuses `toolUse` and `toolResult` blocks without a `toolConfig`.
 ///
 /// `toolChoice` lives inside `toolConfig`, and `toolConfig` needs at least one
 /// tool — so with none there is nothing for a choice to constrain, and `none`
-/// in particular is already true.
+/// in particular is already true. A stand-in is a tool the model could call,
+/// so with one `none` is refused as it is with a tool the client declared.
 fn render_tool_config(req: &CanonicalRequest, names: &FunctionNameMap) -> Result<Option<Value>> {
-    if req.tools.is_empty() {
+    let stand_ins;
+    let tools: &[Tool] = if req.tools.is_empty() {
+        stand_ins = called_in_history(&req.messages);
+        &stand_ins
+    } else {
+        &req.tools
+    };
+    if tools.is_empty() {
         return Ok(None);
     }
     let mut config = json!({
-        "tools": req.tools.iter().map(|t| render_tool(t, names)).collect::<Vec<_>>(),
+        "tools": tools.iter().map(|t| render_tool(t, names)).collect::<Vec<_>>(),
     });
     if let Some(choice) = &req.tool_choice {
         config["toolChoice"] = match choice {
@@ -271,6 +284,34 @@ fn render_tool_config(req: &CanonicalRequest, names: &FunctionNameMap) -> Result
         };
     }
     Ok(Some(config))
+}
+
+/// A stand-in for each tool `messages` called, in the order each was first
+/// called: its name, no description, and a schema that takes any object.
+///
+/// For a request that declares no tools but whose history still holds calls
+/// and their results: a summary, a compaction, a follow-up the client wants
+/// answered in text. Converse refuses those blocks without a `toolConfig`
+/// ("The toolConfig field must be defined when using toolUse and toolResult
+/// content blocks"), and the client's own definitions are not here to send.
+/// No description, because an empty one is refused and there is nothing to
+/// say; the name is the client's, which [`render_tool`] spells as the calls
+/// in the history are spelled.
+fn called_in_history(messages: &[Message]) -> Vec<Tool> {
+    let mut seen = HashSet::new();
+    messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { name, .. } if seen.insert(name.as_str()) => Some(Tool {
+                name: name.clone(),
+                description: String::new(),
+                input_schema: json!({ "type": "object" }),
+                cache_control: None,
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 fn render_tool(t: &Tool, names: &FunctionNameMap) -> Value {
@@ -1489,6 +1530,77 @@ mod tests {
             vec![StreamEvent::Error {
                 message: "InternalError: An internal server error occurred.".to_owned()
             }]
+        );
+    }
+
+    /// A client that called tools earlier in a conversation and declares
+    /// none this turn (a summary, a compaction, a follow-up it wants as text)
+    /// still sends those calls and their results, and Converse refuses
+    /// `toolUse` and `toolResult` blocks without a `toolConfig`. Each tool the
+    /// history called is declared with a stand-in: its name as the call names
+    /// it, a schema that takes any object, and no description, which may not
+    /// be empty.
+    #[test]
+    fn tools_called_in_history_are_declared_when_the_request_declares_none() {
+        let history = |tools: serde_json::Value| {
+            crate::openai::parse_request(&json!({
+                "model": "m",
+                "messages": [
+                    { "role": "user", "content": "read a.rs and b.rs, then the issue" },
+                    { "role": "assistant", "content": null, "tool_calls": [
+                        { "id": "call_1", "type": "function", "function": {
+                            "name": "read_file", "arguments": "{\"path\":\"a.rs\"}" } },
+                        { "id": "call_2", "type": "function", "function": {
+                            "name": "read_file", "arguments": "{\"path\":\"b.rs\"}" } },
+                        { "id": "call_3", "type": "function", "function": {
+                            "name": "user-Github.get_issue", "arguments": "{}" } },
+                    ]},
+                    { "role": "tool", "tool_call_id": "call_1", "content": "fn a() {}" },
+                    { "role": "tool", "tool_call_id": "call_2", "content": "fn b() {}" },
+                    { "role": "tool", "tool_call_id": "call_3", "content": "{}" },
+                    { "role": "user", "content": "now summarise all of it" },
+                ],
+                "tools": tools,
+            }))
+            .expect("parses")
+        };
+
+        let c = history(json!([]));
+        assert!(c.tools.is_empty(), "the premise: no tool declared");
+        let body = render_request(&c).expect("renders");
+        let stand_in = |name: &str| json!({ "toolSpec": { "name": name, "inputSchema": { "json": { "type": "object" } } } });
+        assert_eq!(
+            body["toolConfig"],
+            json!({ "tools": [stand_in("read_file"), stand_in("user-Github_get_issue")] }),
+            "one each, in the order first called, named as the calls are"
+        );
+        assert_eq!(
+            body["messages"][1]["content"][2]["toolUse"]["name"],
+            "user-Github_get_issue"
+        );
+
+        // A request that declares its own tools is sent those, and only those.
+        let c = history(json!([{ "type": "function", "function": {
+            "name": "search", "parameters": { "type": "object" } } }]));
+        let body = render_request(&c).expect("renders");
+        assert_eq!(
+            body["toolConfig"]["tools"].as_array().map(|tools| tools
+                .iter()
+                .map(|t| t["toolSpec"]["name"].clone())
+                .collect::<Vec<_>>()),
+            Some(vec![json!("search")])
+        );
+
+        // And a conversation that never called one declares none.
+        let c = crate::openai::parse_request(&json!({
+            "model": "m", "messages": [{ "role": "user", "content": "hi" }],
+        }))
+        .expect("parses");
+        assert!(
+            render_request(&c)
+                .expect("renders")
+                .get("toolConfig")
+                .is_none()
         );
     }
 

@@ -520,6 +520,12 @@ replayed from an earlier turn, which only the model that wrote it can take
 back. Tool names are held to the OpenAI pattern, as on Chat Completions, and a
 client's own names come back on the calls the model makes.
 
+Converse refuses a conversation it would otherwise take, for a few shapes
+clients send all the time, and the codec reshapes each rather than pass the 400
+on. A request that declares no tools but whose history called some (a summary,
+a compaction) declares a stand-in for each tool called: its name, and a schema
+that takes any object.
+
 **Streams.** `ConverseStream` sends AWS event-stream messages whose payload is
 the event itself, named by a header (see [Framing](#framing)). It announces the
 stop before the usage, so the stop is held until the usage arrives, and a client
