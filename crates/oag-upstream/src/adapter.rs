@@ -39,6 +39,10 @@ pub enum Framing {
     /// AWS `vnd.amazon.eventstream`: length-prefixed binary messages whose
     /// payload carries the provider's own event, base64-encoded.
     AwsEventStream,
+    /// The same binary messages as Bedrock's `ConverseStream` sends them: the
+    /// payload is one Converse event's JSON as it is, and which event it is
+    /// is said only by the message's `:event-type` header.
+    AwsConverseStream,
 }
 
 #[async_trait]

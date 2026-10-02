@@ -1,7 +1,7 @@
 use super::climb::{MAX_ESCALATIONS, budget_alone_prevented_the_climb, spawn_unserved};
 use super::failover::{
     MAX_RETRY_AFTER, Outcome, Step, TRANSPORT_COOLDOWN, backoff, collect_failed, egress_for,
-    may_try_another, step_for, transport_failure, upstream_retry_after,
+    may_try_another, openai_function_names, step_for, transport_failure, upstream_retry_after,
 };
 use super::plan::parse_ladder;
 use super::respond::{
@@ -1005,6 +1005,43 @@ fn a_binary_framed_upstream_is_never_passed_through() {
         matches!(e, sse::Egress::AnthropicMessages { .. }),
         "must be rendered, not forwarded"
     );
+}
+
+#[test]
+fn a_converse_upstream_is_sent_names_it_takes_and_the_client_gets_its_own_back() {
+    // Converse holds a tool name to the OpenAI pattern and its codec
+    // sanitises one that breaks it, so the map that restores the client's
+    // name on the way back has to be the rewriting one. The identity map
+    // handed a connector tool's caller `user-Github_get_file`, which it
+    // cannot dispatch.
+    let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "read it" }],
+        "tools": [{ "type": "function", "function": {
+            "name": "user-Github.get_file", "parameters": { "type": "object" } } }],
+    }))
+    .expect("parses");
+    for (upstream, rewrites) in [
+        (Dialect::BedrockConverse, true),
+        (Dialect::OpenAIChatCompletions, true),
+        (Dialect::OpenAIResponses, true),
+        (Dialect::AnthropicMessages, false),
+        (Dialect::GeminiGenerateContent, false),
+    ] {
+        let names = openai_function_names(&canonical, upstream);
+        assert_eq!(names.rewrites(), rewrites, "{upstream:?}");
+    }
+    let names = openai_function_names(&canonical, Dialect::BedrockConverse);
+    let sent = oag_proto::converse::render_request(&canonical).expect("renders");
+    let wire = sent["toolConfig"]["tools"][0]["toolSpec"]["name"]
+        .as_str()
+        .expect("a name");
+    assert_eq!(
+        names.wire("user-Github.get_file"),
+        wire,
+        "the codec's spelling"
+    );
+    assert_eq!(names.original(wire), "user-Github.get_file");
 }
 
 #[test]

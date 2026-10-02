@@ -16,9 +16,14 @@
 //!      message_crc     u32 be
 //! ```
 //!
-//! Bedrock's payload is JSON of the form `{"bytes": "<base64>"}`, and the
-//! base64 decodes to the provider's own event — Anthropic's, for a Claude
-//! model. So the useful output of this module is that inner JSON.
+//! `InvokeModelWithResponseStream`'s payload is JSON of the form
+//! `{"bytes": "<base64>"}`, and the base64 decodes to the provider's own event
+//! — Anthropic's, for a Claude model. So the useful output of this module is
+//! that inner JSON ([`inner_event`]).
+//!
+//! `ConverseStream` frames its events the same way and wraps them in nothing:
+//! the payload is the event's JSON, and which event it is is the message's
+//! `:event-type` header. [`converse_event`] puts the two back together.
 
 use base64::Engine as _;
 
@@ -180,6 +185,57 @@ fn parse_headers(mut b: &[u8]) -> Headers {
     headers
 }
 
+/// One message framed as AWS frames it, both checksums included: `headers` as
+/// string headers in the order given, then `payload`. `None` when a header or
+/// the whole message is too long for the format to say.
+///
+/// For tests, here and in the crates that depend on this one (the
+/// `test-fixtures` feature): a stand-in Bedrock has to send the bytes the real
+/// one does, and a copy of this per test file would be one more encoder each
+/// to get wrong.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[must_use]
+pub fn encode(headers: &[(&str, &str)], payload: &[u8]) -> Option<Vec<u8>> {
+    let mut block = Vec::new();
+    for (name, value) in headers {
+        block.push(u8::try_from(name.len()).ok()?);
+        block.extend_from_slice(name.as_bytes());
+        // A string, the one value type every header here has.
+        block.push(7);
+        block.extend_from_slice(&u16::try_from(value.len()).ok()?.to_be_bytes());
+        block.extend_from_slice(value.as_bytes());
+    }
+    let total = OVERHEAD + block.len() + payload.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&u32::try_from(total).ok()?.to_be_bytes());
+    out.extend_from_slice(&u32::try_from(block.len()).ok()?.to_be_bytes());
+    let prelude = crc32(&out);
+    out.extend_from_slice(&prelude.to_be_bytes());
+    out.extend_from_slice(&block);
+    out.extend_from_slice(payload);
+    let message = crc32(&out);
+    out.extend_from_slice(&message.to_be_bytes());
+    Some(out)
+}
+
+/// CRC-32 as the format checksums with it: the IEEE polynomial, reflected,
+/// the one zlib computes.
+#[cfg(any(test, feature = "test-fixtures"))]
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 /// An AWS exception frame, rewritten as the dialect's own error event.
 ///
 /// The old code returned the body verbatim, and the doc claimed that surfaced
@@ -241,6 +297,39 @@ pub fn inner_event(msg: &Message) -> Option<String> {
     }
 
     None
+}
+
+/// A `ConverseStream` message as the one-member union the API reference
+/// documents: `{"<event type>": payload}`, which is what
+/// `oag_proto::converse::parse_event` reads.
+///
+/// Converse sends each event's JSON as the payload itself, with no `bytes`
+/// envelope, and says which event it is only in the `:event-type` header, so
+/// the name is put back around the payload here, where it is still in hand.
+///
+/// An exception frame is named by its `:exception-type` the same way —
+/// `{"throttlingException": {"message": …}}` — which the parser turns into an
+/// error in Converse's own terms, the kind kept in the message. As in
+/// [`inner_event`], the header is what makes a frame an exception, so a body
+/// that is not JSON, or not UTF-8, is still one: its text becomes the message.
+///
+/// `None` for a frame that names no event, or whose event payload is not JSON.
+#[must_use]
+pub fn converse_event(msg: &Message) -> Option<String> {
+    let (kind, payload) = if let Some(kind) = msg.headers.exception_type.as_deref() {
+        let body = String::from_utf8_lossy(&msg.payload);
+        let payload = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| serde_json::json!({ "message": body }));
+        (kind, payload)
+    } else {
+        let kind = msg.headers.event_type.as_deref()?;
+        (kind, serde_json::from_slice(&msg.payload).ok()?)
+    };
+    let mut union = serde_json::Map::new();
+    union.insert(kind.to_owned(), payload);
+    Some(serde_json::Value::Object(union).to_string())
 }
 
 #[cfg(test)]
@@ -456,5 +545,160 @@ mod tests {
             payload: br#"{"something":"else"}"#.to_vec(),
         };
         assert!(inner_event(&msg).is_none());
+    }
+
+    // ── ConverseStream ───────────────────────────────────────────────────────
+
+    /// A `ConverseStream` event as Bedrock frames it: three string headers,
+    /// and the event's JSON as the payload, padding field `p` and all.
+    fn converse(event_type: &str, payload: &str) -> Vec<u8> {
+        encode(
+            &[
+                (":event-type", event_type),
+                (":content-type", "application/json"),
+                (":message-type", "event"),
+            ],
+            payload.as_bytes(),
+        )
+        .expect("a short message")
+    }
+
+    fn exception(kind: &str, payload: &[u8]) -> Vec<u8> {
+        encode(
+            &[
+                (":exception-type", kind),
+                (":content-type", "application/json"),
+                (":message-type", "exception"),
+            ],
+            payload,
+        )
+        .expect("a short message")
+    }
+
+    /// The one decoded message in `bytes`.
+    fn only(bytes: &[u8]) -> Message {
+        let mut buf = bytes.to_vec();
+        let mut messages = take_messages(&mut buf);
+        assert!(buf.is_empty(), "a whole message is consumed");
+        assert_eq!(messages.len(), 1);
+        messages.remove(0)
+    }
+
+    fn parsed(named: &str) -> Vec<oag_proto::StreamEvent> {
+        oag_proto::converse::parse_event(named, &mut oag_proto::StreamAccumulator::new())
+            .expect("parses")
+    }
+
+    #[test]
+    fn a_converse_event_is_its_payload_named_by_its_header() {
+        let payload = r#"{"contentBlockIndex":0,"delta":{"text":"Starman"},"p":"abcdefghij"}"#;
+        let msg = only(&converse("contentBlockDelta", payload));
+        assert_eq!(msg.headers.event_type.as_deref(), Some("contentBlockDelta"));
+
+        let named = converse_event(&msg).expect("an event");
+        let event: serde_json::Value = serde_json::from_str(payload).expect("JSON");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&named).expect("JSON"),
+            serde_json::json!({ "contentBlockDelta": event })
+        );
+        // The union the parser reads, and the text in it.
+        assert_eq!(
+            parsed(&named),
+            vec![oag_proto::StreamEvent::TextDelta {
+                text: "Starman".to_owned()
+            }]
+        );
+        // The reader for the other API finds nothing in it: there is no
+        // `bytes` envelope to open.
+        assert!(inner_event(&msg).is_none());
+    }
+
+    #[test]
+    fn a_converse_exception_is_an_error_in_converses_own_terms() {
+        let msg = only(&exception(
+            "throttlingException",
+            br#"{"message":"Too many tokens, please wait before trying again."}"#,
+        ));
+        let named = converse_event(&msg).expect("an exception is never dropped");
+        assert_eq!(
+            named,
+            r#"{"throttlingException":{"message":"Too many tokens, please wait before trying again."}}"#
+        );
+        assert!(
+            !named.contains(r#""type":"error""#),
+            "not Anthropic's: {named}"
+        );
+        assert_eq!(
+            parsed(&named),
+            vec![oag_proto::StreamEvent::Error {
+                message: "throttlingException: Too many tokens, please wait before trying again."
+                    .to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn a_converse_exception_whose_body_cannot_be_read_is_still_an_error() {
+        // Not JSON, not an object, not UTF-8: the header says it is an
+        // exception, and the provider's words are kept as far as they go.
+        let mut not_utf8 = b"quota d".to_vec();
+        not_utf8.extend_from_slice(&[0xff, 0xfe]);
+        for (body, says) in [
+            (b"service unavailable".to_vec(), "service unavailable"),
+            (br#""a JSON string""#.to_vec(), "a JSON string"),
+            (not_utf8, "quota d"),
+        ] {
+            let msg = only(&exception("serviceUnavailableException", &body));
+            let named = converse_event(&msg).expect("an exception is never dropped");
+            let events = parsed(&named);
+            let [oag_proto::StreamEvent::Error { message }] = events.as_slice() else {
+                panic!("one error, from {named}: {events:?}");
+            };
+            assert!(
+                message.starts_with("serviceUnavailableException: ") && message.contains(says),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_converse_frame_that_names_no_event_or_is_not_json_yields_nothing() {
+        let unnamed = only(&encode(&[(":message-type", "event")], b"{}").expect("short"));
+        assert!(converse_event(&unnamed).is_none());
+        let garbled = only(&converse("contentBlockDelta", "{not json"));
+        assert!(converse_event(&garbled).is_none());
+    }
+
+    #[test]
+    fn the_checksum_is_the_one_zlib_computes() {
+        // The standard check value for CRC-32/ISO-HDLC.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn an_encoded_message_is_framed_and_checksummed_as_aws_frames_one() {
+        let bytes = converse("messageStop", r#"{"stopReason":"end_turn"}"#);
+        let word = |at: usize| {
+            u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+        };
+        assert_eq!(
+            word(0),
+            u32::try_from(bytes.len()).expect("short"),
+            "the total length"
+        );
+        assert_eq!(word(8), crc32(&bytes[..8]), "the prelude's checksum");
+        assert_eq!(
+            word(bytes.len() - 4),
+            crc32(&bytes[..bytes.len() - 4]),
+            "the message's checksum covers everything before it"
+        );
+        let msg = only(&bytes);
+        assert_eq!(msg.headers.event_type.as_deref(), Some("messageStop"));
+        assert_eq!(msg.payload, br#"{"stopReason":"end_turn"}"#);
+        assert!(
+            encode(&[("n".repeat(256).as_str(), "v")], b"").is_none(),
+            "a header name is at most 255 bytes"
+        );
     }
 }
