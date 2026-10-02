@@ -92,6 +92,10 @@ chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.10"
 base64 = "0.22"
+# RS256 for the JWT a Google service account signs to get an access token
+# (`oag-upstream/src/gcp_token.rs`). Already in the tree as rustls' crypto
+# provider; named here at the version the lockfile holds, so no crate is added.
+ring = "0.17.14"
 
 # ── observability ──────────────────────────────────────────────────────────────
 tracing = "0.1"

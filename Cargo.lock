@@ -1639,6 +1639,7 @@ dependencies = [
  "oag-proto",
  "oag-router",
  "reqwest",
+ "ring",
  "rust_decimal",
  "serde",
  "serde_json",
@@ -1647,6 +1648,7 @@ dependencies = [
  "tokio",
  "tracing",
  "typesafe-sdk",
+ "url",
  "uuid",
  "wiremock",
 ]
