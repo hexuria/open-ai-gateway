@@ -36,6 +36,13 @@
 //! takes `max_completion_tokens`, and a deployment's name does not say which
 //! model it holds. A version from before it has only `max_tokens`, and is sent
 //! that.
+//!
+//! **A stream's usage** is asked for with `stream_options`, as on every Chat
+//! Completions upstream, wherever Azure takes it: the v1 API and every
+//! deployments-API version from `2024-09-01-preview`, the one that added it.
+//! A version from before it refuses a request that names the field, so there
+//! it is left out, and a stream through such a version reports no usage: its
+//! tokens are not metered (`docs/03-providers.md` says so to the operator).
 
 use crate::adapter::{ProviderAdapter, UpstreamRequest};
 use crate::custom::{ExtraHeaders, authenticate};
@@ -48,6 +55,11 @@ use oag_proto::{StreamAccumulator, StreamEvent, openai};
 /// Azure's API changelog lists it among the changes from `2024-08-01-preview`
 /// to `2024-09-01-preview`.
 const MAX_COMPLETION_TOKENS_SINCE: &str = "2024-09-01";
+
+/// The date of the first API version that takes `stream_options`: Azure's
+/// API changelog lists `stream_options` and `include_usage` among the changes
+/// from `2024-08-01-preview` to `2024-09-01-preview`.
+const STREAM_OPTIONS_SINCE: &str = "2024-09-01";
 
 /// Talks Chat Completions to one `azure` endpoint's resource.
 #[derive(Debug, Clone)]
@@ -113,6 +125,15 @@ impl AzureOpenAIAdapter {
         self.api_version
             .as_deref()
             .is_none_or(|version| dated_on_or_after(version, MAX_COMPLETION_TOKENS_SINCE))
+    }
+
+    /// Whether this endpoint's API takes `stream_options`: the v1 API does,
+    /// and so does every deployments-API version dated
+    /// [`STREAM_OPTIONS_SINCE`] or later.
+    fn takes_stream_options(&self) -> bool {
+        self.api_version
+            .as_deref()
+            .is_none_or(|version| dated_on_or_after(version, STREAM_OPTIONS_SINCE))
     }
 
     /// `body` with its output ceiling under the one name this endpoint's API
@@ -186,6 +207,14 @@ impl ProviderAdapter for AzureOpenAIAdapter {
         let url = self.url(deployment)?;
         let mut body = openai::render_request(req.canonical, deployment)?;
         self.name_the_ceiling(&mut body);
+        // The codec asks every stream for its usage. A version from before
+        // `stream_options` refuses a request that names it, every streamed one,
+        // so there the stream goes without, and reports no usage.
+        if !self.takes_stream_options()
+            && let Some(object) = body.as_object_mut()
+        {
+            object.remove("stream_options");
+        }
 
         let mut builder = crate::builder_client()?
             .post(url)
@@ -581,6 +610,41 @@ mod tests {
                 assert!(
                     body.get("max_completion_tokens").is_none(),
                     "{api_version}, {deployment}: {body}"
+                );
+            }
+        }
+    }
+
+    /// A deployments-API version from before `stream_options` refuses a
+    /// request that names it, so a stream there is not asked for its usage;
+    /// on the v1 API and on every version that has the field, it is.
+    #[test]
+    fn stream_options_go_only_where_the_api_version_takes_them() {
+        for (api_version, asked) in [
+            (None, true),
+            (Some("2024-09-01-preview"), true),
+            (Some(VERSION), true),
+            (Some("2025-04-01-preview"), true),
+            (Some("2024-06-01"), false),
+            (Some("2024-08-01-preview"), false),
+        ] {
+            let spec = spec(
+                "t8-azure-usage",
+                "https://res.openai.azure.com",
+                api_version,
+            );
+            let body = built_body(&build(&spec, "gpt-4o", true).expect("builds"));
+            assert_eq!(body["stream"], true, "{api_version:?}");
+            if asked {
+                assert_eq!(
+                    body["stream_options"],
+                    serde_json::json!({ "include_usage": true }),
+                    "{api_version:?}"
+                );
+            } else {
+                assert!(
+                    body.get("stream_options").is_none(),
+                    "{api_version:?}: {body}"
                 );
             }
         }

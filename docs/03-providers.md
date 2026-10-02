@@ -590,9 +590,13 @@ named `gpt-4o-prod`, priced from Azure's price list.
 **Streams** are Chat Completions streams: passed through to an OpenAI-shaped
 client byte for byte, Azure's filter results and all, and translated for any
 other. The gateway asks every Chat Completions upstream for the stream's usage
-(`stream_options.include_usage`), Azure included, and bills what Azure
-reports. An API version older than that field may refuse a streamed request
-with a 400 naming it; if one does, name a later version.
+(`stream_options.include_usage`), and Azure too wherever it takes the field: on
+the v1 API and on every deployments-API version from `2024-09-01-preview`, the
+one that added it, and bills what Azure reports. A version from before it
+refuses a request that names the field, so a stream through one is sent without
+it and reports no usage: **its tokens are not metered**. Name
+`2024-09-01-preview` or later, or leave `api_version` unset for the v1 API, to
+have Azure streams billed.
 
 **Content filtering.** An answer Azure's filter stops ends with
 `finish_reason: "content_filter"`, which reads as a refusal, as OpenAI's does:
