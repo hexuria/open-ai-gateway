@@ -401,6 +401,230 @@ async fn a_key_is_filed_under_an_endpoint_as_the_kind_its_platform_takes() {
     assert!(err.contains("openai.com"), "and it says which rule: {err}");
 }
 
+/// A gcp endpoint's key is a service account's JSON, read whole from a file,
+/// checked as the gateway's mint reads it, and filed as a `service_account`.
+/// A secret that could never mint is refused before anything is stored, and
+/// the refusal quotes none of it.
+///
+/// Gated on Postgres, as the test above is: the endpoint is a row.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_service_account_key_is_read_from_a_file_and_checked_before_it_is_filed() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 2).expect("connect");
+    db.migrate().await.expect("migrate");
+    let kek =
+        oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=").expect("kek");
+
+    let tag = Uuid::new_v4().simple().to_string()[..10].to_owned();
+    let (route, vertex) = (format!("t10-{tag}"), format!("t10v-{tag}"));
+    sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]')")
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("route");
+    repo::insert_endpoint(
+        &db,
+        &oag_store::NewEndpoint {
+            name: &vertex,
+            dialect: "gemini",
+            platform: "gcp",
+            base_url: None,
+            auth: "bearer",
+            region: Some("us-central1"),
+            project: Some("oag-test"),
+            api_version: None,
+            path: None,
+            extra_headers: &serde_json::json!({}),
+            display_name: None,
+            discover_models: false,
+        },
+    )
+    .await
+    .expect("a gcp endpoint");
+
+    let key = serde_json::json!({
+        "type": "service_account",
+        "project_id": "oag-test",
+        "private_key_id": "t10",
+        "private_key": oag_upstream::gcp_token::TEST_KEY_PEM,
+        "client_email": "t10-cli@oag-test.invalid",
+    });
+    // Over many lines, as Google's download is.
+    let pretty = serde_json::to_string_pretty(&key).expect("JSON");
+    let file = std::env::temp_dir().join(format!("oag-t10-{tag}.json"));
+    std::fs::write(&file, &pretty).expect("a key file");
+    let mut wrong_type = key.clone();
+    wrong_type["type"] = serde_json::json!("authorized_user");
+    let refused = [
+        ("an API key", "AIza-t10-not-a-service-account".to_owned()),
+        ("another kind of Google key", wrong_type.to_string()),
+    ];
+
+    let filed = format!("{vertex}-sa");
+    let outcome = async {
+        let cli = AdminCli::try_parse_from([
+            "admin",
+            "account",
+            "add",
+            "--name",
+            &filed,
+            "--provider",
+            &vertex,
+            "--secret-file",
+            file.to_str().expect("a UTF-8 path"),
+            "--route",
+            &route,
+        ])
+        .expect("parses");
+        let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+            panic!("expected an account add");
+        };
+        add_account_from_args(&db, &kek, args).await?;
+
+        let mut refusals = Vec::new();
+        for (case, secret) in &refused {
+            let name = format!("{vertex}-refused");
+            let err = add_account(&db, &kek, &name, &vertex, secret, &route, 4, 0, None, None)
+                .await
+                .expect_err(case);
+            refusals.push((*case, err));
+        }
+        let rows: Vec<(Uuid, String, String)> =
+            sqlx::query_as("SELECT id, name, kind FROM account WHERE provider = $1")
+                .bind(&vertex)
+                .fetch_all(db.pool())
+                .await
+                .map_err(|e| oag_core::Error::Internal(e.to_string()))?;
+        let stored = match rows.first() {
+            Some((id, _, _)) => repo::account_by_id(&db, oag_core::AccountId::from_uuid(*id))
+                .await?
+                .map(|row| kek.open_json::<oag_core::credential::SecretMaterial>(&row.sealed()))
+                .transpose()?
+                .map(|material| material.access_token.clone()),
+            None => None,
+        };
+        Ok::<_, oag_core::Error>((refusals, rows, stored))
+    }
+    .await;
+
+    // Cleaned up before asserting, so a failure leaves nothing behind.
+    let _ = std::fs::remove_file(&file);
+    sqlx::query("DELETE FROM account WHERE provider = $1")
+        .bind(&vertex)
+        .execute(db.pool())
+        .await
+        .expect("remove the keys");
+    assert_eq!(
+        repo::delete_endpoint(&db, &vertex).await.expect("delete"),
+        oag_store::EndpointDeletion::Deleted
+    );
+    sqlx::query("DELETE FROM route WHERE name = $1")
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("remove the route");
+
+    let (refusals, rows, stored) = outcome.expect("the key in the file is filed");
+    assert_eq!(
+        rows.iter()
+            .map(|(_, name, kind)| (name.as_str(), kind.as_str()))
+            .collect::<Vec<_>>(),
+        [(filed.as_str(), "service_account")],
+        "the file's key, as the kind a gcp endpoint takes, and no refused one"
+    );
+    assert_eq!(
+        stored.as_deref(),
+        Some(pretty.as_str()),
+        "sealed as the file holds it"
+    );
+    for (case, err) in refusals {
+        assert!(matches!(err, oag_core::Error::Config(_)), "{case}: {err:?}");
+        let message = err.to_string();
+        assert!(
+            !message.contains("AIza-t10") && !message.contains("BEGIN PRIVATE KEY"),
+            "{case}: {message}"
+        );
+        for line in oag_upstream::gcp_token::TEST_KEY_PEM.lines() {
+            assert!(!message.contains(line), "{case}: {message}");
+        }
+    }
+}
+
+/// `--secret-file` is a third way to give a secret, and never beside another
+/// or beside an import, which takes its credential from a session file.
+#[test]
+fn a_secret_file_is_one_way_to_give_the_secret_and_never_beside_another() {
+    let parse = |extra: &[&str]| {
+        let mut argv = vec!["admin", "account", "add", "--name", "vertex-sa"];
+        argv.extend_from_slice(extra);
+        AdminCli::try_parse_from(argv)
+    };
+    let cli = parse(&["--provider", "vertex", "--secret-file", "/keys/sa.json"])
+        .expect("a provider and a key file");
+    let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+        panic!("expected an account add");
+    };
+    assert_eq!(args.secret_file.as_deref(), Some("/keys/sa.json"));
+    assert!(args.secret.is_none());
+
+    for clash in [
+        &[
+            "--provider",
+            "vertex",
+            "--secret-file",
+            "/keys/sa.json",
+            "--secret",
+            "typed",
+        ][..],
+        &["--from", "codex", "--secret-file", "/keys/sa.json"],
+    ] {
+        let err = parse(clash).expect_err("two sources for one secret");
+        assert!(
+            err.to_string().contains("--secret-file"),
+            "{clash:?}: {err}"
+        );
+    }
+}
+
+/// A key file that cannot be read is refused, naming the path, before the
+/// database is asked anything: the pool here points at a closed port.
+#[tokio::test]
+async fn an_unreadable_secret_file_is_refused_before_any_query() {
+    let missing =
+        std::env::temp_dir().join(format!("oag-t10-missing-{}.json", Uuid::new_v4().simple()));
+    let missing = missing.to_str().expect("a UTF-8 path");
+    let cli = AdminCli::try_parse_from([
+        "admin",
+        "account",
+        "add",
+        "--name",
+        "vertex-sa",
+        "--provider",
+        "vertex",
+        "--secret-file",
+        missing,
+    ])
+    .expect("parses");
+    let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+        panic!("expected an account add");
+    };
+    let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag_g0", 1).expect("lazy pool");
+    let kek =
+        oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=").expect("kek");
+    let err = add_account_from_args(&db, &kek, args)
+        .await
+        .expect_err("no such file");
+    let message = err.to_string();
+    assert!(
+        message.contains("reading --secret-file") && message.contains(missing),
+        "{message}"
+    );
+}
+
 /// C8. clap does not read `OAG_ACCOUNT_SECRET`, so it cannot conflict on it.
 ///
 /// clap treats an env-supplied value as explicitly present when it

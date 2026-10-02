@@ -423,6 +423,14 @@ pub struct GatewayConfig {
     /// during testing. Omitted providers use their public API.
     #[serde(default)]
     pub provider_base_urls: std::collections::BTreeMap<String, String>,
+    /// Where a Google service account's key is traded for an access token, for
+    /// every endpoint on the `gcp` platform (Vertex AI). Google's own,
+    /// [`DEFAULT_GCP_TOKEN_URL`], unless it is pointed at a stand-in.
+    ///
+    /// The only place the mint goes. A key file names a `token_uri` of its
+    /// own, and it is never used: whoever wrote the file would otherwise choose
+    /// where the gateway posts a signed assertion.
+    pub gcp_token_url: String,
     /// Codex/`ChatGPT` subscription adapter. Only consulted when an OpenAI OAuth
     /// seat is on a route ladder.
     #[serde(default)]
@@ -489,12 +497,17 @@ impl Default for GatewayConfig {
             spend_reconcile_interval: Duration::from_mins(10),
             bedrock_region: default_bedrock_region(),
             provider_base_urls: std::collections::BTreeMap::new(),
+            gcp_token_url: DEFAULT_GCP_TOKEN_URL.to_owned(),
             codex: CodexConfig::default(),
             claude_code_model_aliases: false,
             advertise_auto: false,
         }
     }
 }
+
+/// Google's OAuth 2.0 token endpoint: where `gateway.gcp_token_url` points
+/// unless it is set.
+pub const DEFAULT_GCP_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 /// Codex/`ChatGPT` subscription adapter settings.
 ///
@@ -1033,6 +1046,23 @@ security:
                 .get("anthropic")
                 .map(String::as_str),
             Some("http://127.0.0.1:9")
+        );
+    }
+
+    #[test]
+    fn the_gcp_token_url_is_googles_unless_it_is_set() {
+        let cfg = Config::from_yaml(MINIMAL).expect("parses");
+        assert_eq!(
+            cfg.gateway.gcp_token_url,
+            "https://oauth2.googleapis.com/token"
+        );
+
+        let src = format!("{MINIMAL}\ngateway:\n  gcp_token_url: \"http://127.0.0.1:9/token\"\n");
+        let cfg = Config::from_yaml(&src).expect("parses");
+        assert_eq!(cfg.gateway.gcp_token_url, "http://127.0.0.1:9/token");
+        assert_eq!(
+            cfg.gateway.bedrock_region, "us-east-1",
+            "a sibling keeps its default"
         );
     }
 

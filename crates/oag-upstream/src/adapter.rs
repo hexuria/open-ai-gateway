@@ -131,10 +131,14 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
     /// and before [`ProviderAdapter::build`], which receives what this
     /// returns. An error here is the credential's: the request moves on to the
     /// next one, as it does when a refresh fails.
+    ///
+    /// `proxy` is the credential's own `proxy_url`, as for `refresh`: a call
+    /// made to prepare a credential is one made with it.
     async fn prepare_credential<'a>(
         &'a self,
         _account: AccountId,
         stored: &'a SecretMaterial,
+        _proxy: Option<&str>,
     ) -> Result<Cow<'a, SecretMaterial>> {
         Ok(Cow::Borrowed(stored))
     }
@@ -200,7 +204,11 @@ mod tests {
             account_id: None,
         };
         let prepared = Defaults
-            .prepare_credential(AccountId::from_uuid(uuid::Uuid::nil()), &stored)
+            .prepare_credential(
+                AccountId::from_uuid(uuid::Uuid::nil()),
+                &stored,
+                Some("http://127.0.0.1:3128"),
+            )
             .await
             .expect("the default never fails");
         let Cow::Borrowed(same) = prepared else {

@@ -174,6 +174,7 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
         name,
         provider,
         secret,
+        secret_file,
         from,
         from_grok,
         from_codex,
@@ -213,8 +214,13 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
 
     let max_concurrency = max_concurrency.unwrap_or_else(|| default_concurrency(source));
 
-    // Only after the conflict check, so the fallback cannot resurrect it.
-    let secret = secret.or_else(|| std::env::var("OAG_ACCOUNT_SECRET").ok());
+    // Only after the conflict check, so the fallback cannot resurrect it. A
+    // file and a typed secret cannot both be given: clap refuses the pair.
+    let secret = match (secret, secret_file) {
+        (Some(typed), _) => Some(typed),
+        (None, Some(path)) => Some(read_secret_file(&path)?),
+        (None, None) => std::env::var("OAG_ACCOUNT_SECRET").ok(),
+    };
     match source {
         Some(AccountSource::Grok) => {
             import_grok(
@@ -249,7 +255,7 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
                 return Err(oag_core::Error::Config(
                     "--provider and --secret are required without --from. The secret may \
                      come from OAG_ACCOUNT_SECRET instead of the flag, which keeps it out \
-                     of shell history."
+                     of shell history, or from a file with --secret-file."
                         .to_owned(),
                 ));
             };
@@ -268,6 +274,13 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
             .await
         }
     }
+}
+
+/// The secret in the file at `path`, whole: a service account's JSON key
+/// spans many lines. Its contents are never part of an error.
+pub(super) fn read_secret_file(path: &str) -> Result<String> {
+    std::fs::read_to_string(path)
+        .map_err(|e| oag_core::Error::Config(format!("reading --secret-file {path}: {e}")))
 }
 
 type AccountListRow = (
@@ -441,7 +454,17 @@ pub(super) async fn add_account(
     // The kind this provider takes a plain secret as: an API key everywhere
     // but an endpoint on AWS (a packed Bedrock key) or on GCP (a service
     // account's JSON).
-    let kind = provider.support().credential_kinds[0].to_string();
+    let kind = provider.support().credential_kinds[0];
+    // A service account's key is read now as the gateway's mint will read it,
+    // so a key that could never mint a token is refused here rather than on
+    // every request after. What it answers with is the account's email, which
+    // is no secret; nothing of the key is printed.
+    let service_account = if kind == oag_core::credential::CredentialKind::ServiceAccount {
+        Some(oag_upstream::gcp_token::check_key(secret)?)
+    } else {
+        None
+    };
+    let kind = kind.to_string();
 
     let material = SecretMaterial {
         access_token: secret.to_owned(),
@@ -469,6 +492,9 @@ pub(super) async fn add_account(
     .await?;
 
     println!("account {name} ({provider}) -> {id}");
+    if let Some(email) = service_account {
+        println!("  the service account {email}; its key is never shown");
+    }
     println!(
         "  sealed at rest, attached to route '{route}', {}",
         scope_of(owner_id)

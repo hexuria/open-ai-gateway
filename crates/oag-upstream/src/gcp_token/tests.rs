@@ -137,7 +137,7 @@ fn assert_quotes_nothing(shown: &str, secrets: &[&str]) {
 async fn a_mint_posts_a_jwt_bearer_grant_signed_by_the_key() {
     let server = token_endpoint(granted("ya29.minted"), 1).await;
     let token = cache(&server)
-        .token(AccountId::new(), &key_json().to_string())
+        .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect("a token");
     assert_eq!(token, "ya29.minted");
@@ -201,11 +201,11 @@ async fn a_second_call_within_validity_reuses_the_token() {
     let (account, key) = (AccountId::new(), key_json().to_string());
 
     assert_eq!(
-        cache.token(account, &key).await.expect("minted"),
+        cache.token(account, &key, None).await.expect("minted"),
         "ya29.first"
     );
     assert_eq!(
-        cache.token(account, &key).await.expect("cached"),
+        cache.token(account, &key, None).await.expect("cached"),
         "ya29.first"
     );
     server.verify().await;
@@ -235,17 +235,20 @@ async fn a_token_within_five_minutes_of_expiry_is_minted_again() {
     let (account, key) = (AccountId::new(), key_json().to_string());
 
     assert_eq!(
-        cache.token(account, &key).await.expect("minted"),
+        cache.token(account, &key, None).await.expect("minted"),
         "ya29.first"
     );
     NOW.store(T0 + 3299, Ordering::SeqCst);
     assert_eq!(
-        cache.token(account, &key).await.expect("cached"),
+        cache.token(account, &key, None).await.expect("cached"),
         "ya29.first"
     );
     NOW.store(T0 + 3300, Ordering::SeqCst);
     assert_eq!(
-        cache.token(account, &key).await.expect("minted again"),
+        cache
+            .token(account, &key, None)
+            .await
+            .expect("minted again"),
         "ya29.second"
     );
 
@@ -276,7 +279,7 @@ async fn concurrent_callers_for_one_account_share_one_mint() {
             let (cache, key, start) = (Arc::clone(&cache), key.clone(), Arc::clone(&start));
             tokio::spawn(async move {
                 start.wait().await;
-                cache.token(account, &key).await
+                cache.token(account, &key, None).await
             })
         })
         .collect();
@@ -302,9 +305,12 @@ async fn each_account_gets_its_own_token() {
     let cache = cache(&server);
     let (a, b, key) = (AccountId::new(), AccountId::new(), key_json().to_string());
 
-    assert_eq!(cache.token(a, &key).await.expect("a"), "ya29.for-a");
-    assert_eq!(cache.token(b, &key).await.expect("b"), "ya29.for-b");
-    assert_eq!(cache.token(a, &key).await.expect("a again"), "ya29.for-a");
+    assert_eq!(cache.token(a, &key, None).await.expect("a"), "ya29.for-a");
+    assert_eq!(cache.token(b, &key, None).await.expect("b"), "ya29.for-b");
+    assert_eq!(
+        cache.token(a, &key, None).await.expect("a again"),
+        "ya29.for-a"
+    );
     server.verify().await;
 }
 
@@ -315,7 +321,7 @@ async fn a_credential_that_is_not_a_service_account_key_is_refused() {
     key["type"] = json!("authorized_user");
 
     let err = cache(&server)
-        .token(AccountId::new(), &key.to_string())
+        .token(AccountId::new(), &key.to_string(), None)
         .await
         .expect_err("refused");
     assert!(matches!(err, Error::Config(_)), "{err:?}");
@@ -370,7 +376,7 @@ async fn a_malformed_key_is_refused_without_being_quoted() {
     ];
     for (case, sa_json) in cases {
         let err = cache
-            .token(AccountId::new(), &sa_json)
+            .token(AccountId::new(), &sa_json, None)
             .await
             .expect_err(case);
         assert!(matches!(err, Error::Config(_)), "{case}: {err:?}");
@@ -390,7 +396,7 @@ async fn a_refused_grant_is_an_error_that_names_the_code() {
     let server = token_endpoint(refusal, 1).await;
 
     let err = cache(&server)
-        .token(AccountId::new(), &key_json().to_string())
+        .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect_err("refused");
     assert!(matches!(err, Error::Internal(_)), "{err:?}");
@@ -419,7 +425,7 @@ async fn a_refusal_that_echoes_the_assertion_does_not_get_it_into_the_error() {
     let server = token_endpoint(echo, 1).await;
 
     let err = cache(&server)
-        .token(AccountId::new(), &key_json().to_string())
+        .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect_err("refused");
     assert!(matches!(err, Error::Internal(_)), "{err:?}");
@@ -439,7 +445,7 @@ async fn a_redirect_from_the_token_endpoint_is_not_followed() {
     let server = token_endpoint(redirect, 1).await;
 
     let err = cache(&server)
-        .token(AccountId::new(), &key_json().to_string())
+        .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect_err("not followed");
     assert!(matches!(err, Error::Internal(_)), "{err:?}");
@@ -476,7 +482,7 @@ async fn an_answer_that_is_not_a_bearer_token_is_refused_without_quoting_it() {
     for (case, body) in cases {
         let server = token_endpoint(ResponseTemplate::new(200).set_body_json(body), 1).await;
         let err = cache(&server)
-            .token(AccountId::new(), &key_json().to_string())
+            .token(AccountId::new(), &key_json().to_string(), None)
             .await
             .expect_err(case);
         assert!(matches!(err, Error::Internal(_)), "{case}: {err:?}");
@@ -495,7 +501,7 @@ async fn the_keys_own_token_uri_is_never_used() {
     key["token_uri"] = json!(token_url(&theirs));
 
     let token = cache(&ours)
-        .token(AccountId::new(), &key.to_string())
+        .token(AccountId::new(), &key.to_string(), None)
         .await
         .expect("a token");
     assert_eq!(token, "ya29.ours");
@@ -509,7 +515,7 @@ async fn debug_output_shows_neither_the_key_nor_a_token() {
     let server = token_endpoint(granted("ya29.held-in-the-cache"), 1).await;
     let cache = cache(&server);
     cache
-        .token(AccountId::new(), &key_json().to_string())
+        .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect("a token");
     let shown = format!("{cache:?}");
@@ -529,7 +535,7 @@ async fn the_default_clock_is_the_system_clock() {
     let before = time::OffsetDateTime::now_utc().unix_timestamp();
     GcpTokenCache::new(token_url(&server))
         .expect("a client")
-        .token(AccountId::new(), &key_json().to_string())
+        .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect("a token");
     let after = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -541,4 +547,98 @@ async fn the_default_clock_is_the_system_clock() {
         (before..=after).contains(&iat),
         "{before} <= {iat} <= {after}"
     );
+}
+
+/// A credential's proxy carries every call made with it, and a mint is one.
+/// The token URL here is a closed port, so a grant that reaches a token
+/// endpoint at all went through the proxy, addressed to that URL.
+#[tokio::test]
+async fn a_mint_goes_through_the_accounts_proxy() {
+    const CLOSED: &str = "http://127.0.0.1:1/token";
+    let proxy = token_endpoint(granted("ya29.proxied"), 1).await;
+    let cache = GcpTokenCache::new(CLOSED)
+        .expect("a URL")
+        .with_clock(fixed_clock);
+    let key = key_json().to_string();
+
+    let direct = cache
+        .token(AccountId::new(), &key, None)
+        .await
+        .expect_err("nothing listens there");
+    assert!(matches!(direct, Error::Internal(_)), "{direct:?}");
+
+    let token = cache
+        .token(AccountId::new(), &key, Some(&proxy.uri()))
+        .await
+        .expect("through the proxy");
+    assert_eq!(token, "ya29.proxied");
+    let received = proxy.received_requests().await.expect("recording is on");
+    assert_eq!(
+        received[0].url.as_str(),
+        CLOSED,
+        "the proxy is asked for the token URL itself"
+    );
+    assert_eq!(claims(&grants(&proxy).await[0])["aud"], CLOSED);
+    proxy.verify().await;
+}
+
+/// A token URL that is not one is a config error when the cache is made,
+/// which is when the gateway starts, not on the first Vertex request.
+#[test]
+fn a_token_url_that_is_not_http_is_refused_when_the_cache_is_made() {
+    for bad in [
+        "",
+        "oauth2.googleapis.com/token",
+        "ftp://example.test/token",
+        "file:///etc/passwd",
+    ] {
+        let err = GcpTokenCache::new(bad).expect_err(bad);
+        assert!(matches!(err, Error::Config(_)), "{bad:?}: {err:?}");
+        assert!(err.to_string().contains("Google token URL"), "{err}");
+    }
+    GcpTokenCache::new(DEFAULT_TOKEN_URL).expect("Google's own");
+    GcpTokenCache::new("http://127.0.0.1:9/token").expect("a stand-in's");
+}
+
+/// What `account add` checks before it seals a key: the mint's own reading,
+/// naming the account the key is for, and refusing what could never mint
+/// without quoting any of it.
+#[test]
+fn a_key_is_checked_as_the_mint_reads_it_and_names_its_account() {
+    assert_eq!(
+        check_key(&key_json().to_string()).expect("the test key"),
+        EMAIL
+    );
+
+    let with = |field: &str, value: Option<Value>| {
+        let mut key = key_json();
+        let object = key.as_object_mut().expect("an object");
+        match value {
+            Some(value) => object.insert(field.to_owned(), value),
+            None => object.remove(field),
+        };
+        key.to_string()
+    };
+    let cases = [
+        ("another type", with("type", Some(json!("authorized_user")))),
+        ("no client_email", with("client_email", None)),
+        (
+            "an empty client_email",
+            with("client_email", Some(json!(" "))),
+        ),
+        ("no private_key", with("private_key", None)),
+        (
+            "a PKCS#1 key",
+            with(
+                "private_key",
+                Some(json!(TEST_KEY.replace("PRIVATE KEY", "RSA PRIVATE KEY"))),
+            ),
+        ),
+        ("an API key", "AIzaSy-not-a-service-account".to_owned()),
+    ];
+    for (case, sa_json) in cases {
+        let err = check_key(&sa_json).expect_err(case);
+        assert!(matches!(err, Error::Config(_)), "{case}: {err:?}");
+        assert_quotes_nothing(&err.to_string(), &["AIzaSy-not-a-service-account"]);
+    }
 }

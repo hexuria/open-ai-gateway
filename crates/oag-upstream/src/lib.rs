@@ -18,6 +18,7 @@ pub mod pricing;
 pub mod sigv4;
 pub mod transport;
 pub mod usage;
+pub mod vertex;
 pub mod xai_models;
 pub mod xai_oauth;
 
@@ -30,6 +31,7 @@ pub use gemini::GeminiAdapter;
 pub use jev::JevUpstream;
 pub use openai::OpenAICompatAdapter;
 pub use transport::{HttpTransport, Transport, TransportKey, TransportPool};
+pub use vertex::VertexAdapter;
 
 /// The `reqwest::Client` every adapter builds its requests through.
 ///
