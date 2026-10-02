@@ -247,6 +247,11 @@ pub struct EndpointAddArgs {
     /// The API version an azure endpoint's URLs name. Stored as given.
     #[arg(long)]
     api_version: Option<String>,
+    /// Where a `system_one` endpoint takes a question set, beneath its base
+    /// URL; `/v1/systemone`, Jev's own, when left out. Only a `system_one`
+    /// endpoint has one.
+    #[arg(long)]
+    path: Option<String>,
     /// A name for people. The endpoint's name stays its identity.
     #[arg(long)]
     display_name: Option<String>,
@@ -278,6 +283,9 @@ pub struct EndpointSetArgs {
     project: Option<String>,
     #[arg(long)]
     api_version: Option<String>,
+    /// A `system_one` endpoint's path; empty goes back to `/v1/systemone`.
+    #[arg(long)]
+    path: Option<String>,
     #[arg(long)]
     display_name: Option<String>,
     /// `--discover` turns discovery on, `--discover false` off.

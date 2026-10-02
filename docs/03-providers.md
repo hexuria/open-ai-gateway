@@ -817,19 +817,11 @@ takes a path, and the column is checked as the rules above say.
 
 ```sh
 # Merge's Decisions API: System One's shape, at a path of its own.
-oag admin endpoint add --name merge-decisions --dialect system_one \
+oag admin endpoint add --name merge-decisions --dialect system_one --platform plain \
   --base-url https://api-gateway.merge.dev --path /v1/decisions --auth bearer
 # A Merge Gateway API key, filed under the endpoint's name.
 oag admin account add --name merge-1 --provider merge-decisions \
   --secret <Merge Gateway API key> --route default
-```
-
-Until `oag admin endpoint` has a `--path` flag, the same row is one statement:
-
-```sql
-INSERT INTO endpoint (name, dialect, base_url, auth, path)
-VALUES ('merge-decisions', 'system_one', 'https://api-gateway.merge.dev',
-        'bearer', '/v1/decisions');
 ```
 
 To price its answers, add a catalog row whose provider is `merge-decisions`,

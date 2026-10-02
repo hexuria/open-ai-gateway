@@ -220,6 +220,7 @@ fn checked(mut draft: Draft) -> Result<(Draft, Platform), String> {
         &mut draft.region,
         &mut draft.project,
         &mut draft.api_version,
+        &mut draft.path,
     ] {
         *field = present(field.as_deref());
     }

@@ -101,6 +101,38 @@ fn a_draft_is_stored_tidy() {
     assert_eq!(aws.base_url, None);
 }
 
+/// A System One endpoint's path is stored as written, and blank is none; a
+/// path on a chat dialect, or one the rules refuse, is refused before
+/// anything is asked.
+#[test]
+fn a_path_is_a_system_one_endpoints_alone() {
+    let system_one = |path: &str| Draft {
+        dialect: "system_one".to_owned(),
+        base_url: Some("http://127.0.0.1:9".to_owned()),
+        path: Some(path.to_owned()),
+        ..draft("t7-path")
+    };
+    let (stored, _) = checked(system_one(" /v1/decisions ")).expect("a path");
+    assert_eq!(stored.path.as_deref(), Some("/v1/decisions"));
+    let (blank, _) = checked(system_one("  ")).expect("blank is none");
+    assert_eq!(blank.path, None, "Jev's own path");
+
+    for (bad, says) in [
+        (system_one("/v1/../admin"), "must be `/` and then"),
+        (system_one("v1/decisions"), "must be `/` and then"),
+        (
+            Draft {
+                path: Some("/v1/decisions".to_owned()),
+                ..draft("t7-chat-path")
+            },
+            "only a system_one endpoint takes a path",
+        ),
+    ] {
+        let err = checked(bad).expect_err(says);
+        assert!(err.contains(says), "{err}");
+    }
+}
+
 #[test]
 fn each_rule_refuses_a_draft_before_anything_is_asked() {
     let long = "x".repeat(129);

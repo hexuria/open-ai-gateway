@@ -44,6 +44,11 @@ pub struct EndpointInput {
     pub project: Option<String>,
     #[serde(default)]
     pub api_version: Option<String>,
+    /// Where a `system_one` endpoint takes a question set, beneath its base
+    /// URL; `/v1/systemone`, Jev's own, when left out. Only a `system_one`
+    /// endpoint has one.
+    #[serde(default)]
+    pub path: Option<String>,
     /// Header names to values, sent on every request. Never a key.
     #[serde(default)]
     pub extra_headers: Option<Map<String, Value>>,
@@ -72,7 +77,7 @@ impl EndpointInput {
             region: self.region,
             project: self.project,
             api_version: self.api_version,
-            path: None,
+            path: self.path,
             extra_headers: Value::Object(self.extra_headers.unwrap_or_default()),
             display_name: self.display_name,
             discover_models: self.discover_models,
@@ -103,6 +108,9 @@ pub struct EndpointPatch {
     pub project: Option<Option<String>>,
     #[serde(default, deserialize_with = "sent")]
     pub api_version: Option<Option<String>>,
+    /// A `system_one` endpoint's path; `null` goes back to `/v1/systemone`.
+    #[serde(default, deserialize_with = "sent")]
+    pub path: Option<Option<String>>,
     /// The whole set, replacing the one stored; `null` removes them all.
     #[serde(default, deserialize_with = "sent")]
     pub extra_headers: Option<Option<Map<String, Value>>>,
@@ -133,6 +141,9 @@ impl EndpointPatch {
         }
         if let Some(api_version) = self.api_version {
             draft.api_version = api_version;
+        }
+        if let Some(path) = self.path {
+            draft.path = path;
         }
         if let Some(headers) = self.extra_headers {
             draft.extra_headers = Value::Object(headers.unwrap_or_default());
@@ -172,6 +183,8 @@ pub struct EndpointView {
     pub region: Option<String>,
     pub project: Option<String>,
     pub api_version: Option<String>,
+    /// A `system_one` endpoint's path; `None` is `/v1/systemone`.
+    pub path: Option<String>,
     /// Every header name and value, in stored order, except a value whose
     /// name suggests a secret, which is [`endpoints::REDACTED`].
     pub extra_headers: Map<String, Value>,
@@ -200,6 +213,7 @@ fn view(row: &EndpointRow, refs: EndpointReferences) -> EndpointView {
         region: row.region.clone(),
         project: row.project.clone(),
         api_version: row.api_version.clone(),
+        path: row.path.clone(),
         extra_headers: endpoints::shown_headers(&row.extra_headers)
             .into_iter()
             .map(|(name, value)| (name, Value::String(value)))

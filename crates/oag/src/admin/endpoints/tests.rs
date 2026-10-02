@@ -242,6 +242,44 @@ fn a_set_changes_only_what_it_names() {
     );
 }
 
+/// `--path` reaches the draft on `add`, and on `set` replaces the stored one,
+/// or with an empty value clears it: the shared rules read blank as none.
+#[test]
+fn a_path_is_added_set_and_cleared() {
+    let added = draft(add_args(&[
+        "--name",
+        "merge-decisions",
+        "--dialect",
+        "system_one",
+        "--platform",
+        "plain",
+        "--base-url",
+        "https://api-gateway.merge.example",
+        "--path",
+        "/v1/decisions",
+    ]))
+    .expect("a draft");
+    assert_eq!(added.path.as_deref(), Some("/v1/decisions"));
+
+    let mut moved = added.clone();
+    apply(&mut moved, set_args(&["--path", "/v2/decisions"])).expect("--path is a setting");
+    assert_eq!(moved.path.as_deref(), Some("/v2/decisions"));
+    apply(&mut moved, set_args(&["--path", ""])).expect("cleared");
+    assert_eq!(
+        moved.path.as_deref(),
+        Some(""),
+        "blank, which the rules store as none"
+    );
+
+    let mut row = stored();
+    row.path = Some("/v1/decisions".to_owned());
+    let shown = show_lines(&row, EndpointReferences::default());
+    assert!(
+        shown.iter().any(|l| l == "path          /v1/decisions"),
+        "{shown:?}"
+    );
+}
+
 #[test]
 fn a_listing_names_every_setting_and_counts_what_names_each_endpoint() {
     assert_eq!(
@@ -591,6 +629,101 @@ async fn every_endpoint_command_surfaces_the_databases_failure() {
     ] {
         outcome.expect_err(verb);
     }
+}
+
+/// `--path` stores a System One endpoint's path, `set --path` moves it and an
+/// empty one goes back to Jev's own, and a chat endpoint is refused one before
+/// anything is written: against a real database.
+#[tokio::test]
+async fn a_system_one_endpoints_path_is_set_from_the_cli() {
+    let Some(db) = test_db().await else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _endpoints = ENDPOINT_ROWS.lock().await;
+    let (name, chat) = (fresh(), fresh());
+    let stored_path = |name: String| {
+        let db = db.clone();
+        async move {
+            repo::get_endpoint(&db, &name)
+                .await
+                .expect("read")
+                .expect("stored")
+                .path
+        }
+    };
+
+    run(
+        &db,
+        &[
+            "endpoint",
+            "add",
+            "--name",
+            &name,
+            "--dialect",
+            "system_one",
+            "--platform",
+            "plain",
+            "--base-url",
+            "http://127.0.0.1:9",
+            "--path",
+            "/v1/decisions",
+        ],
+    )
+    .await
+    .expect("added");
+    assert_eq!(
+        stored_path(name.clone()).await.as_deref(),
+        Some("/v1/decisions")
+    );
+    run(&db, &["endpoint", "set", &name, "--path", "/v2/decisions"])
+        .await
+        .expect("moved");
+    assert_eq!(
+        stored_path(name.clone()).await.as_deref(),
+        Some("/v2/decisions")
+    );
+    run(&db, &["endpoint", "set", &name, "--path", ""])
+        .await
+        .expect("cleared");
+    assert_eq!(stored_path(name.clone()).await, None, "Jev's own path");
+
+    let refused = run(
+        &db,
+        &[
+            "endpoint",
+            "add",
+            "--name",
+            &chat,
+            "--dialect",
+            "openai",
+            "--platform",
+            "plain",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--path",
+            "/v1/decisions",
+        ],
+    )
+    .await
+    .expect_err("a chat endpoint takes no path");
+    assert!(
+        refused
+            .to_string()
+            .contains("only a system_one endpoint takes a path"),
+        "{refused}"
+    );
+    assert!(
+        repo::get_endpoint(&db, &chat)
+            .await
+            .expect("read")
+            .is_none(),
+        "nothing written"
+    );
+
+    run(&db, &["endpoint", "remove", &name])
+        .await
+        .expect("removed");
 }
 
 /// Add, refuse, change, give it a model, refuse to remove it while the model

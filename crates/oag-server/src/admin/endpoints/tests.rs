@@ -160,6 +160,11 @@ fn a_patch_tells_a_field_left_out_from_one_cleared() {
     let set = patch(&json!({"region": "eu-west-1", "discover_models": true}));
     assert_eq!(set.region, Some(Some("eu-west-1".to_owned())));
     assert_eq!(set.discover_models, Some(true));
+    assert_eq!(set.path, None, "a path left out is kept");
+
+    let moved = patch(&json!({"path": "/v1/decisions"}));
+    assert_eq!(moved.path, Some(Some("/v1/decisions".to_owned())));
+    assert_eq!(patch(&json!({"path": null})).path, Some(None));
 
     // A misspelt field is refused rather than silently ignored.
     assert!(
@@ -223,6 +228,12 @@ fn a_patch_changes_exactly_the_fields_it_sends() {
         }
     );
 
+    let mut moved = stored.clone();
+    patch(&json!({"path": "/v1/decisions"})).apply(&mut moved);
+    assert_eq!(moved.path.as_deref(), Some("/v1/decisions"));
+    patch(&json!({"path": null})).apply(&mut moved);
+    assert_eq!(moved.path, None, "null goes back to Jev's own path");
+
     let mut emptied = stored;
     patch(&json!({"extra_headers": null})).apply(&mut emptied);
     assert_eq!(
@@ -254,6 +265,14 @@ fn a_registration_takes_its_platforms_auth_unless_it_names_one() {
     assert_eq!(named.auth, "x_api_key");
     assert_eq!(named.extra_headers, json!({"X-Project-Id": "p"}));
     assert!(named.discover_models);
+    assert_eq!(named.path, None);
+
+    let decisions = input(&json!({
+        "name": "t7", "dialect": "system_one", "platform": "plain",
+        "base_url": "https://api-gateway.merge.example", "path": "/v1/decisions",
+    }))
+    .into_draft();
+    assert_eq!(decisions.path.as_deref(), Some("/v1/decisions"));
 }
 
 #[test]
@@ -296,6 +315,7 @@ fn a_view_redacts_what_looks_secret_and_says_why_a_row_is_not_served() {
         (&json!(3), &json!(2), &json!(5), &json!(1))
     );
     assert_eq!(shown["served"], false);
+    assert_eq!(shown["path"], Value::Null);
     assert!(
         shown["problem"]
             .as_str()

@@ -59,7 +59,7 @@ pub(super) fn draft(args: EndpointAddArgs) -> Result<Draft> {
         region: args.region,
         project: args.project,
         api_version: args.api_version,
-        path: None,
+        path: args.path,
         extra_headers: Value::Object(parse_headers(&args.headers)?.into_iter().collect()),
         display_name: args.display_name,
         discover_models: args.discover,
@@ -110,6 +110,7 @@ pub(super) fn apply(draft: &mut Draft, args: EndpointSetArgs) -> Result<()> {
         region,
         project,
         api_version,
+        path,
         display_name,
         discover,
     } = args;
@@ -120,12 +121,14 @@ pub(super) fn apply(draft: &mut Draft, args: EndpointSetArgs) -> Result<()> {
         || region.is_some()
         || project.is_some()
         || api_version.is_some()
+        || path.is_some()
         || display_name.is_some()
         || discover.is_some();
     if !given {
         return Err(oag_core::Error::Config(
             "nothing to change: name a setting, such as --base-url, --auth, --header, \
-             --unset-header, --region, --project, --api-version, --display-name or --discover"
+             --unset-header, --region, --project, --api-version, --path, --display-name or \
+             --discover"
                 .to_owned(),
         ));
     }
@@ -135,6 +138,7 @@ pub(super) fn apply(draft: &mut Draft, args: EndpointSetArgs) -> Result<()> {
         (&mut draft.region, region),
         (&mut draft.project, project),
         (&mut draft.api_version, api_version),
+        (&mut draft.path, path),
         (&mut draft.display_name, display_name),
     ] {
         if let Some(value) = value {
@@ -294,6 +298,7 @@ pub(super) fn show_lines(row: &EndpointRow, refs: EndpointReferences) -> Vec<Str
         format!("region        {}", or_dash(row.region.as_deref())),
         format!("project       {}", or_dash(row.project.as_deref())),
         format!("api version   {}", or_dash(row.api_version.as_deref())),
+        format!("path          {}", or_dash(row.path.as_deref())),
         format!(
             "discover      {}",
             if row.discover_models { "yes" } else { "no" }
