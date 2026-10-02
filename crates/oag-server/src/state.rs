@@ -161,7 +161,8 @@ fn endpoint_upstream(row: &EndpointRow) -> std::result::Result<(Endpoint, Served
         config.auth,
         config.extra_headers,
     )
-    .map_err(|e| Refusal::new(Reason::Headers, e))?;
+    .map_err(|e| Refusal::new(Reason::Headers, e))?
+    .with_api_version(config.api_version);
     let unsupported = |e: Error| Refusal::new(Reason::Unsupported, e.to_string());
     let served = if config.endpoint.dialect() == Dialect::SystemOne {
         Served::SystemOne(Arc::new(
@@ -755,6 +756,67 @@ mod tests {
         );
     }
 
+    /// An azure endpoint row: Azure's v1 API, or its deployments API at
+    /// `api_version`. Nothing is ever sent to its base URL.
+    fn azure_row(name: &str, base_url: &str, api_version: Option<&str>) -> oag_store::EndpointRow {
+        let mut row = endpoint_row(name, "openai", base_url);
+        row.platform = "azure".to_owned();
+        row.auth = "api_key_header".to_owned();
+        row.api_version = api_version.map(str::to_owned);
+        row
+    }
+
+    /// An azure row is served at its resource, in the API its row names: the
+    /// v1 API with no API version, and the deployments API at the row's
+    /// version with one, the deployment in the path. The version comes from
+    /// the row, so a reload that left it behind would post a deployments row
+    /// to the v1 API.
+    #[tokio::test]
+    async fn an_azure_endpoint_is_served_at_its_resource_in_the_api_its_row_names() {
+        let state = crate::testing::state("");
+        let registry = EndpointRegistry::default();
+        state.apply_endpoints(
+            &registry,
+            load_endpoints(&[
+                azure_row("t8-state-v1", "https://res.openai.azure.com/", None),
+                azure_row(
+                    "t8-state-deployments",
+                    "https://RES.services.ai.azure.com",
+                    Some("2024-10-21"),
+                ),
+            ]),
+        );
+        for (name, url) in [
+            (
+                "t8-state-v1",
+                "https://res.openai.azure.com/openai/v1/chat/completions",
+            ),
+            (
+                "t8-state-deployments",
+                "https://res.services.ai.azure.com/openai/deployments/m/chat/completions\
+                 ?api-version=2024-10-21",
+            ),
+        ] {
+            let adapter = state
+                .adapter(custom(name))
+                .expect("an azure endpoint is served");
+            assert_eq!(adapter.provider(), custom(name));
+            assert_eq!(adapter.dialect(), Dialect::OpenAIChatCompletions, "{name}");
+            assert_eq!(target(&adapter), url, "{name}");
+            assert_eq!(
+                registry.get(name).map(Endpoint::platform),
+                Some(Platform::Azure),
+                "{name}"
+            );
+        }
+
+        state.apply_endpoints(&registry, load_endpoints(&[]));
+        assert!(
+            state.adapter(custom("t8-state-v1")).is_err(),
+            "gone with its row"
+        );
+    }
+
     /// Every row that breaks a rule, beside one that does not.
     fn bad_rows() -> Vec<(oag_store::EndpointRow, Reason)> {
         let mut region = endpoint_row("t4-bad-region", "openai", "http://127.0.0.1:9/v1");
@@ -767,6 +829,15 @@ mod tests {
         let mut azure = endpoint_row("t4-bad-azure", "openai", "https://res.openai.azure.com");
         azure.platform = "azure".to_owned();
         azure.auth = "api_key_header".to_owned();
+        // Azure's v1 API is the one a row without an API version gets.
+        azure.api_version = Some("v1".to_owned());
+        // A model server of the operator's own, which an azure row may not name.
+        let azure_host = azure_row("t8-bad-azure-host", "https://10.0.0.7", None);
+        let mut gcp = endpoint_row("t8-bad-gcp", "gemini", "http://127.0.0.1:9");
+        gcp.platform = "gcp".to_owned();
+        gcp.base_url = None;
+        gcp.region = Some("us-central1".to_owned());
+        gcp.project = Some("t8-project".to_owned());
         let mut header = endpoint_row("t4-bad-header", "openai", "http://127.0.0.1:9/v1");
         header.extra_headers = serde_json::json!({"Authorization": "Bearer not-here"});
         let mut jev_header = endpoint_row("t7-bad-jev-header", "system_one", "http://127.0.0.1:9");
@@ -803,8 +874,10 @@ mod tests {
             (jev_header, Reason::Headers),
             (jev_path, Reason::Path),
             (chat_path, Reason::Path),
+            (azure, Reason::ApiVersion),
+            (azure_host, Reason::BaseUrl),
             // A valid row this build has no adapter for.
-            (azure, Reason::Unsupported),
+            (gcp, Reason::Unsupported),
         ]
     }
 

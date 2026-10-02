@@ -258,8 +258,11 @@ before it files a key under an endpoint's name:
 - `plain` and `azure` have a base URL: http or https, with no credentials,
   query or fragment in it, no link-local or cloud-metadata address, and on
   `plain` none of the hosts [compliance.md](compliance.md#a-plain-endpoint-cannot-reach-a-providers-own-api)
-  lists. Loopback and private addresses are allowed, for a model server on your
-  own network;
+  lists. On `plain`, loopback and private addresses are allowed, for a model
+  server on your own network. On `azure` the base URL is an Azure resource's and
+  nothing more, `https://{resource}.openai.azure.com` or
+  `https://{resource}.services.ai.azure.com`, with no path or port; see
+  [Azure OpenAI](#azure-openai);
 - a region (required on `aws` and `gcp`) and a project (required on `gcp`) are
   1 to 63 of `a-z`, `0-9` and `-`, because a platform puts them in a hostname or
   a path;
@@ -267,6 +270,10 @@ before it files a key under an endpoint's name:
   and then at most 127 of letters, digits, `/`, `.`, `_` and `-`, in segments
   that are neither empty, `.` nor `..` (the schema checks the characters, the
   gateway the segments too); see [System One hosts](#system-one-hosts);
+- an API version on `azure` is a date and `-preview` or nothing
+  (`2024-10-21`, `2025-04-01-preview`), because it becomes each request's
+  `api-version`; no other platform reads the column, and the schema does not
+  check it;
 - extra headers are strings, and none of them is `authorization`, `x-api-key`,
   `x-goog-api-key`, `api-key`, `cookie`, `host`, `content-length` or `proxy-*`
   (`oag_core::endpoint` checks the strings; the names are checked where the
@@ -274,17 +281,105 @@ before it files a key under an endpoint's name:
 
 A row that breaks one is skipped, and the rest are served as before. Its keys
 and models serve nothing, a warning naming it is logged on every refresh, and
-`oag_endpoint_invalid_total{reason}` counts it. In this release only `plain`
-endpoints are served: one speaking `openai`, `anthropic` or `gemini` by the chat
-routes, and a `system_one` one by the System One route
-([System One hosts](#system-one-hosts)). An `azure`, `aws` or `gcp` endpoint is
-a valid row skipped with reason `unsupported` until its adapter lands.
+`oag_endpoint_invalid_total{reason}` counts it. In this release `plain` and
+`azure` endpoints are served: a `plain` one speaking `openai`, `anthropic` or
+`gemini` by the chat routes, and a `system_one` one by the System One route
+([System One hosts](#system-one-hosts)); an `azure` one by the chat routes too
+([Azure OpenAI](#azure-openai)). An `aws` or `gcp` endpoint is a valid row
+skipped with reason `unsupported` until its adapter lands.
 
 A request already sent when its endpoint's settings change is not moved: it was
 built for the old base URL and headers and is answered from there, and the next
 request gets the new settings. A request in flight when its endpoint is removed
 can fail once its answer arrives, so remove an endpoint's keys, and let their
 requests finish, before the endpoint itself.
+
+### Azure OpenAI
+
+An endpoint on the `azure` platform is an Azure OpenAI resource, or an Azure AI
+Foundry one, speaking the `openai` dialect. Its key is the resource's API key,
+sent in `api-key`, the header Azure reads one from, so the endpoint's auth is
+`api_key_header`, the only style the platform takes. Microsoft Entra ID is not
+served: an Entra token rides as a bearer, and nothing here mints or sends one
+yet.
+
+**The base URL is the resource's, and nothing more:**
+`https://{resource}.openai.azure.com` or
+`https://{resource}.services.ai.azure.com`, where `{resource}` is the
+resource's name, 2 to 63 of `a-z`, `0-9` and `-` starting with a letter or a
+digit. https, no port, no path: the gateway writes each request's path itself.
+Any other host, an address included, is refused for this platform, so a row
+cannot point an Azure key, or a request built for Azure, anywhere but at an
+Azure resource. A `plain` endpoint may not name `azure.com` at all
+([compliance.md](compliance.md#a-plain-endpoint-cannot-reach-a-providers-own-api)).
+
+**Two APIs**, chosen by the row's `api_version`:
+
+| `api_version` | Request |
+|---|---|
+| unset | Azure's v1 API: `POST {base}/openai/v1/chat/completions`, the deployment named in the body's `model` |
+| a version, e.g. `2024-10-21` | the deployments API: `POST {base}/openai/deployments/{deployment}/chat/completions?api-version=2024-10-21` |
+
+Either way a catalog row's upstream name is the **deployment's name**, the name
+given to a model when it was deployed to the resource, which is what Azure
+routes by in both APIs. In the deployments URL it is one path segment,
+percent-encoded (`prod gpt-4o` is sent as `prod%20gpt-4o`); a name that is
+empty, `.` or `..` cannot be one, and a request for it fails rather than being
+sent. The body is the v1 API's, `model` included: Azure takes the deployment
+from the path, and the OpenAI SDK's Azure client sends the same body. The
+`api-version` query is built from the row, never from the base URL, which may
+not hold a `?`.
+
+```sh
+# Azure's v1 API.
+oag admin endpoint add --name azure-eu --dialect openai --platform azure \
+  --base-url https://my-resource.openai.azure.com --auth api_key_header
+# The deployments API, at a version.
+oag admin endpoint add --name azure-eu-dep --dialect openai --platform azure \
+  --base-url https://my-resource.openai.azure.com --auth api_key_header \
+  --api-version 2024-10-21
+# The resource's key, filed under the endpoint's name.
+oag admin account add --name azure-eu-1 --provider azure-eu \
+  --secret <the resource's API key> --route default
+```
+
+Until `oag admin endpoint add` is in your build, each row is one statement:
+
+```sql
+INSERT INTO endpoint (name, dialect, platform, base_url, auth)
+VALUES ('azure-eu', 'openai', 'azure', 'https://my-resource.openai.azure.com',
+        'api_key_header');
+INSERT INTO endpoint (name, dialect, platform, base_url, auth, api_version)
+VALUES ('azure-eu-dep', 'openai', 'azure', 'https://my-resource.openai.azure.com',
+        'api_key_header', '2024-10-21');
+```
+
+Then a catalog row per deployment, whose provider is the endpoint's name and
+whose upstream name is the deployment's: `azure-eu/gpt-4o` for a deployment
+named `gpt-4o-prod`, priced from Azure's price list.
+
+**Streams** are Chat Completions streams: passed through to an OpenAI-shaped
+client byte for byte, Azure's filter results and all, and translated for any
+other. The gateway asks every Chat Completions upstream for the stream's usage
+(`stream_options.include_usage`), Azure included, and bills what Azure
+reports. An API version older than that field may refuse a streamed request
+with a 400 naming it; if one does, name a later version.
+
+**Content filtering.** An answer Azure's filter stops ends with
+`finish_reason: "content_filter"`, which reads as a refusal, as OpenAI's does:
+an OpenAI-shaped client is told `content_filter`, an Anthropic one
+`stop_reason: "refusal"`, a Gemini one `SAFETY`. A prompt the filter rejects is
+Azure's own 400, which reaches the client under `error.upstream`, as any
+upstream's 400 does, and is not tried on the endpoint's other keys, which would
+refuse it too.
+
+**Testing one.** No test can stand up a host under `azure.com`, so a test puts
+a mock in a resource's place with `oag_core::endpoint::stand_in_for_azure`,
+which admits one loopback origin. It exists only in test builds: it is behind
+`oag-core`'s `test-fixtures` feature, which `oag-server` turns on as a
+dev-dependency and no release build turns on, so nothing a deployment
+configures can widen the rule above. `crates/oag-server/tests/azure_endpoints.rs`
+serves both APIs through a running gateway that way.
 
 ## Which dialect reaches which upstream
 

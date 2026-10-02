@@ -8,8 +8,9 @@
 //!
 //! The schema's CHECKs (migration 0020) are the second line behind these, and
 //! they hold less: the platform matrix and the base URL's scheme, but not what
-//! a region may contain, which auth style a platform takes, or which hosts a
-//! plain endpoint may not name.
+//! a region may contain, which auth style a platform takes, which hosts a
+//! plain endpoint may not name, which hosts an azure one may, or what an API
+//! version looks like.
 //!
 //! Like the rest of this crate, nothing here does I/O. A base URL is judged by
 //! what it says and never by what its name resolves to: a reload that asked DNS
@@ -19,6 +20,7 @@
 use crate::provider::{AuthStyle, Dialect, Endpoint, Platform};
 use crate::service::catalog_url;
 use std::fmt;
+use std::sync::{Mutex, PoisonError};
 use url::{Host, Url};
 
 /// A configured base URL, in the one shape every adapter's concatenation expects.
@@ -116,7 +118,9 @@ pub fn plain_refused_host(url: &Url, platform: Platform) -> Option<&'static str>
 /// link-local or metadata literal. Loopback and private addresses pass, so a
 /// model server on the operator's own network can be registered. Then the
 /// compliance guard, [`plain_refused_host`], and then [`normalise_base_url`]:
-/// no query, no fragment, no trailing slash. No DNS; see the module.
+/// no query, no fragment, no trailing slash. An azure endpoint's must then be
+/// an Azure resource's and nothing more ([`AZURE_HOSTS`]), so no address of
+/// any kind passes there. No DNS; see the module.
 pub fn endpoint_base_url(raw: &str, platform: Platform) -> Result<String, Refusal> {
     let url = catalog_url(raw).map_err(|e| Refusal::new(Reason::BaseUrl, words(e)))?;
     if let Some(refused) = plain_refused_host(&url, platform) {
@@ -129,7 +133,150 @@ pub fn endpoint_base_url(raw: &str, platform: Platform) -> Result<String, Refusa
             ),
         ));
     }
-    normalise_base_url("this endpoint", raw).map_err(|e| Refusal::new(Reason::BaseUrl, words(e)))
+    let normalised = normalise_base_url("this endpoint", raw)
+        .map_err(|e| Refusal::new(Reason::BaseUrl, words(e)))?;
+    if platform == Platform::Azure {
+        return azure_base_url(&url);
+    }
+    Ok(normalised)
+}
+
+/// The hosts an `azure` endpoint's base URL may name, each with one resource's
+/// name in front: Azure `OpenAI`'s `{resource}.openai.azure.com`, and Azure AI
+/// Foundry's `{resource}.services.ai.azure.com`.
+pub const AZURE_HOSTS: [&str; 2] = ["openai.azure.com", "services.ai.azure.com"];
+
+/// `url`, an `azure` endpoint's base URL, as the one URL an Azure resource
+/// answers at, `https://{resource}.{host}` for a host in [`AZURE_HOSTS`], or
+/// why it is not one.
+///
+/// An allow-list, where a plain endpoint has a deny-list, because Azure needs
+/// no more: every request an azure endpoint is sent goes to its resource, and
+/// the adapter writes the rest of the URL itself (`/openai/v1/…`, or
+/// `/openai/deployments/…?api-version=…`). So the base URL is the resource and
+/// nothing else: https, Azure's own port, no path. Anything wider, a host on
+/// the operator's network or an address, is somewhere a request built for
+/// Azure, with an Azure key in it, has no business going, and the narrowest
+/// rule keeps that surface as small as the platform allows.
+///
+/// `{resource}` is 2 to 63 of `a-z`, `0-9` and `-`, starting with a letter or
+/// a digit, so it is one DNS label and cannot reach past the host it sits in
+/// front of. The host is the one the `url` crate parsed: lowercase,
+/// percent-decoded and IDNA-mapped, as [`plain_refused_host`] reads it. A
+/// trailing dot is not ignored here, though: a deny-list has to catch every
+/// spelling of a host, and an allow-list need accept only one.
+///
+/// What comes back is rebuilt from the host, `https://{host}`, so the URL a
+/// request is built on is the one that was checked. A stand-in a test put in
+/// Azure's place comes back as its origin; see `stand_in_for_azure`, which a
+/// release build does not have.
+fn azure_base_url(url: &Url) -> Result<String, Refusal> {
+    let refused = |problem: String| {
+        Refusal::new(
+            Reason::BaseUrl,
+            format!(
+                "{problem}: an azure endpoint's base URL is its resource's, \
+                 https://{{resource}}.openai.azure.com or \
+                 https://{{resource}}.services.ai.azure.com, and nothing more; the gateway \
+                 adds each request's path itself"
+            ),
+        )
+    };
+    // Before the stand-in, which is held to it too: the adapter appends
+    // `/openai/…` to whatever is here. A path of slashes alone is none, and
+    // `normalise_base_url` keeps none of it.
+    if !url.path().bytes().all(|b| b == b'/') {
+        return Err(refused(format!("the base URL has a path, {}", url.path())));
+    }
+    if stood_in(url) {
+        return Ok(url.origin().ascii_serialization());
+    }
+    if url.scheme() != "https" {
+        return Err(refused(format!(
+            "the base URL is {}, not https",
+            url.scheme()
+        )));
+    }
+    let host = url.host_str().unwrap_or_default();
+    let resource = match url.host() {
+        Some(Host::Domain(domain)) => AZURE_HOSTS
+            .into_iter()
+            .find_map(|azure| domain.strip_suffix(azure)?.strip_suffix('.')),
+        // An address names no resource.
+        _ => None,
+    };
+    if !resource.is_some_and(is_azure_resource) {
+        return Err(refused(format!("{host} is not an Azure resource's host")));
+    }
+    // The parser drops 443, https's own, so a port left here is another.
+    if let Some(port) = url.port() {
+        return Err(refused(format!("the base URL names port {port}")));
+    }
+    Ok(format!("https://{host}"))
+}
+
+/// Whether `label` may be an Azure resource's name in front of one of
+/// [`AZURE_HOSTS`]: `^[a-z0-9][a-z0-9-]{1,62}$`, one DNS label of 2 to 63.
+fn is_azure_resource(label: &str) -> bool {
+    let mut bytes = label.bytes();
+    (2..=63).contains(&label.len())
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The origins tests have put in an Azure resource's place.
+///
+/// Only `stand_in_for_azure` adds one, and a build without `test-fixtures`
+/// does not have it, so in a release build this is empty for the life of the
+/// process and [`azure_base_url`] accepts an Azure resource and nothing else.
+static AZURE_STAND_INS: Mutex<Vec<url::Origin>> = Mutex::new(Vec::new());
+
+/// Whether a test put `url`'s origin in an Azure resource's place.
+fn stood_in(url: &Url) -> bool {
+    AZURE_STAND_INS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&url.origin())
+}
+
+/// TEST-ONLY: lets `base_url`, where a test's mock server listens on this
+/// machine, be an `azure` endpoint's base URL for the rest of the process.
+///
+/// No test can stand up a host under `azure.com`, so without this no test
+/// could load an azure row, and none could send one a request through the
+/// gateway. It admits the origin given (scheme, address and port) and no
+/// other, only on a loopback address, and it waives only the scheme and host
+/// [`endpoint_base_url`] asks of an azure endpoint: the stand-in still has no
+/// path, query, fragment or credentials.
+///
+/// Compiled for this crate's own tests and under the `test-fixtures` feature,
+/// which only test builds turn on: `oag-server` asks for it among its
+/// dev-dependencies, and a dev-dependency's features stay out of every build
+/// that is not a test's. A release binary has no such function, so nothing in
+/// it can add a stand-in. That is why this is a feature and not a setting: a
+/// setting ships in every binary, and one line of YAML or one environment
+/// variable would reopen the surface the azure rule exists to close.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn stand_in_for_azure(base_url: &str) -> Result<(), String> {
+    let url = Url::parse(base_url).map_err(|e| format!("{base_url} is not a URL: {e}"))?;
+    let loopback = match url.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    if !loopback {
+        return Err(format!(
+            "{base_url} is not on a loopback address: only a mock on this machine may stand \
+             in for Azure"
+        ));
+    }
+    AZURE_STAND_INS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(url.origin());
+    Ok(())
 }
 
 /// Whether `value` may be a region or a project: 1 to 63 of `a-z`, `0-9` and
@@ -171,6 +318,27 @@ pub fn is_path(value: &str) -> bool {
             .all(|segment| !matches!(segment, "" | "." | ".."))
 }
 
+/// Whether `value` may be an azure endpoint's API version: a date, then
+/// `-preview` or nothing, as `^\d{4}-\d{2}-\d{2}(-preview)?$` says
+/// (`2024-10-21`, `2025-04-01-preview`), which is how Azure names the versions
+/// of its deployments API.
+///
+/// It becomes the `api-version` of every request the endpoint is sent, so it
+/// holds nothing that could end that parameter or begin another. Whether the
+/// date is a version Azure has published is Azure's to say.
+#[must_use]
+pub fn is_api_version(value: &str) -> bool {
+    let date = value.strip_suffix("-preview").unwrap_or(value);
+    date.len() == 10
+        && date.bytes().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+}
+
 /// An endpoint row's columns, as stored: the store's `EndpointRow` lends
 /// them, and a writer can pass what it is about to insert.
 #[derive(Debug, Clone, Copy)]
@@ -200,8 +368,10 @@ pub struct EndpointConfig {
     pub auth: AuthStyle,
     pub region: Option<String>,
     pub project: Option<String>,
-    /// Passed through as stored. What it may contain is the Azure platform's
-    /// to say, and it has not said yet.
+    /// On an azure endpoint, the version of Azure's deployments API its
+    /// requests ask for, checked by [`is_api_version`]; `None` there is
+    /// Azure's v1 API. Passed through as stored on every other platform,
+    /// where nothing reads it yet.
     pub api_version: Option<String>,
     /// Checked by [`is_path`], and only ever set on a System One endpoint.
     /// `None` there is Jev's own path, which whoever builds the upstream
@@ -275,13 +445,14 @@ impl EndpointConfig {
             platform,
         )?;
         let path = path(columns.path, dialect, columns.dialect)?;
+        let api_version = api_version(columns.api_version, platform)?;
         Ok(Self {
             endpoint,
             base_url,
             auth,
             region,
             project,
-            api_version: columns.api_version.map(str::to_owned),
+            api_version,
             path,
             extra_headers: header_pairs(columns.extra_headers)?,
         })
@@ -313,6 +484,23 @@ fn path(value: Option<&str>, dialect: Dialect, column: &str) -> Result<Option<St
         ));
     }
     Ok(Some(value.to_owned()))
+}
+
+/// An API version, if the row may have the one it names: on an azure
+/// endpoint, one [`is_api_version`] accepts, because there it picks Azure's
+/// deployments API and becomes every request's `api-version`. Any other
+/// platform's is passed through as stored: nothing there reads it yet.
+fn api_version(value: Option<&str>, platform: Platform) -> Result<Option<String>, Refusal> {
+    match value {
+        Some(value) if platform == Platform::Azure && !is_api_version(value) => Err(Refusal::new(
+            Reason::ApiVersion,
+            format!(
+                "api_version {value:?} must be a date, YYYY-MM-DD, with -preview after it \
+                     or not, as Azure names its API versions; leave it unset for Azure's v1 API"
+            ),
+        )),
+        value => Ok(value.map(str::to_owned)),
+    }
 }
 
 /// A region or a project, checked by [`is_location`] wherever it is given and
@@ -416,6 +604,8 @@ pub enum Reason {
     Project,
     /// On a dialect that takes none, or not one [`is_path`] accepts.
     Path,
+    /// On an azure endpoint, not one [`is_api_version`] accepts.
+    ApiVersion,
     /// Not an object of strings, or a header an endpoint may not add.
     Headers,
     /// A valid row this build has no adapter for.
@@ -435,6 +625,7 @@ impl Reason {
             Self::Region => "region",
             Self::Project => "project",
             Self::Path => "path",
+            Self::ApiVersion => "api_version",
             Self::Headers => "headers",
             Self::Unsupported => "unsupported",
         }
@@ -615,7 +806,7 @@ mod tests {
         let base = plain(&object);
         let headers_not_object = json!(["x"]);
         let header_not_string = json!({"x-team": 7, "x-ok": "fine"});
-        let cases: [(Columns<'_>, Reason, &str); 19] = [
+        let cases: [(Columns<'_>, Reason, &str); 21] = [
             (
                 Columns {
                     name: "openai",
@@ -783,6 +974,27 @@ mod tests {
                 Reason::Headers,
                 "extra header `x-team` is not a string",
             ),
+            (
+                Columns {
+                    platform: "azure",
+                    base_url: Some("https://res.openai.azure.com/openai/v1"),
+                    auth: "api_key_header",
+                    ..base
+                },
+                Reason::BaseUrl,
+                "the base URL has a path, /openai/v1",
+            ),
+            (
+                Columns {
+                    platform: "azure",
+                    base_url: Some("https://res.openai.azure.com"),
+                    auth: "api_key_header",
+                    api_version: Some("v1"),
+                    ..base
+                },
+                Reason::ApiVersion,
+                "api_version \"v1\" must be a date",
+            ),
         ];
         for (columns, reason, says) in cases {
             let refused = EndpointConfig::from_columns(&columns).expect_err(says);
@@ -914,6 +1126,255 @@ mod tests {
         );
     }
 
+    /// An azure endpoint's base URL is its resource's, spelt however the URL
+    /// parser reads as that one URL, and it comes back as that URL.
+    #[test]
+    fn an_azure_base_url_is_a_resource_and_nothing_more() {
+        let longest = format!("https://{}.openai.azure.com", "a".repeat(63));
+        for (raw, normalised) in [
+            (
+                "https://res.openai.azure.com",
+                "https://res.openai.azure.com",
+            ),
+            (
+                "https://res.openai.azure.com/",
+                "https://res.openai.azure.com",
+            ),
+            (
+                "  https://RES.OpenAI.Azure.COM///  ",
+                "https://res.openai.azure.com",
+            ),
+            (
+                "https://res.openai.azure.com:443",
+                "https://res.openai.azure.com",
+            ),
+            (
+                "https://my-res-01.services.ai.azure.com",
+                "https://my-res-01.services.ai.azure.com",
+            ),
+            ("https://ab.openai.azure.com", "https://ab.openai.azure.com"),
+            ("https://0a.openai.azure.com", "https://0a.openai.azure.com"),
+            ("https://a-.openai.azure.com", "https://a-.openai.azure.com"),
+            (longest.as_str(), longest.as_str()),
+        ] {
+            assert_eq!(
+                endpoint_base_url(raw, Platform::Azure).as_deref(),
+                Ok(normalised),
+                "{raw}"
+            );
+        }
+    }
+
+    /// Everything else, each refused as a base URL and for what it says: a
+    /// host that is not a resource's, an address, plain http, a path, a port,
+    /// and whatever any endpoint is refused for.
+    #[test]
+    fn an_azure_base_url_that_is_not_a_resource_is_refused() {
+        let too_long = format!("https://{}.openai.azure.com", "a".repeat(64));
+        let not_a_resource = "is not an Azure resource's host";
+        for (raw, says) in [
+            (
+                "http://res.openai.azure.com",
+                "the base URL is http, not https",
+            ),
+            ("http://127.0.0.1:8000", "the base URL is http, not https"),
+            ("https://res.openai.azure.com/openai", "has a path, /openai"),
+            (
+                "https://res.openai.azure.com/openai/v1/",
+                "has a path, /openai/v1/",
+            ),
+            (
+                "https://res.openai.azure.com/openai/deployments/gpt",
+                "has a path, /openai/deployments/gpt",
+            ),
+            ("https://res.openai.azure.com:8443", "names port 8443"),
+            ("https://res.openai.azure.com:80", "names port 80"),
+            ("https://openai.azure.com", not_a_resource),
+            ("https://services.ai.azure.com", not_a_resource),
+            ("https://.openai.azure.com", not_a_resource),
+            ("https://a.openai.azure.com", not_a_resource),
+            (too_long.as_str(), not_a_resource),
+            ("https://-res.openai.azure.com", not_a_resource),
+            ("https://res_1.openai.azure.com", not_a_resource),
+            ("https://a.b.openai.azure.com", not_a_resource),
+            ("https://resopenai.azure.com", not_a_resource),
+            ("https://res.openai.azure.com.", not_a_resource),
+            ("https://res.openai.azure.com.evil.example", not_a_resource),
+            ("https://res.cognitiveservices.azure.com", not_a_resource),
+            ("https://res.ai.azure.com", not_a_resource),
+            ("https://res.azure.com", not_a_resource),
+            ("https://evil.example", not_a_resource),
+            ("https://localhost", not_a_resource),
+            ("https://127.0.0.1", not_a_resource),
+            ("https://10.0.0.5", not_a_resource),
+            ("https://[::1]", not_a_resource),
+            ("https://[2001:db8::1]:443", not_a_resource),
+            // The rules every endpoint is held to come first.
+            ("https://169.254.169.254", "link-local or cloud-metadata"),
+            ("https://user:pw@res.openai.azure.com", "credentials"),
+            (
+                "https://res.openai.azure.com/?api-version=2024-10-21",
+                "contains '?'",
+            ),
+            ("https://res.openai.azure.com#x", "contains '#'"),
+            ("ftp://res.openai.azure.com", "http or https"),
+        ] {
+            let err = endpoint_base_url(raw, Platform::Azure).expect_err(raw);
+            assert_eq!(err.reason, Reason::BaseUrl, "{raw}: {err}");
+            assert!(err.message.contains(says), "{raw}: {err}");
+        }
+        // The message names the host it read, and what an azure base URL is.
+        let err = endpoint_base_url("https://10.0.0.5", Platform::Azure).expect_err("an address");
+        assert!(
+            err.message
+                .starts_with("10.0.0.5 is not an Azure resource's host: "),
+            "{err}"
+        );
+        assert!(
+            err.message
+                .contains("https://{resource}.openai.azure.com or https://{resource}.services"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_resource_name_is_one_dns_label() {
+        let longest = "a".repeat(63);
+        for good in ["ab", "a1", "0a", "my-res-01", "a-", longest.as_str()] {
+            assert!(is_azure_resource(good), "{good}");
+        }
+        let too_long = "a".repeat(64);
+        for bad in [
+            "",
+            "a",
+            "-a",
+            "Res",
+            "res_1",
+            "res.x",
+            "rés",
+            "a b",
+            too_long.as_str(),
+        ] {
+            assert!(!is_azure_resource(bad), "{bad:?}");
+        }
+    }
+
+    /// A stand-in is the origin a test named and no other, and it is held to
+    /// the rest of the rule. This is the only test in this crate that adds
+    /// one, on ports no other test uses: stand-ins last for the process.
+    #[test]
+    fn a_stand_in_takes_azure_s_place_only_where_a_test_put_it() {
+        let refused = |raw: &str| endpoint_base_url(raw, Platform::Azure).expect_err(raw);
+        assert!(refused("http://127.0.0.1:1").message.contains("not https"));
+
+        stand_in_for_azure("http://127.0.0.1:1").expect("a loopback address");
+        stand_in_for_azure("http://[::1]:2/").expect("a loopback address");
+        for (raw, normalised) in [
+            ("http://127.0.0.1:1", "http://127.0.0.1:1"),
+            ("http://127.0.0.1:1/", "http://127.0.0.1:1"),
+            ("http://[::1]:2", "http://[::1]:2"),
+        ] {
+            assert_eq!(
+                endpoint_base_url(raw, Platform::Azure).as_deref(),
+                Ok(normalised),
+                "{raw}"
+            );
+        }
+        // The origin, exactly: another port, address or scheme is not it.
+        for (raw, says) in [
+            ("http://127.0.0.1:3", "not https"),
+            ("http://[::1]:1", "not https"),
+            ("https://127.0.0.1:1", "is not an Azure resource's host"),
+            ("http://localhost:1", "not https"),
+            // And a stand-in is a resource's URL in every other way.
+            ("http://127.0.0.1:1/openai/v1", "has a path"),
+            ("http://127.0.0.1:1/?x=1", "contains '?'"),
+            ("http://user:pw@127.0.0.1:1", "credentials"),
+        ] {
+            let err = refused(raw);
+            assert_eq!(err.reason, Reason::BaseUrl, "{raw}: {err}");
+            assert!(err.message.contains(says), "{raw}: {err}");
+        }
+
+        // Only a loopback address stands in, so a test cannot point an azure
+        // endpoint anywhere else either.
+        for raw in [
+            "http://10.0.0.5:80",
+            "http://192.168.1.2:8080",
+            "http://localhost:4",
+            "https://res.openai.azure.com.evil.example",
+            "not a URL",
+        ] {
+            let err = stand_in_for_azure(raw).expect_err(raw);
+            assert!(err.starts_with(raw), "{raw}: {err}");
+        }
+        assert!(refused("http://10.0.0.5:80").message.contains("not https"));
+    }
+
+    #[test]
+    fn an_api_version_is_a_date_and_preview_or_not() {
+        for good in ["2024-10-21", "2025-04-01-preview", "0000-00-00"] {
+            assert!(is_api_version(good), "{good}");
+        }
+        for bad in [
+            "",
+            "v1",
+            "preview",
+            "latest",
+            "-preview",
+            "2024-10-21-Preview",
+            "2024-10-21-preview-preview",
+            "2024-10-21-beta",
+            "2024-10-21preview",
+            "2024-1-021",
+            "24-10-21",
+            "2024/10/21",
+            "20241021",
+            "2024-10-210",
+            "2024-10-2",
+            " 2024-10-21",
+            "2024-10-21 ",
+            "2024-10-21&x=1",
+            "2024-10-21#",
+            "2024-10-2\u{FF11}",
+            "\u{FF12}024-10-21",
+        ] {
+            assert!(!is_api_version(bad), "{bad:?}");
+        }
+
+        let empty = json!({});
+        let azure = |api_version: Option<&'static str>| Columns {
+            name: "t8-core-azure",
+            platform: "azure",
+            base_url: Some("https://res.openai.azure.com"),
+            auth: "api_key_header",
+            api_version,
+            ..plain(&empty)
+        };
+        let v1 = EndpointConfig::from_columns(&azure(None)).expect("Azure's v1 API");
+        assert_eq!(v1.api_version, None);
+        let preview = EndpointConfig::from_columns(&azure(Some("2025-04-01-preview")))
+            .expect("a preview version");
+        assert_eq!(preview.api_version.as_deref(), Some("2025-04-01-preview"));
+        let refused = EndpointConfig::from_columns(&azure(Some("2024-10-21&x=1")))
+            .expect_err("a second parameter");
+        assert_eq!(refused.reason, Reason::ApiVersion);
+        assert!(
+            refused
+                .message
+                .contains("leave it unset for Azure's v1 API"),
+            "{refused}"
+        );
+
+        // Only azure holds an API version to it: nothing else reads one yet.
+        let elsewhere = EndpointConfig::from_columns(&Columns {
+            api_version: Some("v1"),
+            ..plain(&empty)
+        })
+        .expect("passed through");
+        assert_eq!(elsewhere.api_version.as_deref(), Some("v1"));
+    }
+
     #[test]
     fn a_location_is_a_dns_label_and_nothing_more() {
         let longest = "a".repeat(63);
@@ -992,6 +1453,7 @@ mod tests {
             Reason::Region,
             Reason::Project,
             Reason::Path,
+            Reason::ApiVersion,
             Reason::Headers,
             Reason::Unsupported,
         ];
@@ -1004,6 +1466,7 @@ mod tests {
             );
         }
         assert_eq!(Reason::BaseUrl.as_str(), "base_url");
+        assert_eq!(Reason::ApiVersion.as_str(), "api_version");
         assert_eq!(Reason::Unsupported.as_str(), "unsupported");
     }
 }

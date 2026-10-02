@@ -4,6 +4,7 @@
 
 pub mod adapter;
 pub mod anthropic;
+pub mod azure;
 pub mod bedrock;
 pub mod codex;
 pub mod custom;
@@ -21,6 +22,7 @@ pub mod xai_oauth;
 
 pub use adapter::{Framing, ProviderAdapter, UpstreamRequest};
 pub use anthropic::AnthropicAdapter;
+pub use azure::AzureOpenAIAdapter;
 pub use bedrock::BedrockAdapter;
 pub use codex::CodexAdapter;
 pub use gemini::GeminiAdapter;
