@@ -19,7 +19,7 @@ use oag_core::Provider;
 use oag_core::credential::SecretMaterial;
 use oag_core::provider::{Dialect, Endpoint, Platform};
 use oag_server::AppState;
-use oag_store::{Cache, Db, EndpointDeletion, EndpointUpdate, NewEndpoint, repo};
+use oag_store::{Cache, Db, EndpointDeletion, EndpointUpdate, EndpointUpdated, NewEndpoint, repo};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -356,6 +356,11 @@ async fn failover(gw: &Gateway, oai: &MockServer, key_b: Uuid) {
 /// and catalog row still in place: nothing is sent to it, the listing loses
 /// its model, and the metric says why.
 async fn refused_by_the_compliance_guard(gw: &Gateway, anth: &MockServer) {
+    let seen = repo::get_endpoint(&gw.db, "mockanth")
+        .await
+        .expect("read")
+        .expect("registered")
+        .updated_at;
     let updated = repo::update_endpoint(
         &gw.db,
         "mockanth",
@@ -369,11 +374,15 @@ async fn refused_by_the_compliance_guard(gw: &Gateway, anth: &MockServer) {
             extra_headers: &json!({}),
             display_name: None,
             discover_models: false,
+            seen,
         },
     )
     .await
     .expect("the schema takes it: only the gateway's guard refuses it");
-    assert!(updated.is_some());
+    assert!(
+        matches!(updated, EndpointUpdated::Updated(_)),
+        "{updated:?}"
+    );
 
     gw.listing_until("mockanth's model is withdrawn", |ids| {
         !ids.iter().any(|id| id == "mockanth/m-anth")

@@ -334,6 +334,7 @@ async fn each_write_failure_has_its_status() {
         ),
         (WriteError::Taken("taken".to_owned()), StatusCode::CONFLICT),
         (WriteError::NotFound, StatusCode::NOT_FOUND),
+        (WriteError::Changed, StatusCode::CONFLICT),
         (
             WriteError::Failed(oag_core::Error::Internal("down".to_owned())),
             StatusCode::INTERNAL_SERVER_ERROR,

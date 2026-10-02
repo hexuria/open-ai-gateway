@@ -284,6 +284,10 @@ pub async fn create_endpoint(
 
 /// `PATCH /admin/api/endpoints/{name}`: the settings, never the dialect or
 /// the platform, which are refused with a 400 before anything is read.
+///
+/// The patch is applied to the row as this request read it, and written only
+/// over that row: a write that landed in between is a 409, and nothing is
+/// written, rather than lost under a field this request copied unchanged.
 pub async fn update_endpoint(
     State(state): State<Arc<AppState>>,
     actor: AdminActor,
@@ -407,6 +411,15 @@ fn write_failed(e: WriteError) -> Response {
             (StatusCode::CONFLICT, Json(json!({ "error": message }))).into_response()
         }
         WriteError::NotFound => not_found("no endpoint with that name"),
+        WriteError::Changed => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "the endpoint changed since this request read it, so nothing was \
+                          written",
+                "hint": "read it again, and send the change again if it is still wanted",
+            })),
+        )
+            .into_response(),
         WriteError::Failed(e) => failed(&e),
     }
 }

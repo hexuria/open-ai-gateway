@@ -673,6 +673,58 @@ async fn every_endpoint_command_surfaces_the_databases_failure() {
     }
 }
 
+/// C9. A `set` made from a row someone else changed after it was read reads
+/// the row again and puts its flags on top: both changes stand.
+#[tokio::test]
+async fn a_set_that_lost_a_race_reads_the_row_again_and_keeps_both_changes() {
+    let Some(db) = test_db().await else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _endpoints = ENDPOINT_ROWS.lock().await;
+    let name = fresh();
+    run(
+        &db,
+        &[
+            "endpoint",
+            "add",
+            "--name",
+            &name,
+            "--dialect",
+            "openai",
+            "--platform",
+            "plain",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+        ],
+    )
+    .await
+    .expect("added");
+    let stale = repo::get_endpoint(&db, &name)
+        .await
+        .expect("read")
+        .expect("stored");
+    // Someone else's change, after `stale` was read.
+    run(&db, &["endpoint", "set", &name, "--display-name", "Theirs"])
+        .await
+        .expect("their change");
+
+    let mut args = set_args(&["--discover"]);
+    args.name.clone_from(&name);
+    let written = set_from(&db, stale, &args).await;
+    run(&db, &["endpoint", "remove", &name])
+        .await
+        .expect("removed");
+
+    let row = written.expect("read again, and written");
+    assert!(row.discover_models, "this change");
+    assert_eq!(
+        row.display_name.as_deref(),
+        Some("Theirs"),
+        "and theirs, kept"
+    );
+}
+
 /// `--path` stores a System One endpoint's path, `set --path` moves it and an
 /// empty one goes back to Jev's own, and a chat endpoint is refused one before
 /// anything is written: against a real database.

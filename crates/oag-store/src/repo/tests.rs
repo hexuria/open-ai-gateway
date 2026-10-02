@@ -3903,6 +3903,11 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
         .execute(db.pool())
         .await
         .expect("backdate");
+    let backdated = get_endpoint(&db, &name)
+        .await
+        .expect("get")
+        .expect("there")
+        .updated_at;
     let beta = serde_json::json!({ "anthropic-beta": "tools-2024-04-04" });
     let settings = EndpointUpdate {
         base_url: Some("https://eu.llm.example.test"),
@@ -3914,11 +3919,15 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
         extra_headers: &beta,
         display_name: None,
         discover_models: false,
+        seen: backdated,
     };
-    let updated = update_endpoint(&db, &name, &settings)
+    let EndpointUpdated::Updated(updated) = update_endpoint(&db, &name, &settings)
         .await
         .expect("update")
-        .expect("exists");
+    else {
+        panic!("written over the row it was made from");
+    };
+    let updated = *updated;
     assert_eq!(
         (updated.dialect.as_str(), updated.platform.as_str()),
         ("anthropic", "plain"),
@@ -3963,6 +3972,7 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
         &name,
         &EndpointUpdate {
             base_url: None,
+            seen: updated.updated_at,
             ..settings.clone()
         },
     )
@@ -3974,8 +3984,26 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
     );
     assert_eq!(
         get_endpoint(&db, &name).await.expect("get"),
-        Some(updated),
+        Some(updated.clone()),
         "a refused update changes nothing"
+    );
+
+    // Made from the row before the update above: refused, and nothing changes.
+    let stale = update_endpoint(
+        &db,
+        &name,
+        &EndpointUpdate {
+            display_name: Some("Stale"),
+            ..settings.clone()
+        },
+    )
+    .await
+    .expect("a stale update is an answer, not an error");
+    assert_eq!(stale, EndpointUpdated::Changed);
+    assert_eq!(
+        get_endpoint(&db, &name).await.expect("get"),
+        Some(updated),
+        "a stale update changes nothing"
     );
 
     let nobody = endpoint_name();
@@ -3983,7 +4011,7 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
         update_endpoint(&db, &nobody, &settings)
             .await
             .expect("update"),
-        None
+        EndpointUpdated::NotFound
     );
     assert_eq!(get_endpoint(&db, &nobody).await.expect("get"), None);
 
@@ -4052,12 +4080,20 @@ async fn a_system_one_path_round_trips_and_an_update_moves_or_clears_it() {
         extra_headers: &headers,
         display_name: None,
         discover_models: false,
+        seen: row.updated_at,
     };
-    let moved = update_endpoint(&db, &name, &settings)
+    let EndpointUpdated::Updated(moved) = update_endpoint(&db, &name, &settings)
         .await
         .expect("update")
-        .expect("exists");
+    else {
+        panic!("written over the row it was made from");
+    };
+    let moved = *moved;
     assert_eq!(moved.path.as_deref(), Some("/v2/decide"));
+    let settings = EndpointUpdate {
+        seen: moved.updated_at,
+        ..settings
+    };
 
     let refused = update_endpoint(
         &db,
@@ -4079,7 +4115,7 @@ async fn a_system_one_path_round_trips_and_an_update_moves_or_clears_it() {
         "a refused update changes nothing"
     );
 
-    let cleared = update_endpoint(
+    let EndpointUpdated::Updated(cleared) = update_endpoint(
         &db,
         &name,
         &EndpointUpdate {
@@ -4088,8 +4124,9 @@ async fn a_system_one_path_round_trips_and_an_update_moves_or_clears_it() {
         },
     )
     .await
-    .expect("update")
-    .expect("exists");
+    .expect("update") else {
+        panic!("written over the row it was made from");
+    };
     assert_eq!(cleared.path, None, "back to Jev's own path");
 }
 

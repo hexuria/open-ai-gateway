@@ -15,7 +15,7 @@ use futures_util::FutureExt as _;
 use oag_core::credential::SecretMaterial;
 use oag_server::AppState;
 use oag_server::endpoint_sync::{SyncOptions, sync};
-use oag_store::{Cache, Db, EndpointUpdate, NewEndpoint, repo};
+use oag_store::{Cache, Db, EndpointUpdate, EndpointUpdated, NewEndpoint, repo};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -219,7 +219,12 @@ async fn rung_pin(gw: &Gateway, merge: &MockServer) {
 /// Turned on, discovery reads `{base}/models` with the endpoint's key, records
 /// what it names, and the listing stops offering the synced model it does not.
 async fn discovery_narrows_the_listing(gw: &Gateway, base: &str, key: Uuid) {
-    repo::update_endpoint(
+    let seen = repo::get_endpoint(&gw.db, ENDPOINT)
+        .await
+        .expect("read")
+        .expect("the endpoint")
+        .updated_at;
+    let updated = repo::update_endpoint(
         &gw.db,
         ENDPOINT,
         &EndpointUpdate {
@@ -232,11 +237,15 @@ async fn discovery_narrows_the_listing(gw: &Gateway, base: &str, key: Uuid) {
             extra_headers: &json!({}),
             display_name: Some("Merge"),
             discover_models: true,
+            seen,
         },
     )
     .await
-    .expect("discovery on")
-    .expect("the endpoint");
+    .expect("discovery on");
+    assert!(
+        matches!(updated, EndpointUpdated::Updated(_)),
+        "{updated:?}"
+    );
 
     let listed = gw
         .listing_until("the model the list does not name is withdrawn", |ids| {

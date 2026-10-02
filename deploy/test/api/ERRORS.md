@@ -240,6 +240,15 @@ The endpoint routes, `/admin/api/endpoints`, use each of them:
     "hint": "remove its credentials and its catalog models first, and take its models off every ladder" }
   ```
 
+  And for a `PATCH` that lost a race: someone else changed the endpoint after
+  this request read it, so nothing was written, rather than undoing their
+  change with fields this one copied. Read it again and send the change again.
+
+  ```json
+  { "error": "the endpoint changed since this request read it, so nothing was written",
+    "hint": "read it again, and send the change again if it is still wanted" }
+  ```
+
 - `POST /admin/api/endpoints/{name}/check` is **200 whatever the endpoint
   answered**, with `ok`, `status`, `models` and `error` saying what that was. A
   redirect is reported and never followed. Only a name nobody registered is 404.

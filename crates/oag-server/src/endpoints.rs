@@ -14,7 +14,7 @@
 use crate::egress::{deny_resolved_target, validate_endpoint_base_url};
 use oag_core::endpoint::{CheckedColumns, Columns, Reason, Refusal};
 use oag_core::provider::{AuthStyle, Platform};
-use oag_store::repo::{self, EndpointUpdate, NewEndpoint};
+use oag_store::repo::{self, EndpointUpdate, EndpointUpdated, NewEndpoint};
 use oag_store::{Db, EndpointRow};
 use oag_upstream::custom::EndpointSpec;
 use oag_upstream::gcp_token::{DEFAULT_TOKEN_URL, GcpTokenCache};
@@ -124,7 +124,9 @@ impl Draft {
         }
     }
 
-    fn update(&self) -> EndpointUpdate<'_> {
+    /// The update that writes this draft over the row whose `updated_at` was
+    /// `seen`, and over no later one.
+    fn update(&self, seen: time::OffsetDateTime) -> EndpointUpdate<'_> {
         EndpointUpdate {
             base_url: self.base_url.as_deref(),
             auth: &self.auth,
@@ -135,6 +137,7 @@ impl Draft {
             extra_headers: &self.extra_headers,
             display_name: self.display_name.as_deref(),
             discover_models: self.discover_models,
+            seen,
         }
     }
 }
@@ -148,6 +151,9 @@ pub enum WriteError {
     Taken(String),
     /// No endpoint has the name: the caller's 404.
     NotFound,
+    /// Someone else wrote the endpoint after the caller read it, and nothing
+    /// was written: the caller's 409, or a cue to read it again.
+    Changed,
     /// The database failed: the caller's 500.
     Failed(oag_core::Error),
 }
@@ -160,6 +166,11 @@ impl WriteError {
             Self::Invalid(message) | Self::Taken(message) => oag_core::Error::Config(message),
             Self::NotFound => oag_core::Error::Config(format!(
                 "no endpoint named '{name}'; see `oag admin endpoint list`"
+            )),
+            Self::Changed => oag_core::Error::Config(format!(
+                "endpoint '{name}' was changed by someone else while this changed it, so \
+                 nothing was written; see `oag admin endpoint show {name}` and run the command \
+                 again"
             )),
             Self::Failed(e) => e,
         }
@@ -176,11 +187,17 @@ pub async fn register(db: &Db, draft: Draft) -> Result<EndpointRow, WriteError> 
 }
 
 /// Replace `stored`'s settings with `draft`'s, if the draft passes every rule
-/// and names the same endpoint.
+/// and names the same endpoint, and the row is still the one `stored` is.
 ///
 /// The base URL's name is resolved only when the URL changed: a lookup that
 /// fails today is no reason to refuse a new display name for an endpoint that
 /// was checked when its URL was written.
+///
+/// The draft was made from `stored`, so it is written only over that row:
+/// another writer's change in between is [`WriteError::Changed`], with
+/// nothing written, rather than undone by a draft that never saw it. Every
+/// field a draft does not change is one it copied from `stored`, so writing
+/// it over a later row would put back whatever that writer changed.
 pub async fn change(
     db: &Db,
     stored: &EndpointRow,
@@ -202,9 +219,10 @@ pub async fn change(
     if draft.base_url != stored.base_url {
         resolves(&draft, platform).await?;
     }
-    match repo::update_endpoint(db, &stored.name, &draft.update()).await {
-        Ok(Some(row)) => Ok(row),
-        Ok(None) => Err(WriteError::NotFound),
+    match repo::update_endpoint(db, &stored.name, &draft.update(stored.updated_at)).await {
+        Ok(EndpointUpdated::Updated(row)) => Ok(*row),
+        Ok(EndpointUpdated::NotFound) => Err(WriteError::NotFound),
+        Ok(EndpointUpdated::Changed) => Err(WriteError::Changed),
         Err(e) => Err(write_error(e)),
     }
 }

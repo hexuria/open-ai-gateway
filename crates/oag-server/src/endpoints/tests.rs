@@ -291,6 +291,56 @@ async fn a_refused_registration_leaves_no_name_behind() {
     }
 }
 
+/// C9. Two writers that read the same row: the first one's change lands, and
+/// the second, made from a row that is no longer there, writes nothing and
+/// says so, rather than putting back what the first one changed.
+#[tokio::test]
+async fn a_change_made_from_a_row_another_writer_changed_is_refused() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 2).expect("connect");
+    db.migrate().await.expect("migrate");
+    let name = format!("t9-{}", &uuid::Uuid::new_v4().simple().to_string()[..20]);
+    let stored = register(&db, draft(&name)).await.expect("registered");
+
+    let first = change(
+        &db,
+        &stored,
+        Draft {
+            display_name: Some("First".to_owned()),
+            ..Draft::from_row(&stored)
+        },
+    )
+    .await;
+    let second = change(
+        &db,
+        &stored,
+        Draft {
+            discover_models: true,
+            ..Draft::from_row(&stored)
+        },
+    )
+    .await;
+    let now = repo::get_endpoint(&db, &name).await.expect("read");
+    repo::delete_endpoint(&db, &name).await.expect("clean up");
+
+    let first = first.expect("the first writer's change lands");
+    assert!(
+        first.updated_at > stored.updated_at,
+        "and moves the version"
+    );
+    let second = second.expect_err("made from the row before the first change");
+    assert!(matches!(second, WriteError::Changed), "{second:?}");
+    let now = now.expect("still there");
+    assert_eq!(
+        (now.display_name.as_deref(), now.discover_models),
+        (Some("First"), false),
+        "the first change stands, and the second wrote nothing"
+    );
+}
+
 #[tokio::test]
 async fn a_change_keeps_what_the_endpoint_is_and_resolves_only_a_new_url() {
     let db = nowhere();

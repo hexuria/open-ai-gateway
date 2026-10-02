@@ -261,7 +261,7 @@ pub struct EndpointAddArgs {
 }
 
 /// No `--dialect` and no `--platform`: see `EndpointCommand::Set`.
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 pub struct EndpointSetArgs {
     #[arg(value_name = "NAME")]
     name: String,

@@ -10,7 +10,7 @@ use super::{EndpointAddArgs, EndpointCommand, EndpointSetArgs};
 use oag_core::config::Config;
 use oag_core::provider::Platform;
 use oag_core::{Kek, Provider, Result, credential::SecretMaterial};
-use oag_server::endpoints::{self, Checked, Draft};
+use oag_server::endpoints::{self, Checked, Draft, WriteError};
 use oag_store::repo::{self, EndpointDeletion, EndpointReferences};
 use oag_store::{Db, EndpointRow};
 use serde_json::{Map, Value};
@@ -361,19 +361,46 @@ pub(super) fn show_lines(row: &EndpointRow, refs: EndpointReferences) -> Vec<Str
 }
 
 async fn set(db: &Db, args: EndpointSetArgs) -> Result<()> {
-    let name = args.name.clone();
-    let Some(stored) = repo::get_endpoint(db, &name).await? else {
-        return Err(not_found(&name));
+    let Some(stored) = repo::get_endpoint(db, &args.name).await? else {
+        return Err(not_found(&args.name));
     };
-    let mut draft = Draft::from_row(&stored);
-    apply(&mut draft, args)?;
-    let row = endpoints::change(db, &stored, draft)
-        .await
-        .map_err(|e| e.into_error(&name))?;
+    let row = set_from(db, stored, &args).await?;
     for line in set_lines(&row) {
         println!("{line}");
     }
     Ok(())
+}
+
+/// `args` applied to `stored` and written, and, if someone else wrote the
+/// endpoint after `stored` was read, applied once more to the row as it is
+/// then and written again.
+///
+/// The write lands only over the row it was made from (see
+/// `endpoints::change`), so a change made meanwhile is never undone: it is
+/// read, and these flags go on top of it. Once, because a second change in
+/// the time one write takes is a row being rewritten in a loop, which a
+/// retry here would only join.
+pub(super) async fn set_from(
+    db: &Db,
+    mut stored: EndpointRow,
+    args: &EndpointSetArgs,
+) -> Result<EndpointRow> {
+    let name = args.name.as_str();
+    let mut read_again = true;
+    loop {
+        let mut draft = Draft::from_row(&stored);
+        apply(&mut draft, args.clone())?;
+        match endpoints::change(db, &stored, draft).await {
+            Ok(row) => return Ok(row),
+            Err(WriteError::Changed) if read_again => {
+                read_again = false;
+                stored = repo::get_endpoint(db, name)
+                    .await?
+                    .ok_or_else(|| not_found(name))?;
+            }
+            Err(e) => return Err(e.into_error(name)),
+        }
+    }
 }
 
 /// What `set` prints once the change is written.

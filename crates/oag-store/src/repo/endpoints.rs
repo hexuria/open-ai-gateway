@@ -11,6 +11,7 @@ use crate::Db;
 use crate::rows::EndpointRow;
 use oag_core::{Error, Result};
 use std::collections::HashMap;
+use time::OffsetDateTime;
 
 const LIST_ENDPOINTS_SQL: &str = concat!(
     "SELECT ",
@@ -32,12 +33,16 @@ const INSERT_ENDPOINT_SQL: &str = concat!(
     "name, dialect, platform, base_url, auth, region, project, api_version, path, ",
     "extra_headers, display_name, discover_models, created_at, updated_at"
 );
+// Written only over the row as the writer read it (`updated_at = $11`), and
+// always to a later `updated_at` than the one it replaces, even within one
+// microsecond of that write or against a clock that stepped back: a stamp
+// that could come out equal is one a stale `seen` could match.
 const UPDATE_ENDPOINT_SQL: &str = concat!(
     "UPDATE endpoint SET ",
     "base_url = $2, auth = $3, region = $4, project = $5, api_version = $6, ",
     "extra_headers = $7, display_name = $8, discover_models = $9, path = $10, ",
-    "updated_at = now() ",
-    "WHERE name = $1 RETURNING ",
+    "updated_at = greatest(now(), updated_at + interval '1 microsecond') ",
+    "WHERE name = $1 AND updated_at = $11 RETURNING ",
     "name, dialect, platform, base_url, auth, region, project, api_version, path, ",
     "extra_headers, display_name, discover_models, created_at, updated_at"
 );
@@ -81,6 +86,25 @@ pub struct EndpointUpdate<'a> {
     pub extra_headers: &'a serde_json::Value,
     pub display_name: Option<&'a str>,
     pub discover_models: bool,
+    /// The `updated_at` of the row these settings were made from. The update
+    /// is written only while the row still has it, so a writer that read the
+    /// row before someone else changed it cannot put back what they changed:
+    /// it gets [`EndpointUpdated::Changed`] instead.
+    pub seen: OffsetDateTime,
+}
+
+/// What [`update_endpoint`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EndpointUpdated {
+    /// Written, and this is the row now. Boxed: a whole row beside two
+    /// empty variants would make every answer as large.
+    Updated(Box<EndpointRow>),
+    /// There is no endpoint by that name: the caller's 404.
+    NotFound,
+    /// Someone wrote the endpoint after the caller read it, so its
+    /// `updated_at` is no longer `seen`, and nothing was written: the caller's
+    /// 409, or its cue to read the row again.
+    Changed,
 }
 
 /// What names one endpoint: its credentials, its catalog models, and the places
@@ -197,14 +221,21 @@ pub async fn insert_endpoint(db: &Db, e: &NewEndpoint<'_>) -> Result<EndpointRow
         .map_err(|err| endpoint_write_error("registering endpoint", e.name, &err))
 }
 
-/// Replace an endpoint's settings and stamp `updated_at`. Returns `None` when
-/// there is no endpoint by that name, which is the caller's 404.
+/// Replace an endpoint's settings and stamp `updated_at`, if the row is still
+/// the one the settings were made from (`e.seen`).
+///
+/// Optimistic: nothing is locked between the caller's read and this write, so
+/// two writers never wait on each other, and the second to write finds the
+/// first one's stamp where it expected its own read's. Which of the two
+/// arrived first is the database's to say: an update that waits on another's
+/// row lock reads the row again once that one commits, and its `seen` no
+/// longer matches.
 pub async fn update_endpoint(
     db: &Db,
     name: &str,
     e: &EndpointUpdate<'_>,
-) -> Result<Option<EndpointRow>> {
-    sqlx::query_as::<_, EndpointRow>(UPDATE_ENDPOINT_SQL)
+) -> Result<EndpointUpdated> {
+    let updated = sqlx::query_as::<_, EndpointRow>(UPDATE_ENDPOINT_SQL)
         .bind(name)
         .bind(e.base_url)
         .bind(e.auth)
@@ -215,9 +246,25 @@ pub async fn update_endpoint(
         .bind(e.display_name)
         .bind(e.discover_models)
         .bind(e.path)
+        .bind(e.seen)
         .fetch_optional(db.pool())
         .await
-        .map_err(|err| endpoint_write_error("updating endpoint", name, &err))
+        .map_err(|err| endpoint_write_error("updating endpoint", name, &err))?;
+    if let Some(row) = updated {
+        return Ok(EndpointUpdated::Updated(Box::new(row)));
+    }
+    // Nothing matched: either there is no such endpoint, or there is and it
+    // has moved on from `seen`.
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM endpoint WHERE name = $1)")
+        .bind(name)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|err| Error::Internal(format!("reading endpoint after an update: {err}")))?;
+    Ok(if exists {
+        EndpointUpdated::Changed
+    } else {
+        EndpointUpdated::NotFound
+    })
 }
 
 /// Remove an endpoint, unless a credential or a catalog model still names it.

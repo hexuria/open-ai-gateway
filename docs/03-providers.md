@@ -312,13 +312,19 @@ them:
 | `GET /admin/api/endpoints` | List, with the counts and whether this build serves each. |
 | `POST /admin/api/endpoints` | Register. The body is the columns; `auth` defaults to the platform's style. |
 | `GET /admin/api/endpoints/{name}` | One endpoint. |
-| `PATCH /admin/api/endpoints/{name}` | Change settings. A field left out is kept, `null` clears; `dialect`, `platform` and `name` are a 400. |
+| `PATCH /admin/api/endpoints/{name}` | Change settings. A field left out is kept, `null` clears; `dialect`, `platform` and `name` are a 400. A 409 when someone else changed the endpoint while this was being applied: nothing was written, so read it again. |
 | `DELETE /admin/api/endpoints/{name}` | Remove. 409, with the counts, while anything names it. |
 | `POST /admin/api/endpoints/{name}/check` | Ask it for its models, with no key. 200 whatever it answered. |
 
 A write from the CLI is served from each replica's next refresh. One through the
 admin API is served at once by the replica that took it, which reloads, and by
 the others from their next refresh.
+
+A change is written only over the row it was made from. Two writers that read
+the same endpoint cannot undo each other: the second to write finds the row
+changed under it and writes nothing. `endpoint set` then reads the row again
+and puts its flags on top, once; a `PATCH` answers 409 and leaves the retry to
+its caller.
 
 ### The rules a row must pass
 
