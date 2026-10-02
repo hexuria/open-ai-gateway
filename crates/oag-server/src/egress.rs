@@ -3,13 +3,13 @@
 //! Two URLs an operator writes become places this process connects to: a
 //! capability service's health check and an endpoint's base URL. Both are
 //! refused if they name a link-local or cloud-metadata address, as a literal
-//! (`oag_core::catalog_url`) or once the name is resolved (here, because
-//! resolving is I/O and `oag-core` does none).
+//! (`oag_core::catalog_url`, and here again) or once the name is resolved
+//! (here, because resolving is I/O and `oag-core` does none).
 
 use oag_core::endpoint::endpoint_base_url;
 use oag_core::ip_is_denied;
 use oag_core::provider::Platform;
-use std::net::ToSocketAddrs;
+use std::net::{IpAddr, ToSocketAddrs};
 use url::{Host, Url};
 
 /// Whether an endpoint on `platform` may be written with `raw` as its base
@@ -34,8 +34,12 @@ pub(crate) async fn deny_resolved_target(url: &Url) -> Result<(), String> {
     // failed there.
     let host = match url.host() {
         Some(Host::Domain(name)) => name,
-        // An address needs no lookup; `catalog_url` has judged it already.
-        Some(Host::Ipv4(_) | Host::Ipv6(_)) => return Ok(()),
+        // An address needs no lookup, and is judged as a resolved one is.
+        // `catalog_url` judges it too where an endpoint is written, but this
+        // answers for whatever URL it is handed, and an address it waved
+        // through unexamined would be one only that caller had checked.
+        Some(Host::Ipv4(ip)) => return judged(IpAddr::V4(ip), url),
+        Some(Host::Ipv6(ip)) => return judged(IpAddr::V6(ip), url),
         None => return Err("URL is missing a host".to_owned()),
     };
     let port = url.port_or_known_default().unwrap_or(80);
@@ -56,6 +60,17 @@ pub(crate) async fn deny_resolved_target(url: &Url) -> Result<(), String> {
     }
     if !any {
         return Err(format!("resolving {host}: no addresses"));
+    }
+    Ok(())
+}
+
+/// `ip`, the address `url` names, refused if [`ip_is_denied`] says so.
+fn judged(ip: IpAddr, url: &Url) -> Result<(), String> {
+    if ip_is_denied(ip) {
+        return Err(format!(
+            "refusing to probe {}: it is a link-local or metadata address",
+            url.host_str().unwrap_or_default()
+        ));
     }
     Ok(())
 }
@@ -102,6 +117,50 @@ mod tests {
             validate_endpoint_base_url(raw, Platform::Plain)
                 .await
                 .unwrap_or_else(|e| panic!("{raw}: {e}"));
+        }
+    }
+
+    /// An address in the URL is judged as a resolved one is, with no lookup:
+    /// whoever calls this with a URL `catalog_url` never saw is refused the
+    /// same addresses.
+    #[tokio::test]
+    async fn an_address_is_judged_without_a_lookup() {
+        for raw in [
+            "http://169.254.169.254/latest",
+            "http://[fe80::1]:8000/",
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://[fd20:ce::254]/computeMetadata/v1/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/",
+        ] {
+            let url = Url::parse(raw).expect("a URL");
+            let err = deny_resolved_target(&url).await.expect_err(raw);
+            assert!(
+                err.contains("is a link-local or metadata address"),
+                "{raw}: {err}"
+            );
+        }
+        for raw in [
+            "http://127.0.0.1:8000/v1",
+            "http://[::1]:11434",
+            "http://10.1.2.3:8000/v1",
+            "http://[fd12:3456::7]:8000/v1",
+        ] {
+            let url = Url::parse(raw).expect("a URL");
+            deny_resolved_target(&url)
+                .await
+                .unwrap_or_else(|e| panic!("{raw}: {e}"));
+        }
+        // And a base URL naming one is refused before anything is asked.
+        for raw in [
+            "http://[fd00:ec2::254]/v1",
+            "http://[fd20:ce::254]/v1",
+            "http://100.100.100.200/v1",
+        ] {
+            let err = validate_endpoint_base_url(raw, Platform::Plain)
+                .await
+                .expect_err(raw);
+            assert!(err.contains("link-local or cloud-metadata"), "{raw}: {err}");
         }
     }
 

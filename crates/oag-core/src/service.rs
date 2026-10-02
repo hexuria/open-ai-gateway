@@ -161,8 +161,10 @@ pub fn health_url(base: &str, path: &str) -> Result<Url, crate::Error> {
 /// Addresses we will not send a health check to.
 ///
 /// Link-local (including the cloud metadata well-known `169.254.169.254`),
-/// unspecified, multicast, and broadcast. Not loopback and not RFC1918 —
-/// those are where the catalog's own backends actually run.
+/// unspecified, multicast, and broadcast, and the metadata services the
+/// clouds put anywhere else: [`METADATA_V4`] and [`METADATA_V6`]. Not
+/// loopback and not RFC1918 — those are where the catalog's own backends
+/// actually run.
 #[must_use]
 pub fn ip_is_denied(ip: IpAddr) -> bool {
     match ip {
@@ -171,12 +173,34 @@ pub fn ip_is_denied(ip: IpAddr) -> bool {
     }
 }
 
+/// Alibaba Cloud's metadata service, in the shared address space (RFC 6598)
+/// rather than link-local.
+pub const METADATA_V4: [Ipv4Addr; 1] = [Ipv4Addr::new(100, 100, 100, 200)];
+
+/// The IPv6 addresses of AWS's instance metadata service (`fd00:ec2::254`)
+/// and of GCP's metadata server (`fd20:ce::254`).
+///
+/// Both are unique-local, a range an operator's own network may use, so each
+/// is refused by its address and the range is left alone.
+pub const METADATA_V6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+    Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254),
+];
+
 fn v4_is_denied(ip: Ipv4Addr) -> bool {
-    ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
+    ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || METADATA_V4.contains(&ip)
 }
 
 fn v6_is_denied(ip: Ipv6Addr) -> bool {
-    if ip.is_unicast_link_local() || ip.is_unspecified() || ip.is_multicast() {
+    if ip.is_unicast_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || METADATA_V6.contains(&ip)
+    {
         return true;
     }
     ip.to_ipv4_mapped().is_some_and(v4_is_denied)
@@ -279,6 +303,44 @@ mod tests {
                 err.contains("link-local") || err.contains("metadata"),
                 "{raw} should be denied, got {err}"
             );
+        }
+    }
+
+    /// The metadata services that are not on a link-local address: AWS's and
+    /// GCP's over IPv6, which sit in the unique-local range an operator's own
+    /// network may use, and Alibaba Cloud's, in the shared address space.
+    /// Refused by address, as a literal and as an IPv4-mapped one; their
+    /// neighbours stay usable.
+    #[test]
+    fn the_metadata_services_off_link_local_are_refused() {
+        for ip in [
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "100.100.100.200",
+            "::ffff:100.100.100.200",
+        ] {
+            let ip: IpAddr = ip.parse().expect("an address");
+            assert!(ip_is_denied(ip), "{ip}");
+        }
+        for raw in [
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://[FD00:EC2:0::254]:80/",
+            "http://[fd20:ce::254]/computeMetadata/v1/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://[::ffff:100.100.100.200]/",
+        ] {
+            let err = catalog_url(raw).unwrap_err().to_string();
+            assert!(err.contains("link-local or cloud-metadata"), "{raw}: {err}");
+        }
+        for ip in [
+            "fd00:ec2::253",
+            "fd20:ce::1",
+            "fd12:3456::254",
+            "100.100.100.199",
+            "100.64.0.1",
+        ] {
+            let ip: IpAddr = ip.parse().expect("an address");
+            assert!(!ip_is_denied(ip), "{ip} is someone's own network");
         }
     }
 
