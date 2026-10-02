@@ -333,15 +333,17 @@ jobs:
         run: |
           out="$RUNNER_TEMP/mutants.out"
           mkdir -p "$out"
-          prev=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci --branch "$HEAD_REF" \
-            --json databaseId,headSha,status --limit 20 \
-            --jq "[.[] | select(.headSha != \"$GITHUB_SHA\" and .status == \"completed\")][0].databaseId // empty")
-          if [ -n "$prev" ] && gh run download "$prev" -R "$GITHUB_REPOSITORY" -p 'mutants.out-*' -D "$RUNNER_TEMP/prev"; then
-            cat "$RUNNER_TEMP"/prev/*/caught.txt 2>/dev/null | sort -u > "$out/caught.txt"
-            cat "$RUNNER_TEMP"/prev/*/unviable.txt 2>/dev/null | sort -u > "$out/unviable.txt"
-          fi
-          touch "$out/caught.txt" "$out/unviable.txt"
-          echo "reusing $(wc -l < "$out/caught.txt") caught and $(wc -l < "$out/unviable.txt") unviable from run ${prev:-none}"
+          # Each run records only the mutants it tested, so the union of the
+          # last few runs is what this branch has settled.
+          runs=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci --branch "$HEAD_REF" \
+            --json databaseId,headSha,status --limit 30 \
+            --jq "[.[] | select(.headSha != \"$GITHUB_SHA\" and .status == \"completed\")][:5][].databaseId")
+          for run in $runs; do
+            gh run download "$run" -R "$GITHUB_REPOSITORY" -p 'mutants.out-*' -D "$RUNNER_TEMP/prev/$run" || true
+          done
+          find "$RUNNER_TEMP/prev" -name caught.txt -exec cat {} + 2>/dev/null | sort -u > "$out/caught.txt"
+          find "$RUNNER_TEMP/prev" -name unviable.txt -exec cat {} + 2>/dev/null | sort -u > "$out/unviable.txt"
+          echo "reusing $(wc -l < "$out/caught.txt") caught and $(wc -l < "$out/unviable.txt") unviable from runs:" $runs
       - name: cargo mutants
         run: cargo mutants --no-shuffle --cap-lints true --iterate --jobs 2 --sharding round-robin --shard "${SHARD}/20" --in-diff "$RUNNER_TEMP/pr.diff" -o "$RUNNER_TEMP"
         env:
