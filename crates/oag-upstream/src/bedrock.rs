@@ -157,8 +157,9 @@ impl BedrockAdapter {
         // The model id contains characters that must survive verbatim in the
         // path (`anthropic.claude-sonnet-4-v1:0`), including the colon — and
         // `url` does keep `:` literal, which `the_model_id_survives_in_the_path`
-        // pins.
-        let path = format!("/model/{model_id}/{action}");
+        // pins. One that is an ARN holds a `/` as well, which must not end the
+        // segment: `model_segment` escapes it, and everything else reserved.
+        let path = format!("/model/{}/{action}", model_segment(model_id));
         let host = self.host();
         let origin = self.origin();
 
@@ -203,6 +204,34 @@ impl BedrockAdapter {
             .build()
             .map_err(|e| oag_core::Error::Internal(format!("building bedrock request: {e}")))
     }
+}
+
+/// `model_id` as one URL path segment: every byte percent-encoded but an
+/// unreserved one (RFC 3986 §2.3) or `:`.
+///
+/// A model id may be an ARN (an application inference profile's, a
+/// provisioned throughput's, a custom model deployment's), and an ARN names
+/// its resource after a `/`. Left as it is, that `/` ends the segment, and the
+/// request is posted to a path Bedrock does not serve.
+///
+/// `:` is a byte a path segment may hold (RFC 3986 §3.3), every Bedrock model
+/// id has one, and it has always been sent as it is, so an id with nothing
+/// else reserved in it goes on the wire exactly as before. AWS decodes the
+/// segment to find the model, and rebuilds the canonical request from the
+/// path that arrived, encoded once more: `signed_post` signs `url.path()`, so
+/// a `%2F` there is signed as `%252F`, as AWS's own SDKs sign one.
+fn model_segment(model_id: &str) -> String {
+    use std::fmt::Write as _;
+    let mut segment = String::with_capacity(model_id.len());
+    for byte in model_id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b':') {
+            segment.push(char::from(byte));
+        } else {
+            // Writing to a `String` cannot fail.
+            let _ = write!(segment, "%{byte:02X}");
+        }
+    }
+    segment
 }
 
 #[async_trait]
@@ -413,6 +442,79 @@ mod tests {
             at,
         );
         assert_eq!(header("authorization"), recomputed.authorization);
+    }
+
+    /// An ARN is one path segment. A model id may be one (an application
+    /// inference profile's, a provisioned throughput's), and its resource
+    /// follows a `/`: sent as it is, that split the id across two segments
+    /// and posted to a path Bedrock does not serve. Sent as `%2F`, it is
+    /// signed over that wire path, which AWS encodes once more when it
+    /// rebuilds the canonical request.
+    #[test]
+    fn an_arn_model_id_is_one_path_segment() {
+        const ARN: &str =
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4e5f6";
+        let a = BedrockAdapter::new("us-east-1");
+        let c = request(false);
+        let mut m = model();
+        m.upstream_name = ARN.to_owned();
+        let raw = "AKIDEXAMPLE:secret";
+        let cr = cred(raw);
+        let req = a
+            .build(&UpstreamRequest {
+                canonical: &c,
+                model: &m,
+                credential: &cr,
+                session: None,
+            })
+            .expect("builds");
+
+        let wire = req.url().path();
+        assert_eq!(
+            wire,
+            "/model/arn:aws:bedrock:us-east-1:123456789012:\
+             application-inference-profile%2Fa1b2c3d4e5f6/invoke"
+        );
+        let segments: Vec<&str> = req.url().path_segments().expect("a path").collect();
+        assert_eq!(segments.len(), 3, "{segments:?}");
+        assert_eq!(segments[1].replace("%2F", "/"), ARN);
+
+        // Signed over the wire path, `%2F` and all: what AWS recomputes from
+        // the request it receives. Signed over the decoded id, it would not
+        // match.
+        let header = |name: &str| {
+            req.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map_or_else(|| panic!("{name} header"), str::to_owned)
+        };
+        let at = time::PrimitiveDateTime::parse(
+            &header("x-amz-date"),
+            &time::macros::format_description!("[year][month][day]T[hour][minute][second]Z"),
+        )
+        .expect("amz date")
+        .assume_utc();
+        let body = req.body().and_then(reqwest::Body::as_bytes).expect("body");
+        let signed_over = |path: &str| {
+            sigv4::sign(
+                &BedrockAdapter::credentials(raw).expect("creds"),
+                "us-east-1",
+                "bedrock",
+                sigv4::SigningRequest {
+                    method: "POST",
+                    path,
+                    host: &header("host"),
+                    body,
+                },
+                at,
+            )
+            .authorization
+        };
+        assert_eq!(header("authorization"), signed_over(wire));
+        assert_ne!(
+            header("authorization"),
+            signed_over(&format!("/model/{ARN}/invoke"))
+        );
     }
 
     #[test]

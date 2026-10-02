@@ -487,7 +487,9 @@ built-in is unchanged by any of them, and none of them reads its settings.
   token is signed, not merely attached.
 - **Model ids.** A catalog row's upstream name is Bedrock's model id, or an
   inference profile's (`us.meta.llama3-1-70b-instruct-v1:0`). It goes in the
-  path, colon and all, and is signed as it is sent.
+  path, colon and all, and is signed as it is sent. An ARN works too (an
+  application inference profile's, a provisioned throughput's): it stays one
+  path segment, its `/` sent as `%2F`.
 - **Extra headers** are sent on every request, outside the signature, which
   covers `host`, `x-amz-date`, `x-amz-content-sha256` and the session token.
 
