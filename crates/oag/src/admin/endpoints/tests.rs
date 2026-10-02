@@ -360,6 +360,41 @@ fn a_listing_names_every_setting_and_counts_what_names_each_endpoint() {
     );
 }
 
+/// C18. A control character a row holds is printed as text, `\u{1b}`, and
+/// never sent raw: a column set by hand, or an extra header's value, can hold
+/// one, and raw it is an instruction to the operator's terminal.
+#[test]
+fn a_control_character_in_a_row_is_printed_as_text() {
+    let row = EndpointRow {
+        display_name: Some("Merge\u{1b}[2J".to_owned()),
+        base_url: Some("http://127.0.0.1:9/v1\u{1b}]8;;http://elsewhere.example/\u{7}".to_owned()),
+        region: Some("eu\u{7}".to_owned()),
+        api_version: Some("2024\u{9b}31m".to_owned()),
+        extra_headers: json!({"X-Title": "t18\u{1b}[31mred", "X-Note": "two\nlines"}),
+        ..stored()
+    };
+    let printed = [
+        list_lines(std::slice::from_ref(&row), &HashMap::new()),
+        show_lines(&row, EndpointReferences::default()),
+        added_lines(&row),
+        set_lines(&row),
+    ]
+    .concat();
+    for line in &printed {
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+    }
+    let all = printed.join("\n");
+    for escaped in [
+        "Merge\\u{1b}[2J",
+        "eu\\u{7}",
+        "2024\\u{9b}31m",
+        "t18\\u{1b}[31mred",
+        "two\\nlines",
+    ] {
+        assert!(all.contains(escaped), "{escaped}: {all}");
+    }
+}
+
 #[test]
 fn show_prints_every_setting_and_whether_it_is_served() {
     let refs = EndpointReferences {

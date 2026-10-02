@@ -45,6 +45,28 @@ fn not_found(name: &str) -> oag_core::Error {
     ))
 }
 
+/// `line` with every control character in it written as its escape: an
+/// escape character as `\u{1b}`, a newline as `\n`.
+///
+/// What these commands print comes from rows, and the rules a writer passes
+/// are not the only way a row is written: a column set by hand, or an extra
+/// header's value, can hold any character at all. Printed raw, one is an
+/// instruction to the operator's terminal rather than text on it.
+fn printable(line: String) -> String {
+    if !line.chars().any(char::is_control) {
+        return line;
+    }
+    let mut shown = String::with_capacity(line.len());
+    for c in line.chars() {
+        if c.is_control() {
+            shown.extend(c.escape_default());
+        } else {
+            shown.push(c);
+        }
+    }
+    shown
+}
+
 /// `add`'s flags as the row to register.
 pub(super) fn draft(args: EndpointAddArgs) -> Result<Draft> {
     let platform = args.platform.platform();
@@ -238,7 +260,7 @@ pub(super) fn added_lines(row: &EndpointRow) -> Vec<String> {
          --input-per-mtok <usd> --output-per-mtok <usd> --context <tokens> --max-output <tokens>"
     ));
     lines.push(REFRESH.to_owned());
-    lines
+    lines.into_iter().map(printable).collect()
 }
 
 async fn list(db: &Db) -> Result<()> {
@@ -283,7 +305,7 @@ pub(super) fn list_lines(
             lines.push(format!("{:21}not served: {refusal}", ""));
         }
     }
-    lines
+    lines.into_iter().map(printable).collect()
 }
 
 async fn show(db: &Db, name: &str) -> Result<()> {
@@ -335,7 +357,7 @@ pub(super) fn show_lines(row: &EndpointRow, refs: EndpointReferences) -> Vec<Str
         None => "served        yes".to_owned(),
         Some(refusal) => format!("served        no: {refusal}"),
     });
-    lines
+    lines.into_iter().map(printable).collect()
 }
 
 async fn set(db: &Db, args: EndpointSetArgs) -> Result<()> {
@@ -348,17 +370,26 @@ async fn set(db: &Db, args: EndpointSetArgs) -> Result<()> {
     let row = endpoints::change(db, &stored, draft)
         .await
         .map_err(|e| e.into_error(&name))?;
-    println!(
-        "endpoint {name} updated: {} on {} at {}",
+    for line in set_lines(&row) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What `set` prints once the change is written.
+pub(super) fn set_lines(row: &EndpointRow) -> Vec<String> {
+    let mut lines = vec![format!(
+        "endpoint {} updated: {} on {} at {}",
+        row.name,
         row.dialect,
         row.platform,
-        place(&row)
-    );
-    if let Some(refusal) = endpoints::refusal(&row) {
-        println!("  not served by this build: {refusal}");
+        place(row)
+    )];
+    if let Some(refusal) = endpoints::refusal(row) {
+        lines.push(format!("  not served by this build: {refusal}"));
     }
-    println!("{REFRESH}");
-    Ok(())
+    lines.push(REFRESH.to_owned());
+    lines.into_iter().map(printable).collect()
 }
 
 async fn remove(db: &Db, name: &str) -> Result<()> {
@@ -485,7 +516,7 @@ pub(super) fn check_lines(checked: &Checked, account: Option<&str>) -> Vec<Strin
             }
         }
     }
-    lines
+    lines.into_iter().map(printable).collect()
 }
 
 #[cfg(test)]

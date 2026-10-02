@@ -114,14 +114,31 @@ pub fn plain_refused_host(url: &Url, platform: Platform) -> Option<&'static str>
 /// `raw` as the base URL of an endpoint on `platform`, normalised as a
 /// built-in's is, or why it cannot be one.
 ///
-/// [`catalog_url`] first: http or https, no credentials in it, and no
-/// link-local or metadata literal. Loopback and private addresses pass, so a
-/// model server on the operator's own network can be registered. Then the
-/// compliance guard, [`plain_refused_host`], and then [`normalise_base_url`]:
-/// no query, no fragment, no trailing slash. An azure endpoint's must then be
-/// an Azure resource's and nothing more ([`AZURE_HOSTS`]), so no address of
-/// any kind passes there. No DNS; see the module.
+/// No control character, first: a URL parser drops a tab or a newline and
+/// escapes the rest, so the URL every rule below judges would not be the text
+/// a writer stored, and that text would reach a terminal as written. Then
+/// [`catalog_url`]: http or https, no credentials in it, and no link-local or
+/// metadata literal. Loopback and private addresses pass, so a model server
+/// on the operator's own network can be registered. Then the compliance
+/// guard, [`plain_refused_host`], and then [`normalise_base_url`]: no query,
+/// no fragment. An azure endpoint's must then be an Azure resource's and
+/// nothing more ([`AZURE_HOSTS`]), so no address of any kind passes there.
+/// No DNS; see the module.
+///
+/// What comes back is the URL the parser read, which is the one every rule
+/// judged: scheme and host in lowercase, no default port, the path
+/// percent-encoded, and no trailing slash. So what a writer stores is what was
+/// checked, and every spelling of one base URL is stored as one.
 pub fn endpoint_base_url(raw: &str, platform: Platform) -> Result<String, Refusal> {
+    if raw.trim().chars().any(char::is_control) {
+        // Not repeated: the value is what holds the character.
+        return Err(Refusal::new(
+            Reason::BaseUrl,
+            "the base URL holds a control character, such as a tab, a newline or an \
+             escape: a URL parser would drop or escape it, so the URL checked would not \
+             be the one stored. Type it again without one",
+        ));
+    }
     let url = catalog_url(raw).map_err(|e| Refusal::new(Reason::BaseUrl, words(e)))?;
     if let Some(refused) = plain_refused_host(&url, platform) {
         return Err(Refusal::new(
@@ -133,12 +150,12 @@ pub fn endpoint_base_url(raw: &str, platform: Platform) -> Result<String, Refusa
             ),
         ));
     }
-    let normalised = normalise_base_url("this endpoint", raw)
+    normalise_base_url("this endpoint", raw)
         .map_err(|e| Refusal::new(Reason::BaseUrl, words(e)))?;
     if platform == Platform::Azure {
         return azure_base_url(&url);
     }
-    Ok(normalised)
+    Ok(url.as_str().trim_end_matches('/').to_owned())
 }
 
 /// The hosts an `azure` endpoint's base URL may name, each with one resource's
@@ -1694,5 +1711,66 @@ mod tests {
             crate::provider::is_interned("t14-served"),
             "a served row is"
         );
+    }
+
+    /// C18. A base URL holding a control character is refused, and the
+    /// refusal does not repeat it. The parser would drop the tab or newline,
+    /// and escape the rest, so the URL checked and the text stored would be
+    /// two things, and the stored one would reach a terminal as written. At
+    /// either end it is whitespace, and trimmed as it always was.
+    #[test]
+    fn a_base_url_with_a_control_character_is_refused_without_repeating_it() {
+        for raw in [
+            "http://10.0.0.7:8000/v1\u{1b}[2J",
+            "http://10.0.0.\t7:8000/v1",
+            "http://10.0.0.7:8000/v\n1",
+            "http://10.0.0.7:8000/\u{7f}v1",
+            "http://10.0.0.7:8000/\u{9b}31m",
+        ] {
+            let err = endpoint_base_url(raw, Platform::Plain).expect_err(raw);
+            assert_eq!(err.reason, Reason::BaseUrl, "{raw:?}: {err}");
+            assert!(err.message.contains("control character"), "{raw:?}: {err}");
+            assert!(
+                !err.message.chars().any(char::is_control),
+                "{raw:?}: {err:?}"
+            );
+        }
+        assert_eq!(
+            endpoint_base_url("\thttp://10.0.0.7:8000/v1\n", Platform::Plain).as_deref(),
+            Ok("http://10.0.0.7:8000/v1")
+        );
+    }
+
+    /// C18. The base URL that comes back is the one the URL parser read,
+    /// which is the one every rule judged: what is stored is what was
+    /// checked, and every spelling of one URL is stored as one.
+    #[test]
+    fn a_base_url_comes_back_as_the_url_that_was_checked() {
+        for (raw, normalised) in [
+            (
+                "HTTP://Models.Example.COM:80/V1/",
+                "http://models.example.com/V1",
+            ),
+            (
+                "https://models.example.com:443",
+                "https://models.example.com",
+            ),
+            (
+                "http://10.0.0.7:8000/my models/",
+                "http://10.0.0.7:8000/my%20models",
+            ),
+            ("http://10.0.0.7:8000/a/../v1", "http://10.0.0.7:8000/v1"),
+            ("http://[::1]:11434/", "http://[::1]:11434"),
+            (
+                "http://bücher.example/v1",
+                "http://xn--bcher-kva.example/v1",
+            ),
+        ] {
+            assert_eq!(
+                endpoint_base_url(raw, Platform::Plain).as_deref(),
+                Ok(normalised),
+                "{raw}"
+            );
+        }
     }
 }
