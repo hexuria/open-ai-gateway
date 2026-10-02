@@ -120,7 +120,8 @@ pub fn plain_refused_host(url: &Url, platform: Platform) -> Option<&'static str>
 /// compliance guard, [`plain_refused_host`], and then [`normalise_base_url`]:
 /// no query, no fragment, no trailing slash. An azure endpoint's must then be
 /// an Azure resource's and nothing more ([`AZURE_HOSTS`]), so no address of
-/// any kind passes there. No DNS; see the module.
+/// any kind passes there. A gcp endpoint's must be https, or http only to this
+/// machine's loopback ([`is_https_or_loopback`]). No DNS; see the module.
 pub fn endpoint_base_url(raw: &str, platform: Platform) -> Result<String, Refusal> {
     let url = catalog_url(raw).map_err(|e| Refusal::new(Reason::BaseUrl, words(e)))?;
     if let Some(refused) = plain_refused_host(&url, platform) {
@@ -138,7 +139,42 @@ pub fn endpoint_base_url(raw: &str, platform: Platform) -> Result<String, Refusa
     if platform == Platform::Azure {
         return azure_base_url(&url);
     }
+    // Every request a gcp endpoint is sent carries a bearer token minted from
+    // a service account, good for an hour against whatever that account may
+    // reach; over plain http every hop on the way could read it.
+    if platform == Platform::Gcp && !is_https_or_loopback(&url) {
+        return Err(Refusal::new(
+            Reason::BaseUrl,
+            format!(
+                "the base URL is {}, not https: a gcp endpoint's requests carry a bearer \
+                 token minted from a service account, which plain http would show to every \
+                 hop on the way; http is allowed only to this machine's loopback \
+                 (127.0.0.0/8, [::1] or localhost), for a stand-in or a local proxy",
+                url.scheme()
+            ),
+        ));
+    }
     Ok(normalised)
+}
+
+/// Whether `url` is https, or http to this machine's own loopback: where a
+/// bearer token, or a signed assertion, may be sent.
+///
+/// Loopback by what the URL says, as every rule here judges a URL: an IPv4
+/// address in `127.0.0.0/8`, `[::1]`, or `localhost`, the name RFC 6761
+/// reserves for it. Nothing is resolved.
+#[must_use]
+pub fn is_https_or_loopback(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => match url.host() {
+            Some(Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(Host::Ipv6(ip)) => ip.is_loopback(),
+            Some(Host::Domain(name)) => name == "localhost",
+            None => false,
+        },
+        _ => false,
+    }
 }
 
 /// The hosts an `azure` endpoint's base URL may name, each with one resource's
@@ -853,6 +889,51 @@ mod tests {
             jev_shaped.path, None,
             "the default is the upstream's to supply"
         );
+    }
+
+    /// A gcp endpoint's every request carries a bearer token minted from a
+    /// service account, so its base URL is https, or http only to this
+    /// machine's own loopback (a stand-in, a local proxy). Judged by what the
+    /// URL says: no DNS.
+    #[test]
+    fn a_gcp_base_url_is_https_or_on_loopback() {
+        let headers = json!({});
+        let gcp = |base_url| Columns {
+            name: "t10-core-gcp-base",
+            dialect: "gemini",
+            platform: "gcp",
+            base_url: Some(base_url),
+            auth: "bearer",
+            region: Some("us-central1"),
+            project: Some("my-project-1"),
+            ..plain(&headers)
+        };
+        for refused in [
+            "http://vertex-proxy.internal",
+            "http://10.0.0.7:8443",
+            "http://us-central1-aiplatform.googleapis.com",
+            "http://localhost.example.test",
+        ] {
+            let refusal = EndpointConfig::from_columns(&gcp(refused)).expect_err(refused);
+            assert_eq!(refusal.reason, Reason::BaseUrl, "{refused}: {refusal}");
+            assert!(refusal.message.contains("https"), "{refusal}");
+        }
+        for served in [
+            "https://psc-vertex.p.googleapis.com",
+            "https://10.0.0.7:8443",
+            "http://127.0.0.1:9",
+            "http://127.8.9.10:9/vertex",
+            "http://[::1]:9",
+            "http://localhost:9",
+        ] {
+            EndpointConfig::from_columns(&gcp(served)).expect(served);
+        }
+        // The other platforms' rules are their own.
+        EndpointConfig::from_columns(&Columns {
+            base_url: Some("http://vertex-proxy.internal"),
+            ..plain(&headers)
+        })
+        .expect("a plain endpoint may be http");
     }
 
     // Long because it is a table: one row per rule, each a whole set of

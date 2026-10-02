@@ -346,6 +346,9 @@ before it files a key under an endpoint's name:
   nothing more, `https://{resource}.openai.azure.com` or
   `https://{resource}.services.ai.azure.com`, with no path or port; see
   [Azure OpenAI](#azure-openai);
+- a base URL on `gcp`, which is optional, is https, or http only to this
+  machine's loopback (`127.0.0.0/8`, `[::1]` or `localhost`): every request it
+  is sent carries a bearer token minted from a service account;
 - a region (required on `aws` and `gcp`) and a project (required on `gcp`) are
   1 to 63 of `a-z`, `0-9` and `-`, because a platform puts them in a hostname or
   a path; and an `aws` region is shaped like one, two letters, then words, then
@@ -652,7 +655,9 @@ that.
   `https://aiplatform.googleapis.com` for the `global` region.
 - **Base URL**, optional, replaces the host: a Private Service Connect
   endpoint, a proxy, or a stand-in. The path beneath it still names the project
-  and the region. A multi-region location (`us`, `eu`) has a host of its own,
+  and the region. It is https, or http only to this machine's loopback (a
+  stand-in, a local proxy), because every request carries a bearer token. A
+  multi-region location (`us`, `eu`) has a host of its own,
   `https://aiplatform.{location}.rep.googleapis.com`, so give it as the base
   URL.
 - **Auth** is `bearer`: the minted token goes in `Authorization`, and no other
