@@ -8,6 +8,7 @@
 use super::accounts::price_account;
 use super::{EndpointAddArgs, EndpointCommand, EndpointSetArgs};
 use oag_core::config::Config;
+use oag_core::provider::Platform;
 use oag_core::{Kek, Provider, Result, credential::SecretMaterial};
 use oag_server::endpoints::{self, Checked, Draft};
 use oag_store::repo::{self, EndpointDeletion, EndpointReferences};
@@ -182,6 +183,17 @@ async fn add(db: &Db, args: EndpointAddArgs) -> Result<()> {
     Ok(())
 }
 
+/// How `account add` is handed a key for an endpoint on `platform`: a gcp
+/// endpoint's credential is a service account's JSON key, read whole from the
+/// file Google issues; every other platform's is one line.
+pub(super) fn secret_flag(platform: &str) -> &'static str {
+    if platform == Platform::Gcp.as_str() {
+        "--secret-file <service-account.json>"
+    } else {
+        "--secret <key>"
+    }
+}
+
 /// Where `row`'s endpoint answers: its base URL, or what its platform builds
 /// one from.
 fn place(row: &EndpointRow) -> String {
@@ -218,7 +230,8 @@ pub(super) fn added_lines(row: &EndpointRow) -> Vec<String> {
         ));
     }
     lines.push(format!(
-        "  next: oag admin account add --name {name}-1 --provider {name} --secret <key>"
+        "  next: oag admin account add --name {name}-1 --provider {name} {}",
+        secret_flag(&row.platform)
     ));
     lines.push(format!(
         "        oag admin catalog add --id {name}/<model> --upstream <model> \

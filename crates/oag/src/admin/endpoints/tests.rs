@@ -520,6 +520,13 @@ fn adding_says_what_was_registered_and_what_is_left_to_do() {
     );
     assert!(vertex.contains("auth bearer; no extra headers"), "{vertex}");
     assert!(!vertex.contains("not served"), "{vertex}");
+    assert!(
+        vertex.contains(
+            "next: oag admin account add --name merge-1 --provider merge \
+             --secret-file <service-account.json>"
+        ),
+        "a gcp endpoint's key is read from its file: {vertex}"
+    );
 
     // At an address, which no Azure resource is.
     let unserved = added_lines(&EndpointRow {

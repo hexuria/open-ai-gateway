@@ -161,6 +161,7 @@ async fn check_endpoints(db: &Db) -> Result<u32> {
     for row in &rows {
         let (lines, problems) = endpoint_report(
             &row.name,
+            &row.platform,
             oag_server::endpoints::refusal(row).map(|refusal| refusal.message),
             refs.get(&row.name).copied().unwrap_or_default(),
         );
@@ -180,6 +181,7 @@ async fn check_endpoints(db: &Db) -> Result<u32> {
 /// whoever made that choice, as an unpriced seat would.
 fn endpoint_report(
     name: &str,
+    platform: &str,
     problem: Option<String>,
     refs: oag_store::repo::EndpointReferences,
 ) -> (Vec<String>, u32) {
@@ -204,7 +206,8 @@ fn endpoint_report(
                 "FAIL endpoint    {name} has no credential, so a request routed to it fails"
             ));
             lines.push(format!(
-                "     fix: oag admin account add --name {name}-1 --provider {name} --secret <key>"
+                "     fix: oag admin account add --name {name}-1 --provider {name} {}",
+                super::endpoints::secret_flag(platform)
             ));
         } else {
             lines.push(format!(
@@ -979,7 +982,7 @@ mod tests {
             models: 3,
             on_ladder: 1,
         };
-        let (lines, failed) = endpoint_report("merge", None, whole);
+        let (lines, failed) = endpoint_report("merge", "plain", None, whole);
         assert_eq!(failed, 0);
         assert_eq!(
             lines,
@@ -987,7 +990,8 @@ mod tests {
         );
 
         let says = |refs, problem: Option<&str>| {
-            let (lines, failed) = endpoint_report("merge", problem.map(str::to_owned), refs);
+            let (lines, failed) =
+                endpoint_report("merge", "plain", problem.map(str::to_owned), refs);
             (lines.join("\n"), failed)
         };
         let (text, failed) = says(EndpointReferences::default(), None);
@@ -997,6 +1001,15 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("--provider merge --secret <key>"), "{text}");
+        // A gcp endpoint's key is a service account's JSON, read from its file.
+        let (vertex, _) = endpoint_report("vertex", "gcp", None, EndpointReferences::default());
+        assert!(
+            vertex.join("\n").contains(
+                "fix: oag admin account add --name vertex-1 --provider vertex \
+                 --secret-file <service-account.json>"
+            ),
+            "{vertex:?}"
+        );
         assert!(text.contains("has no model in the catalog"), "{text}");
         assert!(text.contains("catalog add --id merge/<model>"), "{text}");
         assert!(!text.contains("ok   endpoint"), "{text}");
