@@ -45,8 +45,22 @@ fn listed() -> Vec<ListedModel> {
         .collect()
 }
 
+/// A row as an earlier sync of its endpoint left it.
 fn stored(model: ModelRow, is_override: bool) -> StoredModelRow {
-    StoredModelRow { model, is_override }
+    StoredModelRow {
+        synced_by: Some(model.provider.clone()),
+        model,
+        is_override,
+    }
+}
+
+/// A row an operator stated with `catalog add`: an override no sync wrote.
+fn by_hand(model: ModelRow) -> StoredModelRow {
+    StoredModelRow {
+        model,
+        is_override: true,
+        synced_by: None,
+    }
 }
 
 /// A row under `endpoint` with terms no list states.
@@ -114,6 +128,9 @@ fn a_filter_scopes_both_what_a_sync_writes_and_what_it_may_remove() {
         &HashSet::new(),
         &SyncOptions {
             include: vec!["zai/*".to_owned()],
+            // The one synced row it manages goes, which is more than half of
+            // them: the shrink guard's to judge, and not what this is about.
+            allow_shrink: true,
             ..SyncOptions::default()
         },
     )
@@ -171,7 +188,13 @@ fn a_list_that_offers_nothing_plans_nothing() {
         },
     )
     .expect_err("nothing matched");
-    assert_eq!(err, "0 skipped, 10 filtered out");
+    assert_eq!(
+        err,
+        Refused::Nothing {
+            skipped: 0,
+            filtered: 10
+        }
+    );
 
     let unservable: Vec<ListedModel> = listed()
         .into_iter()
@@ -186,7 +209,122 @@ fn a_list_that_offers_nothing_plans_nothing() {
         &SyncOptions::default(),
     )
     .expect_err("nothing to price");
-    assert_eq!(err, "7 skipped, 0 filtered out");
+    assert_eq!(
+        err,
+        Refused::Nothing {
+            skipped: 7,
+            filtered: 0
+        }
+    );
+}
+
+/// C3. A sync removes only the rows it wrote, and only once the list stops
+/// naming them: a row added by hand stays whatever the list says, and so does
+/// one the list still names but this run skipped.
+#[test]
+fn a_sync_removes_only_what_it_wrote_and_the_list_no_longer_names() {
+    let e = "t6-own";
+    // The fixture lists this one and the sync skips it: it is listed free.
+    let skipped = "moonshot/kimi-k2-free";
+    assert!(
+        listed()
+            .iter()
+            .any(|m| m.upstream.as_deref() == Some(skipped)
+                && listing::choose(m, PriceChoice::Cheapest).is_err()),
+        "the fixture lists {skipped} and does not price it"
+    );
+    let existing = [
+        stored(any_row(e, "gone/synced"), true),
+        by_hand(any_row(e, "gone/by-hand")),
+        stored(any_row(e, skipped), true),
+    ];
+    let p = plan(
+        e,
+        "Merge",
+        &listed(),
+        &existing,
+        &HashSet::new(),
+        &SyncOptions::default(),
+    )
+    .expect("the list offers three");
+    assert_eq!(
+        p.remove,
+        [format!("{e}/gone/synced")],
+        "never the row added by hand, nor the one still listed"
+    );
+    assert_eq!(p.report.removed, p.remove);
+    assert!(p.report.kept_on_ladder.is_empty());
+}
+
+/// C3. A list that no longer names more than half of the rows earlier syncs
+/// wrote is refused, and nothing is written or removed, unless the run says
+/// `--allow-shrink`. Rows a ladder keeps are not removed, so they are not
+/// counted among those that would be, and rows added by hand count for
+/// nothing.
+#[test]
+fn a_sync_that_would_remove_most_of_what_it_wrote_is_refused() {
+    let e = "t6-shrink";
+    let offered: Vec<StoredModelRow> = [GLM, SONNET, DEEPSEEK]
+        .iter()
+        .map(|name| stored(any_row(e, name), true))
+        .collect();
+    let gone = |n: usize| -> Vec<StoredModelRow> {
+        (0..n)
+            .map(|i| stored(any_row(e, &format!("gone/{i}")), true))
+            .collect()
+    };
+    let decide = |existing: &[StoredModelRow], laddered: &HashSet<String>, allow: bool| {
+        plan(
+            e,
+            "Merge",
+            &listed(),
+            existing,
+            laddered,
+            &SyncOptions {
+                allow_shrink: allow,
+                ..SyncOptions::default()
+            },
+        )
+    };
+
+    // Four of seven would go: refused.
+    let most = [offered.clone(), gone(4)].concat();
+    assert_eq!(
+        decide(&most, &HashSet::new(), false).expect_err("more than half"),
+        Refused::Shrinks {
+            removing: 4,
+            synced: 7
+        }
+    );
+    let allowed = decide(&most, &HashSet::new(), true).expect("--allow-shrink");
+    assert_eq!(allowed.remove.len(), 4);
+
+    // Three of six is half, not more: planned.
+    let half = [offered.clone(), gone(3)].concat();
+    assert_eq!(
+        decide(&half, &HashSet::new(), false)
+            .expect("half is not more than half")
+            .remove
+            .len(),
+        3
+    );
+
+    // Four of seven gone, one of them on a ladder: three would be removed.
+    let laddered = HashSet::from([format!("{e}/gone/0")]);
+    let kept = decide(&most, &laddered, false).expect("three of seven");
+    assert_eq!(kept.remove.len(), 3);
+    assert_eq!(kept.report.kept_on_ladder, [format!("{e}/gone/0")]);
+
+    // Rows added by hand are not the sync's, so they count for nothing.
+    let mut theirs = offered;
+    theirs.extend((0..10).map(|i| by_hand(any_row(e, &format!("mine/{i}")))));
+    theirs.extend(gone(1));
+    assert_eq!(
+        decide(&theirs, &HashSet::new(), false)
+            .expect("one of four")
+            .remove,
+        [format!("{e}/gone/0")]
+    );
 }
 
 /// A row is unchanged only when it is already an override with the list's
@@ -754,6 +892,40 @@ async fn an_id_only_list_is_refused_and_nothing_is_written() {
         assert!(elsewhere.contains("origin"), "{elsewhere}");
 
         assert!(m.rows().await.is_empty());
+    })
+    .await;
+}
+
+/// C3, against the store: what the operator added by hand survives the next
+/// sync, whether the list names it and skips it (the free model the skip
+/// says to add with `catalog add --free`), never named it, or named a row a
+/// sync wrote that the operator restated. Only the row a sync wrote and the
+/// list dropped goes.
+#[tokio::test]
+async fn a_sync_leaves_the_operators_rows_and_removes_only_its_own() {
+    with_merge("/v1/openai", |m| async move {
+        {
+            let _served = m.serve(page(PAGE_1), page(PAGE_2)).await;
+            m.sync(SyncOptions::default()).await.expect("first sync");
+        }
+        for upstream in ["moonshot/kimi-k2-free", "mine/private", DEEPSEEK] {
+            repo::override_model(&m.db, &any_row(&m.endpoint, upstream))
+                .await
+                .expect("catalog add");
+        }
+        let _served = m
+            .serve(without(PAGE_1, &[SONNET]), without(PAGE_2, &[DEEPSEEK]))
+            .await;
+
+        let report = m.sync(SyncOptions::default()).await.expect("second sync");
+        let left: Vec<String> = m.rows().await.into_iter().map(|row| row.id).collect();
+
+        assert_eq!(report.removed, [m.id(SONNET)], "the one row a sync wrote");
+        assert!(report.kept_on_ladder.is_empty());
+        for kept in ["moonshot/kimi-k2-free", "mine/private", DEEPSEEK, GLM] {
+            assert!(left.contains(&m.id(kept)), "{kept}: {left:?}");
+        }
+        assert!(!left.contains(&m.id(SONNET)), "{left:?}");
     })
     .await;
 }

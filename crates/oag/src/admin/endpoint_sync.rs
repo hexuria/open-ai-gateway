@@ -26,9 +26,11 @@ pub enum EndpointCatalogCommand {
     ///
     /// Each chat model the list prices becomes, or rewrites, the row
     /// `<endpoint>/<model>`, as an override, with a label where the row has
-    /// none. A model the list no longer offers is removed, unless a route's
-    /// ladder names it. The running gateway serves the rows from its next
-    /// catalog refresh.
+    /// none. A row an earlier sync wrote that the list no longer names is
+    /// removed, unless a route's ladder names it; a row added with `catalog
+    /// add` never is. A run that would remove more than half of the rows
+    /// earlier syncs wrote is refused without --allow-shrink. The running
+    /// gateway serves the rows from its next catalog refresh.
     Sync {
         #[arg(value_name = "NAME")]
         name: String,
@@ -57,6 +59,11 @@ pub enum EndpointCatalogCommand {
         /// Used for this run only; nothing stores it.
         #[arg(long, value_name = "URL")]
         listing_url: Option<String>,
+        /// Remove the rows the list no longer names even when they are more
+        /// than half of those earlier syncs wrote, which is refused without
+        /// this: a list that shrinks that far is more often one read in part.
+        #[arg(long)]
+        allow_shrink: bool,
     },
     /// Show the models an endpoint's list names, as discovery reads it, beside
     /// the catalog. Writes nothing.
@@ -103,6 +110,7 @@ pub(super) async fn run(
             exclude,
             price,
             listing_url,
+            allow_shrink,
         } => {
             let options = SyncOptions {
                 account,
@@ -111,6 +119,7 @@ pub(super) async fn run(
                 exclude,
                 price: price.into(),
                 dry_run,
+                allow_shrink,
             };
             let report = endpoint_sync::sync(db, kek, &name, &options).await?;
             sync_lines(&report, config.gateway.catalog_refresh_interval)
@@ -300,12 +309,14 @@ mod tests {
             exclude,
             price,
             listing_url,
+            allow_shrink,
         } = parse(&["endpoint", "sync", "merge"]).expect("parses")
         else {
             panic!("expected sync");
         };
         assert_eq!(name, "merge");
         assert_eq!((account, dry_run, listing_url), (None, false, None));
+        assert!(!allow_shrink, "a shrinking list is refused unless asked");
         assert!(include.is_empty() && exclude.is_empty());
         assert_eq!(price, Price::Cheapest);
         assert_eq!(PriceChoice::from(price), PriceChoice::Cheapest);
@@ -317,6 +328,7 @@ mod tests {
             exclude,
             price,
             listing_url,
+            allow_shrink,
             ..
         } = parse(&[
             "endpoint",
@@ -335,6 +347,7 @@ mod tests {
             "first",
             "--listing-url",
             "https://api-gateway.merge.dev/v1/models",
+            "--allow-shrink",
         ])
         .expect("parses")
         else {
@@ -342,6 +355,7 @@ mod tests {
         };
         assert_eq!(account.as_deref(), Some("merge-key"));
         assert!(dry_run);
+        assert!(allow_shrink);
         assert_eq!(include, ["zai/*", "anthropic/*"]);
         assert_eq!(exclude, ["*-preview"]);
         assert_eq!(PriceChoice::from(price), PriceChoice::First);

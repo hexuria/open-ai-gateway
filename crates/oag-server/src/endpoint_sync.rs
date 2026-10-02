@@ -116,6 +116,10 @@ pub struct SyncOptions {
     pub price: PriceChoice,
     /// Report what would change, and write nothing.
     pub dry_run: bool,
+    /// Remove what the list no longer names even when that is more than half
+    /// of the rows earlier syncs wrote, which is refused otherwise: see
+    /// [`sync`].
+    pub allow_shrink: bool,
 }
 
 /// What a sync found, and did or, on a dry run, would do. Every list is of
@@ -150,14 +154,23 @@ pub struct SyncReport {
 /// Each model the list offers for chat at a price becomes, or rewrites, the
 /// override row `<endpoint>/<upstream id>`, with the chosen vendor's prices,
 /// window and capabilities and, where the row has none, a label naming the
-/// model and the endpoint. A row of the endpoint's the list no longer offers is
-/// removed, unless a route's ladder names it, in which case it is kept and
-/// reported: a sync never takes a model out from under a ladder. Rows a filter
-/// leaves out are left alone either way.
+/// model and the endpoint, marked as this endpoint's sync's (`synced_by`).
+///
+/// A row is removed only when an earlier sync of this endpoint wrote it and
+/// the list no longer names it at all, and even then not while a route's
+/// ladder names it: then it is kept and reported, because a sync never takes
+/// a model out from under a ladder. So a row the operator stated with
+/// `catalog add` is never removed, and nor is a row the list still names but
+/// this run skipped, such as a free model the operator added by hand as the
+/// skip says to. Rows a filter leaves out are left alone either way.
 ///
 /// A list that offers nothing writes nothing, and removes nothing: that is a
 /// list this sync cannot read (a vocabulary it does not know, a filter that
-/// matched nothing), not an endpoint that stopped serving everything.
+/// matched nothing), not an endpoint that stopped serving everything. For the
+/// same reason a list that no longer names more than half of the rows earlier
+/// syncs wrote is refused, unless [`SyncOptions::allow_shrink`] says that is
+/// meant: a list that shrinks that far is more often one read in part, or
+/// changed in shape, than an endpoint withdrawing its models.
 ///
 /// Everything is written in one transaction. The gateway serves the rows from
 /// its next catalog refresh; nothing has to restart.
@@ -184,12 +197,21 @@ pub async fn sync(db: &Db, kek: &Kek, endpoint: &str, options: &SyncOptions) -> 
         &laddered,
         options,
     )
-    .map_err(|nothing| {
-        Error::Config(format!(
-            "the model list at {} offers no chat model this sync can price ({nothing}), so \
-             nothing was written or removed",
+    .map_err(|refused| match refused {
+        Refused::Nothing { skipped, filtered } => Error::Config(format!(
+            "the model list at {} offers no chat model this sync can price ({skipped} \
+             skipped, {filtered} filtered out), so nothing was written or removed",
             listed.url
-        ))
+        )),
+        Refused::Shrinks { removing, synced } => Error::Config(format!(
+            "the model list at {} no longer names {removing} of the {synced} models earlier \
+             syncs of {endpoint} wrote, more than half, so nothing was written or removed: a \
+             list that shrinks that far is more often one read in part, or changed in shape, \
+             than an endpoint withdrawing its models. See what it names with `oag admin \
+             endpoint models {endpoint}`, and run the sync again with --allow-shrink to \
+             remove them",
+            listed.url
+        )),
     })?;
     report.url = listed.url;
     report.pages = listed.pages;
@@ -231,12 +253,26 @@ struct Plan {
     remove: Vec<String>,
 }
 
-/// Decide a sync against the endpoint's rows as they stand, or, when the list
-/// offers nothing to write, say how many entries it skipped and filtered out.
+/// Why a sync writes and removes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    /// The list offers nothing to write: how many entries it skipped, and how
+    /// many the filters left out.
+    Nothing { skipped: usize, filtered: usize },
+    /// The list no longer names more than half of the rows earlier syncs of
+    /// the endpoint wrote (`synced`), and `--allow-shrink` was not given:
+    /// how many would be removed.
+    Shrinks { removing: usize, synced: usize },
+}
+
+/// Decide a sync against the endpoint's rows as they stand, or say why it
+/// would write and remove nothing.
 ///
 /// `existing` holds every row whose provider is the endpoint and every row
 /// whose id carries its prefix; one of another provider holds its id, and is
-/// neither written nor removed.
+/// neither written nor removed. Of the endpoint's own, only those an earlier
+/// sync of it wrote (`synced_by`) may be removed, and only once the list no
+/// longer names them at all, priced or skipped.
 fn plan(
     endpoint: &str,
     label: &str,
@@ -244,7 +280,7 @@ fn plan(
     existing: &[StoredModelRow],
     laddered: &HashSet<String>,
     options: &SyncOptions,
-) -> std::result::Result<Plan, String> {
+) -> std::result::Result<Plan, Refused> {
     let filter = Filter {
         include: &options.include,
         exclude: &options.exclude,
@@ -259,12 +295,16 @@ fn plan(
     };
     let mut writes = Vec::new();
     let mut offered = HashSet::new();
+    // Every id the list names, offered or skipped: none of them is removed.
+    let mut named = HashSet::new();
     for model in models {
-        if let Some(name) = model.upstream.as_deref()
-            && !filter.admits(name, &format!("{endpoint}/{name}"))
-        {
-            report.filtered.push(name.to_owned());
-            continue;
+        if let Some(name) = model.upstream.as_deref() {
+            let id = format!("{endpoint}/{name}");
+            if !filter.admits(name, &id) {
+                report.filtered.push(name.to_owned());
+                continue;
+            }
+            named.insert(id);
         }
         let offer = match listing::choose(model, options.price) {
             Ok(offer) => offer,
@@ -293,22 +333,31 @@ fn plan(
         }
     }
     if offered.is_empty() {
-        return Err(format!(
-            "{} skipped, {} filtered out",
-            report.skipped.len(),
-            report.filtered.len()
-        ));
+        return Err(Refused::Nothing {
+            skipped: report.skipped.len(),
+            filtered: report.filtered.len(),
+        });
     }
-    let (kept, remove): (Vec<String>, Vec<String>) = existing
+    // The rows earlier syncs of this endpoint wrote, of those this run
+    // manages: the only rows a sync removes, and the measure of how far the
+    // list shrank.
+    let synced: Vec<&ModelRow> = existing
         .iter()
+        .filter(|r| r.synced_by.as_deref() == Some(endpoint))
         .map(|r| &r.model)
-        .filter(|m| {
-            m.provider == endpoint
-                && !offered.contains(&m.id)
-                && filter.admits(&m.upstream_name, &m.id)
-        })
+        .filter(|m| m.provider == endpoint && filter.admits(&m.upstream_name, &m.id))
+        .collect();
+    let (kept, remove): (Vec<String>, Vec<String>) = synced
+        .iter()
+        .filter(|m| !named.contains(&m.id))
         .map(|m| m.id.clone())
         .partition(|id| laddered.contains(id));
+    if remove.len() * 2 > synced.len() && !options.allow_shrink {
+        return Err(Refused::Shrinks {
+            removing: remove.len(),
+            synced: synced.len(),
+        });
+    }
     report.kept_on_ladder = kept;
     report.removed.clone_from(&remove);
     Ok(Plan {

@@ -851,4 +851,80 @@ mod tests {
         let with_query = with_query.expect_err("nor a query");
         assert!(with_query.contains("endpoint_path_check"), "{with_query}");
     }
+
+    /// 0022 applies over a database at 0021 that already holds catalog rows,
+    /// and is expand-only: every row gets no `synced_by`, which no sync
+    /// removes, and the 0021 release's sync write, which names no
+    /// `synced_by`, still goes through, both as a new row and as a rewrite
+    /// that leaves a mark where it was.
+    #[tokio::test]
+    async fn the_synced_by_migration_applies_over_a_database_at_0021() {
+        let Some((url, name)) = scratch_database().await else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        // What the 0021 release's sync writes: every column but `synced_by`.
+        let sync_as_0021 = "INSERT INTO model_catalog (id, provider, upstream_name, \
+             input_per_mtok, output_per_mtok, context_window, max_output_tokens, is_override) \
+             VALUES ($1, 'e', $2, $3, 2, 1000, 100, true) ON CONFLICT (id) DO UPDATE SET \
+             input_per_mtok = EXCLUDED.input_per_mtok, updated_at = now() \
+             WHERE model_catalog.provider = EXCLUDED.provider";
+        let result = async {
+            sqlx::migrate!("../../migrations")
+                .run_to(21, db.pool())
+                .await
+                .map_err(|e| format!("migrating to 0021: {e}"))?;
+            for id in ["e/before", "e/marked"] {
+                sqlx::query(sync_as_0021)
+                    .bind(id)
+                    .bind(id.trim_start_matches("e/"))
+                    .bind(rust_decimal::Decimal::from(1))
+                    .execute(db.pool())
+                    .await
+                    .map_err(|e| format!("seeding 0021's rows: {e}"))?;
+            }
+
+            db.migrate().await.map_err(|e| e.to_string())?;
+
+            // A row a sync of this release marked, rewritten by the last one's.
+            sqlx::query("UPDATE model_catalog SET synced_by = 'e' WHERE id = 'e/marked'")
+                .execute(db.pool())
+                .await
+                .map_err(|e| e.to_string())?;
+            for id in ["e/marked", "e/after"] {
+                sqlx::query(sync_as_0021)
+                    .bind(id)
+                    .bind(id.trim_start_matches("e/"))
+                    .bind(rust_decimal::Decimal::from(5))
+                    .execute(db.pool())
+                    .await
+                    .map_err(|e| format!("the 0021 release's sync, after 0022: {e}"))?;
+            }
+            sqlx::query_as::<_, (String, Option<String>, i64)>(
+                "SELECT id, synced_by, input_per_mtok::bigint FROM model_catalog ORDER BY id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .map_err(|e| e.to_string())
+        }
+        .await;
+        drop(db);
+        drop_database(&name).await;
+
+        let rows = result.expect("0022 over a database at 0021");
+        let rows: Vec<(&str, Option<&str>, i64)> = rows
+            .iter()
+            .map(|(id, by, price)| (id.as_str(), by.as_deref(), *price))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("e/after", None, 5),
+                ("e/before", None, 1),
+                ("e/marked", Some("e"), 5),
+            ],
+            "a row 0021 held is no sync's, and the old sync's writes go through"
+        );
+    }
 }

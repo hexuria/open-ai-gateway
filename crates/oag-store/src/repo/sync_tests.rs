@@ -299,6 +299,73 @@ async fn a_stale_row_a_ladder_names_is_kept_and_the_rest_are_removed() {
     assert_eq!(left, [kept, stays]);
 }
 
+/// C3. The store removes only rows the endpoint's own sync wrote, whatever
+/// the caller names: a row the operator stated with `catalog add`, and a row
+/// a sync wrote that the operator then restated, stay. A sync's rows are
+/// marked as its own, and the operator's are not.
+#[tokio::test]
+async fn a_sync_removes_only_the_rows_its_own_syncs_wrote() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let e = fresh("t6-own");
+    endpoint(&db, &e, false).await;
+    let (synced, restated, theirs) = (
+        format!("{e}/synced"),
+        format!("{e}/restated"),
+        format!("{e}/theirs"),
+    );
+    sync_endpoint_models(
+        &db,
+        &e,
+        &[model(&e, "synced", 1, None), model(&e, "restated", 1, None)],
+        &[],
+    )
+    .await
+    .expect("seed");
+    override_model(&db, &model(&e, "restated", 2, None))
+        .await
+        .expect("the operator restates it");
+    override_model(&db, &model(&e, "theirs", 3, None))
+        .await
+        .expect("the operator adds one");
+    let marks: Vec<(String, Option<String>)> = provider_models(&db, &e)
+        .await
+        .expect("rows")
+        .into_iter()
+        .map(|r| (r.model.id, r.synced_by))
+        .collect();
+
+    let removed = sync_endpoint_models(
+        &db,
+        &e,
+        &[],
+        &[synced.clone(), restated.clone(), theirs.clone()],
+    )
+    .await;
+    let left: Vec<String> = provider_models(&db, &e)
+        .await
+        .expect("rows")
+        .into_iter()
+        .map(|r| r.model.id)
+        .collect();
+    remove(&db, &[&e]).await;
+
+    assert_eq!(
+        marks,
+        [
+            (restated.clone(), None),
+            (synced.clone(), Some(e.clone())),
+            (theirs.clone(), None),
+        ],
+        "the sync's own rows are marked, and the operator's are not"
+    );
+    assert_eq!(removed.expect("sync").removed, [synced]);
+    assert_eq!(left, [restated, theirs], "the operator's rows stay");
+}
+
 /// Every row handed to a sync must be the endpoint's own.
 #[tokio::test]
 async fn a_sync_refuses_a_row_of_another_provider() {

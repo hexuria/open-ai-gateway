@@ -293,6 +293,7 @@ pub(super) const OVERRIDE_MODEL_SQL: &str = r"
             supports_prompt_cache = EXCLUDED.supports_prompt_cache,
             is_override = true,
             display_label = COALESCE(EXCLUDED.display_label, model_catalog.display_label),
+            synced_by = NULL,
             updated_at = now()
         ";
 
@@ -306,6 +307,9 @@ pub(super) const OVERRIDE_MODEL_SQL: &str = r"
 /// `catalog seed` to write back over. Here the operator is the writer that
 /// guard exists for, so there is no guard: every column is replaced, the flag
 /// is set, and a label they already gave survives unless they give another.
+///
+/// It also clears `synced_by` (migration 0022), so a row a sync wrote and
+/// the operator then stated is theirs from then on, and no sync removes it.
 pub async fn override_model(db: &Db, m: &ModelRow) -> Result<()> {
     sqlx::query(OVERRIDE_MODEL_SQL)
         .bind(&m.id)
@@ -373,16 +377,17 @@ pub async fn update_model_prices(
 
 /// One provider's catalog rows, and any row of another provider whose id
 /// carries this provider's prefix (`<provider>/…`), each with whether an
-/// operator override protects it: what an endpoint's catalog sync compares its
-/// list against. The second kind holds an id the sync would write, and is
-/// how it learns not to.
+/// operator override protects it and which endpoint's sync wrote it: what an
+/// endpoint's catalog sync compares its list against. The second kind holds
+/// an id the sync would write, and is how it learns not to.
 pub async fn provider_models(db: &Db, provider: &str) -> Result<Vec<StoredModelRow>> {
     sqlx::query_as::<_, StoredModelRow>(
         r"
         SELECT id, provider, upstream_name, input_per_mtok, output_per_mtok,
                cache_read_per_mtok, cache_write_per_mtok, context_window,
                max_output_tokens, supports_vision, supports_tools,
-               supports_reasoning, supports_prompt_cache, display_label, is_override
+               supports_reasoning, supports_prompt_cache, display_label, is_override,
+               synced_by
         FROM model_catalog
         WHERE provider = $1 OR left(id, char_length($1) + 1) = $1 || '/'
         ORDER BY id
@@ -436,13 +441,17 @@ pub async fn laddered_models(db: &Db) -> Result<HashSet<String>> {
 /// only where the row has none: a label is the operator's, as it is to
 /// [`UPSERT_MODEL_SQL`], and a sync supplies one only for a row nobody has
 /// named.
+///
+/// Every row it writes is marked as the endpoint's sync's (`synced_by`,
+/// migration 0022), which is what lets a later sync remove it, and nothing
+/// else lets one: see [`DELETE_STALE_SQL`].
 const SYNC_MODEL_SQL: &str = r"
         INSERT INTO model_catalog (
             id, provider, upstream_name, input_per_mtok, output_per_mtok,
             cache_read_per_mtok, cache_write_per_mtok, context_window, max_output_tokens,
             supports_vision, supports_tools, supports_reasoning, supports_prompt_cache,
-            is_override, display_label
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true,$14)
+            is_override, display_label, synced_by
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,true,$14,$2)
         ON CONFLICT (id) DO UPDATE SET
             upstream_name = EXCLUDED.upstream_name,
             input_per_mtok = EXCLUDED.input_per_mtok,
@@ -457,15 +466,21 @@ const SYNC_MODEL_SQL: &str = r"
             supports_prompt_cache = EXCLUDED.supports_prompt_cache,
             is_override = true,
             display_label = COALESCE(model_catalog.display_label, EXCLUDED.display_label),
+            synced_by = EXCLUDED.synced_by,
             updated_at = now()
         WHERE model_catalog.provider = EXCLUDED.provider
         RETURNING id
         ";
 
-/// Removes the provider's rows named in `$2` that no ladder names, and says
-/// which it removed.
+/// Removes the provider's rows named in `$2` that its own sync wrote and no
+/// ladder names, and says which it removed.
+///
+/// Both conditions are read in the statement that removes the row: a row the
+/// operator stated with `catalog add` after the caller planned, which clears
+/// `synced_by`, and a ladder written after it, each keep the row.
 const DELETE_STALE_SQL: &str = concat!(
-    "DELETE FROM model_catalog c WHERE c.provider = $1 AND c.id = ANY($2) ",
+    "DELETE FROM model_catalog c WHERE c.provider = $1 AND c.synced_by = $1 ",
+    "AND c.id = ANY($2) ",
     "AND NOT EXISTS (SELECT 1 FROM (",
     laddered_models_sql!(),
     ") AS laddered WHERE laddered.model = c.id) ",
@@ -488,9 +503,11 @@ pub struct EndpointSync {
 /// transaction, so a catalog refresh sees the endpoint's rows as they were or
 /// as the sync left them and never half of each.
 ///
-/// Every row must be `provider`'s. A stale row is removed only if no ladder
-/// names it, decided in the statement that removes it: a ladder written
-/// between the caller's look and this one still keeps its model.
+/// Every row must be `provider`'s, and is marked as its sync's. A stale row is
+/// removed only if an earlier sync of `provider` wrote it and no ladder names
+/// it, decided in the statement that removes it: a ladder written, or a row
+/// stated by an operator, between the caller's look and this one still keeps
+/// its model.
 pub async fn sync_endpoint_models(
     db: &Db,
     provider: &str,

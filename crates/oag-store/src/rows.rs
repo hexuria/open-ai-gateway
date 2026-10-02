@@ -276,13 +276,18 @@ impl ModelRow {
     }
 }
 
-/// A catalog row with whether an operator override protects it from a refresh:
-/// what an endpoint's catalog sync compares the endpoint's list against.
+/// A catalog row with whether an operator override protects it from a refresh,
+/// and which endpoint's sync wrote it: what an endpoint's catalog sync
+/// compares the endpoint's list against.
 #[derive(Debug, Clone, FromRow)]
 pub struct StoredModelRow {
     #[sqlx(flatten)]
     pub model: ModelRow,
     pub is_override: bool,
+    /// The endpoint whose catalog sync last wrote the row, or `None` for a row
+    /// no sync wrote (migration 0022): an operator's, a seed's, or one an
+    /// earlier release's sync wrote. A sync removes only its own.
+    pub synced_by: Option<String>,
 }
 
 /// One registered capability service.

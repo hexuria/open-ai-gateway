@@ -453,13 +453,22 @@ oag admin endpoint sync merge --include 'anthropic/*' --exclude '*-preview' --pr
   the list changes: the list owns the numbers of the rows it prices, so a price
   edited by hand on one of them lasts until the next sync, unless that model is
   `--exclude`d. A label, `<display_name> (<endpoint display name>)`, is written
-  only where the row has none, so a name you gave a model survives. A row of the
-  endpoint's that the list no longer offers is removed, unless a route's ladder
-  names it: then it is kept and reported. `--include` and `--exclude` globs
-  (`*` and `?`, matched against the upstream id or the catalog id) scope what a
-  run manages, and a model they leave out is neither written nor removed. A list
+  only where the row has none, so a name you gave a model survives. Each row a
+  sync writes is marked as that endpoint's sync's (`model_catalog.synced_by`,
+  migration 0022), and only such a row is ever removed: one the list no longer
+  names at all, unless a route's ladder names it, when it is kept and reported.
+  A row you added with `catalog add` is yours and is never removed, nor is a
+  model the list still names but the sync skipped, such as a free one you
+  added by hand as the skip says to; `catalog add` over a row a sync wrote
+  makes it yours. Rows written before 0022 carry no mark, so no sync removes
+  them until it has written them again. `--include` and `--exclude` globs (`*`
+  and `?`, matched against the upstream id or the catalog id) scope what a run
+  manages, and a model they leave out is neither written nor removed. A list
   that offers nothing at all is refused rather than read as "remove every
-  model". The whole sync is one transaction.
+  model", and so is one that no longer names more than half of the rows earlier
+  syncs wrote: that is more often a list read in part, or changed in shape,
+  than an endpoint withdrawing its models. `--allow-shrink` removes them anyway.
+  The whole sync is one transaction.
 - **What it prints.** Added, updated, unchanged, removed and kept counts,
   skipped entries by reason, and what the filters left out. The running gateway
   serves the rows from its next catalog refresh
