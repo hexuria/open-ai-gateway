@@ -494,7 +494,7 @@ pub(super) async fn try_credential(
         .await
     {
         Ok(c) => c,
-        Err(e) => return Outcome::Switch(e),
+        Err(e) => return unprepared(state, account, e).await,
     };
 
     let mut last = Error::NoCredential { provider };
@@ -634,6 +634,22 @@ pub(super) async fn try_credential(
     }
 
     Outcome::Switch(last)
+}
+
+/// A credential whose preparation failed: a service account whose key
+/// Google would not exchange for a token, or a token endpoint that did not
+/// answer.
+///
+/// The request moves on to the next credential, as it always has, and this
+/// one sits out the cooldown its error asks for, through the same
+/// `apply_disposition` an upstream's refusal goes through: ten minutes for a
+/// key Google refuses, thirty seconds for a token endpoint out of reach. So
+/// the requests after this one go to another credential first, instead of
+/// each finding the same thing out. An error that asks for nothing
+/// (`Disposition::Fatal`) writes nothing.
+async fn unprepared(state: &AppState, account: AccountId, e: Error) -> Outcome {
+    apply_disposition(state, account, e.disposition()).await;
+    Outcome::Switch(e)
 }
 
 /// Turn a successful response into the attempt the caller returns.

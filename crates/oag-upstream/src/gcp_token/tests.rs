@@ -324,7 +324,10 @@ async fn a_credential_that_is_not_a_service_account_key_is_refused() {
         .token(AccountId::new(), &key.to_string(), None)
         .await
         .expect_err("refused");
-    assert!(matches!(err, Error::Config(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::UpstreamUnavailable { lasting: true, .. }),
+        "{err:?}"
+    );
     assert!(err.to_string().contains("service_account"), "{err}");
     assert_quotes_nothing(&err.to_string(), &[]);
     server.verify().await;
@@ -379,7 +382,10 @@ async fn a_malformed_key_is_refused_without_being_quoted() {
             .token(AccountId::new(), &sa_json, None)
             .await
             .expect_err(case);
-        assert!(matches!(err, Error::Config(_)), "{case}: {err:?}");
+        assert!(
+            matches!(err, Error::UpstreamUnavailable { lasting: true, .. }),
+            "{case}: {err:?}"
+        );
         assert_quotes_nothing(&err.to_string(), &[]);
     }
     server.verify().await;
@@ -399,7 +405,10 @@ async fn a_refused_grant_is_an_error_that_names_the_code() {
         .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect_err("refused");
-    assert!(matches!(err, Error::Internal(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::UpstreamUnavailable { lasting: true, .. }),
+        "Google refused the key: {err:?}"
+    );
     let message = err.to_string();
     assert!(
         message.contains("400") && message.contains("(invalid_grant: Invalid JWT Signature.)"),
@@ -428,7 +437,10 @@ async fn a_refusal_that_echoes_the_assertion_does_not_get_it_into_the_error() {
         .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect_err("refused");
-    assert!(matches!(err, Error::Internal(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::UpstreamUnavailable { lasting: true, .. }),
+        "{err:?}"
+    );
     let message = err.to_string();
     assert!(message.contains("401"), "{message}");
     let sent = grants(&server).await;
@@ -448,7 +460,10 @@ async fn a_redirect_from_the_token_endpoint_is_not_followed() {
         .token(AccountId::new(), &key_json().to_string(), None)
         .await
         .expect_err("not followed");
-    assert!(matches!(err, Error::Internal(_)), "{err:?}");
+    assert!(
+        matches!(err, Error::UpstreamUnavailable { lasting: false, .. }),
+        "the way to Google, not the key: {err:?}"
+    );
     let message = err.to_string();
     assert!(
         message.contains("307") && message.contains("not followed"),
@@ -485,7 +500,10 @@ async fn an_answer_that_is_not_a_bearer_token_is_refused_without_quoting_it() {
             .token(AccountId::new(), &key_json().to_string(), None)
             .await
             .expect_err(case);
-        assert!(matches!(err, Error::Internal(_)), "{case}: {err:?}");
+        assert!(
+            matches!(err, Error::UpstreamUnavailable { lasting: false, .. }),
+            "{case}: {err:?}"
+        );
         assert_quotes_nothing(&err.to_string(), &[TOKEN]);
         server.verify().await;
     }
@@ -568,7 +586,10 @@ async fn a_mint_goes_through_the_accounts_proxy() {
         .token(AccountId::new(), &key, None)
         .await
         .expect_err("nothing listens there");
-    assert!(matches!(direct, Error::Internal(_)), "{direct:?}");
+    assert!(
+        matches!(direct, Error::UpstreamUnavailable { lasting: false, .. }),
+        "{direct:?}"
+    );
 
     let token = cache
         .token(AccountId::new(), &key, Some(&proxy.uri()))
@@ -746,4 +767,94 @@ async fn a_description_that_echoes_the_assertion_or_breaks_the_rfc_is_dropped() 
         assert_quotes_nothing(&message, &[sent[0]["assertion"].as_str()]);
         server.verify().await;
     }
+}
+
+/// Google's refusal of a key it no longer honours.
+fn refused_grant() -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(json!({
+        "error": "invalid_grant",
+        "error_description": "Invalid JWT Signature.",
+    }))
+}
+
+/// Ten callers arriving at once for one account, while the one mint in
+/// flight is refused: every caller is told the refusal, and Google is asked
+/// once. Without the memo each waiter made an attempt of its own in turn,
+/// each up to the mint timeout, so ten callers were ten grants.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn waiters_behind_a_failed_mint_share_its_failure() {
+    const CALLERS: usize = 10;
+    // Slow enough that every caller arrives while the first mint is in flight.
+    let server = token_endpoint(refused_grant().set_delay(Duration::from_millis(300)), 1).await;
+    let cache = Arc::new(cache(&server));
+    let (account, key) = (AccountId::new(), key_json().to_string());
+    let start = Arc::new(tokio::sync::Barrier::new(CALLERS));
+
+    let callers: Vec<_> = (0..CALLERS)
+        .map(|_| {
+            let (cache, key, start) = (Arc::clone(&cache), key.clone(), Arc::clone(&start));
+            tokio::spawn(async move {
+                start.wait().await;
+                cache.token(account, &key, None).await
+            })
+        })
+        .collect();
+    for caller in callers {
+        let err = caller
+            .await
+            .expect("the caller ran")
+            .expect_err("the mint was refused");
+        assert!(err.to_string().contains("invalid_grant"), "{err}");
+        assert!(
+            matches!(err, Error::UpstreamUnavailable { lasting: true, .. }),
+            "{err:?}"
+        );
+    }
+    server.verify().await;
+}
+
+/// A refused mint is remembered for fifteen seconds: a caller inside them is
+/// told the refusal without asking Google, and the first one after them asks
+/// again.
+#[tokio::test]
+async fn a_failed_mint_is_remembered_for_fifteen_seconds() {
+    static NOW: AtomicI64 = AtomicI64::new(T0);
+    fn now() -> i64 {
+        NOW.load(Ordering::SeqCst)
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(refused_grant())
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(granted("ya29.after"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cache = GcpTokenCache::new(token_url(&server))
+        .expect("a client")
+        .with_clock(now);
+    let (account, key) = (AccountId::new(), key_json().to_string());
+
+    let first = cache.token(account, &key, None).await.expect_err("refused");
+    NOW.store(T0 + 14, Ordering::SeqCst);
+    let remembered = cache
+        .token(account, &key, None)
+        .await
+        .expect_err("still refused, without asking");
+    assert_eq!(remembered.to_string(), first.to_string());
+    assert_eq!(grants(&server).await.len(), 1, "Google was asked once");
+
+    NOW.store(T0 + 15, Ordering::SeqCst);
+    assert_eq!(
+        cache.token(account, &key, None).await.expect("asked again"),
+        "ya29.after"
+    );
+    server.verify().await;
 }

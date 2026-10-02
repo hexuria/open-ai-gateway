@@ -2028,6 +2028,140 @@ async fn a_credential_that_cannot_be_prepared_fails_over_to_the_next() {
     );
 }
 
+/// A credential that cannot mint sits out a cooldown, through the one every
+/// upstream failure writes, so the requests after this one go to another
+/// credential first: ten minutes for a key Google refuses, which stays
+/// refused until an operator replaces it, and thirty seconds for a token
+/// endpoint that could not be reached, which may answer the next time.
+///
+/// Against Postgres, because a cooldown is a row; skipped without one.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_credential_that_cannot_mint_sits_out_a_cooldown() {
+    use oag_core::provider::{AuthStyle, Endpoint, EndpointRegistry, Platform};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let Some(state) = crate::testing::live_state().await else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+        return;
+    };
+    let google = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "Invalid JWT Signature.",
+        })))
+        .mount(&google)
+        .await;
+
+    // The seconds of cooldown each failure earns, give or take a slow
+    // machine: refused by Google, and Google out of reach.
+    for (token_url, cooldown) in [
+        (format!("{}/token", google.uri()), 600),
+        ("http://127.0.0.1:1/token".to_owned(), 30),
+    ] {
+        let endpoint = Endpoint::new(
+            "t2-cooling-vertex",
+            Dialect::GeminiGenerateContent,
+            Platform::Gcp,
+        )
+        .expect("a name");
+        let tokens = Arc::new(
+            oag_upstream::gcp_token::GcpTokenCache::new(token_url.as_str()).expect("a token URL"),
+        );
+        let spec = oag_upstream::custom::EndpointSpec::new(
+            endpoint,
+            "http://127.0.0.1:1",
+            AuthStyle::Bearer,
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .expect("no headers to refuse")
+        .with_region(Some("global".to_owned()))
+        .with_project(Some("oag-test".to_owned()))
+        .with_gcp_tokens(tokens);
+        let adapter = oag_upstream::custom::adapter(&spec).expect("a gcp adapter");
+        state.apply_endpoints(
+            &EndpointRegistry::default(),
+            vec![(endpoint, crate::state::Served::Chat(adapter))],
+        );
+
+        let sealed = state
+            .kek
+            .seal_json(&oag_core::credential::SecretMaterial {
+                access_token: serde_json::json!({
+                    "type": "service_account",
+                    "private_key_id": "t2",
+                    "private_key": oag_upstream::gcp_token::TEST_KEY_PEM,
+                    "client_email": "t2-cooling@oag-test.invalid",
+                })
+                .to_string(),
+                refresh_token: None,
+                expires_at: None,
+                version: 0,
+                client_id: None,
+                account_id: None,
+            })
+            .expect("seals");
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce) VALUES (gen_random_uuid(), 't2-' || gen_random_uuid(), \
+             $1, 'service_account', $2, $3) RETURNING id",
+        )
+        .bind(endpoint.name())
+        .bind(&sealed.ciphertext)
+        .bind(&sealed.nonce)
+        .fetch_one(state.db.pool())
+        .await
+        .expect("an account");
+        let slots = Arc::new(select::testing::CountingSlots::default());
+        let mut lease = select::testing::lease(&slots);
+        lease.account.id = id;
+        lease.account.provider = endpoint.name().to_owned();
+        lease.account.kind = "service_account".to_owned();
+        lease.account.credentials_sealed = sealed.ciphertext;
+        lease.account.credentials_nonce = sealed.nonce;
+
+        let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+            "model": "t2-cooling-vertex/m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("parses");
+        let outcome = super::failover::try_credential(
+            &state,
+            &decision_for(oag_core::Provider::Custom(endpoint)),
+            &canonical,
+            &lease,
+            RequestId::new(),
+            0,
+            uuid::Uuid::nil(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Outcome::Switch(_)),
+            "a credential that cannot mint moves the request on"
+        );
+
+        let (from, to): (Option<bool>, Option<bool>) = sqlx::query_as(
+            "SELECT cooldown_until > now() + make_interval(secs => $2), \
+                    cooldown_until < now() + make_interval(secs => $3) \
+             FROM account WHERE id = $1",
+        )
+        .bind(id)
+        .bind(f64::from(cooldown) * 0.75)
+        .bind(f64::from(cooldown) * 1.25)
+        .fetch_one(state.db.pool())
+        .await
+        .expect("the account");
+        assert_eq!(
+            (from, to),
+            (Some(true), Some(true)),
+            "{cooldown}s of cooldown, from {token_url}"
+        );
+    }
+}
+
 /// A Vertex endpoint's request through `try_credential`, against a stand-in
 /// token endpoint and a stand-in Vertex, with no database behind it: the
 /// stored service-account key is minted into a token through the state's one

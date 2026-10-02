@@ -22,12 +22,19 @@
 //!
 //! A failed mint is a failure of this credential, and the caller moves on to
 //! another one. The failover path does that for any error from `ensure_fresh`
-//! or `prepare_credential`, and this is called from the second. `oag_core::Error`
-//! has no variant for a bad credential, so the variants follow the existing
-//! refresh code. A key that cannot be read is [`Error::Config`], as a malformed
-//! Bedrock credential is. A token endpoint that refuses, redirects or answers
-//! with something that is not a token is [`Error::Internal`], as a failed Codex
-//! or xAI refresh is.
+//! or `prepare_credential`, and this is called from the second. Every failure
+//! is [`Error::UpstreamUnavailable`], which the client is told as 503, not the
+//! 500 of a gateway that broke. Its `lasting` says whether the credential
+//! itself is at fault (a key that cannot be read or signed with, or one the
+//! token endpoint refused with a 4xx) or only the way to Google (a transport
+//! error, a 5xx, a 429, a redirect, an answer that is not a token), and the
+//! failover path cools the credential down for as long as that says: ten
+//! minutes, or thirty seconds.
+//!
+//! A failure is remembered per account for fifteen seconds, behind the same
+//! lock as the token. The callers that waited on a mint that failed, and those
+//! that arrive just after it, are handed its error rather than each sent to
+//! the token endpoint to be told the same thing.
 //!
 //! No error message and no `Debug` output contains the private key, the signed
 //! assertion or an access token. Error messages are logged, and an assertion is
@@ -92,6 +99,10 @@ const REFRESH_SKEW_SECS: i64 = 5 * 60;
 /// How long one mint may take. Every caller for the account waits behind it,
 /// so this bounds their wait as well as its own.
 const MINT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a failed mint is remembered: its error is handed to every caller
+/// for the account in that time, with no request to the token endpoint.
+const FAILURE_TTL_SECS: i64 = 15;
 
 /// The parts of a service-account JSON key that a mint needs.
 ///
@@ -328,9 +339,70 @@ struct Minted {
     expires_at: i64,
 }
 
+/// A mint that failed, kept so the callers behind it, and those that arrive
+/// in the next [`FAILURE_TTL_SECS`], are told what it was told.
+struct Failed {
+    /// Unix seconds.
+    at: i64,
+    reason: String,
+    lasting: bool,
+}
+
+impl Failed {
+    /// `e`, as a mint that failed at `at`. A key that cannot be read or signed
+    /// with (`Error::Config`) is lasting, and so is a refusal the exchange
+    /// marked lasting; anything else is the way to Google, which may answer
+    /// the next time.
+    fn new(e: Error, at: i64) -> Self {
+        match e {
+            Error::UpstreamUnavailable { reason, lasting } => Self {
+                at,
+                reason,
+                lasting,
+            },
+            Error::Config(reason) => Self {
+                at,
+                reason,
+                lasting: true,
+            },
+            other => Self {
+                at,
+                reason: other.to_string(),
+                lasting: false,
+            },
+        }
+    }
+
+    /// The error a caller is handed: a new one each time, as `Error` is not
+    /// `Clone`.
+    fn error(&self) -> Error {
+        Error::UpstreamUnavailable {
+            reason: self.reason.clone(),
+            lasting: self.lasting,
+        }
+    }
+}
+
+/// What a slot holds for one account: its token, and the mint that last
+/// failed.
+#[derive(Default)]
+struct Held {
+    minted: Option<Minted>,
+    failed: Option<Failed>,
+}
+
 /// A slot per account. At most one mint is in flight per account, because the
 /// mint happens while the slot is locked.
-type Slot = Arc<tokio::sync::Mutex<Option<Minted>>>;
+type Slot = Arc<tokio::sync::Mutex<Held>>;
+
+/// The way to Google failed, or Google did: not this credential's fault, and
+/// the next attempt may well succeed.
+fn unreachable(reason: String) -> Error {
+    Error::UpstreamUnavailable {
+        reason,
+        lasting: false,
+    }
+}
 
 /// Mints Google access tokens from service-account keys, and keeps them until
 /// five minutes before they expire.
@@ -398,10 +470,10 @@ impl GcpTokenCache {
     /// is one.
     ///
     /// Concurrent callers for one account wait for the single mint in flight
-    /// and then share its token. A mint that fails caches nothing, so each
-    /// caller that was waiting behind it makes its own attempt in turn:
-    /// serially, never concurrently, each bounded by the mint timeout. A caller
-    /// that is cancelled mid-mint abandons it, and the next one starts over.
+    /// and then share what it came to: its token, or its failure, which is
+    /// kept for [`FAILURE_TTL_SECS`] and handed to every caller in that time
+    /// without another request to the token endpoint. A caller that is
+    /// cancelled mid-mint abandons it, and the next one starts over.
     pub async fn token(
         &self,
         account: AccountId,
@@ -409,28 +481,63 @@ impl GcpTokenCache {
         proxy: Option<&str>,
     ) -> Result<String> {
         let slot = self.slot(account);
-        let mut cached = slot.lock().await;
+        let mut held = slot.lock().await;
         // Read after the lock is taken: a caller that waited has to judge the
         // token the one before it minted against the time now, not the time
         // it started waiting.
         let now = (self.clock)();
-        if let Some(minted) = cached
+        if let Some(minted) = held
+            .minted
             .as_ref()
             .filter(|m| now < m.expires_at - REFRESH_SKEW_SECS)
         {
             return Ok(minted.access_token.clone());
         }
+        if let Some(failed) = held
+            .failed
+            .as_ref()
+            .filter(|f| now < f.at.saturating_add(FAILURE_TTL_SECS))
+        {
+            return Err(failed.error());
+        }
 
-        let key = ServiceAccountKey::from_json(sa_json)?;
-        let assertion = key.sign_assertion(now)?;
-        let (access_token, expires_in) = self.exchange(&assertion, proxy).await?;
+        match self.mint(sa_json, proxy, now).await {
+            Ok(minted) => {
+                let access_token = minted.access_token.clone();
+                *held = Held {
+                    minted: Some(minted),
+                    failed: None,
+                };
+                Ok(access_token)
+            }
+            Err(failed) => {
+                let error = failed.error();
+                held.failed = Some(failed);
+                Err(error)
+            }
+        }
+    }
+
+    /// A token minted from `sa_json` at `now`, or the failure its callers
+    /// will be told.
+    async fn mint(
+        &self,
+        sa_json: &str,
+        proxy: Option<&str>,
+        now: i64,
+    ) -> std::result::Result<Minted, Failed> {
+        let exchanged = async {
+            let key = ServiceAccountKey::from_json(sa_json)?;
+            let assertion = key.sign_assertion(now)?;
+            self.exchange(&assertion, proxy).await
+        };
+        let (access_token, expires_in) = exchanged.await.map_err(|e| Failed::new(e, now))?;
         // Counted from before the request went out, so the recorded expiry is
         // never later than the real one.
-        *cached = Some(Minted {
-            access_token: access_token.clone(),
+        Ok(Minted {
+            access_token,
             expires_at: now.saturating_add_unsigned(expires_in),
-        });
-        Ok(access_token)
+        })
     }
 
     fn slot(&self, account: AccountId) -> Slot {
@@ -453,24 +560,27 @@ impl GcpTokenCache {
             .form(&[("grant_type", GRANT_TYPE), ("assertion", assertion)])
             .send()
             .await
-            .map_err(|e| Error::Internal(format!("the Google token endpoint: {e}")))?;
+            .map_err(|e| unreachable(format!("the Google token endpoint: {e}")))?;
         let status = response.status();
         let body = response.bytes().await;
         if !status.is_success() {
             // The status is the finding; a body that failed to arrive only
             // costs the error code that might have come with it.
-            return Err(Error::Internal(refusal(
-                status,
-                &body.unwrap_or_default(),
-                assertion,
-            )));
+            // A 4xx is the endpoint refusing this credential (`invalid_grant`,
+            // `invalid_client`), which lasts until an operator acts; a timeout,
+            // a throttle, a redirect or a 5xx is the way to Google, which may
+            // clear on its own.
+            return Err(Error::UpstreamUnavailable {
+                reason: refusal(status, &body.unwrap_or_default(), assertion),
+                lasting: status.is_client_error() && !matches!(status.as_u16(), 408 | 429),
+            });
         }
-        let body = body.map_err(|e| Error::Internal(format!("the Google token endpoint: {e}")))?;
+        let body = body.map_err(|e| unreachable(format!("the Google token endpoint: {e}")))?;
 
         // Where, never what: the body holds the access token, and serde quotes
         // the value it choked on.
         let token: TokenResponse = serde_json::from_slice(&body).map_err(|e| {
-            Error::Internal(format!(
+            unreachable(format!(
                 "the Google token endpoint answered {status} with something other \
                  than a token ({:?} error at line {}, column {})",
                 e.classify(),
@@ -481,7 +591,7 @@ impl GcpTokenCache {
         // The caller sends it as `Authorization: Bearer`, which is only right
         // for a bearer token. The type is case-insensitive (RFC 6749 §5.1).
         if !token.token_type.eq_ignore_ascii_case("bearer") {
-            return Err(Error::Internal(
+            return Err(unreachable(
                 "the Google token endpoint issued a token that is not a bearer token".to_owned(),
             ));
         }

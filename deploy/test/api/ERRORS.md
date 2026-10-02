@@ -54,6 +54,7 @@ when the body was truncated and no longer parses.
 | `system_one_not_configured` | 503 | a System One request on a route that holds no key for the provider its model names: Jev's, or a System One host's, which the message names. There is no chat fallback to offer instead | do not retry; the operator adds that provider's key to the route |
 | `stream_idle` | 504 | the upstream went quiet mid-stream | retry |
 | `upstream_timeout` | 504 | the upstream accepted the connection and never began a response | retry |
+| `upstream_unavailable` | 503 | no credential the route holds for the upstream could be made ready to send: a Vertex service account's key Google's token endpoint refused (the message says why), or a token endpoint out of reach. Each such credential sits out a cooldown, so a retry soon after is `no_credential` | retry later; the operator replaces a refused key |
 | `upstream_error` | *see below* | the provider refused | depends on `upstream_status` |
 | `internal_error` | 500 | a bug | retry once, then report |
 

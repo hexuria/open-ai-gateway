@@ -739,10 +739,15 @@ service account was deleted or disabled, or this host's clock is far enough off
 to make the assertion look wrong), a token endpoint that cannot be reached, or
 an answer that is not a token, is that credential failing. The request moves to
 the endpoint's next credential, as it does when a refresh fails, and the log
-names the status, the OAuth error code and Google's description of it. A
-failure is not remembered, so the next request tries that key again. When no
-credential can mint, the client is answered 500 `internal_error`. No log line
-and no answer holds the key, the signed assertion or a token.
+names the status, the OAuth error code and Google's description of it. The
+failure is remembered for fifteen seconds, so the requests waiting on that
+mint, and those that arrive just after it, are told the same without asking
+Google again; and the credential cools down as one an upstream refused does:
+ten minutes for a key Google refuses or one that cannot be read, thirty seconds
+for a token endpoint that failed to answer. When no credential can mint, the
+client is answered 503 `upstream_unavailable`, its message naming Google's
+refusal. No log line and no answer holds the key, the signed assertion or a
+token.
 
 ## Which dialect reaches which upstream
 
