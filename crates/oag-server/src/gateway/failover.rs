@@ -131,15 +131,20 @@ pub(crate) fn adapter_for(
 /// Bedrock Converse rewrite, because those are the dialects that hold a name
 /// to the OpenAI function-name pattern and refuse one outside it with a 400.
 /// Converse's codec sanitises the same way, so this map is the one that puts
-/// the client's names back. Other dialects keep identity, so same-dialect
-/// passthrough is undisturbed.
+/// the client's names back; and it respells a tool call's id its own pattern
+/// refuses, which the map puts back too. Other dialects keep identity, so
+/// same-dialect passthrough is undisturbed.
 pub(super) fn openai_function_names(
     canonical: &oag_proto::CanonicalRequest,
     upstream: Dialect,
 ) -> FunctionNameMap {
     match upstream {
         Dialect::OpenAIChatCompletions | Dialect::OpenAIResponses | Dialect::BedrockConverse => {
-            let names = FunctionNameMap::from_request(canonical);
+            let mut names = FunctionNameMap::from_request(canonical);
+            if upstream == Dialect::BedrockConverse {
+                names = names
+                    .with_tool_use_ids(oag_proto::converse::ToolUseIds::from_request(canonical));
+            }
             if names.rewrites() {
                 for (original, wire) in names.rewritten() {
                     tracing::debug!(original, wire, "sanitized OpenAI function name");
@@ -333,7 +338,8 @@ pub(super) enum Outcome {
     Switch(Error),
     /// Try a different credential, and meter what this one generated first:
     /// the answer was read far enough to cost something before it was lost.
-    Lost(Error, oag_proto::StreamAccumulator),
+    /// Boxed for the same reason `Ok` is.
+    Lost(Error, Box<oag_proto::StreamAccumulator>),
     /// Another request took this credential's half-open probe between
     /// selection and dispatch. Nothing was sent and nothing failed: try a
     /// different credential, and say nothing about this one.
@@ -712,7 +718,7 @@ pub(super) async fn succeeded(
 pub(super) fn collect_failed(failure: sse::StreamFailure) -> Outcome {
     let (e, accumulator) = *failure;
     if accumulator.usage().output_tokens > 0 {
-        Outcome::Lost(e, accumulator)
+        Outcome::Lost(e, Box::new(accumulator))
     } else {
         Outcome::Switch(e)
     }

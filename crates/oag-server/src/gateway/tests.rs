@@ -1045,6 +1045,89 @@ fn a_converse_upstream_is_sent_names_it_takes_and_the_client_gets_its_own_back()
 }
 
 #[test]
+fn a_converse_upstream_is_sent_ids_it_takes_and_the_client_gets_its_own_back() {
+    // Gemini names a call by its function and a counter, which Converse's
+    // `toolUseId` pattern refuses, so its codec respells one. The map the
+    // failover path hands the accumulator has to be the one that puts the
+    // client's id back, on a whole answer and on a stream.
+    let original = "read_file#1";
+    let canonical = oag_proto::CanonicalRequest {
+        model: "m".to_owned(),
+        system: vec![],
+        messages: vec![
+            oag_proto::Message {
+                role: oag_proto::Role::User,
+                content: vec![oag_proto::ContentBlock::Text {
+                    text: "read it".to_owned(),
+                    cache_control: None,
+                }],
+            },
+            oag_proto::Message {
+                role: oag_proto::Role::Assistant,
+                content: vec![oag_proto::ContentBlock::ToolUse {
+                    id: original.to_owned(),
+                    name: "read_file".to_owned(),
+                    input: serde_json::json!({}),
+                }],
+            },
+        ],
+        tools: vec![],
+        max_tokens: 64,
+        stream: false,
+        temperature: None,
+        thinking_budget: None,
+        thinking_effort: None,
+        client_session: None,
+        tool_choice: None,
+        response_format: None,
+        stop: Vec::new(),
+        previous_response_id: None,
+        passthrough: None,
+    };
+    let sent = oag_proto::converse::render_request(&canonical).expect("renders");
+    let wire = sent["messages"][1]["content"][0]["toolUse"]["toolUseId"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+    assert_ne!(wire, original, "Converse refuses `#` in a toolUseId");
+
+    let names = openai_function_names(&canonical, Dialect::BedrockConverse);
+    let mut whole = oag_proto::converse::parse_response(&serde_json::json!({
+        "output": { "message": { "role": "assistant", "content": [
+            { "toolUse": { "toolUseId": wire, "name": "read_file", "input": {} } },
+        ]}},
+        "stopReason": "tool_use",
+        "usage": { "inputTokens": 3, "outputTokens": 2, "totalTokens": 5 },
+    }));
+    names.restore_in_events(&mut whole);
+    let ids: Vec<&str> = whole
+        .iter()
+        .filter_map(|e| match e {
+            oag_proto::StreamEvent::ToolUseStart { id, .. }
+            | oag_proto::StreamEvent::ToolUseDelta { id, .. }
+            | oag_proto::StreamEvent::ToolUseEnd { id } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, [original; 3], "{whole:?}");
+
+    let mut acc = oag_proto::StreamAccumulator::new().with_function_names(names);
+    let start = serde_json::json!({ "contentBlockStart": {
+        "start": { "toolUse": { "toolUseId": wire, "name": "read_file" } },
+        "contentBlockIndex": 0,
+    }})
+    .to_string();
+    let streamed = oag_proto::converse::parse_event(&start, &mut acc).expect("parses");
+    assert_eq!(
+        streamed,
+        vec![oag_proto::StreamEvent::ToolUseStart {
+            id: original.to_owned(),
+            name: "read_file".to_owned(),
+        }]
+    );
+}
+
+#[test]
 fn a_cross_dialect_pair_selects_the_client_s_renderer() {
     let d = decision_for(oag_core::Provider::Anthropic);
     let e = egress_for(

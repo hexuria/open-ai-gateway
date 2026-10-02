@@ -524,7 +524,10 @@ Converse refuses a conversation it would otherwise take, for a few shapes
 clients send all the time, and the codec reshapes each rather than pass the 400
 on. A request that declares no tools but whose history called some (a summary,
 a compaction) declares a stand-in for each tool called: its name, and a schema
-that takes any object.
+that takes any object. A tool call's id outside Converse's pattern,
+`[a-zA-Z0-9_.:-]{1,64}` (Gemini's `read_file#1`, an id past 64 bytes), is
+respelled the same way in the call and in its result, and the client's own id
+comes back on anything Converse answers with.
 
 **Streams.** `ConverseStream` sends AWS event-stream messages whose payload is
 the event itself, named by a header (see [Framing](#framing)). It announces the

@@ -12,6 +12,7 @@
 //! original back on `tool_calls` so the client can still dispatch.
 
 use crate::canonical::{CanonicalRequest, ContentBlock, ToolChoice};
+use crate::converse::ToolUseIds;
 use crate::stream::StreamEvent;
 use std::collections::{HashMap, HashSet};
 
@@ -70,6 +71,9 @@ pub fn sanitize_openai_function_name(name: &str) -> String {
 pub struct FunctionNameMap {
     to_wire: HashMap<String, String>,
     from_wire: HashMap<String, String>,
+    /// Tool-call ids the upstream was sent respelled, for an upstream that
+    /// holds them to a pattern: Converse. The same for every other.
+    tool_use_ids: ToolUseIds,
 }
 
 impl FunctionNameMap {
@@ -130,7 +134,11 @@ impl FunctionNameMap {
             .iter()
             .map(|(orig, wire)| (wire.clone(), orig.clone()))
             .collect();
-        Self { to_wire, from_wire }
+        Self {
+            to_wire,
+            from_wire,
+            tool_use_ids: ToolUseIds::default(),
+        }
     }
 
     /// The name to put on the OpenAI wire for this original.
@@ -143,6 +151,20 @@ impl FunctionNameMap {
     #[must_use]
     pub fn original<'a>(&'a self, wire: &'a str) -> &'a str {
         self.from_wire.get(wire).map_or(wire, String::as_str)
+    }
+
+    /// This map, restoring the tool-call ids `ids` respelled as well.
+    #[must_use]
+    pub fn with_tool_use_ids(mut self, ids: ToolUseIds) -> Self {
+        self.tool_use_ids = ids;
+        self
+    }
+
+    /// The tool-call id the client sent, for one the upstream was sent or
+    /// answers with.
+    #[must_use]
+    pub fn original_tool_use_id<'a>(&'a self, wire: &'a str) -> &'a str {
+        self.tool_use_ids.original(wire)
     }
 
     /// Whether any original was rewritten. Same-dialect passthrough is only
@@ -166,14 +188,21 @@ impl FunctionNameMap {
         pairs
     }
 
-    /// Restore client-facing names on parsed tool-call events.
+    /// Restore client-facing names, and ids, on parsed tool-call events.
     pub fn restore_in_events(&self, events: &mut [StreamEvent]) {
-        if self.from_wire.is_empty() {
+        if self.from_wire.is_empty() && self.tool_use_ids.is_identity() {
             return;
         }
         for event in events {
-            if let StreamEvent::ToolUseStart { name, .. } = event {
-                *name = self.original(name).to_owned();
+            match event {
+                StreamEvent::ToolUseStart { id, name } => {
+                    *name = self.original(name).to_owned();
+                    *id = self.original_tool_use_id(id).to_owned();
+                }
+                StreamEvent::ToolUseDelta { id, .. } | StreamEvent::ToolUseEnd { id } => {
+                    *id = self.original_tool_use_id(id).to_owned();
+                }
+                _ => {}
             }
         }
     }
