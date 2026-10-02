@@ -33,6 +33,8 @@ time.workspace = true
 # A stand-in endpoint for `oag admin endpoint check --account`: nobody holds a
 # key for the hosts it stands in for.
 wiremock.workspace = true
+# The committed test-only RSA key, for a service-account key to file.
+oag-upstream = { workspace = true, features = ["test-fixtures"] }
 
 [lints]
 workspace = true

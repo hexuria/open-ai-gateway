@@ -1784,6 +1784,8 @@ struct Preparing {
     endpoint: oag_core::provider::Endpoint,
     prepared: std::result::Result<&'static str, &'static str>,
     built_with: std::sync::Mutex<Vec<String>>,
+    /// The proxy each preparation was handed.
+    proxied: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -1812,7 +1814,12 @@ impl oag_upstream::ProviderAdapter for Preparing {
         &'a self,
         _account: AccountId,
         stored: &'a oag_core::credential::SecretMaterial,
+        proxy: Option<&str>,
     ) -> Result<std::borrow::Cow<'a, oag_core::credential::SecretMaterial>> {
+        self.proxied
+            .lock()
+            .expect("unpoisoned")
+            .push(proxy.map(str::to_owned));
         match self.prepared {
             Ok(token) => {
                 let mut minted = stored.clone();
@@ -1824,9 +1831,12 @@ impl oag_upstream::ProviderAdapter for Preparing {
     }
 }
 
-/// One `try_credential` over a sealed `stored-key` credential for an endpoint
-/// served by a [`Preparing`] adapter; what came of it, and every credential
-/// `build` was handed.
+/// The proxy the credential `try_prepared` leases is configured with.
+const PREPARED_PROXY: &str = "http://t10-proxy.invalid:3128";
+
+/// One `try_credential` over a sealed `stored-key` credential, whose proxy is
+/// [`PREPARED_PROXY`], for an endpoint served by a [`Preparing`] adapter; what
+/// came of it, and every credential `build` was handed.
 async fn try_prepared(
     prepared: std::result::Result<&'static str, &'static str>,
 ) -> (Outcome, Vec<String>) {
@@ -1841,6 +1851,7 @@ async fn try_prepared(
         endpoint,
         prepared,
         built_with: std::sync::Mutex::default(),
+        proxied: std::sync::Mutex::default(),
     });
     let state = state();
     state.apply_endpoints(
@@ -1869,6 +1880,7 @@ async fn try_prepared(
     lease.account.provider = endpoint.name().to_owned();
     lease.account.credentials_sealed = sealed.ciphertext;
     lease.account.credentials_nonce = sealed.nonce;
+    lease.account.proxy_url = Some(PREPARED_PROXY.to_owned());
 
     let canonical = oag_proto::CanonicalRequest {
         model: "t4-prepare/m".to_owned(),
@@ -1898,6 +1910,13 @@ async fn try_prepared(
     )
     .await;
     let built_with = adapter.built_with.lock().expect("unpoisoned").clone();
+    // Asked of every preparation, refused or not: a mint is a call made with
+    // the credential, so it leaves through the credential's proxy.
+    assert_eq!(
+        *adapter.proxied.lock().expect("unpoisoned"),
+        [Some(PREPARED_PROXY.to_owned())],
+        "the credential's own proxy is handed to its preparation"
+    );
     (outcome, built_with)
 }
 
@@ -1924,4 +1943,132 @@ async fn a_credential_that_cannot_be_prepared_fails_over_to_the_next() {
         matches!(outcome, Outcome::Switch(Error::Internal(ref m)) if m == "token mint refused"),
         "a failed preparation switches credentials, carrying its own error"
     );
+}
+
+/// A Vertex endpoint's request through `try_credential`, against a stand-in
+/// token endpoint and a stand-in Vertex, with no database behind it: the
+/// stored service-account key is minted into a token through the state's one
+/// cache, the token reaches the model's exact path as a bearer, and a second
+/// request on the same credential is sent the same token without a second
+/// mint.
+///
+/// Built through the endpoint factory, as a reload builds it, so a request
+/// that skipped `prepare_credential` would be built with the key: refused by
+/// the adapter, and this test fails.
+// Long for its setup: two stand-ins, an endpoint and a sealed key.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_vertex_request_is_sent_the_token_minted_from_its_key() {
+    use oag_core::provider::{AuthStyle, Endpoint, EndpointRegistry, Platform};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (google, vertex) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "ya29.t10-failover",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        })))
+        .expect(1)
+        .mount(&google)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/projects/oag-test/locations/global/publishers/google/models/m:generateContent",
+        ))
+        .and(header("authorization", "Bearer ya29.t10-failover"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hello from vertex"}]},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 4, "totalTokenCount": 7}
+        })))
+        .expect(2)
+        .mount(&vertex)
+        .await;
+
+    let state = crate::testing::state(&format!(
+        "gateway:\n  gcp_token_url: \"{}/token\"\n",
+        google.uri()
+    ));
+    let endpoint = Endpoint::new(
+        "t10-try-vertex",
+        Dialect::GeminiGenerateContent,
+        Platform::Gcp,
+    )
+    .expect("a name");
+    let spec = oag_upstream::custom::EndpointSpec::new(
+        endpoint,
+        vertex.uri(),
+        AuthStyle::Bearer,
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .expect("no headers to refuse")
+    .with_region(Some("global".to_owned()))
+    .with_project(Some("oag-test".to_owned()))
+    .with_gcp_tokens(Arc::clone(&state.gcp_tokens));
+    let adapter = oag_upstream::custom::adapter(&spec).expect("a gcp adapter");
+    state.apply_endpoints(
+        &EndpointRegistry::default(),
+        vec![(endpoint, crate::state::Served::Chat(adapter))],
+    );
+
+    let sa_json = serde_json::json!({
+        "type": "service_account",
+        "private_key_id": "t10",
+        "private_key": oag_upstream::gcp_token::TEST_KEY_PEM,
+        "client_email": "t10-try@oag-test.invalid",
+    })
+    .to_string();
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let mut lease = select::testing::lease(&slots);
+    let sealed = state
+        .kek
+        .seal_json(&oag_core::credential::SecretMaterial {
+            access_token: sa_json,
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        })
+        .expect("seals");
+    lease.account.provider = endpoint.name().to_owned();
+    lease.account.kind = "service_account".to_owned();
+    lease.account.credentials_sealed = sealed.ciphertext;
+    lease.account.credentials_nonce = sealed.nonce;
+
+    let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+        "model": "t10-try-vertex/m",
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .expect("parses");
+    for request in 0..2 {
+        let outcome = super::failover::try_credential(
+            &state,
+            &decision_for(oag_core::Provider::Custom(endpoint)),
+            &canonical,
+            &lease,
+            RequestId::new(),
+            0,
+            uuid::Uuid::nil(),
+        )
+        .await;
+        let Outcome::Ok(attempt) = outcome else {
+            panic!("request {request} was not answered");
+        };
+        let super::failover::Attempt::Collected { events, .. } = *attempt else {
+            panic!("request {request}: a JSON answer is collected");
+        };
+        assert!(
+            format!("{events:?}").contains("hello from vertex"),
+            "request {request}: {events:?}"
+        );
+    }
+    google.verify().await;
+    vertex.verify().await;
 }

@@ -26,8 +26,8 @@ pub enum CredentialKind {
     ///
     /// The whole JSON is the sealed secret, and a request carries a
     /// short-lived access token minted from it, never the key itself. 0018
-    /// dropped the kind from the schema when nothing could serve it; until a
-    /// migration admits it again, no row can hold one.
+    /// dropped the kind from the schema when nothing could serve it, and 0020
+    /// admitted it again for the Vertex adapter (`oag_upstream::vertex`).
     ServiceAccount,
 }
 

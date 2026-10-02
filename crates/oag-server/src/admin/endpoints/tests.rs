@@ -260,16 +260,17 @@ fn a_registration_takes_its_platforms_auth_unless_it_names_one() {
 fn a_view_redacts_what_looks_secret_and_says_why_a_row_is_not_served() {
     let row = EndpointRow {
         name: "t5-view".to_owned(),
-        dialect: "gemini".to_owned(),
-        platform: "gcp".to_owned(),
-        base_url: None,
-        auth: "bearer".to_owned(),
-        region: Some("us-central1".to_owned()),
-        project: Some("acme".to_owned()),
+        dialect: "openai".to_owned(),
+        // At an address, which no Azure resource is.
+        platform: "azure".to_owned(),
+        base_url: Some("https://10.0.0.7".to_owned()),
+        auth: "api_key_header".to_owned(),
+        region: None,
+        project: None,
         api_version: None,
         path: None,
         extra_headers: json!({"X-Team": "core", "X-Session-Token": "t5-hidden"}),
-        display_name: Some("Vertex".to_owned()),
+        display_name: Some("Azure".to_owned()),
         discover_models: false,
         created_at: time::OffsetDateTime::UNIX_EPOCH,
         updated_at: time::OffsetDateTime::UNIX_EPOCH,
@@ -298,7 +299,7 @@ fn a_view_redacts_what_looks_secret_and_says_why_a_row_is_not_served() {
     assert!(
         shown["problem"]
             .as_str()
-            .is_some_and(|p| p.contains("not supported yet")),
+            .is_some_and(|p| p.contains("not an Azure resource's host")),
         "{shown}"
     );
     assert_eq!(shown["created_at"], "1970-01-01T00:00:00Z");

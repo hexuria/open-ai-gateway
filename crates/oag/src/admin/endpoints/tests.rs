@@ -278,7 +278,16 @@ fn a_listing_names_every_setting_and_counts_what_names_each_endpoint() {
             on_ladder: 3,
         },
     )]);
-    let lines = list_lines(&[stored(), gcp, aws], &refs);
+    // At an address, which no Azure resource is.
+    let azure = EndpointRow {
+        name: "t5-azure".to_owned(),
+        platform: "azure".to_owned(),
+        base_url: Some("https://10.0.0.7".to_owned()),
+        auth: "api_key_header".to_owned(),
+        extra_headers: json!({}),
+        ..stored()
+    };
+    let lines = list_lines(&[stored(), gcp, azure, aws], &refs);
     assert!(lines[0].starts_with("NAME"), "{lines:?}");
     assert!(
         lines[1].starts_with("merge ")
@@ -300,11 +309,10 @@ fn a_listing_names_every_setting_and_counts_what_names_each_endpoint() {
         "{lines:?}"
     );
     assert!(!lines.iter().any(|l| l.contains("t5-hidden")), "{lines:?}");
+    let unserved: Vec<_> = lines.iter().filter(|l| l.contains("not served")).collect();
     assert!(
-        lines
-            .iter()
-            .any(|l| l.contains("not served") && l.contains("not supported yet")),
-        "the gcp row is valid and unserved: {lines:?}"
+        unserved.len() == 1 && unserved[0].contains("10.0.0.7 is not an Azure resource's host"),
+        "the azure row alone is not served: {lines:?}"
     );
     assert!(
         lines
@@ -458,7 +466,7 @@ fn adding_says_what_was_registered_and_what_is_left_to_do() {
     );
     assert!(!lines.contains("not served"), "{lines}");
 
-    let unserved = added_lines(&EndpointRow {
+    let vertex = added_lines(&EndpointRow {
         platform: "gcp".to_owned(),
         dialect: "gemini".to_owned(),
         base_url: None,
@@ -469,13 +477,21 @@ fn adding_says_what_was_registered_and_what_is_left_to_do() {
     })
     .join("\n");
     assert!(
-        unserved.contains("at project acme in us-central1"),
-        "{unserved}"
+        vertex.contains("at project acme in us-central1"),
+        "{vertex}"
     );
-    assert!(
-        unserved.contains("auth bearer; no extra headers"),
-        "{unserved}"
-    );
+    assert!(vertex.contains("auth bearer; no extra headers"), "{vertex}");
+    assert!(!vertex.contains("not served"), "{vertex}");
+
+    // At an address, which no Azure resource is.
+    let unserved = added_lines(&EndpointRow {
+        platform: "azure".to_owned(),
+        base_url: Some("https://10.0.0.7".to_owned()),
+        auth: "api_key_header".to_owned(),
+        extra_headers: json!({}),
+        ..stored()
+    })
+    .join("\n");
     assert!(
         unserved.contains("not served by this build") && unserved.contains("kept for a build"),
         "{unserved}"

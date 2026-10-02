@@ -318,22 +318,25 @@ fn a_refused_store_write_is_answered_as_the_callers_mistake_or_the_databases() {
 #[test]
 fn the_reloads_answer_is_asked_of_one_row() {
     assert_eq!(refusal(&row(&draft("t5-served"))), None);
+    // A gcp row is served, as the reload serves it: the check hands it a token
+    // cache too.
     let gcp = row(&Draft {
         dialect: "gemini".to_owned(),
         platform: "gcp".to_owned(),
         base_url: None,
         region: Some("us-central1".to_owned()),
         project: Some("acme".to_owned()),
-        ..draft("t5-unserved-gcp")
+        ..draft("t5-served-gcp")
     });
-    let unsupported = refusal(&gcp).expect("a valid row this build has no adapter for");
-    assert_eq!(unsupported.reason, Reason::Unsupported);
-    assert!(
-        unsupported
-            .message
-            .starts_with("endpoint `t5-unserved-gcp` is on the gcp platform"),
-        "the words an operator reads, with no `configuration: ` before them: {unsupported}"
-    );
+    assert_eq!(refusal(&gcp), None);
+    // An azure row at an address, which no Azure resource is.
+    let azure = row(&Draft {
+        platform: "azure".to_owned(),
+        base_url: Some("https://10.0.0.7".to_owned()),
+        auth: "api_key_header".to_owned(),
+        ..draft("t5-unserved-azure")
+    });
+    assert_eq!(refusal(&azure).map(|r| r.reason), Some(Reason::BaseUrl));
     let compliance = row(&Draft {
         base_url: Some("https://api.x.ai/v1".to_owned()),
         ..draft("t5-unserved-xai")

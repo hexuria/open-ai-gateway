@@ -7,9 +7,11 @@
 //! server-to-server OAuth. [`GcpTokenCache`] does the trade and keeps each
 //! account's token until five minutes before it expires.
 //!
-//! Nothing calls this yet. PR 10b wires it in through the adapter's
+//! The Vertex adapter (`crate::vertex`) calls it from the adapter's
 //! `prepare_credential` hook, which runs on the failover path just before the
-//! request is built, so the Vertex adapter only ever sees the minted token.
+//! request is built, so the request is only ever built with the minted token.
+//! The gateway holds one cache for every `gcp` endpoint, and it outlives the
+//! reloads that rebuild their adapters.
 //!
 //! Each replica mints its own tokens, and that is safe. A mint consumes
 //! nothing, unlike an OAuth refresh, so two replicas minting for one account
@@ -19,8 +21,8 @@
 //! # Errors
 //!
 //! A failed mint is a failure of this credential, and the caller moves on to
-//! another one. The failover path already does that for any error from
-//! `ensure_fresh`, and PR 10b calls this from the same place. `oag_core::Error`
+//! another one. The failover path does that for any error from `ensure_fresh`
+//! or `prepare_credential`, and this is called from the second. `oag_core::Error`
 //! has no variant for a bad credential, so the variants follow the existing
 //! refresh code. A key that cannot be read is [`Error::Config`], as a malformed
 //! Bedrock credential is. A token endpoint that refuses, redirects or answers
@@ -44,10 +46,17 @@ use std::time::Duration;
 
 /// Google's OAuth 2.0 token endpoint.
 ///
-/// Production mints here. Tests pass a stand-in, and PR 10b lets config
-/// override it. A key's own `token_uri` never does; `ServiceAccountKey` says
-/// why.
-pub const DEFAULT_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// Production mints here. Tests pass a stand-in, and `gateway.gcp_token_url`
+/// overrides it, whose default this is. A key's own `token_uri` never does;
+/// `ServiceAccountKey` says why.
+pub const DEFAULT_TOKEN_URL: &str = oag_core::config::DEFAULT_GCP_TOKEN_URL;
+
+/// The committed test-only RSA key (`tests/fixtures/README.md`), PKCS#8 PEM,
+/// for a test to build a service-account key around, in this crate or, with
+/// `test-fixtures`, in another. No release build carries it. It guards
+/// nothing.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const TEST_KEY_PEM: &str = include_str!("../tests/fixtures/gcp-test-key.pem");
 
 /// The one scope asked for. What the token may actually do is decided by the
 /// service account's IAM roles, not by this string, and Vertex AI accepts it.
@@ -106,11 +115,18 @@ impl ServiceAccountKey {
                     .to_owned(),
             ));
         }
+        // The assertion's issuer. Google refuses one with none, and saying so
+        // here costs no round trip.
+        if key.client_email.trim().is_empty() {
+            return Err(Error::Config(
+                "the service account key has an empty `client_email`".to_owned(),
+            ));
+        }
         Ok(key)
     }
 
-    /// The signed JWT that is traded for an access token at `audience`.
-    fn sign_assertion(&self, audience: &str, now: i64) -> Result<String> {
+    /// The RSA key the assertion is signed with, from `private_key`.
+    fn key_pair(&self) -> Result<RsaKeyPair> {
         let der = pkcs8_der(&self.private_key).ok_or_else(|| {
             Error::Config(
                 "the service account's `private_key` is not a PKCS#8 PEM \
@@ -120,11 +136,16 @@ impl ServiceAccountKey {
         })?;
         // `KeyRejected` names the defect with a fixed description, never bytes
         // of the key, so it is safe to pass on.
-        let key_pair = RsaKeyPair::from_pkcs8(&der).map_err(|e| {
+        RsaKeyPair::from_pkcs8(&der).map_err(|e| {
             Error::Config(format!(
                 "the service account's `private_key` is not a usable RSA key: {e}"
             ))
-        })?;
+        })
+    }
+
+    /// The signed JWT that is traded for an access token at `audience`.
+    fn sign_assertion(&self, audience: &str, now: i64) -> Result<String> {
+        let key_pair = self.key_pair()?;
 
         let header = serde_json::json!({
             "alg": "RS256",
@@ -172,6 +193,22 @@ impl std::fmt::Debug for ServiceAccountKey {
             .field("private_key", &"<redacted>")
             .finish()
     }
+}
+
+/// The email of the service account `sa_json` is a key for, if it is a key a
+/// mint can sign with: Google's JSON for a service account, whose
+/// `private_key` is an RSA key in PKCS#8 PEM.
+///
+/// What `oag admin account add` asks before it seals a key for a `gcp`
+/// endpoint, so a key that could never mint is refused when it is filed
+/// rather than on every request after. It reads the key exactly as a mint
+/// does, so the two cannot disagree, and it sends nothing anywhere: whether
+/// Google will take the key is the first mint's to find out. The email is no
+/// secret. No error quotes the key.
+pub fn check_key(sa_json: &str) -> Result<String> {
+    let key = ServiceAccountKey::from_json(sa_json)?;
+    key.key_pair()?;
+    Ok(key.client_email)
 }
 
 /// The DER inside a PKCS#8 PEM, or `None` if the text is not one.
@@ -250,7 +287,6 @@ type Slot = Arc<tokio::sync::Mutex<Option<Minted>>>;
 /// only as many of those as there are rows.
 pub struct GcpTokenCache {
     token_url: String,
-    client: reqwest::Client,
     /// Unix seconds. Injected so a test can move time instead of sleeping.
     clock: fn() -> i64,
     /// Held only to find or create a slot, never across an await.
@@ -259,20 +295,30 @@ pub struct GcpTokenCache {
 
 impl GcpTokenCache {
     /// A cache that mints at `token_url`, which is [`DEFAULT_TOKEN_URL`]
-    /// outside tests.
+    /// unless `gateway.gcp_token_url` says otherwise.
+    ///
+    /// Refused unless `token_url` is an http or https URL, so a mistyped one
+    /// stops the gateway at startup instead of failing every Vertex request.
     ///
     /// Redirects are not followed. A token endpoint that answers 3xx has
     /// failed the mint, because following the redirect would post the signed
     /// assertion to a host nobody configured.
     pub fn new(token_url: impl Into<String>) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(MINT_TIMEOUT)
-            .build()
-            .map_err(|e| Error::Internal(format!("building the Google token client: {e}")))?;
+        let token_url = token_url.into();
+        let scheme = reqwest::Url::parse(&token_url)
+            .map(|url| url.scheme().to_owned())
+            .map_err(|e| {
+                Error::Config(format!(
+                    "the Google token URL {token_url:?} is not a URL: {e}"
+                ))
+            })?;
+        if !matches!(scheme.as_str(), "http" | "https") {
+            return Err(Error::Config(format!(
+                "the Google token URL {token_url:?} is not an http or https URL"
+            )));
+        }
         Ok(Self {
-            token_url: token_url.into(),
-            client,
+            token_url,
             clock: system_now,
             slots: std::sync::Mutex::default(),
         })
@@ -289,12 +335,21 @@ impl GcpTokenCache {
     /// service-account JSON key) unless a cached one has more than five
     /// minutes left.
     ///
+    /// A mint goes through `proxy`, the account's own `proxy_url`, when it has
+    /// one: a credential's proxy applies to every call made with it, and this
+    /// is one.
+    ///
     /// Concurrent callers for one account wait for the single mint in flight
     /// and then share its token. A mint that fails caches nothing, so each
     /// caller that was waiting behind it makes its own attempt in turn:
     /// serially, never concurrently, each bounded by the mint timeout. A caller
     /// that is cancelled mid-mint abandons it, and the next one starts over.
-    pub async fn token(&self, account: AccountId, sa_json: &str) -> Result<String> {
+    pub async fn token(
+        &self,
+        account: AccountId,
+        sa_json: &str,
+        proxy: Option<&str>,
+    ) -> Result<String> {
         let slot = self.slot(account);
         let mut cached = slot.lock().await;
         // Read after the lock is taken: a caller that waited has to judge the
@@ -310,7 +365,7 @@ impl GcpTokenCache {
 
         let key = ServiceAccountKey::from_json(sa_json)?;
         let assertion = key.sign_assertion(&self.token_url, now)?;
-        let (access_token, expires_in) = self.exchange(&assertion).await?;
+        let (access_token, expires_in) = self.exchange(&assertion, proxy).await?;
         // Counted from before the request went out, so the recorded expiry is
         // never later than the real one.
         *cached = Some(Minted {
@@ -328,9 +383,14 @@ impl GcpTokenCache {
     }
 
     /// Trade a signed assertion for an access token and its lifetime in seconds.
-    async fn exchange(&self, assertion: &str) -> Result<(String, u64)> {
-        let response = self
-            .client
+    ///
+    /// Through a client built for this mint, as every call made with a
+    /// credential is (`side_channel_client`): `proxy` applied, no redirect
+    /// followed, and the whole exchange bounded by the mint timeout. A mint
+    /// is due at most once an hour per account, so nothing is worth keeping
+    /// between two.
+    async fn exchange(&self, assertion: &str, proxy: Option<&str>) -> Result<(String, u64)> {
+        let response = crate::side_channel_client(proxy, MINT_TIMEOUT)?
             .post(&self.token_url)
             .form(&[("grant_type", GRANT_TYPE), ("assertion", assertion)])
             .send()

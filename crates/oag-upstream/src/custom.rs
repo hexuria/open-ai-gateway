@@ -15,14 +15,19 @@
 //! An endpoint on the `azure` platform speaks `OpenAI`'s dialect at an Azure
 //! resource, whose URLs and key header are Azure's own, so it gets an adapter
 //! of its own: [`crate::azure::AzureOpenAIAdapter`].
+//!
+//! An endpoint on the `gcp` platform is Vertex AI in a project and region of
+//! the operator's choosing: Gemini, or Claude, with a token minted from the
+//! service account each of its credentials holds (`crate::vertex`).
 
 use crate::adapter::ProviderAdapter;
+use crate::gcp_token::GcpTokenCache;
 use crate::listing::ModelSource;
 use crate::{
     AnthropicAdapter, BedrockAdapter, ConverseAdapter, GeminiAdapter, JevUpstream,
-    OpenAICompatAdapter,
+    OpenAICompatAdapter, VertexAdapter,
 };
-use oag_core::endpoint::is_aws_region;
+use oag_core::endpoint::{is_aws_region, is_location};
 use oag_core::provider::{AuthStyle, Dialect, Endpoint, Platform};
 use oag_core::{Error, Provider, Result};
 use reqwest::RequestBuilder;
@@ -52,6 +57,12 @@ pub struct EndpointSpec {
     /// The region an `aws` endpoint's requests go to and are signed for; see
     /// [`EndpointSpec::with_region`].
     region: Option<String>,
+    /// The project a `gcp` endpoint's requests name; see
+    /// [`EndpointSpec::with_project`].
+    project: Option<String>,
+    /// What a `gcp` endpoint's adapter mints its tokens through; see
+    /// [`EndpointSpec::with_gcp_tokens`].
+    gcp_tokens: Option<Arc<GcpTokenCache>>,
 }
 
 impl EndpointSpec {
@@ -85,6 +96,8 @@ impl EndpointSpec {
             extra_headers,
             discover: false,
             region: None,
+            project: None,
+            gcp_tokens: None,
         })
     }
 
@@ -180,6 +193,30 @@ impl EndpointSpec {
     #[must_use]
     pub fn with_api_version(mut self, api_version: Option<String>) -> Self {
         self.api_version = api_version;
+        self
+    }
+
+    /// This spec, with the project its platform puts in a request's path.
+    ///
+    /// A `gcp` endpoint needs one, and a region too: every Vertex request is
+    /// for `projects/{project}/locations/{region}`, at the region's own host
+    /// unless the base URL names another. Its base URL may be empty, which
+    /// means that host.
+    #[must_use]
+    pub fn with_project(mut self, project: Option<String>) -> Self {
+        self.project = project;
+        self
+    }
+
+    /// This spec, with the cache a `gcp` endpoint's adapter mints its tokens
+    /// through.
+    ///
+    /// The gateway's one cache, never one of the adapter's own: a reload
+    /// rebuilds every endpoint's adapter, and a cache per adapter would mint
+    /// every account's token again after each one.
+    #[must_use]
+    pub fn with_gcp_tokens(mut self, tokens: Arc<GcpTokenCache>) -> Self {
+        self.gcp_tokens = Some(tokens);
         self
     }
 }
@@ -289,10 +326,8 @@ pub(crate) fn authenticate(
 /// discovery, and not the rule that Anthropic's key goes in `x-api-key`. It
 /// discovers models only when the spec says to, from the endpoint's own list.
 ///
-/// The plain, aws and azure platforms are served (`aws` and `azure` below say
-/// how the second and third are). An endpoint on GCP is refused rather than
-/// sent a request built for a plain host, which its platform would reject for
-/// want of a minted token.
+/// Every platform is served: plain here, and `aws`, `azure` and `gcp` below,
+/// each before the plain check.
 pub fn adapter(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
     let endpoint = spec.endpoint;
     let name = endpoint.name();
@@ -301,6 +336,9 @@ pub fn adapter(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
     }
     if endpoint.platform() == Platform::Azure {
         return azure(spec);
+    }
+    if endpoint.platform() == Platform::Gcp {
+        return gcp(spec);
     }
     plain(endpoint)?;
 
@@ -377,6 +415,52 @@ fn aws(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
     }
 }
 
+/// The adapter for an endpoint on the gcp platform: Vertex AI in the
+/// endpoint's own project and region, every request carrying a token minted
+/// from the service account its credential holds.
+///
+/// The `gemini` dialect is Google's models through `generateContent`;
+/// `anthropic` is Claude through `rawPredict`. Either way the request goes to
+/// the region's own host unless the endpoint names a base URL (a Private
+/// Service Connect endpoint, a proxy, a stand-in), and the path names the
+/// project and the region regardless. The key header is `authorization`,
+/// whatever the spec's auth says: a minted token is a bearer token.
+///
+/// Refused without a region and a project that [`is_location`] accepts, or
+/// without the gateway's token cache: a request this adapter could build
+/// without them would go nowhere Vertex answers, or carry no token.
+fn gcp(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
+    let endpoint = spec.endpoint;
+    let name = endpoint.name();
+    let region = spec.region.as_deref().filter(|region| is_location(region));
+    let project = spec
+        .project
+        .as_deref()
+        .filter(|project| is_location(project));
+    let (Some(region), Some(project)) = (region, project) else {
+        return Err(Error::Config(format!(
+            "endpoint `{name}` is on the gcp platform, and names no region and project"
+        )));
+    };
+    let tokens = spec.gcp_tokens.clone().ok_or_else(|| {
+        Error::Config(format!(
+            "endpoint `{name}` is on the gcp platform, and was given no token cache to \
+             mint its credentials' tokens with"
+        ))
+    })?;
+    // An empty base URL is no override: the region's own host.
+    let base_url = Some(spec.base_url.as_str()).filter(|base| !base.is_empty());
+    let adapter = VertexAdapter::for_endpoint(
+        endpoint,
+        base_url,
+        region,
+        project,
+        spec.extra_headers.clone(),
+        tokens,
+    )?;
+    Ok(Arc::new(adapter))
+}
+
 /// The upstream that serves `spec`'s System One endpoint: Jev's two requests,
 /// at the endpoint's base URL, with its key where it was registered to go and
 /// its extra headers on both.
@@ -405,8 +489,8 @@ pub fn system_one(spec: &EndpointSpec, path: Option<&str>) -> Result<JevUpstream
 }
 
 /// Refuses an endpoint on any platform but plain, where only a plain one is
-/// served: a chat endpoint on GCP (an aws or azure one never gets here), and
-/// a System One endpoint on any platform but plain.
+/// served: a System One endpoint on any platform but plain. A chat endpoint
+/// on aws, azure or gcp never gets here.
 ///
 /// Refused rather than sent a request built for a plain host, which another
 /// platform would reject for want of a signature, a minted token or a
@@ -849,27 +933,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_endpoint_on_a_cloud_platform_is_refused_until_one_serves_it() {
-        for (platform, dialect) in [
-            (Platform::Gcp, Dialect::GeminiGenerateContent),
-        ] {
-            let name = format!("t3-cloud-{}", platform.as_str());
-            let spec = plain_spec(
-                endpoint(&name, dialect, platform),
-                "http://h",
-                AuthStyle::Bearer,
-            );
-            let err = adapter(&spec).expect_err(&name).to_string();
-            assert!(err.contains("not supported yet"), "{err}");
-            assert!(
-                err.contains(&format!("the {} platform", platform.as_str())),
-                "{err}"
-            );
-            assert!(err.contains(&name), "{err}");
-        }
-    }
-
     // ── the aws platform ─────────────────────────────────────────────────────
 
     /// An aws endpoint's key, packed as Bedrock's are. Obviously not one.
@@ -1094,6 +1157,160 @@ mod tests {
             assert!(
                 err.contains(&format!(
                     "speaks {dialect}, which the aws platform does not serve"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    // ── the gcp platform ─────────────────────────────────────────────────────
+
+    /// A token cache at a port nothing listens on: nothing here mints.
+    fn idle_tokens() -> Arc<GcpTokenCache> {
+        Arc::new(GcpTokenCache::new("http://127.0.0.1:1/token").unwrap())
+    }
+
+    fn gcp_spec(name: &str, dialect: Dialect, region: &str, base_url: &str) -> EndpointSpec {
+        EndpointSpec::new(
+            endpoint(name, dialect, Platform::Gcp),
+            base_url,
+            AuthStyle::Bearer,
+            EXTRA,
+        )
+        .unwrap()
+        .with_region(Some(region.to_owned()))
+        .with_project(Some("oag-test".to_owned()))
+        .with_gcp_tokens(idle_tokens())
+    }
+
+    /// A gcp endpoint is Vertex in its own project and region, Gemini or
+    /// Claude: at the region's host, the global one, or its base URL, with a
+    /// bearer token and the operator's headers.
+    #[test]
+    fn a_gcp_endpoint_is_vertex_in_its_own_project_and_region() {
+        let cases = [
+            (
+                Dialect::GeminiGenerateContent,
+                "us-central1",
+                "",
+                "https://us-central1-aiplatform.googleapis.com/v1/projects/oag-test/\
+                 locations/us-central1/publishers/google/models/some-model:generateContent",
+            ),
+            (
+                Dialect::AnthropicMessages,
+                "global",
+                "",
+                "https://aiplatform.googleapis.com/v1/projects/oag-test/\
+                 locations/global/publishers/anthropic/models/some-model:rawPredict",
+            ),
+            (
+                Dialect::GeminiGenerateContent,
+                "europe-west4",
+                "http://127.0.0.1:9/psc",
+                "http://127.0.0.1:9/psc/v1/projects/oag-test/\
+                 locations/europe-west4/publishers/google/models/some-model:generateContent",
+            ),
+        ];
+        for (dialect, region, base_url, url) in cases {
+            let name = format!("t10-gcp-{region}");
+            let spec = gcp_spec(&name, dialect, region, base_url);
+            let adapter = adapter(&spec).expect("the gcp platform is served");
+            assert_eq!(
+                adapter.provider(),
+                Provider::Custom(spec.endpoint),
+                "{name}"
+            );
+            assert_eq!(adapter.dialect(), dialect, "{name}");
+            assert_eq!(adapter.framing(), Framing::Sse, "{name}");
+            assert!(!adapter.always_streams(), "{name}");
+
+            let (canonical, model) = (request(), model(spec.endpoint));
+            let mut credential = credential();
+            "ya29.t10".clone_into(&mut credential.access_token);
+            let built = adapter
+                .build(&UpstreamRequest {
+                    canonical: &canonical,
+                    model: &model,
+                    credential: &credential,
+                    session: None,
+                })
+                .expect("builds");
+            assert_eq!(built.url().as_str(), url, "{name}");
+            let headers = built.headers();
+            let bearers: Vec<_> = headers.get_all("authorization").iter().collect();
+            assert_eq!(bearers, ["Bearer ya29.t10"], "{name}");
+            for key in ["x-api-key", "x-goog-api-key", "api-key"] {
+                assert!(headers.get(key).is_none(), "{name}: {key}");
+            }
+            for (extra, value) in EXTRA {
+                assert_eq!(headers[extra], value, "{name}: the operator's {extra}");
+            }
+        }
+    }
+
+    /// Without a region and a project a URL can hold, or without the
+    /// gateway's token cache, a gcp endpoint has no adapter.
+    #[test]
+    fn a_gcp_endpoint_without_a_location_or_a_token_cache_is_refused() {
+        let spec = || {
+            EndpointSpec::new(
+                endpoint(
+                    "t10-gcp-nowhere",
+                    Dialect::GeminiGenerateContent,
+                    Platform::Gcp,
+                ),
+                "",
+                AuthStyle::Bearer,
+                EXTRA,
+            )
+            .unwrap()
+        };
+        let located = |region: Option<&str>, project: Option<&str>| {
+            spec()
+                .with_region(region.map(str::to_owned))
+                .with_project(project.map(str::to_owned))
+                .with_gcp_tokens(idle_tokens())
+        };
+        for unlocated in [
+            located(None, Some("oag-test")),
+            located(Some("us-central1"), None),
+            located(Some("us-central1.example.test"), Some("oag-test")),
+            located(Some("us-central1"), Some("oag-test/../other")),
+        ] {
+            let err = adapter(&unlocated)
+                .expect_err("nowhere to send it")
+                .to_string();
+            assert!(
+                err.contains(
+                    "endpoint `t10-gcp-nowhere` is on the gcp platform, and names no region \
+                     and project"
+                ),
+                "{err}"
+            );
+        }
+        let untokened = spec()
+            .with_region(Some("global".to_owned()))
+            .with_project(Some("oag-test".to_owned()));
+        let err = adapter(&untokened)
+            .expect_err("no token to send")
+            .to_string();
+        assert!(err.contains("was given no token cache"), "{err}");
+    }
+
+    #[test]
+    fn a_gcp_endpoint_in_a_dialect_vertex_does_not_speak_is_refused() {
+        // The platform matrix never pairs these with gcp, and this does not
+        // take the matrix's word for it.
+        for dialect in [
+            Dialect::OpenAIChatCompletions,
+            Dialect::SystemOne,
+            Dialect::BedrockConverse,
+        ] {
+            let spec = gcp_spec("t10-gcp-wrong", dialect, "global", "");
+            let err = adapter(&spec).expect_err("not Vertex's").to_string();
+            assert!(
+                err.contains(&format!(
+                    "speaks {dialect}, which the gcp platform does not serve"
                 )),
                 "{err}"
             );

@@ -12,13 +12,15 @@
 //! asks one row the reload's own question.
 
 use crate::egress::{deny_resolved_target, validate_endpoint_base_url};
-use oag_core::endpoint::{Columns, EndpointConfig, Refusal};
+use oag_core::endpoint::{Columns, EndpointConfig, Reason, Refusal};
 use oag_core::provider::{AuthStyle, Platform};
 use oag_store::repo::{self, EndpointUpdate, NewEndpoint};
 use oag_store::{Db, EndpointRow};
 use oag_upstream::custom::EndpointSpec;
+use oag_upstream::gcp_token::{DEFAULT_TOKEN_URL, GcpTokenCache};
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Why a change that names another dialect or platform is refused.
@@ -285,9 +287,16 @@ fn write_error(e: oag_core::Error) -> WriteError {
 
 /// Why this build does not serve `row`, or `None` when it does: the reload's
 /// own answer, asked of one row.
+///
+/// The reload hands every spec the gateway's token cache, and the factory
+/// refuses a gcp endpoint without one, so this hands it one too. Nothing is
+/// minted through it: an adapter is built here, and never sent anything.
 #[must_use]
 pub fn refusal(row: &EndpointRow) -> Option<Refusal> {
-    crate::state::endpoint_upstream(row).err()
+    match GcpTokenCache::new(DEFAULT_TOKEN_URL) {
+        Ok(tokens) => crate::state::endpoint_upstream(row, &Arc::new(tokens)).err(),
+        Err(e) => Some(Refusal::new(Reason::Unsupported, e.to_string())),
+    }
 }
 
 /// The extra headers as a person may see them: every name and value, in the

@@ -412,6 +412,14 @@ pub struct AccountAddArgs {
     /// operator was not asserting anything about this invocation.
     #[arg(long)]
     secret: Option<String>,
+    /// Read the secret from this file instead: the JSON key of a Google
+    /// service account, for an endpoint on the gcp platform, or any key that
+    /// should not be typed at all.
+    ///
+    /// Read whole, and never printed. A service account's key is checked as
+    /// the gateway will read it before it is sealed.
+    #[arg(long, conflicts_with_all = ["secret", "from", "from_grok", "from_codex"])]
+    secret_file: Option<String>,
     /// Import a signed-in CLI session as an OAuth credential.
     ///
     /// `grok` reads `~/.grok/auth.json`, `codex` reads `~/.codex/auth.json`.

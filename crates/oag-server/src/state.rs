@@ -9,6 +9,7 @@ use oag_core::{Error, Kek, Provider, Result};
 use oag_router::{Catalog, ModelSpec};
 use oag_store::{AuthCache, Cache, Db, EndpointRow};
 use oag_upstream::custom::EndpointSpec;
+use oag_upstream::gcp_token::GcpTokenCache;
 use oag_upstream::{JevUpstream, ProviderAdapter, TransportPool};
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError};
@@ -83,6 +84,16 @@ pub struct AppState {
     /// a chat adapter at all. Swapped with `adapters` on every reload, by the
     /// same three steps; see [`AppState::apply_endpoints`].
     system_one_upstreams: Arc<std::sync::RwLock<Arc<SystemOneMap>>>,
+    /// The Google access tokens every `gcp` endpoint's credentials are sent
+    /// with, minted at `gateway.gcp_token_url` and kept per credential until
+    /// five minutes before they expire.
+    ///
+    /// One for the state's life, handed to each gcp adapter a reload builds.
+    /// Every reload rebuilds every endpoint's adapter, so a cache an adapter
+    /// owned would be thrown away with it, and each account's token minted
+    /// again after every reload. Per replica: each mints its own, which costs
+    /// nothing, unlike an OAuth refresh.
+    pub(crate) gcp_tokens: Arc<GcpTokenCache>,
     /// Swapped wholesale on refresh rather than mutated in place, so a request
     /// that started with one catalog finishes with it — a price changing
     /// halfway through a request would make the ledger disagree with itself.
@@ -120,10 +131,16 @@ impl std::fmt::Debug for AppState {
 /// `oag_endpoint_invalid_total`, on every reload for as long as it stays that
 /// way. Its credentials and models then serve nothing: the provider name they
 /// carry parses to nothing, as an unknown provider's always has.
-fn load_endpoints(rows: &[EndpointRow]) -> Vec<(Endpoint, Served)> {
+///
+/// `gcp_tokens` is what every `gcp` endpoint's adapter mints through: the
+/// state's one cache, which outlives the adapters a reload replaces.
+fn load_endpoints(
+    rows: &[EndpointRow],
+    gcp_tokens: &Arc<GcpTokenCache>,
+) -> Vec<(Endpoint, Served)> {
     let mut served = Vec::with_capacity(rows.len());
     for row in rows {
-        match endpoint_upstream(row) {
+        match endpoint_upstream(row, gcp_tokens) {
             Ok(loaded) => served.push(loaded),
             Err(refusal) => {
                 metrics::counter!(
@@ -153,12 +170,14 @@ fn load_endpoints(rows: &[EndpointRow]) -> Vec<(Endpoint, Served)> {
 /// same rules whichever it is.
 pub(crate) fn endpoint_upstream(
     row: &EndpointRow,
+    gcp_tokens: &Arc<GcpTokenCache>,
 ) -> std::result::Result<(Endpoint, Served), Refusal> {
     let config = row.to_endpoint()?;
-    // Only aws and gcp may have no base URL. An aws adapter reads the empty
-    // string as the region's own host, and the factory refuses gcp whatever
-    // it is given, so the empty string is never sent. The region is the row's:
-    // `gateway.bedrock_region` is the built-in provider's alone.
+    // Only aws and gcp may have no base URL, and the adapter for either reads
+    // the empty string as its region's own host, so the empty string is never
+    // sent. The region is the row's: `gateway.bedrock_region` is the built-in
+    // provider's alone. Every spec is handed the token cache, and only a gcp
+    // endpoint's adapter reads it.
     let spec = EndpointSpec::new(
         config.endpoint,
         config.base_url.unwrap_or_default(),
@@ -168,16 +187,9 @@ pub(crate) fn endpoint_upstream(
     .map_err(|e| Refusal::new(Reason::Headers, e))?
     .with_discovery(row.discover_models)
     .with_region(config.region)
-    .with_api_version(config.api_version);
-    // The words, not the `Display`, whose `configuration: ` would lead every
-    // reason `oag admin endpoint list` and the console print.
-    let unsupported = |e: Error| {
-        let message = match e {
-            Error::Config(message) => message,
-            other => other.to_string(),
-        };
-        Refusal::new(Reason::Unsupported, message)
-    };
+    .with_project(config.project)
+    .with_api_version(config.api_version)
+    .with_gcp_tokens(Arc::clone(gcp_tokens));
     let served = if config.endpoint.dialect() == Dialect::SystemOne {
         Served::SystemOne(Arc::new(
             oag_upstream::custom::system_one(&spec, config.path.as_deref()).map_err(unsupported)?,
@@ -186,6 +198,17 @@ pub(crate) fn endpoint_upstream(
         Served::Chat(oag_upstream::custom::adapter(&spec).map_err(unsupported)?)
     };
     Ok((config.endpoint, served))
+}
+
+/// The factory's refusal of a row, as the reason it is not served: the words,
+/// not the `Display`, whose `configuration: ` would lead every reason `oag
+/// admin endpoint list` and the console print.
+fn unsupported(e: Error) -> Refusal {
+    let message = match e {
+        Error::Config(message) => message,
+        other => other.to_string(),
+    };
+    Refusal::new(Reason::Unsupported, message)
 }
 
 /// The System One map before any endpoint: the built-in Jev alone.
@@ -338,6 +361,8 @@ impl AppState {
                 Duration::from_secs(10),
                 config.gateway.upstream_response_timeout,
             ),
+            // Here, so a token URL that is not one stops the gateway at startup.
+            gcp_tokens: Arc::new(GcpTokenCache::new(config.gateway.gcp_token_url.clone())?),
             config: Arc::new(config),
             db,
             cache,
@@ -548,7 +573,10 @@ impl AppState {
     pub async fn reload_catalog(&self) -> Result<usize> {
         let _one_at_a_time = RELOADS.lock().await;
         match oag_store::repo::list_endpoints(&self.db).await {
-            Ok(rows) => self.apply_endpoints(EndpointRegistry::global(), load_endpoints(&rows)),
+            Ok(rows) => self.apply_endpoints(
+                EndpointRegistry::global(),
+                load_endpoints(&rows, &self.gcp_tokens),
+            ),
             Err(e) => tracing::warn!(
                 error = %e,
                 "could not read the endpoints; keeping the ones already loaded"
@@ -567,10 +595,10 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, bridge, endpoint_upstream, load_endpoints};
-    use oag_core::Provider;
+    use super::{AppState, bridge, endpoint_upstream, load_endpoints, unsupported};
     use oag_core::endpoint::Reason;
     use oag_core::provider::{Dialect, Endpoint, EndpointRegistry, Platform};
+    use oag_core::{Error, Provider};
     use oag_upstream::ProviderAdapter;
     use std::sync::Arc;
 
@@ -601,6 +629,29 @@ mod tests {
         row.auth = "none".to_owned();
         row.region = Some(region.to_owned());
         row
+    }
+
+    /// A gcp endpoint row in project `oag-test`, at its region's own host or
+    /// at `base_url`.
+    fn gcp_row(
+        name: &str,
+        dialect: &str,
+        region: &str,
+        base_url: Option<&str>,
+    ) -> oag_store::EndpointRow {
+        let mut row = endpoint_row(name, dialect, "http://127.0.0.1:9");
+        row.platform = "gcp".to_owned();
+        row.base_url = base_url.map(str::to_owned);
+        row.region = Some(region.to_owned());
+        row.project = Some("oag-test".to_owned());
+        row
+    }
+
+    /// A token cache for a test with no state, at a port nothing listens on.
+    fn tokens() -> Arc<oag_upstream::gcp_token::GcpTokenCache> {
+        Arc::new(
+            oag_upstream::gcp_token::GcpTokenCache::new("http://127.0.0.1:1/token").expect("a URL"),
+        )
     }
 
     /// The provider an endpoint row of this name is served as. An endpoint is
@@ -676,11 +727,14 @@ mod tests {
 
         state.apply_endpoints(
             &registry,
-            load_endpoints(&[endpoint_row(
-                "t4-state-groq",
-                "anthropic",
-                "http://127.0.0.1:9/",
-            )]),
+            load_endpoints(
+                &[endpoint_row(
+                    "t4-state-groq",
+                    "anthropic",
+                    "http://127.0.0.1:9/",
+                )],
+                &state.gcp_tokens,
+            ),
         );
         let adapter = state.adapter(groq).expect("the endpoint has an adapter");
         assert_eq!(adapter.provider(), groq);
@@ -693,7 +747,7 @@ mod tests {
         );
         assert!(state.providers().contains(&groq), "and it is listed");
 
-        state.apply_endpoints(&registry, load_endpoints(&[]));
+        state.apply_endpoints(&registry, load_endpoints(&[], &state.gcp_tokens));
         assert!(
             state.adapter(groq).is_err(),
             "its adapter went with its row"
@@ -756,7 +810,10 @@ mod tests {
         claude.base_url = None;
         let converse = aws_row("t9-state-converse", "bedrock_converse", "ap-northeast-2");
 
-        state.apply_endpoints(&registry, load_endpoints(&[claude, converse]));
+        state.apply_endpoints(
+            &registry,
+            load_endpoints(&[claude, converse], &state.gcp_tokens),
+        );
         for (name, dialect, url, scope) in [
             (
                 "t9-state-claude",
@@ -794,6 +851,106 @@ mod tests {
         );
     }
 
+    /// A gcp row is Vertex in the row's own project and region, Gemini or
+    /// Claude. Every adapter a reload builds for it mints through the state's
+    /// one cache, at `gateway.gcp_token_url`, so a token minted before a
+    /// reload is the one sent after it.
+    #[tokio::test]
+    async fn a_gcp_endpoint_is_served_and_its_tokens_outlive_a_reload() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let google = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "ya29.t10-state",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            })))
+            .expect(1)
+            .mount(&google)
+            .await;
+        let state = crate::testing::state(&format!(
+            "gateway:\n  gcp_token_url: \"{}/token\"\n",
+            google.uri()
+        ));
+        let registry = EndpointRegistry::default();
+        let rows = [
+            gcp_row("t10-state-gemini", "gemini", "us-central1", None),
+            gcp_row(
+                "t10-state-claude",
+                "anthropic",
+                "global",
+                Some("http://127.0.0.1:9"),
+            ),
+        ];
+
+        state.apply_endpoints(&registry, load_endpoints(&rows, &state.gcp_tokens));
+        for (name, dialect, url) in [
+            (
+                "t10-state-gemini",
+                Dialect::GeminiGenerateContent,
+                "https://us-central1-aiplatform.googleapis.com/v1/projects/oag-test/\
+                 locations/us-central1/publishers/google/models/m:generateContent",
+            ),
+            (
+                "t10-state-claude",
+                Dialect::AnthropicMessages,
+                "http://127.0.0.1:9/v1/projects/oag-test/\
+                 locations/global/publishers/anthropic/models/m:rawPredict",
+            ),
+        ] {
+            let adapter = state
+                .adapter(custom(name))
+                .expect("a gcp endpoint is served");
+            assert_eq!(adapter.provider(), custom(name));
+            assert_eq!(adapter.dialect(), dialect, "{name}");
+            assert_eq!(target(&adapter), url, "{name}");
+            assert_eq!(
+                registry.get(name).map(Endpoint::dialect),
+                Some(dialect),
+                "{name}"
+            );
+        }
+
+        let account = oag_core::AccountId::new();
+        let stored = oag_core::credential::SecretMaterial {
+            access_token: serde_json::json!({
+                "type": "service_account",
+                "private_key_id": "t10",
+                "private_key": oag_upstream::gcp_token::TEST_KEY_PEM,
+                "client_email": "t10-state@oag-test.invalid",
+            })
+            .to_string(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        };
+        let before = state.adapter(custom("t10-state-gemini")).expect("served");
+        let minted = before
+            .prepare_credential(account, &stored, None)
+            .await
+            .expect("minted")
+            .access_token
+            .clone();
+        assert_eq!(minted, "ya29.t10-state");
+
+        state.apply_endpoints(&registry, load_endpoints(&rows, &state.gcp_tokens));
+        let after = state
+            .adapter(custom("t10-state-gemini"))
+            .expect("still served");
+        assert!(!Arc::ptr_eq(&before, &after), "rebuilt on reload");
+        let again = after
+            .prepare_credential(account, &stored, None)
+            .await
+            .expect("cached");
+        assert_eq!(again.access_token, minted, "and the token outlived it");
+        google.verify().await;
+    }
+
     /// A System One row is served too, by the System One route rather than a
     /// chat adapter: an upstream at the path it names, beside the built-in
     /// Jev, from the reload that loads it until the one that no longer finds
@@ -809,10 +966,13 @@ mod tests {
 
         state.apply_endpoints(
             &registry,
-            load_endpoints(&[
-                row,
-                endpoint_row("t7-state-jev", "system_one", "http://127.0.0.1:9/jev"),
-            ]),
+            load_endpoints(
+                &[
+                    row,
+                    endpoint_row("t7-state-jev", "system_one", "http://127.0.0.1:9/jev"),
+                ],
+                &state.gcp_tokens,
+            ),
         );
         let credential = oag_core::credential::SecretMaterial {
             access_token: "t7-key".to_owned(),
@@ -853,7 +1013,7 @@ mod tests {
         );
         assert!(state.providers().contains(&decisions), "and it is listed");
 
-        state.apply_endpoints(&registry, load_endpoints(&[]));
+        state.apply_endpoints(&registry, load_endpoints(&[], &state.gcp_tokens));
         assert!(state.system_one(decisions).is_err(), "gone with its row");
         assert_eq!(registry.get("t7-state-decisions"), None);
         assert_eq!(state.system_one_providers(), [Provider::Jev]);
@@ -887,14 +1047,17 @@ mod tests {
         let registry = EndpointRegistry::default();
         state.apply_endpoints(
             &registry,
-            load_endpoints(&[
-                azure_row("t8-state-v1", "https://res.openai.azure.com/", None),
-                azure_row(
-                    "t8-state-deployments",
-                    "https://RES.services.ai.azure.com",
-                    Some("2024-10-21"),
-                ),
-            ]),
+            load_endpoints(
+                &[
+                    azure_row("t8-state-v1", "https://res.openai.azure.com/", None),
+                    azure_row(
+                        "t8-state-deployments",
+                        "https://RES.services.ai.azure.com",
+                        Some("2024-10-21"),
+                    ),
+                ],
+                &state.gcp_tokens,
+            ),
         );
         for (name, url) in [
             (
@@ -920,7 +1083,7 @@ mod tests {
             );
         }
 
-        state.apply_endpoints(&registry, load_endpoints(&[]));
+        state.apply_endpoints(&registry, load_endpoints(&[], &state.gcp_tokens));
         assert!(
             state.adapter(custom("t8-state-v1")).is_err(),
             "gone with its row"
@@ -941,11 +1104,6 @@ mod tests {
         azure.api_version = Some("v1".to_owned());
         // A model server of the operator's own, which an azure row may not name.
         let azure_host = azure_row("t8-bad-azure-host", "https://10.0.0.7", None);
-        let mut gcp = endpoint_row("t8-bad-gcp", "gemini", "http://127.0.0.1:9");
-        gcp.platform = "gcp".to_owned();
-        gcp.base_url = None;
-        gcp.region = Some("us-central1".to_owned());
-        gcp.project = Some("t8-project".to_owned());
         let mut header = endpoint_row("t4-bad-header", "openai", "http://127.0.0.1:9/v1");
         header.extra_headers = serde_json::json!({"Authorization": "Bearer not-here"});
         let mut jev_header = endpoint_row("t7-bad-jev-header", "system_one", "http://127.0.0.1:9");
@@ -984,15 +1142,32 @@ mod tests {
             (chat_path, Reason::Path),
             (azure, Reason::ApiVersion),
             (azure_host, Reason::BaseUrl),
-            // A valid row this build has no adapter for.
-            (gcp, Reason::Unsupported),
         ]
+    }
+
+    /// Every platform is served, so no row that passes the rules reaches a
+    /// factory refusal; what one would say is pinned here instead: its words,
+    /// with no `configuration: ` before them.
+    #[test]
+    fn a_factory_refusal_reads_as_its_words() {
+        let words = unsupported(Error::Config(
+            "endpoint `t5-x` is on the y platform".to_owned(),
+        ));
+        assert_eq!(words.reason, Reason::Unsupported);
+        assert_eq!(words.message, "endpoint `t5-x` is on the y platform");
+        let other = unsupported(Error::Internal("down".to_owned()));
+        assert_eq!(
+            other.message,
+            Error::Internal("down".to_owned()).to_string()
+        );
     }
 
     #[test]
     fn each_bad_row_is_refused_for_its_own_reason() {
         for (row, reason) in bad_rows() {
-            let refused = endpoint_upstream(&row).map(|_| ()).expect_err(&row.name);
+            let refused = endpoint_upstream(&row, &tokens())
+                .map(|_| ())
+                .expect_err(&row.name);
             assert_eq!(refused.reason, reason, "{}: {refused}", row.name);
             assert!(
                 !refused.message.contains("not-here"),
@@ -1012,7 +1187,7 @@ mod tests {
             "http://127.0.0.1:9/v1beta",
         ));
 
-        let served = load_endpoints(&rows);
+        let served = load_endpoints(&rows, &state.gcp_tokens);
         assert_eq!(
             served.iter().map(|(e, _)| e.name()).collect::<Vec<_>>(),
             ["t4-good"],
@@ -1053,21 +1228,27 @@ mod tests {
 
         state.apply_endpoints(
             &registry,
-            load_endpoints(&[endpoint_row(
-                "t4-state-moved",
-                "openai",
-                "http://127.0.0.1:9/old/v1",
-            )]),
+            load_endpoints(
+                &[endpoint_row(
+                    "t4-state-moved",
+                    "openai",
+                    "http://127.0.0.1:9/old/v1",
+                )],
+                &state.gcp_tokens,
+            ),
         );
         let in_flight = state.adapter(moved).expect("served");
 
         state.apply_endpoints(
             &registry,
-            load_endpoints(&[endpoint_row(
-                "t4-state-moved",
-                "openai",
-                "http://127.0.0.1:9/new/v1",
-            )]),
+            load_endpoints(
+                &[endpoint_row(
+                    "t4-state-moved",
+                    "openai",
+                    "http://127.0.0.1:9/new/v1",
+                )],
+                &state.gcp_tokens,
+            ),
         );
         let next = state.adapter(moved).expect("still served");
         assert!(!Arc::ptr_eq(&in_flight, &next), "rebuilt on reload");
@@ -1078,7 +1259,7 @@ mod tests {
             "the request that held the old adapter still has it"
         );
         let anthropic = state.adapter(Provider::Anthropic).expect("built-in");
-        state.apply_endpoints(&registry, load_endpoints(&[]));
+        state.apply_endpoints(&registry, load_endpoints(&[], &state.gcp_tokens));
         assert!(
             Arc::ptr_eq(
                 &anthropic,

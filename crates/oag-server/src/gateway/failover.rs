@@ -482,7 +482,11 @@ pub(super) async fn try_credential(
     // What the request is built with, which is not always what is stored: a
     // service account's JSON key is exchanged for a token. Failing to make one
     // is this credential failing, so it is answered as a failed refresh is.
-    let credential = match adapter.prepare_credential(account, &stored).await {
+    // Through the credential's own proxy, as its refresh and its requests go.
+    let credential = match adapter
+        .prepare_credential(account, &stored, lease.account.proxy_url.as_deref())
+        .await
+    {
         Ok(c) => c,
         Err(e) => return Outcome::Switch(e),
     };

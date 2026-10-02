@@ -63,7 +63,9 @@ oag admin account add --name deepseek-1 --provider deepseek --secret sk-...
 ```
 
 `--secret` is read from `OAG_ACCOUNT_SECRET` when it is omitted, so the key need
-not appear in shell history or the process table. It is sealed with the KEK
+not appear in shell history or the process table. `--secret-file <path>` reads
+it from a file instead, whole, which is how a Google service account's JSON key
+arrives ([Vertex endpoints](#vertex-endpoints)). It is sealed with the KEK
 before it reaches the row.
 
 Every `api_key` provider in the table takes exactly that command; only
@@ -185,8 +187,8 @@ pub trait ProviderAdapter: Send + Sync + Debug {
     fn build(&self, req: &UpstreamRequest<'_>) -> Result<reqwest::Request>;
     fn parse_event(&self, raw: &str, acc: &mut StreamAccumulator) -> Result<Vec<StreamEvent>>;
     async fn refresh(&self, cred: &SecretMaterial) -> Result<Option<SecretMaterial>>;
-    async fn prepare_credential<'a>(&'a self, account: AccountId, stored: &'a SecretMaterial)
-        -> Result<Cow<'a, SecretMaterial>>;
+    async fn prepare_credential<'a>(&'a self, account: AccountId, stored: &'a SecretMaterial,
+        proxy: Option<&str>) -> Result<Cow<'a, SecretMaterial>>;
 }
 ```
 
@@ -209,6 +211,8 @@ overrides it where what is stored is not what goes on the wire, such as a
 service account's JSON key exchanged for a short-lived token. The request path
 calls it once per credential tried, after `refresh` and before `build`, and an
 error from it is that credential failing: the request moves to the next one.
+`proxy` is the credential's own `proxy_url`, which carries anything the
+preparation sends, as it carries the credential's refresh and its requests.
 
 ## Most providers need no adapter
 
@@ -363,15 +367,14 @@ before it files a key under an endpoint's name:
 
 A row that breaks one is skipped, and the rest are served as before. Its keys
 and models serve nothing, a warning naming it is logged on every refresh, and
-`oag_endpoint_invalid_total{reason}` counts it. In this release `plain`,
-`aws` and `azure` endpoints are served: a `plain` one speaking `openai`,
-`anthropic` or `gemini` by the chat routes, and a `system_one` one by the System
-One route ([System One hosts](#system-one-hosts)); an `aws` one by the chat
-routes too ([Bedrock endpoints](#bedrock-endpoints)), and an `azure` one as well
-([Azure OpenAI](#azure-openai)). A `gcp` endpoint is a valid row skipped with
-reason `unsupported` until its adapter lands. Such a row can still be
-registered, and `endpoint add`, `list`, `show`, `doctor` and the console all say
-it is not served, so it is in place for the build that serves it. `check` asks
+`oag_endpoint_invalid_total{reason}` counts it. In this release every platform
+is served: a `plain` endpoint speaking `openai`, `anthropic` or `gemini` by the
+chat routes, and a `system_one` one by the System One route
+([System One hosts](#system-one-hosts)); an `aws` one by the chat routes too
+([Bedrock endpoints](#bedrock-endpoints)), and an `azure`
+([Azure OpenAI](#azure-openai)) and a `gcp` one
+([Vertex endpoints](#vertex-endpoints)) as well. `endpoint list`, `show`,
+`doctor` and the console say when a row is not served, and why. `check` asks
 only a `plain` endpoint: the clouds list their models on hosts, and with
 signatures, of their own.
 
@@ -607,6 +610,108 @@ which admits one loopback origin. It exists only in test builds: it is behind
 dev-dependency and no release build turns on, so nothing a deployment
 configures can widen the rule above. `crates/oag-server/tests/azure_endpoints.rs`
 serves both APIs through a running gateway that way.
+
+### Vertex endpoints
+
+An endpoint on the `gcp` platform is Google's Vertex AI in a project and a
+region of its own: Gemini through `generateContent`, or Claude through
+`rawPredict`. Its credential is a service account's JSON key, and no request
+carries the key. The gateway mints a short-lived access token from it and sends
+that.
+
+| Dialect | Models | Vertex method, beneath `{host}/v1/projects/{project}/locations/{region}` |
+|---|---|---|
+| `gemini` | Gemini | `/publishers/google/models/{model}:generateContent`, and `:streamGenerateContent?alt=sse` to stream, in the Gemini API's body |
+| `anthropic` | Claude | `/publishers/anthropic/models/{model}:rawPredict`, and `:streamRawPredict` to stream, in Anthropic's body without `model` and with `"anthropic_version": "vertex-2023-10-16"` |
+
+- **Region and project**, both required, are in every request's path. The host
+  is the region's own, `https://{region}-aiplatform.googleapis.com`, or
+  `https://aiplatform.googleapis.com` for the `global` region.
+- **Base URL**, optional, replaces the host: a Private Service Connect
+  endpoint, a proxy, or a stand-in. The path beneath it still names the project
+  and the region. A multi-region location (`us`, `eu`) has a host of its own,
+  `https://aiplatform.{location}.rep.googleapis.com`, so give it as the base
+  URL.
+- **Auth** is `bearer`: the minted token goes in `Authorization`, and no other
+  header carries anything of the credential. There is no `anthropic-version`
+  header either; the body carries the version, as Google's own requests do.
+- **Model ids.** A catalog row's upstream name is Vertex's model id. Each goes
+  in the path as one segment, with everything but letters, digits, `-`, `.`,
+  `_` and `~` percent-encoded, so a Claude model's version pin
+  (`claude-sonnet-4-5@20250929`) is sent as `claude-sonnet-4-5%4020250929`.
+- **Extra headers** are sent on every request, for instance
+  `x-goog-user-project` to bill another project's quota.
+- `api_version` is not read: requests go to Vertex's `v1`.
+
+```sh
+oag admin endpoint add --name vertex-gemini --platform gcp --dialect gemini \
+  --region us-central1 --project my-project --auth bearer
+oag admin endpoint add --name vertex-claude --platform gcp --dialect anthropic \
+  --region global --project my-project --auth bearer
+# The service account's JSON key, as Google's console downloads it.
+oag admin account add --name vertex-sa-1 --provider vertex-gemini \
+  --secret-file ./my-project-sa.json --route default
+```
+
+The same two rows as statements (`auth` defaults to `bearer`):
+
+```sql
+INSERT INTO endpoint (name, dialect, platform, region, project)
+VALUES ('vertex-gemini', 'gemini', 'gcp', 'us-central1', 'my-project'),
+       ('vertex-claude', 'anthropic', 'gcp', 'global', 'my-project');
+```
+
+`account add` files the key as a credential of kind `service_account`, the one
+kind a `gcp` endpoint takes. It reads the key as the gateway's mint will: `type`
+is `service_account`, and it has a `client_email`, a `private_key_id` and a
+`private_key` that is an RSA key in PKCS#8 PEM, as Google issues them. A key
+that could never mint is refused before anything is sealed, and nothing of it is
+printed; what is printed is the service account's email. `--secret` and
+`OAG_ACCOUNT_SECRET` work too, but a file is what Google hands out. Filed under
+two endpoints, one key is two credentials, each with its own token and its own
+concurrency.
+
+Then a catalog row per model, whose provider is the endpoint's name and whose
+upstream name is Vertex's id for it: `vertex-gemini/gemini-2.5-flash` for
+`gemini-2.5-flash`, and `vertex-claude/claude-sonnet-4-5` for
+`claude-sonnet-4-5@20250929`, priced from Google's Vertex AI price list.
+
+**What the service account needs.** Permission to call Vertex AI in the project:
+`roles/aiplatform.user` is the role commonly granted for it (Google's IAM
+documentation currently titles it Agent Platform User). Google's
+[Vertex AI access control](https://cloud.google.com/vertex-ai/docs/general/access-control)
+page lists what each role holds. A Claude model is served only once it is
+enabled for the project in Model Garden, which Google's
+[Claude on Vertex AI](https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/claude/use-claude)
+page walks through, and which regions serve which model is Google's
+[locations](https://cloud.google.com/vertex-ai/generative-ai/docs/learn/locations)
+page to say.
+
+**The token.** A credential's key signs a JWT (RS256, scope
+`https://www.googleapis.com/auth/cloud-platform`, valid for an hour), which the
+gateway trades at `gateway.gcp_token_url`, Google's
+`https://oauth2.googleapis.com/token` unless it is set, for an access token. The
+token is kept until five minutes before it expires, in one cache per gateway
+process that every `gcp` endpoint shares and that outlives every reload. So a
+credential is minted for at most once at a time, and about once an hour, on
+each replica. Each replica mints its own: a mint uses nothing up, unlike an
+OAuth refresh, so replicas do not contend. The key's own `token_uri` is never
+used, and a redirect from the token endpoint is not followed: a signed
+assertion goes to the configured URL or nowhere. A mint goes through the
+credential's `proxy_url` when it has one, as its requests do.
+
+The mint happens on the request path, just before the request is built, while
+the request holds its slot on that credential; one takes at most ten seconds.
+
+**When a mint fails.** A key Google refuses (`invalid_grant`: the key or its
+service account was deleted or disabled, or this host's clock is far enough off
+to make the assertion look wrong), a token endpoint that cannot be reached, or
+an answer that is not a token, is that credential failing. The request moves to
+the endpoint's next credential, as it does when a refresh fails, and the log
+names the status and the OAuth error code. A failure is not remembered, so the
+next request tries that key again. When no credential can mint, the client is
+answered 500 `internal_error`. No log line and no answer holds the key, the
+signed assertion or a token.
 
 ## Which dialect reaches which upstream
 
@@ -862,6 +967,7 @@ nothing changes, and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` apply as before.
 | Gemini | Model and mode in the URL path; its own auth header; a genuinely different body shape. |
 | Bedrock | Anthropic's body, but the model is in the path, `anthropic_version` replaces the version header, and every request is SigV4-signed. |
 | Bedrock Converse (`aws` endpoints) | Converse's own body and stream, on the Bedrock adapter's host, region and signing. |
+| Vertex (`gcp` endpoints) | Gemini's body or Anthropic's at a path naming the project, the region and the publisher; Claude's `model` replaced by `anthropic_version`; a bearer token minted from a service account. |
 
 `sigv4.rs` is hand-rolled — a few dozen lines against the AWS SDK's several
 hundred transitive crates and a second HTTP stack, none of which this gateway
