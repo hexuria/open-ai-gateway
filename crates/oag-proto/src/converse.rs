@@ -18,7 +18,9 @@
 //!   `inferenceConfig`, tools under `toolConfig`, structured output under
 //!   `outputConfig`. The model, and whether to stream, are in the URL.
 //! - Roles must alternate, so turns the canonical form keeps apart — a tool
-//!   result and the user's next words, say — are merged into one.
+//!   result and the user's next words, say — are merged into one. And the
+//!   first turn must be the user's, so a conversation that opens with the
+//!   model is sent a minimal user turn in front.
 //! - Tool names are held to the OpenAI function-name pattern, and sanitised
 //!   the same way. A tool call's id is held to a pattern of its own, and one
 //!   outside it is respelled ([`ToolUseIds`]) and restored on the way back.
@@ -139,6 +141,11 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
     Ok(body)
 }
 
+/// What the user turn in front of a conversation that opens with the model
+/// says: that the conversation was under way, and nothing the model could
+/// take for a question.
+const CONTINUED: &str = "(continued)";
+
 /// The canonical turns as Converse messages.
 ///
 /// Turns whose role would repeat are merged, because Converse refuses a
@@ -148,6 +155,14 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
 /// left with no block this dialect carries is dropped, since an empty
 /// `content` is refused too — and dropping it can leave its neighbours
 /// adjacent, which the merge then settles.
+///
+/// And the first turn must be the user's ("A conversation must start with a
+/// user message"), which a client's need not be: a prefill with no question,
+/// a transcript resumed part way, history trimmed from the front, or a first
+/// user turn that held nothing this dialect carries. Such a conversation is
+/// sent a minimal user turn in front, [`CONTINUED`], judged after the drops
+/// and the merge so it is judged on what is sent, and keeping every word the
+/// client sent.
 fn render_messages(messages: &[Message], names: &FunctionNameMap, ids: &ToolUseIds) -> Vec<Value> {
     let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
     for m in messages {
@@ -170,6 +185,9 @@ fn render_messages(messages: &[Message], names: &FunctionNameMap, ids: &ToolUseI
             Some((last, content)) if *last == role => content.extend(blocks),
             _ => turns.push((role, blocks)),
         }
+    }
+    if turns.first().is_some_and(|(role, _)| *role == "assistant") {
+        turns.insert(0, ("user", vec![json!({ "text": CONTINUED })]));
     }
     turns
         .into_iter()
@@ -1812,6 +1830,59 @@ mod tests {
             render_request(&req).expect("renders"),
             body,
             "the same every turn"
+        );
+    }
+
+    /// Converse refuses a conversation that opens with the model ("A
+    /// conversation must start with a user message"), and a client can send
+    /// one: a prefill with no question, a transcript resumed part way, or a
+    /// first user turn that held nothing this dialect carries. A minimal user
+    /// turn goes in front, judged on what is sent once turns are dropped and
+    /// merged; every word the client sent is kept.
+    #[test]
+    fn a_conversation_that_opens_with_the_model_is_sent_a_user_turn_first() {
+        let continued = json!({ "role": "user", "content": [{ "text": "(continued)" }] });
+        let req = request(|r| {
+            r.messages = vec![
+                turn(Role::Assistant, vec![text("As I was saying,")]),
+                turn(Role::User, vec![text("go on")]),
+            ];
+        });
+        assert_eq!(
+            render_request(&req).expect("renders")["messages"],
+            json!([
+                continued,
+                { "role": "assistant", "content": [{ "text": "As I was saying," }] },
+                { "role": "user", "content": [{ "text": "go on" }] },
+            ])
+        );
+
+        // The first user turn carried only reasoning, which is not sent.
+        let req = request(|r| {
+            r.messages = vec![
+                turn(
+                    Role::User,
+                    vec![ContentBlock::Thinking {
+                        text: "hmm".to_owned(),
+                        signature: None,
+                    }],
+                ),
+                turn(Role::Assistant, vec![text("Prefilled")]),
+            ];
+        });
+        assert_eq!(
+            render_request(&req).expect("renders")["messages"],
+            json!([
+                continued,
+                { "role": "assistant", "content": [{ "text": "Prefilled" }] },
+            ])
+        );
+
+        // One that opens with the user is sent as it is.
+        let req = request(|r| r.messages = vec![turn(Role::User, vec![text("hi")])]);
+        assert_eq!(
+            render_request(&req).expect("renders")["messages"],
+            json!([{ "role": "user", "content": [{ "text": "hi" }] }])
         );
     }
 

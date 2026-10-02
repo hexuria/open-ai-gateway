@@ -527,7 +527,9 @@ a compaction) declares a stand-in for each tool called: its name, and a schema
 that takes any object. A tool call's id outside Converse's pattern,
 `[a-zA-Z0-9_.:-]{1,64}` (Gemini's `read_file#1`, an id past 64 bytes), is
 respelled the same way in the call and in its result, and the client's own id
-comes back on anything Converse answers with.
+comes back on anything Converse answers with. A conversation that opens with
+the model (a prefill, a transcript resumed part way) is sent a `(continued)`
+user turn in front of it.
 
 **Streams.** `ConverseStream` sends AWS event-stream messages whose payload is
 the event itself, named by a header (see [Framing](#framing)). It announces the
