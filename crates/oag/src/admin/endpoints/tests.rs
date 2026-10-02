@@ -377,7 +377,7 @@ fn a_control_character_in_a_row_is_printed_as_text() {
         list_lines(std::slice::from_ref(&row), &HashMap::new()),
         show_lines(&row, EndpointReferences::default()),
         added_lines(&row),
-        set_lines(&row),
+        set_lines(&row, None),
     ]
     .concat();
     for line in &printed {
@@ -716,13 +716,124 @@ async fn a_set_that_lost_a_race_reads_the_row_again_and_keeps_both_changes() {
         .await
         .expect("removed");
 
-    let row = written.expect("read again, and written");
+    let (_, row) = written.expect("read again, and written");
     assert!(row.discover_models, "this change");
     assert_eq!(
         row.display_name.as_deref(),
         Some("Theirs"),
         "and theirs, kept"
     );
+}
+
+/// C1. `set --base-url` on an endpoint with a credential is refused without
+/// `--yes-move-keys`, and nothing is written, since the key would go to the
+/// new URL; any other setting still changes, and with the flag the URL moves.
+#[tokio::test]
+async fn a_base_url_moves_keys_only_with_yes_move_keys() {
+    let Some(db) = test_db().await else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let _endpoints = ENDPOINT_ROWS.lock().await;
+    let name = fresh();
+    run(
+        &db,
+        &[
+            "endpoint",
+            "add",
+            "--name",
+            &name,
+            "--dialect",
+            "openai",
+            "--platform",
+            "plain",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+        ],
+    )
+    .await
+    .expect("added");
+    sqlx::query(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+         VALUES (gen_random_uuid(), $1, $1, 'api_key', '\\x00', '\\x00')",
+    )
+    .bind(&name)
+    .execute(db.pool())
+    .await
+    .expect("a credential");
+    let base_url = |db: Db, name: String| async move {
+        repo::get_endpoint(&db, &name)
+            .await
+            .expect("read")
+            .expect("stored")
+            .base_url
+    };
+
+    let refused = run(
+        &db,
+        &[
+            "endpoint",
+            "set",
+            &name,
+            "--base-url",
+            "http://127.0.0.2:9/v1",
+        ],
+    )
+    .await;
+    let after_refusal = base_url(db.clone(), name.clone()).await;
+    let renamed = run(&db, &["endpoint", "set", &name, "--display-name", "Kept"]).await;
+    let moved = run(
+        &db,
+        &[
+            "endpoint",
+            "set",
+            &name,
+            "--base-url",
+            "http://127.0.0.2:9/v1",
+            "--yes-move-keys",
+        ],
+    )
+    .await;
+    let after_move = base_url(db.clone(), name.clone()).await;
+    sqlx::query("DELETE FROM account WHERE provider = $1")
+        .bind(&name)
+        .execute(db.pool())
+        .await
+        .expect("remove the credential");
+    run(&db, &["endpoint", "remove", &name])
+        .await
+        .expect("removed");
+
+    let refused = refused.expect_err("a key would follow the URL");
+    assert!(
+        refused.to_string().contains("1 credential(s)")
+            && refused.to_string().contains("--yes-move-keys"),
+        "{refused}"
+    );
+    assert_eq!(after_refusal.as_deref(), Some("http://127.0.0.1:9/v1"));
+    renamed.expect("every other setting changes");
+    moved.expect("moved, as asked");
+    assert_eq!(after_move.as_deref(), Some("http://127.0.0.2:9/v1"));
+}
+
+/// C1. A `set` that moved an endpoint's keys says so, and where they go now.
+#[test]
+fn a_set_that_moved_keys_says_where_they_go_now() {
+    let row = stored();
+    let quiet = set_lines(&row, None);
+    assert!(!quiet.join("\n").contains("warning"), "{quiet:?}");
+    let moved = set_lines(&row, Some((Some("http://127.0.0.1:9/v1"), 2)));
+    assert!(
+        moved.iter().any(|line| line
+            == "  warning: the keys of 2 credential(s) filed under merge now go to \
+                https://api-gateway.merge.example/v1/openai, no longer to http://127.0.0.1:9/v1"),
+        "{moved:?}"
+    );
+    assert!(
+        set_args(&["--base-url", "http://127.0.0.2:9/v1", "--yes-move-keys"]).yes_move_keys,
+        "the flag parses"
+    );
+    assert!(!set_args(&["--display-name", "x"]).yes_move_keys);
 }
 
 /// `--path` stores a System One endpoint's path, `set --path` moves it and an

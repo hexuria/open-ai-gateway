@@ -249,6 +249,16 @@ The endpoint routes, `/admin/api/endpoints`, use each of them:
     "hint": "read it again, and send the change again if it is still wanted" }
   ```
 
+  And for a `PATCH` with a new `base_url` while credentials are filed under
+  the endpoint, because every one of their keys would go to the new host. This
+  API cannot read the keys it would be moving; the CLI, which can, moves them:
+
+  ```json
+  { "error": "endpoint merge has 2 credential(s), and every one of their keys would be sent to the new base URL, so nothing was written",
+    "accounts": 2,
+    "hint": "move it with `oag admin endpoint set merge --base-url <url> --yes-move-keys`, which runs with the database and the key-encryption key, or remove the endpoint's credentials first" }
+  ```
+
 - `POST /admin/api/endpoints/{name}/check` is **200 whatever the endpoint
   answered**, with `ok`, `status`, `models` and `error` saying what that was. A
   redirect is reported and never followed. Only a name nobody registered is 404.

@@ -10,7 +10,7 @@ use super::{EndpointAddArgs, EndpointCommand, EndpointSetArgs};
 use oag_core::config::Config;
 use oag_core::provider::Platform;
 use oag_core::{Kek, Provider, Result, credential::SecretMaterial};
-use oag_server::endpoints::{self, Checked, Draft, WriteError};
+use oag_server::endpoints::{self, Checked, Draft, KeysMove, WriteError};
 use oag_store::repo::{self, EndpointDeletion, EndpointReferences};
 use oag_store::{Db, EndpointRow};
 use serde_json::{Map, Value};
@@ -136,6 +136,8 @@ pub(super) fn apply(draft: &mut Draft, args: EndpointSetArgs) -> Result<()> {
         path,
         display_name,
         discover,
+        // Not a setting: what `set_from` may do about the endpoint's keys.
+        yes_move_keys: _,
     } = args;
     let given = base_url.is_some()
         || auth.is_some()
@@ -364,8 +366,30 @@ async fn set(db: &Db, args: EndpointSetArgs) -> Result<()> {
     let Some(stored) = repo::get_endpoint(db, &args.name).await? else {
         return Err(not_found(&args.name));
     };
-    let row = set_from(db, stored, &args).await?;
-    for line in set_lines(&row) {
+    let (from, row) = set_from(db, stored, &args).await?;
+    // Counted after the write, for the warning alone: the rule that let the
+    // move through counted them before it.
+    let moved = if endpoints::moves_base_url(&from, row.base_url.as_deref()) {
+        Some((
+            from.base_url.as_deref(),
+            repo::endpoint_account_count(db, &row.name).await?,
+        ))
+        .filter(|(_, accounts)| *accounts > 0)
+    } else {
+        None
+    };
+    // Same target and shape as the admin API's line for a change, so the
+    // one way to move an endpoint's keys is not a hole in the trail.
+    tracing::warn!(
+        target: "oag::audit",
+        actor = "cli",
+        action = "endpoint.update",
+        subject = %row.name,
+        base_url_from = from.base_url.as_deref().unwrap_or("-"),
+        base_url_to = row.base_url.as_deref().unwrap_or("-"),
+        "admin write"
+    );
+    for line in set_lines(&row, moved) {
         println!("{line}");
     }
     Ok(())
@@ -373,25 +397,34 @@ async fn set(db: &Db, args: EndpointSetArgs) -> Result<()> {
 
 /// `args` applied to `stored` and written, and, if someone else wrote the
 /// endpoint after `stored` was read, applied once more to the row as it is
-/// then and written again.
+/// then and written again. The row the change was made from, and the row it
+/// wrote.
 ///
 /// The write lands only over the row it was made from (see
 /// `endpoints::change`), so a change made meanwhile is never undone: it is
 /// read, and these flags go on top of it. Once, because a second change in
 /// the time one write takes is a row being rewritten in a loop, which a
 /// retry here would only join.
+///
+/// A new base URL is refused while credentials are filed under the endpoint
+/// unless `--yes-move-keys` says to send their keys there.
 pub(super) async fn set_from(
     db: &Db,
     mut stored: EndpointRow,
     args: &EndpointSetArgs,
-) -> Result<EndpointRow> {
+) -> Result<(EndpointRow, EndpointRow)> {
     let name = args.name.as_str();
+    let keys = if args.yes_move_keys {
+        KeysMove::Allowed
+    } else {
+        KeysMove::Refused
+    };
     let mut read_again = true;
     loop {
         let mut draft = Draft::from_row(&stored);
         apply(&mut draft, args.clone())?;
-        match endpoints::change(db, &stored, draft).await {
-            Ok(row) => return Ok(row),
+        match endpoints::change(db, &stored, draft, keys).await {
+            Ok(row) => return Ok((stored, row)),
             Err(WriteError::Changed) if read_again => {
                 read_again = false;
                 stored = repo::get_endpoint(db, name)
@@ -403,8 +436,10 @@ pub(super) async fn set_from(
     }
 }
 
-/// What `set` prints once the change is written.
-pub(super) fn set_lines(row: &EndpointRow) -> Vec<String> {
+/// What `set` prints once the change is written. `moved` is the base URL the
+/// endpoint had and how many credentials' keys now go to the one it has, when
+/// the change moved it with credentials filed under it.
+pub(super) fn set_lines(row: &EndpointRow, moved: Option<(Option<&str>, i64)>) -> Vec<String> {
     let mut lines = vec![format!(
         "endpoint {} updated: {} on {} at {}",
         row.name,
@@ -412,6 +447,15 @@ pub(super) fn set_lines(row: &EndpointRow) -> Vec<String> {
         row.platform,
         place(row)
     )];
+    if let Some((from, accounts)) = moved {
+        lines.push(format!(
+            "  warning: the keys of {accounts} credential(s) filed under {} now go to {}, \
+             no longer to {}",
+            row.name,
+            place(row),
+            from.unwrap_or("-")
+        ));
+    }
     if let Some(refusal) = endpoints::refusal(row) {
         lines.push(format!("  not served by this build: {refusal}"));
     }

@@ -287,7 +287,8 @@ oag admin doctor
 The rest of the verbs: `endpoint list` (every endpoint, with how many
 credentials, models and ladder places name it), `endpoint show <name>`,
 `endpoint set <name>` (only the flags given change; an empty value clears one;
-`--header` adds or replaces and `--unset-header` drops), and `endpoint remove
+`--header` adds or replaces and `--unset-header` drops; a new `--base-url` on an
+endpoint with credentials needs `--yes-move-keys`, below), and `endpoint remove
 <name>`, which refuses while a credential or a catalog model still names the
 endpoint and prints how to clear each. There is no `--dialect` or `--platform`
 on `set`: they are what the endpoint is, so changing either is a remove and an
@@ -312,7 +313,7 @@ them:
 | `GET /admin/api/endpoints` | List, with the counts and whether this build serves each. |
 | `POST /admin/api/endpoints` | Register. The body is the columns; `auth` defaults to the platform's style. |
 | `GET /admin/api/endpoints/{name}` | One endpoint. |
-| `PATCH /admin/api/endpoints/{name}` | Change settings. A field left out is kept, `null` clears; `dialect`, `platform` and `name` are a 400. A 409 when someone else changed the endpoint while this was being applied: nothing was written, so read it again. |
+| `PATCH /admin/api/endpoints/{name}` | Change settings. A field left out is kept, `null` clears; `dialect`, `platform` and `name` are a 400. A 409 when someone else changed the endpoint while this was being applied: nothing was written, so read it again. A 409 too for a new `base_url` while credentials are filed under the endpoint (below). |
 | `DELETE /admin/api/endpoints/{name}` | Remove. 409, with the counts, while anything names it. |
 | `POST /admin/api/endpoints/{name}/check` | Ask it for its models, with no key. 200 whatever it answered. |
 
@@ -325,6 +326,17 @@ the same endpoint cannot undo each other: the second to write finds the row
 changed under it and writes nothing. `endpoint set` then reads the row again
 and puts its flags on top, once; a `PATCH` answers 409 and leaves the retry to
 its caller.
+
+**Moving a base URL moves the keys.** Every request under an endpoint's name,
+and every discovery read, carries one of its credentials' keys to its base URL.
+So a new base URL on an endpoint with credentials sends all of their keys
+there. The admin API refuses it with a 409 that names the way that can:
+`oag admin endpoint set <name> --base-url <url> --yes-move-keys`, which runs
+with the database and the key-encryption key, and so could read every key it
+moves anyway. Without `--yes-move-keys` the CLI refuses it too, and with it,
+it says how many credentials' keys now go to the new URL. Or remove the
+endpoint's credentials, move the URL, and add them again. Every change, from
+either, leaves an `oag::audit` line with the base URL before and after.
 
 ### The rules a row must pass
 

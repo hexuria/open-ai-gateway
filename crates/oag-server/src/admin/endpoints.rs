@@ -10,7 +10,7 @@
 use super::auth::AdminActor;
 use super::{failed, invalid, not_found};
 use crate::AppState;
-use crate::endpoints::{self, Checked, Draft, WriteError};
+use crate::endpoints::{self, Checked, Draft, KeysMove, WriteError};
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -288,6 +288,12 @@ pub async fn create_endpoint(
 /// The patch is applied to the row as this request read it, and written only
 /// over that row: a write that landed in between is a 409, and nothing is
 /// written, rather than lost under a field this request copied unchanged.
+///
+/// A new base URL is a 409 too while any credential is filed under the
+/// endpoint, because every one of their keys would go to it
+/// ([`KeysMove::Refused`]). This API holds no key-encryption key and cannot
+/// read the keys it would be moving; the CLI, which can, moves them with
+/// `--yes-move-keys`, or the credentials go first.
 pub async fn update_endpoint(
     State(state): State<Arc<AppState>>,
     actor: AdminActor,
@@ -304,14 +310,36 @@ pub async fn update_endpoint(
     };
     let mut draft = Draft::from_row(&stored);
     patch.apply(&mut draft);
-    match endpoints::change(&state.db, &stored, draft).await {
+    match endpoints::change(&state.db, &stored, draft, KeysMove::Refused).await {
         Ok(row) => {
-            audit(&actor, "endpoint.update", &row.name);
+            audit_update(&actor, &stored, &row);
             reload(&state).await;
             answer(&state, &row, StatusCode::OK, "written").await
         }
+        Err(WriteError::KeysWouldMove { accounts }) => keys_would_move(&name, accounts),
         Err(e) => write_failed(e),
     }
+}
+
+/// The 409 for a new base URL on an endpoint with credentials: how many, and
+/// the two ways the URL can move.
+fn keys_would_move(name: &str, accounts: i64) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": format!(
+                "endpoint {name} has {accounts} credential(s), and every one of their keys \
+                 would be sent to the new base URL, so nothing was written"
+            ),
+            "accounts": accounts,
+            "hint": format!(
+                "move it with `oag admin endpoint set {name} --base-url <url> --yes-move-keys`, \
+                 which runs with the database and the key-encryption key, or remove the \
+                 endpoint's credentials first"
+            ),
+        })),
+    )
+        .into_response()
 }
 
 /// `DELETE /admin/api/endpoints/{name}`: 409 with the counts while a
@@ -420,6 +448,8 @@ fn write_failed(e: WriteError) -> Response {
             })),
         )
             .into_response(),
+        // `update_endpoint` answers this itself, with the endpoint's name.
+        WriteError::KeysWouldMove { accounts } => keys_would_move("<name>", accounts),
         WriteError::Failed(e) => failed(&e),
     }
 }
@@ -436,6 +466,22 @@ fn audit(actor: &AdminActor, action: &str, subject: &str) {
         actor_id = %actor.principal_id,
         action,
         subject,
+        "admin write"
+    );
+}
+
+/// [`audit`]'s line for a change, with the base URL the endpoint had and the
+/// one it has now: where its credentials' keys were going, and where they go.
+/// URLs only, which hold no key: the rules refuse one with credentials in it.
+fn audit_update(actor: &AdminActor, before: &EndpointRow, after: &EndpointRow) {
+    tracing::warn!(
+        target: "oag::audit",
+        actor = %actor.email,
+        actor_id = %actor.principal_id,
+        action = "endpoint.update",
+        subject = %after.name,
+        base_url_from = before.base_url.as_deref().unwrap_or("-"),
+        base_url_to = after.base_url.as_deref().unwrap_or("-"),
         "admin write"
     );
 }

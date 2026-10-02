@@ -555,6 +555,140 @@ async fn an_endpoint_lives_its_whole_life_through_the_api() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// C1. With a credential filed under it, an endpoint's base URL does not move
+/// through this API: the PATCH is a 409 that names the way that can move it,
+/// and nothing is written, because every key filed under the endpoint would
+/// go to the new host. Every other setting still changes, and the URL moves
+/// once the credentials are gone.
+// Long because it is one endpoint's whole story, each step needing the last.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn a_base_url_change_is_refused_while_credentials_would_follow_it() {
+    let Some(state) = crate::testing::live_state().await else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+        return;
+    };
+    let name = fresh();
+    let body = json!({
+        "name": name,
+        "dialect": "openai",
+        "platform": "plain",
+        "base_url": "http://127.0.0.1:9/v1",
+    });
+    let (status, created) =
+        read(create_endpoint(State(Arc::clone(&state)), actor(), Json(input(&body))).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    sqlx::query(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+         VALUES (gen_random_uuid(), $1, $1, 'api_key', '\\x00', '\\x00')",
+    )
+    .bind(&name)
+    .execute(state.db.pool())
+    .await
+    .expect("a credential");
+    let patched = |body: Value| {
+        let (state, name) = (Arc::clone(&state), name.clone());
+        async move {
+            read(update_endpoint(State(state), actor(), Path(name), Json(patch(&body))).await).await
+        }
+    };
+
+    let (refused, moved) = patched(json!({"base_url": "http://127.0.0.2:9/v1"})).await;
+    let (_, after_refusal) =
+        read(get_endpoint(State(Arc::clone(&state)), Path(name.clone())).await).await;
+    let (renamed, kept) = patched(json!({"display_name": "Kept", "discover_models": true})).await;
+    sqlx::query("DELETE FROM account WHERE provider = $1")
+        .bind(&name)
+        .execute(state.db.pool())
+        .await
+        .expect("remove the credential");
+    let (unkeyed, moved_freely) = patched(json!({"base_url": "http://127.0.0.2:9/v1"})).await;
+    let deleted = repo::delete_endpoint(&state.db, &name).await;
+
+    assert_eq!(refused, StatusCode::CONFLICT, "{moved}");
+    assert_eq!(moved["accounts"], 1, "{moved}");
+    let error = moved["error"].as_str().unwrap_or_default();
+    assert!(error.contains("1 credential(s)"), "{error}");
+    assert!(error.contains("nothing was written"), "{error}");
+    let hint = moved["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains(&format!(
+            "oag admin endpoint set {name} --base-url <url> --yes-move-keys"
+        )),
+        "{hint}"
+    );
+    assert!(hint.contains("remove the endpoint's credentials"), "{hint}");
+    assert_eq!(
+        after_refusal["base_url"], "http://127.0.0.1:9/v1",
+        "the keys still go where they went"
+    );
+
+    assert_eq!(renamed, StatusCode::OK, "{kept}");
+    assert_eq!(
+        (
+            &kept["display_name"],
+            &kept["discover_models"],
+            &kept["base_url"]
+        ),
+        (
+            &json!("Kept"),
+            &json!(true),
+            &json!("http://127.0.0.1:9/v1")
+        ),
+        "every other setting changes with credentials in place"
+    );
+
+    assert_eq!(unkeyed, StatusCode::OK, "{moved_freely}");
+    assert_eq!(moved_freely["base_url"], "http://127.0.0.2:9/v1");
+    assert_eq!(deleted.expect("clean up"), EndpointDeletion::Deleted);
+}
+
+/// C1. A change's audit line names the base URL the endpoint had and the one
+/// it has now: where its credentials' keys went, and where they go.
+#[test]
+fn a_change_leaves_an_audit_line_naming_the_base_url_it_had_and_has() {
+    let before = EndpointRow {
+        name: "t1-audited".to_owned(),
+        dialect: "openai".to_owned(),
+        platform: "plain".to_owned(),
+        base_url: Some("http://127.0.0.1:9/v1".to_owned()),
+        auth: "bearer".to_owned(),
+        region: None,
+        project: None,
+        api_version: None,
+        path: None,
+        extra_headers: json!({}),
+        display_name: None,
+        discover_models: false,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
+    };
+    let after = EndpointRow {
+        base_url: Some("http://127.0.0.2:9/v1".to_owned()),
+        ..before.clone()
+    };
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        audit_update(&actor(), &before, &after);
+    });
+    let log = String::from_utf8_lossy(&captured.0.lock().expect("log")).into_owned();
+    for says in [
+        "oag::audit",
+        "ops@example.invalid",
+        "endpoint.update",
+        "t1-audited",
+        // Quoted, as tracing prints every text field it is handed.
+        r#"base_url_from="http://127.0.0.1:9/v1""#,
+        r#"base_url_to="http://127.0.0.2:9/v1""#,
+    ] {
+        assert!(log.contains(says), "{says}: {log}");
+    }
+}
+
 #[tokio::test]
 async fn a_check_asks_the_stored_endpoint_and_reports_what_it_found() {
     let Some(state) = crate::testing::live_state().await else {

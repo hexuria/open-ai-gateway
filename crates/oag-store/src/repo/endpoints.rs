@@ -170,6 +170,16 @@ pub async fn endpoint_references(db: &Db) -> Result<HashMap<String, EndpointRefe
         .collect())
 }
 
+/// How many credentials are filed under the endpoint `name`, in rotation or
+/// not: the keys a request to it can carry.
+pub async fn endpoint_account_count(db: &Db, name: &str) -> Result<i64> {
+    sqlx::query_scalar("SELECT count(*) FROM account WHERE provider = $1")
+        .bind(name)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("counting {name}'s credentials: {e}")))
+}
+
 /// What [`delete_endpoint`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EndpointDeletion {

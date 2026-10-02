@@ -12,7 +12,7 @@
 //! asks one row the reload's own question.
 
 use crate::egress::{deny_resolved_target, validate_endpoint_base_url};
-use oag_core::endpoint::{CheckedColumns, Columns, Reason, Refusal};
+use oag_core::endpoint::{CheckedColumns, Columns, Reason, Refusal, endpoint_base_url};
 use oag_core::provider::{AuthStyle, Platform};
 use oag_store::repo::{self, EndpointUpdate, EndpointUpdated, NewEndpoint};
 use oag_store::{Db, EndpointRow};
@@ -142,6 +142,26 @@ impl Draft {
     }
 }
 
+/// Whether a change may move an endpoint's base URL while credentials are
+/// filed under it.
+///
+/// The base URL is where every request under the endpoint's name goes, with
+/// one of its credentials' keys in it, and where discovery sends each of them
+/// to read the model list. Moving it moves every one of those keys to the new
+/// host: whoever can change it, and could not open the keys, could otherwise
+/// have them all sent somewhere of their choosing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysMove {
+    /// Refused while any credential is filed under the endpoint: the admin
+    /// API's rule. Its caller holds an admin key, not the database and the
+    /// key-encryption key, with which they could have read the keys anyway.
+    Refused,
+    /// Allowed: the CLI's, once its operator has said so with
+    /// `--yes-move-keys`. It runs with the database and the key-encryption
+    /// key, so nothing it moves is a key it could not already read.
+    Allowed,
+}
+
 /// Why an endpoint write was not made.
 #[derive(Debug)]
 pub enum WriteError {
@@ -154,6 +174,10 @@ pub enum WriteError {
     /// Someone else wrote the endpoint after the caller read it, and nothing
     /// was written: the caller's 409, or a cue to read it again.
     Changed,
+    /// The change moves the base URL, this many credentials are filed under
+    /// the endpoint, and [`KeysMove::Refused`] was asked for: the caller's
+    /// 409, or a CLI's cue for `--yes-move-keys`. Nothing was written.
+    KeysWouldMove { accounts: i64 },
     /// The database failed: the caller's 500.
     Failed(oag_core::Error),
 }
@@ -171,6 +195,11 @@ impl WriteError {
                 "endpoint '{name}' was changed by someone else while this changed it, so \
                  nothing was written; see `oag admin endpoint show {name}` and run the command \
                  again"
+            )),
+            Self::KeysWouldMove { accounts } => oag_core::Error::Config(format!(
+                "endpoint '{name}' has {accounts} credential(s), and every one of their keys \
+                 would be sent to the new base URL, so nothing was written; run it again with \
+                 --yes-move-keys if that host is meant to have them"
             )),
             Self::Failed(e) => e,
         }
@@ -198,10 +227,14 @@ pub async fn register(db: &Db, draft: Draft) -> Result<EndpointRow, WriteError> 
 /// nothing written, rather than undone by a draft that never saw it. Every
 /// field a draft does not change is one it copied from `stored`, so writing
 /// it over a later row would put back whatever that writer changed.
+///
+/// A new base URL on an endpoint with credentials sends their keys to it, and
+/// `keys` says whether that may happen here: see [`KeysMove`].
 pub async fn change(
     db: &Db,
     stored: &EndpointRow,
     draft: Draft,
+    keys: KeysMove,
 ) -> Result<EndpointRow, WriteError> {
     let same = (
         draft.name.as_str(),
@@ -216,7 +249,15 @@ pub async fn change(
         return Err(WriteError::Invalid(FIXED.to_owned()));
     }
     let (draft, platform) = checked(draft).map_err(WriteError::Invalid)?;
-    if draft.base_url != stored.base_url {
+    if moves_base_url(stored, draft.base_url.as_deref()) {
+        if keys == KeysMove::Refused {
+            let accounts = repo::endpoint_account_count(db, &stored.name)
+                .await
+                .map_err(WriteError::Failed)?;
+            if accounts > 0 {
+                return Err(WriteError::KeysWouldMove { accounts });
+            }
+        }
         resolves(&draft, platform).await?;
     }
     match repo::update_endpoint(db, &stored.name, &draft.update(stored.updated_at)).await {
@@ -225,6 +266,26 @@ pub async fn change(
         Ok(EndpointUpdated::Changed) => Err(WriteError::Changed),
         Err(e) => Err(write_error(e)),
     }
+}
+
+/// Whether `to`, a base URL as the rules store one, sends `stored`'s requests
+/// somewhere other than its own base URL does.
+///
+/// The stored one is compared in the form the rules give it now, so a row
+/// written before they normalised as they do is not moved by a change that
+/// leaves its URL alone. A stored URL the rules no longer accept is compared
+/// as written.
+#[must_use]
+pub fn moves_base_url(stored: &EndpointRow, to: Option<&str>) -> bool {
+    let from = stored.base_url.as_deref().map(|url| {
+        stored
+            .platform
+            .parse::<Platform>()
+            .ok()
+            .and_then(|platform| endpoint_base_url(url, platform).ok())
+            .unwrap_or_else(|| url.to_owned())
+    });
+    from.as_deref() != to
 }
 
 /// `draft` as it is stored, and its platform, or the first rule it breaks.

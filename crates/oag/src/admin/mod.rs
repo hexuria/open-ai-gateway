@@ -291,6 +291,11 @@ pub struct EndpointSetArgs {
     /// `--discover` turns discovery on, `--discover false` off.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     discover: Option<bool>,
+    /// Move the base URL of an endpoint that has credentials. Every key filed
+    /// under it goes to the new URL from its next request, so without this a
+    /// new --base-url is refused while any credential is filed under it.
+    #[arg(long)]
+    yes_move_keys: bool,
 }
 
 /// The one command that changes a principal's authority.

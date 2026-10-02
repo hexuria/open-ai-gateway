@@ -312,6 +312,7 @@ async fn a_change_made_from_a_row_another_writer_changed_is_refused() {
             display_name: Some("First".to_owned()),
             ..Draft::from_row(&stored)
         },
+        KeysMove::Refused,
     )
     .await;
     let second = change(
@@ -321,6 +322,7 @@ async fn a_change_made_from_a_row_another_writer_changed_is_refused() {
             discover_models: true,
             ..Draft::from_row(&stored)
         },
+        KeysMove::Refused,
     )
     .await;
     let now = repo::get_endpoint(&db, &name).await.expect("read");
@@ -362,7 +364,7 @@ async fn a_change_keeps_what_the_endpoint_is_and_resolves_only_a_new_url() {
             ..Draft::from_row(&stored)
         },
     ] {
-        match change(&db, &stored, moved).await {
+        match change(&db, &stored, moved, KeysMove::Allowed).await {
             Err(WriteError::Invalid(message)) => assert_eq!(message, FIXED),
             other => panic!("a change of what the endpoint is: {other:?}"),
         }
@@ -374,7 +376,7 @@ async fn a_change_keeps_what_the_endpoint_is_and_resolves_only_a_new_url() {
         display_name: Some("Renamed".to_owned()),
         ..Draft::from_row(&stored)
     };
-    match change(&db, &stored, renamed).await {
+    match change(&db, &stored, renamed, KeysMove::Allowed).await {
         Err(WriteError::Failed(e)) => assert!(e.to_string().contains("updating endpoint")),
         other => panic!("an unchanged URL is not resolved again: {other:?}"),
     }
@@ -384,7 +386,7 @@ async fn a_change_keeps_what_the_endpoint_is_and_resolves_only_a_new_url() {
         base_url: Some("https://another-host.invalid/v1".to_owned()),
         ..Draft::from_row(&stored)
     };
-    match change(&db, &stored, moved).await {
+    match change(&db, &stored, moved, KeysMove::Allowed).await {
         Err(WriteError::Invalid(message)) => {
             assert!(
                 message.starts_with("resolving another-host.invalid"),
