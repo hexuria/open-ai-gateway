@@ -207,8 +207,11 @@ fn v6_is_denied(ip: Ipv6Addr) -> bool {
 }
 
 fn is_metadata_host(name: &str) -> bool {
-    // Compared case-insensitively; DNS is.
-    let name = name.to_ascii_lowercase();
+    // Compared case-insensitively, as DNS compares names, and without the
+    // trailing dots that make a name fully qualified: DNS reads
+    // `metadata.google.internal.` as `metadata.google.internal`, so it is the
+    // same metadata server.
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
     matches!(
         name.as_str(),
         "metadata" | "metadata.google.internal" | "metadata.google.com" | "metadata.azure.com"
@@ -356,6 +359,25 @@ mod tests {
                 "{raw} is a metadata hostname and must fail closed"
             );
         }
+    }
+
+    /// A metadata server's name with the trailing dot that makes it fully
+    /// qualified names the same server: DNS reads `metadata.google.internal.`
+    /// as `metadata.google.internal`, and so must this.
+    #[test]
+    fn a_metadata_hostname_is_refused_with_its_trailing_dot() {
+        for raw in [
+            "http://metadata.google.internal./computeMetadata/v1/",
+            "http://METADATA.Google.Internal./",
+            "http://metadata.google.com./",
+            "http://metadata.azure.com./metadata/instance",
+            "http://metadata./",
+        ] {
+            let err = catalog_url(raw).unwrap_err().to_string();
+            assert!(err.contains("link-local or cloud-metadata"), "{raw}: {err}");
+        }
+        // A name that only ends like one is someone else's.
+        catalog_url("http://metadata.google.internal.example./").unwrap();
     }
 
     #[test]

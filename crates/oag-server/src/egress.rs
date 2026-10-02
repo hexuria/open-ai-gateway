@@ -91,6 +91,10 @@ mod tests {
                 "http://metadata.google.internal/v1",
                 "link-local or cloud-metadata",
             ),
+            (
+                "http://metadata.google.internal./v1",
+                "link-local or cloud-metadata",
+            ),
             ("https://api.openai.com/v1", "openai.com"),
             ("https://API.Anthropic.com.:443", "anthropic.com"),
             ("https://h.example/v1?key=1", "contains '?'"),
