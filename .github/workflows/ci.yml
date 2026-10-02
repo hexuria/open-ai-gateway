@@ -249,10 +249,18 @@ jobs:
   # and fails if the tests still pass. That is how `claim_slot` shipped with
   # its refusal branch unexercised. Diff-scoped so the cost follows the PR;
   # with the backends bound, because a gated test that skips kills nothing.
-  mutants:
+  # Sharded: a whole train of PRs (#140: 1065 mutants at 10-22 s each) cannot
+  # finish in one 60-minute job, and a cancelled job tests nothing. Ten shards
+  # keep each one well inside the limit; `mutants` below is the one check the
+  # branch requires, and it is green only when every shard is.
+  mutants-shard:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     services:
       postgres:
         image: postgres:18-alpine
@@ -303,9 +311,21 @@ jobs:
       # leaves an argument unused failed to build and was counted "unviable"
       # instead of tested -- 27 of 29 on #97, against 6 of 29 locally.
       - name: cargo mutants
-        run: cargo mutants --no-shuffle --cap-lints true --in-diff "$RUNNER_TEMP/pr.diff" -o "$RUNNER_TEMP"
+        run: cargo mutants --no-shuffle --cap-lints true --shard "${SHARD}/10" --in-diff "$RUNNER_TEMP/pr.diff" -o "$RUNNER_TEMP"
+        env:
+          SHARD: ${{ matrix.shard }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: mutants.out
+          name: mutants.out-${{ matrix.shard }}
           path: ${{ runner.temp }}/mutants.out
+
+  mutants:
+    if: always() && github.event_name == 'pull_request'
+    needs: mutants-shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: every shard passed
+        run: test "$RESULT" = success
+        env:
+          RESULT: ${{ needs.mutants-shard.result }}
