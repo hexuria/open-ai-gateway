@@ -303,6 +303,37 @@ impl ServiceRow {
     }
 }
 
+/// An upstream an operator registered, as stored.
+///
+/// Strings, not the core types: the store persists what it is given, and the
+/// schema's CHECKs are the second line behind whoever parses these. There is no
+/// key here and never will be. A credential for an endpoint is an `account` row
+/// whose `provider` is this row's `name`.
+#[derive(Debug, Clone, PartialEq, FromRow)]
+pub struct EndpointRow {
+    /// Identity and model prefix: `groq` serves `groq/<model>`.
+    pub name: String,
+    /// `openai`, `anthropic`, `gemini`, `system_one` or `bedrock_converse`.
+    pub dialect: String,
+    /// `plain`, `azure`, `aws` or `gcp`.
+    pub platform: String,
+    /// `None` only on `aws` and `gcp`, whose host comes from the region.
+    pub base_url: Option<String>,
+    /// How the key is presented to a `plain` upstream: `bearer`, `x_api_key`,
+    /// `x_goog_api_key`, `api_key_header` or `none`.
+    pub auth: String,
+    pub region: Option<String>,
+    pub project: Option<String>,
+    pub api_version: Option<String>,
+    /// A JSON object of headers that carry no authority. The schema promises
+    /// only that it is an object; its values are for the caller to check.
+    pub extra_headers: serde_json::Value,
+    pub display_name: Option<String>,
+    pub discover_models: bool,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
 /// A row to append to the ledger.
 #[derive(Debug, Clone)]
 pub struct UsageWrite {

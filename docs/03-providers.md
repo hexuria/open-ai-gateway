@@ -349,6 +349,17 @@ evicts by idle time; an evicted transport's in-flight requests are unaffected,
 because the `Arc` outlives the cache entry — a long-running stream is never cut
 short by eviction.
 
+**No redirects.** Neither the transport nor the client behind token refresh,
+quota polls, model lists and price lookups follows one, because every request
+either of them sends carries a credential. `reqwest`, following a redirect to
+another host, strips `authorization` and nothing else: `x-api-key`,
+`x-goog-api-key`, `api-key` and Bedrock's `x-amz-security-token` went along to
+wherever `Location` pointed, and a 307 or 308 posted the body there as well —
+a refresh token, on a refresh. So a provider's 3xx is an error. The request
+fails without trying another credential, since every one would be sent the same
+redirect, and the client gets a 502 `upstream_error` with the provider's status
+in `upstream_status`. When a provider moves, point its base URL at where it went.
+
 **System proxy settings.** The build turns on `reqwest`'s `system-proxy`
 feature (it comes in with `typesafe-sdk`, and Cargo enables a feature for the
 whole binary). On macOS and Windows every upstream client — chat, refresh, usage

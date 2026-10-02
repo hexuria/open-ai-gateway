@@ -60,6 +60,14 @@ impl HttpTransport {
             .pool_max_idle_per_host(32)
             .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(30))
+            // No redirects. Every request through here carries a key, and
+            // reqwest, following a redirect to another host, strips
+            // `authorization` and nothing else: `x-api-key`, `x-goog-api-key`,
+            // `api-key` and Bedrock's session token went to wherever `Location`
+            // pointed, and a 307 or 308 posted the body there too. A redirect
+            // comes back as the response instead, and the caller reports it
+            // as the upstream error it is.
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("open-ai-gateway/", env!("CARGO_PKG_VERSION")));
 
         if let Some(url) = proxy {
@@ -208,6 +216,61 @@ mod tests {
             ),
             "a silent provider is failed over, like a 5xx"
         );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_handed_back_and_never_followed_with_the_key() {
+        // reqwest, following a redirect to another host, strips
+        // `authorization` and nothing else: an `x-api-key`, `x-goog-api-key`
+        // or `api-key` went along to wherever `Location` pointed, and a 307 or
+        // 308 posted the body there too. Two ports on one address are two
+        // origins to it, which is the hop this needs.
+        use wiremock::matchers::{any, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [307u16, 308, 301, 302, 303] {
+            let elsewhere = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200).set_body_string("elsewhere answered"))
+                .expect(0)
+                .mount(&elsewhere)
+                .await;
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("location", format!("{}/v1/messages", elsewhere.uri())),
+                )
+                .expect(1)
+                .mount(&upstream)
+                .await;
+
+            let transport =
+                HttpTransport::new(None, Duration::from_secs(5), Duration::from_secs(5))
+                    .expect("transport");
+            let req = reqwest::Client::new()
+                .post(format!("{}/v1/messages", upstream.uri()))
+                .header("x-api-key", "key-must-stay-home")
+                .body("{}")
+                .build()
+                .expect("request");
+            let response = transport.execute(req).await.expect("the upstream answered");
+
+            // First, because it is the point: nothing reached the other host.
+            elsewhere.verify().await;
+            upstream.verify().await;
+            assert_eq!(
+                response.status().as_u16(),
+                status,
+                "the redirect itself comes back, for the caller to report"
+            );
+            assert_ne!(
+                response.text().await.expect("body"),
+                "elsewhere answered",
+                "{status}"
+            );
+        }
     }
 
     #[tokio::test]

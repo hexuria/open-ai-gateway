@@ -552,6 +552,21 @@ mod tests {
     }
 
     #[test]
+    fn a_redirect_is_fatal_rather_than_a_reason_to_try_another_key() {
+        // The upstream transport follows no redirect, so a provider's 3xx
+        // arrives here. It is about the URL, which every credential for that
+        // provider shares: another key would be sent the same redirect, and
+        // nothing about the request was too much for the model.
+        for status in [300u16, 301, 302, 303, 307, 308] {
+            assert_eq!(
+                upstream(status).disposition(),
+                Disposition::Fatal,
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
     fn being_at_capacity_is_not_treated_as_a_missing_credential() {
         // One is a config problem and one is a sizing problem. Collapsing them
         // sends whoever is on call to look at the credential pool when what

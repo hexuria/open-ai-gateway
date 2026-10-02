@@ -69,8 +69,15 @@ re-authenticate against the wrong thing.
 Not 503 either: 503 means "come back shortly", and a pool of dead keys will not
 heal on its own.
 
-So for a client: `upstream_error` + 502 means *the operator has a credential
-problem*. `upstream_error` + 400 means *your request*, and `error.upstream` says
+**Every 3xx** becomes 502 too. The gateway follows no redirect from a provider,
+because the provider's key would go with it, so a 3xx reaching the client is a
+provider that has moved. Passed through, it would tell the client to send its
+request somewhere else and name nowhere: the provider's `Location` is not
+forwarded. The provider's status is still in `upstream_status`.
+
+So for a client: `upstream_error` + 502 means *the operator has something to
+fix* — a dead credential, or a provider that moved, and `upstream_status` says
+which. `upstream_error` + 400 means *your request*, and `error.upstream` says
 why in the provider's own words.
 
 ### The three 503s are not interchangeable

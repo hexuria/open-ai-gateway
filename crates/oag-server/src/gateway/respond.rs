@@ -322,12 +322,18 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
 /// "come back shortly" and neither of which is true of a pool whose keys are all
 /// dead.
 ///
+/// A **3xx** is 502 as well. It tells the client to send its request, gateway
+/// key and all, somewhere else, and names nowhere: the provider's `Location` is
+/// not forwarded, and is not the client's to follow. The upstream transport
+/// follows no redirect, because a key would go with it, so one arriving here is
+/// a provider that has moved, and its base URL is ours to fix.
+///
 /// Everything else keeps the provider's status, because everything else is
 /// already about the right party: 400, 413 and 422 are the client's own request,
 /// and 5xx already reads as ours.
 fn client_status_for(upstream: u16) -> StatusCode {
     match upstream {
-        401..=403 | 407 => StatusCode::BAD_GATEWAY,
+        300..=399 | 401..=403 | 407 => StatusCode::BAD_GATEWAY,
         other => StatusCode::from_u16(other).unwrap_or(StatusCode::BAD_GATEWAY),
     }
 }
