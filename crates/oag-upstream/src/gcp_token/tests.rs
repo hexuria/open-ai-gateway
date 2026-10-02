@@ -858,3 +858,65 @@ async fn a_failed_mint_is_remembered_for_fifteen_seconds() {
     );
     server.verify().await;
 }
+
+/// A token past the point it is replaced is still a token. When the mint
+/// that should replace it fails, it is handed out while it has more than
+/// thirty seconds left; inside those, the failure is the caller's.
+#[tokio::test]
+async fn a_token_outlives_a_failed_refresh_until_its_last_thirty_seconds() {
+    static NOW: AtomicI64 = AtomicI64::new(T0);
+    fn now() -> i64 {
+        NOW.load(Ordering::SeqCst)
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(granted("ya29.first"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    // Google, briefly unreachable from here on.
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let cache = GcpTokenCache::new(token_url(&server))
+        .expect("a client")
+        .with_clock(now);
+    let (account, key) = (AccountId::new(), key_json().to_string());
+
+    assert_eq!(
+        cache.token(account, &key, None).await.expect("minted"),
+        "ya29.first"
+    );
+    // Two hundred seconds left: due to be replaced, and the replacement fails.
+    NOW.store(T0 + 3400, Ordering::SeqCst);
+    assert_eq!(
+        cache
+            .token(account, &key, None)
+            .await
+            .expect("the token in hand"),
+        "ya29.first"
+    );
+    assert_eq!(grants(&server).await.len(), 2, "the refresh was tried");
+    // Thirty-one seconds left, and the refresh still fails.
+    NOW.store(T0 + 3569, Ordering::SeqCst);
+    assert_eq!(
+        cache
+            .token(account, &key, None)
+            .await
+            .expect("still the token in hand"),
+        "ya29.first"
+    );
+    // Twenty-nine left: too few to set out with.
+    NOW.store(T0 + 3571, Ordering::SeqCst);
+    let err = cache
+        .token(account, &key, None)
+        .await
+        .expect_err("too close to its expiry");
+    assert!(err.to_string().contains("503"), "{err}");
+    server.verify().await;
+}

@@ -104,6 +104,11 @@ const MINT_TIMEOUT: Duration = Duration::from_secs(10);
 /// for the account in that time, with no request to the token endpoint.
 const FAILURE_TTL_SECS: i64 = 15;
 
+/// How long a token must still have to be handed out when the mint that
+/// should have replaced it failed: long enough for a request to set out with
+/// it and be answered.
+const LAST_RESORT_SECS: i64 = 30;
+
 /// The parts of a service-account JSON key that a mint needs.
 ///
 /// `token_uri` is left out on purpose, and must stay out. The key file names a
@@ -391,6 +396,16 @@ struct Held {
     failed: Option<Failed>,
 }
 
+impl Held {
+    /// The token in hand, while it has more than [`LAST_RESORT_SECS`] left:
+    /// past the point it is replaced, but still good to set out with.
+    fn last_resort(&self, now: i64) -> Option<&Minted> {
+        self.minted
+            .as_ref()
+            .filter(|m| now < m.expires_at - LAST_RESORT_SECS)
+    }
+}
+
 /// A slot per account. At most one mint is in flight per account, because the
 /// mint happens while the slot is locked.
 type Slot = Arc<tokio::sync::Mutex<Held>>;
@@ -474,6 +489,11 @@ impl GcpTokenCache {
     /// kept for [`FAILURE_TTL_SECS`] and handed to every caller in that time
     /// without another request to the token endpoint. A caller that is
     /// cancelled mid-mint abandons it, and the next one starts over.
+    ///
+    /// A token past the point it is replaced is still a token. When the mint
+    /// that should replace it fails, it is handed out while it has more than
+    /// [`LAST_RESORT_SECS`] left, and the failure is the caller's only after
+    /// that.
     pub async fn token(
         &self,
         account: AccountId,
@@ -498,7 +518,10 @@ impl GcpTokenCache {
             .as_ref()
             .filter(|f| now < f.at.saturating_add(FAILURE_TTL_SECS))
         {
-            return Err(failed.error());
+            return held
+                .last_resort(now)
+                .map(|m| m.access_token.clone())
+                .ok_or_else(|| failed.error());
         }
 
         match self.mint(sa_json, proxy, now).await {
@@ -513,7 +536,18 @@ impl GcpTokenCache {
             Err(failed) => {
                 let error = failed.error();
                 held.failed = Some(failed);
-                Err(error)
+                match held.last_resort(now) {
+                    Some(minted) => {
+                        tracing::warn!(
+                            %account,
+                            seconds_left = minted.expires_at - now,
+                            error = %error,
+                            "a new Google token could not be minted; the one in hand is used while it lasts"
+                        );
+                        Ok(minted.access_token.clone())
+                    }
+                    None => Err(error),
+                }
             }
         }
     }

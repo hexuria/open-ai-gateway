@@ -746,8 +746,10 @@ Google again; and the credential cools down as one an upstream refused does:
 ten minutes for a key Google refuses or one that cannot be read, thirty seconds
 for a token endpoint that failed to answer. When no credential can mint, the
 client is answered 503 `upstream_unavailable`, its message naming Google's
-refusal. No log line and no answer holds the key, the signed assertion or a
-token.
+refusal. A token already in hand is used instead while it has more than thirty
+seconds left: a mint that fails is the one replacing it five minutes early,
+and the log says so. No log line and no answer holds the key, the signed
+assertion or a token.
 
 ## Which dialect reaches which upstream
 
