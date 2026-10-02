@@ -121,6 +121,7 @@ async fn scenario(db_url: String, redis_url: String) {
     unknown_models(&gw, &hosts).await;
     listing(&gw, &hosts).await;
     failover(&gw, &hosts, merge_a, merge_b).await;
+    a_host_whose_listing_fails(&gw, &hosts, [merge_a, merge_b]).await;
     removed(&gw, &hosts).await;
 }
 
@@ -461,6 +462,79 @@ async fn listing(gw: &Gateway, hosts: &Hosts) {
         body,
         json!({"models": [{"name": MERGE_MODEL, "description": "", "release_date": ""}]})
     );
+}
+
+/// C7. A host whose listing fails is left out of it, and the others are
+/// listed: Jev's models and `selfjev`'s. Merge refuses the listing with a
+/// Retry-After, and neither of its keys is parked for it. This runs after the
+/// failover step because a listing leases a key as a question set does, so it
+/// moves the caller's pin, which that step starts from.
+async fn a_host_whose_listing_fails(gw: &Gateway, hosts: &Hosts, merge_keys: [Uuid; 2]) {
+    let before = [
+        parked(gw, merge_keys[0]).await,
+        parked(gw, merge_keys[1]).await,
+    ];
+    let mocks = [
+        listing_mock(
+            &hosts.jev,
+            Page::Unpaged,
+            None,
+            json!({"models": [
+                {"name": "jev-latest", "description": "Fast", "release_date": "2026-08-01"}
+            ]}),
+        )
+        .await,
+        listing_mock(
+            &hosts.selfjev,
+            Page::First,
+            None,
+            json!({"models": [
+                {"name": "jev-latest", "description": "Fast", "release_date": "2026-08-01"}
+            ]}),
+        )
+        .await,
+    ];
+    let failing = Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "600")
+                .set_body_string("t7: listing is down"),
+        )
+        .mount_as_scoped(&hosts.merge)
+        .await;
+
+    let listing = gw
+        .sdk()
+        .models()
+        .await
+        .expect("listed without the host that failed");
+    let names: Vec<&str> = listing.models.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["jev-latest", "selfjev/jev-latest"]);
+    for mock in &mocks {
+        only_request(mock).await;
+    }
+    assert!(
+        !failing.received_requests().await.is_empty(),
+        "the failing host was asked"
+    );
+    let after = [
+        parked(gw, merge_keys[0]).await,
+        parked(gw, merge_keys[1]).await,
+    ];
+    assert_eq!(after, before, "a listing parks no key");
+}
+
+/// A key's `cooldown_until` and `rate_limited_until`.
+async fn parked(
+    gw: &Gateway,
+    key: Uuid,
+) -> (Option<time::OffsetDateTime>, Option<time::OffsetDateTime>) {
+    sqlx::query_as("SELECT cooldown_until, rate_limited_until FROM account WHERE id = $1")
+        .bind(key)
+        .fetch_one(gw.db.pool())
+        .await
+        .expect("the account")
 }
 
 /// A 429 on the host's first key is served by its second: one request each,

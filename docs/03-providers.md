@@ -911,8 +911,15 @@ says what it outputs (in `capabilities.output`, at its top level or under any
 vendor) is listed only if a `decision` is among it; an entry that says nothing
 is listed. A host is asked for pages of 500, the most Merge allows, and its
 cursor is followed until it says there are no more, repeats one, or eight pages
-have been read. A host whose listing fails fails the whole listing, as Jev's
-always has, rather than quietly leaving its models out.
+have been read. A provider whose listing fails is left out of it, with a
+warning naming it in the log, and every other one is listed: one host that
+cannot list does not hide what the rest serve. Only when every provider the
+route holds a key for fails does the listing fail, with the first one's error,
+as Jev's failing always has. Nor does a listing count against a key: its
+failures trip no breaker and cool no key down, and its successes close no
+breaker, because a host's model list failing says nothing about whether its
+keys answer questions. A model the listing shows is asked only once a catalog
+row prices it (rule 3).
 
 ## Framing
 

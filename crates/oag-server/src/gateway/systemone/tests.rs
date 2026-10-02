@@ -1059,6 +1059,44 @@ async fn the_route_s_rate_limit_counts_system_one_requests() {
     assert_eq!(gw.mock.calls().len(), 1, "the throttled one never left");
 }
 
+/// C7. A listing that fails benches no key and counts against no breaker:
+/// past the breaker's threshold of failures, every listing still reaches the
+/// key, nothing in the store parks it, and its breaker still admits it. A
+/// host's model list failing says nothing about whether its keys answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_listing_benches_no_key_and_trips_no_breaker() {
+    let Some(gw) = Gateway::start(CHAT_LADDER, None).await else {
+        return;
+    };
+    let key = gw.add_jev_key("jev-key-a", 0).await;
+    gw.mock.behave("jev-key-a", Behaviour::Refuse(500));
+
+    // One more than the breaker's threshold of five. Each is Jev's own 500,
+    // not "no credential": the key was there to ask every time.
+    for listing in 0..6 {
+        let response = gw.post_get("/jev/v1/models").await;
+        assert_eq!(response.status(), 500, "listing {listing}");
+        let body = json_of(response).await;
+        assert_eq!(
+            body["error"]["upstream_status"], 500,
+            "listing {listing}: {body}"
+        );
+    }
+    assert_eq!(
+        gw.mock.calls_with("jev-key-a"),
+        6,
+        "every listing reached the key: none was benched by the one before"
+    );
+    assert_eq!(gw.benched(key).await, (None, None), "nothing parks the key");
+    assert!(
+        gw.state.breakers.permits(
+            AccountId::from_uuid(key),
+            time::OffsetDateTime::now_utc().unix_timestamp()
+        ),
+        "and its breaker never opened"
+    );
+}
+
 /// The listing is Jev's own, unchanged, with its request id.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_jev_listing_passes_through_unchanged() {

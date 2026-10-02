@@ -135,6 +135,7 @@ async fn ask(
         &route,
         target.provider,
         request_id,
+        Purpose::Answer,
         |upstream, credential| upstream.system_one(credential, body.clone()),
         decoded::<SystemOneResponse>,
     )
@@ -349,8 +350,13 @@ impl<'de> Deserialize<'de> for Members<'de> {
 /// `<endpoint>/<name>` — the name [`resolve`] sends to that endpoint.
 ///
 /// A provider the route holds no credential for lists nothing. One that is
-/// there and fails fails the listing, as Jev's failing always has: a listing
-/// that quietly left a host out would read as that host having no models.
+/// there and fails is left out, and its failure logged under its name, so one
+/// host that cannot list does not stop the caller seeing what every other one
+/// serves. Only when every provider there failed does the listing fail, with
+/// the first one's error, as Jev's failing always has.
+///
+/// A listing touches no breaker and no cooldown ([`Purpose::Listing`]): a
+/// host's model list failing says nothing about whether its keys answer.
 async fn list(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
@@ -360,6 +366,7 @@ async fn list(
     let mut jev = None;
     let mut hosted: Vec<ModelMetadata> = Vec::new();
     let mut hosts_listed = false;
+    let mut failed: Option<Error> = None;
     for provider in state.system_one_providers() {
         match listed(state, auth, &route, provider, request_id).await {
             Ok(Listed::Jev(reply)) => jev = Some(reply),
@@ -368,15 +375,21 @@ async fn list(
                 hosted.extend(models);
             }
             Err(Error::SystemOneNotConfigured { .. }) => {}
-            Err(e) => return Err(e),
+            Err(e) => {
+                tracing::warn!(
+                    %request_id, %provider, error = %e,
+                    "a System One provider could not list its models; listing the others"
+                );
+                failed.get_or_insert(e);
+            }
         }
     }
     match jev {
         Some(reply) if !hosts_listed => Ok(relay(*reply, None, request_id)),
-        None if !hosts_listed => Err(Error::SystemOneNotConfigured {
+        None if !hosts_listed => Err(failed.unwrap_or(Error::SystemOneNotConfigured {
             route: route.name,
             provider: Provider::Jev,
-        }),
+        })),
         jev => {
             let models = jev
                 .into_iter()
@@ -412,6 +425,7 @@ async fn listed(
             route,
             provider,
             request_id,
+            Purpose::Listing,
             JevUpstream::models,
             decoded::<ListModelsResponse>,
         )
@@ -430,6 +444,7 @@ async fn listed(
             route,
             provider,
             request_id,
+            Purpose::Listing,
             |upstream, credential| upstream.models_page(credential, cursor.as_deref()),
             listing_page,
         )
@@ -515,6 +530,64 @@ struct Answered<T> {
     reply: Reply<T>,
 }
 
+/// What a request through [`call`] is for, which decides what its outcome
+/// says about the credential that carried it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// A question set: its failures count against the credential's breaker
+    /// and cool it down, and its successes close the breaker, as a chat
+    /// request's do.
+    Answer,
+    /// A model listing: it touches neither the breaker nor the cooldowns. A
+    /// host whose `/v1/models` fails is not a host whose answers fail, and
+    /// benching its keys over a listing would take them out of the rotation
+    /// that serves question sets; nor does a listing that works say a key the
+    /// breaker opened on answers again. It claims no half-open probe either,
+    /// so one stays for a question set to spend.
+    Listing,
+}
+
+/// The credential's breaker and cooldowns, as one attempt under `purpose`
+/// writes to them: as the chat path does for [`Purpose::Answer`], and not at
+/// all for [`Purpose::Listing`].
+struct Health<'a> {
+    state: &'a AppState,
+    account: AccountId,
+    purpose: Purpose,
+}
+
+impl Health<'_> {
+    fn counts(&self) -> bool {
+        self.purpose == Purpose::Answer
+    }
+
+    fn succeeded(&self) {
+        if self.counts() {
+            self.state.breakers.record_success(self.account);
+        }
+    }
+
+    fn failed(&self) {
+        if self.counts() {
+            self.state.breakers.record_failure(self.account);
+        }
+    }
+
+    async fn dispose(&self, disposition: oag_core::Disposition) {
+        if self.counts() {
+            apply_disposition(self.state, self.account, disposition).await;
+        }
+    }
+
+    async fn unreachable(&self, retrying: bool) {
+        if self.counts()
+            && let Some(d) = transport_failure(&self.state.breakers, self.account, retrying)
+        {
+            apply_disposition(self.state, self.account, d).await;
+        }
+    }
+}
+
 /// Send one request through a credential of `provider` on the caller's route,
 /// failing over between them under the chat path's rules.
 ///
@@ -524,13 +597,16 @@ struct Answered<T> {
 /// chat path's rule for a body that is not JSON.
 ///
 /// Two bounds, as there: `max_account_switches` on how many credentials, and
-/// `failover_budget` on how long, checked only between them.
+/// `failover_budget` on how long, checked only between them. `purpose` says
+/// whether what happens counts against each credential's health.
+#[allow(clippy::too_many_arguments)]
 async fn call<T>(
     state: &Arc<AppState>,
     auth: &oag_store::AuthContext,
     route: &oag_store::RouteRow,
     provider: Provider,
     request_id: RequestId,
+    purpose: Purpose,
     build: impl Fn(&JevUpstream, &SecretMaterial) -> Result<reqwest::Request>,
     decode: impl Fn(&[u8]) -> Result<T>,
 ) -> Result<Answered<T>> {
@@ -580,7 +656,7 @@ async fn call<T>(
         };
         let account = lease.account.account_id();
         match attempt_on(
-            state, &upstream, &lease, provider, request_id, &build, &decode,
+            state, &upstream, &lease, provider, request_id, purpose, &build, &decode,
         )
         .await
         {
@@ -668,17 +744,27 @@ enum Tried<T> {
 }
 
 /// One credential, with bounded same-credential retries: `try_credential`'s
-/// rules, for a body that is sent whole and read whole.
+/// rules, for a body that is sent whole and read whole. What happens is
+/// recorded against the credential's health only for [`Purpose::Answer`].
+// One loop over one credential's attempts, as `try_credential`'s is, and
+// long for the same reason: each arm says what its outcome means.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn attempt_on<T>(
     state: &Arc<AppState>,
     upstream: &JevUpstream,
     lease: &select::Lease,
     provider: Provider,
     request_id: RequestId,
+    purpose: Purpose,
     build: &impl Fn(&JevUpstream, &SecretMaterial) -> Result<reqwest::Request>,
     decode: &impl Fn(&[u8]) -> Result<T>,
 ) -> Tried<T> {
     let account = lease.account.account_id();
+    let health = Health {
+        state,
+        account,
+        purpose,
+    };
     // For an API key this is the unseal, trimmed: it never expires, so there
     // is nothing to refresh.
     let credential = match refresh::ensure_fresh(state, &lease.account).await {
@@ -686,8 +772,14 @@ async fn attempt_on<T>(
         Err(e) => return Tried::Switch(e),
     };
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let Some(mut dispatch) = Dispatch::claim(&state.breakers, account, now) else {
-        return Tried::Raced;
+    // A listing claims no dispatch: it records nothing against the breaker,
+    // so it must not spend the half-open probe a question set is waiting on.
+    let mut dispatch = match purpose {
+        Purpose::Answer => match Dispatch::claim(&state.breakers, account, now) {
+            Some(dispatch) => Some(dispatch),
+            None => return Tried::Raced,
+        },
+        Purpose::Listing => None,
     };
 
     let retries = state.config.gateway.same_account_retries;
@@ -712,13 +804,15 @@ async fn attempt_on<T>(
         };
         let retries_left = attempt < retries;
 
-        dispatch.sent();
+        if let Some(dispatch) = dispatch.as_mut() {
+            dispatch.sent();
+        }
         let step = match transport.execute(request).await {
             Ok(response) if response.status().is_success() => {
                 let ceiling = state.config.gateway.max_stream_duration;
                 return match read(response, decode, ceiling).await {
                     Ok(reply) => {
-                        state.breakers.record_success(account);
+                        health.succeeded();
                         Tried::Answered(Box::new(reply))
                     }
                     Err(e) => {
@@ -726,7 +820,7 @@ async fn attempt_on<T>(
                             %request_id, %provider, %account, error = %e,
                             "System One upstream answered 2xx with no answer in it"
                         );
-                        state.breakers.record_failure(account);
+                        health.failed();
                         Tried::Switch(e)
                     }
                 };
@@ -738,8 +832,8 @@ async fn attempt_on<T>(
                     %request_id, %provider, %account, error = %last, ?disposition,
                     "System One upstream refused"
                 );
-                state.breakers.record_failure(account);
-                apply_disposition(state, account, disposition).await;
+                health.failed();
+                health.dispose(disposition).await;
                 step_for(disposition, retries_left)
             }
             // Silent for the whole headers deadline. Fail over at once, as the
@@ -750,8 +844,8 @@ async fn attempt_on<T>(
                     %request_id, %provider, %account, error = %e,
                     "System One upstream silent"
                 );
-                state.breakers.record_failure(account);
-                apply_disposition(state, account, e.disposition()).await;
+                health.failed();
+                health.dispose(e.disposition()).await;
                 return Tried::Switch(e);
             }
             // Nothing came back at all: connect, TLS or DNS.
@@ -760,9 +854,7 @@ async fn attempt_on<T>(
                     %request_id, %provider, %account, error = %e, retrying = retries_left,
                     "System One upstream unreachable"
                 );
-                if let Some(d) = transport_failure(&state.breakers, account, retries_left) {
-                    apply_disposition(state, account, d).await;
-                }
+                health.unreachable(retries_left).await;
                 last = e;
                 if retries_left {
                     Step::Retry
