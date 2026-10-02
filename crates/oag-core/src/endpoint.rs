@@ -147,6 +147,31 @@ pub fn is_location(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+/// Whether `value` is shaped like an AWS region, as `^[a-z]{2}(-[a-z]+)+-\d$`
+/// says: `us-east-1`, `eu-central-2`, `us-gov-west-1`.
+///
+/// Stricter than [`is_location`], which an aws endpoint's region passes too.
+/// The region is the host a request goes to
+/// (`bedrock-runtime.{region}.amazonaws.com`) and the scope its signature is
+/// made for, and AWS answers a signature scoped to something that is not a
+/// region as it answers a bad key. A Google-shaped `us-central1` would be
+/// loaded, sent, and fail on every credential the endpoint has, with an error
+/// that points at the credentials.
+#[must_use]
+pub fn is_aws_region(value: &str) -> bool {
+    let lower = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_lowercase());
+    let parts: Vec<&str> = value.split('-').collect();
+    let [area, words @ .., number] = parts.as_slice() else {
+        return false;
+    };
+    area.len() == 2
+        && lower(area)
+        && !words.is_empty()
+        && words.iter().copied().all(lower)
+        && number.len() == 1
+        && number.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Whether `value` may be a System One endpoint's path: `/`, then at most 127
 /// of letters, digits, `/`, `.`, `_` and `-`, in segments that are neither
 /// empty, `.` nor `..`.
@@ -268,6 +293,18 @@ impl EndpointConfig {
             }
         };
         let region = location(Reason::Region, columns.region, regional, platform)?;
+        if platform == Platform::Aws
+            && let Some(region) = region.as_deref()
+            && !is_aws_region(region)
+        {
+            return Err(Refusal::new(
+                Reason::Region,
+                format!(
+                    "region {region:?} is not an AWS region: one is shaped like us-east-1, \
+                     two letters, then words, then one digit, each after a `-`"
+                ),
+            ));
+        }
         let project = location(
             Reason::Project,
             columns.project,
@@ -551,6 +588,27 @@ mod tests {
         assert_eq!(aws.region.as_deref(), Some("eu-west-1"));
         assert_eq!(aws.extra_headers, []);
 
+        // Converse, for the models Bedrock serves that are not Claude, at a
+        // VPC endpoint rather than the regional host.
+        let converse = EndpointConfig::from_columns(&Columns {
+            name: "t9-core-converse",
+            dialect: "bedrock_converse",
+            platform: "aws",
+            base_url: Some("https://vpce-0a1b.bedrock-runtime.us-gov-west-1.vpce.amazonaws.com/"),
+            auth: "none",
+            region: Some("us-gov-west-1"),
+            ..plain(&json!({}))
+        })
+        .expect("a converse row");
+        assert_eq!(converse.endpoint.dialect(), Dialect::BedrockConverse);
+        assert_eq!(converse.endpoint.platform(), Platform::Aws);
+        assert_eq!(converse.region.as_deref(), Some("us-gov-west-1"));
+        assert_eq!(
+            converse.base_url.as_deref(),
+            Some("https://vpce-0a1b.bedrock-runtime.us-gov-west-1.vpce.amazonaws.com"),
+            "an aws row may name amazonaws.com, which a plain one may not"
+        );
+
         let gcp = EndpointConfig::from_columns(&Columns {
             name: "t4-core-gcp",
             dialect: "gemini",
@@ -646,11 +704,11 @@ mod tests {
                     platform: "aws",
                     base_url: None,
                     auth: "none",
-                    region: Some("us-east-1"),
+                    region: Some("us-central1"),
                     ..base
                 },
-                Reason::Dialect,
-                "not served by this build",
+                Reason::Region,
+                "region \"us-central1\" is not an AWS region",
             ),
             (
                 Columns {
@@ -940,6 +998,54 @@ mod tests {
         ] {
             assert!(!is_location(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn an_aws_region_is_shaped_like_one() {
+        for good in [
+            "us-east-1",
+            "eu-central-2",
+            "ap-southeast-4",
+            "us-gov-west-1",
+            "us-isob-east-1",
+            "il-central-1",
+        ] {
+            assert!(is_aws_region(good), "{good}");
+        }
+        for bad in [
+            "",
+            "us-central1",
+            "europe-west4",
+            "global",
+            "useast-1",
+            "u-east-1",
+            "usa-east-1",
+            "us-1",
+            "us--1",
+            "us-east-",
+            "us-east-12",
+            "us-east-x",
+            "US-EAST-1",
+            "us-east1-1",
+            "us-east-1-",
+            "-us-east-1",
+            "us-east-\u{661}",
+        ] {
+            assert!(!is_aws_region(bad), "{bad:?}");
+        }
+
+        // Only aws holds a region to it. Google's regions are not shaped so.
+        let gcp = EndpointConfig::from_columns(&Columns {
+            name: "t9-core-gcp",
+            dialect: "gemini",
+            platform: "gcp",
+            base_url: None,
+            auth: "bearer",
+            region: Some("us-central1"),
+            project: Some("p"),
+            ..plain(&json!({}))
+        });
+        assert!(gcp.is_ok(), "{gcp:?}");
     }
 
     /// Migration 0021's characters, and segments a URL parser would leave as

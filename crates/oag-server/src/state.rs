@@ -155,8 +155,10 @@ pub(crate) fn endpoint_upstream(
     row: &EndpointRow,
 ) -> std::result::Result<(Endpoint, Served), Refusal> {
     let config = row.to_endpoint()?;
-    // Only aws and gcp may have no base URL, and the factory refuses both
-    // platforms whatever it is given: the empty string is never sent.
+    // Only aws and gcp may have no base URL. An aws adapter reads the empty
+    // string as the region's own host, and the factory refuses gcp whatever
+    // it is given, so the empty string is never sent. The region is the row's:
+    // `gateway.bedrock_region` is the built-in provider's alone.
     let spec = EndpointSpec::new(
         config.endpoint,
         config.base_url.unwrap_or_default(),
@@ -164,7 +166,8 @@ pub(crate) fn endpoint_upstream(
         config.extra_headers,
     )
     .map_err(|e| Refusal::new(Reason::Headers, e))?
-    .with_discovery(row.discover_models);
+    .with_discovery(row.discover_models)
+    .with_region(config.region);
     // The words, not the `Display`, whose `configuration: ` would lead every
     // reason `oag admin endpoint list` and the console print.
     let unsupported = |e: Error| {
@@ -590,6 +593,15 @@ mod tests {
         }
     }
 
+    /// An aws endpoint row at a stand-in host. Nothing is ever sent there.
+    fn aws_row(name: &str, dialect: &str, region: &str) -> oag_store::EndpointRow {
+        let mut row = endpoint_row(name, dialect, "http://127.0.0.1:9");
+        row.platform = "aws".to_owned();
+        row.auth = "none".to_owned();
+        row.region = Some(region.to_owned());
+        row
+    }
+
     /// The provider an endpoint row of this name is served as. An endpoint is
     /// its name, so the dialect here does not have to be the row's.
     fn custom(name: &str) -> Provider {
@@ -694,6 +706,93 @@ mod tests {
         }
     }
 
+    /// What an adapter builds for one request with a packed AWS credential:
+    /// where it goes, and the scope its `SigV4` signature names.
+    fn signed(adapter: &Arc<dyn ProviderAdapter>) -> (String, String) {
+        let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+            "model": "m", "messages": [{ "role": "user", "content": "hi" }],
+        }))
+        .expect("parses");
+        let model = spec("t9/m", adapter.provider(), "m");
+        let credential = oag_core::credential::SecretMaterial {
+            access_token: "TESTACCESSKEY:TESTSECRETKEY".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        };
+        let built = adapter
+            .build(&oag_upstream::UpstreamRequest {
+                canonical: &canonical,
+                model: &model,
+                credential: &credential,
+                session: None,
+            })
+            .expect("builds");
+        let authorization = built.headers()["authorization"]
+            .to_str()
+            .expect("ASCII")
+            .to_owned();
+        let scope = authorization
+            .split('/')
+            .skip(2)
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("/");
+        (built.url().to_string(), scope)
+    }
+
+    /// An aws row is Bedrock in the row's own region, whatever region the
+    /// config names for the built-in provider: Claude through `InvokeModel`,
+    /// every other model through `Converse`, each sent to its region's host or
+    /// the row's base URL and signed for its region.
+    #[tokio::test]
+    async fn an_aws_endpoint_is_served_in_its_own_region_and_not_the_gateways() {
+        let state = crate::testing::state("gateway:\n  bedrock_region: \"sa-east-1\"\n");
+        let registry = EndpointRegistry::default();
+        let mut claude = aws_row("t9-state-claude", "anthropic", "eu-west-3");
+        claude.base_url = None;
+        let converse = aws_row("t9-state-converse", "bedrock_converse", "ap-northeast-2");
+
+        state.apply_endpoints(&registry, load_endpoints(&[claude, converse]));
+        for (name, dialect, url, scope) in [
+            (
+                "t9-state-claude",
+                Dialect::AnthropicMessages,
+                "https://bedrock-runtime.eu-west-3.amazonaws.com/model/m/invoke",
+                "eu-west-3/bedrock",
+            ),
+            (
+                "t9-state-converse",
+                Dialect::BedrockConverse,
+                "http://127.0.0.1:9/model/m/converse",
+                "ap-northeast-2/bedrock",
+            ),
+        ] {
+            let adapter = state
+                .adapter(custom(name))
+                .expect("an aws endpoint is served");
+            assert_eq!(adapter.provider(), custom(name));
+            assert_eq!(adapter.dialect(), dialect, "{name}");
+            assert_eq!(
+                signed(&adapter),
+                (url.to_owned(), scope.to_owned()),
+                "{name}"
+            );
+            assert_eq!(
+                registry.get(name).map(Endpoint::dialect),
+                Some(dialect),
+                "{name}"
+            );
+        }
+        let (_, builtin) = signed(&state.adapter(Provider::Bedrock).expect("built-in"));
+        assert_eq!(
+            builtin, "sa-east-1/bedrock",
+            "the built-in keeps the region configured for it"
+        );
+    }
+
     /// A System One row is served too, by the System One route rather than a
     /// chat adapter: an upstream at the path it names, beside the built-in
     /// Jev, from the reload that loads it until the one that no longer finds
@@ -770,11 +869,9 @@ mod tests {
     fn bad_rows() -> Vec<(oag_store::EndpointRow, Reason)> {
         let mut region = endpoint_row("t4-bad-region", "openai", "http://127.0.0.1:9/v1");
         region.region = Some("US_EAST_1".to_owned());
-        let mut converse = endpoint_row("t4-bad-converse", "bedrock_converse", "http://h");
-        converse.platform = "aws".to_owned();
+        // A region Google would name, on Bedrock.
+        let mut converse = aws_row("t9-bad-converse", "bedrock_converse", "us-central1");
         converse.base_url = None;
-        converse.auth = "none".to_owned();
-        converse.region = Some("us-east-1".to_owned());
         let mut azure = endpoint_row("t4-bad-azure", "openai", "https://res.openai.azure.com");
         azure.platform = "azure".to_owned();
         azure.auth = "api_key_header".to_owned();
@@ -804,7 +901,7 @@ mod tests {
                 endpoint_row("t4-bad-dialect", "klingon", "http://127.0.0.1:9"),
                 Reason::Dialect,
             ),
-            (converse, Reason::Dialect),
+            (converse, Reason::Region),
             (
                 endpoint_row("anthropic", "anthropic", "http://127.0.0.1:9"),
                 Reason::Name,

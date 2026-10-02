@@ -33,5 +33,11 @@ wiremock.workspace = true
 # Reads the form a token request posts, as the token endpoint would.
 url.workspace = true
 
+[features]
+# Exposes `eventstream::encode`, which frames an AWS event-stream message for a
+# stand-in Bedrock in another crate's tests. Behind a feature so it is not in a
+# release build: nothing at runtime sends Bedrock's framing.
+test-fixtures = []
+
 [lints]
 workspace = true

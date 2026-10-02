@@ -412,6 +412,9 @@ pub struct GatewayConfig {
     pub spend_reconcile_interval: Duration,
     /// AWS region for Bedrock. Also part of the SigV4 signing scope, so it has
     /// to be right even when `provider_base_urls` points somewhere else.
+    ///
+    /// The built-in `bedrock` provider's alone. An endpoint on the `aws`
+    /// platform names its own region, and never reads this one.
     #[serde(default = "default_bedrock_region")]
     pub bedrock_region: String,
     /// Override a provider's base URL, keyed by provider name.

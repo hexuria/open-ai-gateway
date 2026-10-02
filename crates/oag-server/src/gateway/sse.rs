@@ -551,6 +551,12 @@ fn take_payloads(buf: &mut Vec<u8>, framing: Framing) -> Vec<String> {
             .iter()
             .filter_map(oag_upstream::eventstream::inner_event)
             .collect(),
+        // The same messages, and a different envelope: the event is the
+        // payload, named by its header.
+        Framing::AwsConverseStream => oag_upstream::eventstream::take_messages(buf)
+            .iter()
+            .filter_map(oag_upstream::eventstream::converse_event)
+            .collect(),
     }
 }
 
@@ -734,6 +740,7 @@ pub async fn collect_with(
         Dialect::OpenAIChatCompletions => oag_proto::openai::parse_response(&v),
         Dialect::GeminiGenerateContent => oag_proto::gemini::parse_response(&v),
         Dialect::OpenAIResponses => oag_proto::responses::parse_response(&v),
+        Dialect::BedrockConverse => oag_proto::converse::parse_response(&v),
         // `Dialect` is non-exhaustive. A dialect with no reader cannot be
         // rendered for the client either, so this is an error rather than an
         // unjudged pass: the comment that used to sit here — "no provider
@@ -1658,6 +1665,369 @@ mod tests {
         assert!(take_payloads(&mut buf, Framing::AwsEventStream).is_empty());
         buf.extend_from_slice(&whole[split..]);
         assert_eq!(take_payloads(&mut buf, Framing::AwsEventStream).len(), 1);
+    }
+
+    // ── Bedrock Converse ─────────────────────────────────────────────────────
+
+    /// A Converse event, framed as `ConverseStream` sends one.
+    fn converse_frame(event_type: &str, payload: &serde_json::Value) -> Vec<u8> {
+        oag_upstream::eventstream::encode(
+            &[
+                (":event-type", event_type),
+                (":content-type", "application/json"),
+                (":message-type", "event"),
+            ],
+            payload.to_string().as_bytes(),
+        )
+        .expect("a short message")
+    }
+
+    fn converse_exception(kind: &str, message: &str) -> Vec<u8> {
+        oag_upstream::eventstream::encode(
+            &[
+                (":exception-type", kind),
+                (":content-type", "application/json"),
+                (":message-type", "exception"),
+            ],
+            serde_json::json!({ "message": message })
+                .to_string()
+                .as_bytes(),
+        )
+        .expect("a short message")
+    }
+
+    fn converse() -> Arc<dyn ProviderAdapter> {
+        Arc::new(oag_upstream::ConverseAdapter::new(
+            oag_upstream::BedrockAdapter::new("us-west-2"),
+        ))
+    }
+
+    /// A Converse answer in the order the user guide draws one: a few words,
+    /// a call to `tool` whose input arrives in three fragments that split a
+    /// key and a value, the stop, and last the bill. `p` is the padding AWS
+    /// puts in every event.
+    fn converse_answer(tool: &str) -> Vec<Vec<u8>> {
+        use serde_json::json;
+        vec![
+            converse_frame(
+                "messageStart",
+                &json!({ "role": "assistant", "p": "abcdefgh" }),
+            ),
+            converse_frame(
+                "contentBlockDelta",
+                &json!({ "contentBlockIndex": 0, "delta": { "text": "Let me " }, "p": "ab" }),
+            ),
+            converse_frame(
+                "contentBlockDelta",
+                &json!({ "contentBlockIndex": 0, "delta": { "text": "look." } }),
+            ),
+            converse_frame("contentBlockStop", &json!({ "contentBlockIndex": 0 })),
+            converse_frame(
+                "contentBlockStart",
+                &json!({ "contentBlockIndex": 1,
+                         "start": { "toolUse": { "toolUseId": "tooluse_1", "name": tool } } }),
+            ),
+            converse_frame(
+                "contentBlockDelta",
+                &json!({ "contentBlockIndex": 1, "delta": { "toolUse": { "input": "{\"si" } } }),
+            ),
+            converse_frame(
+                "contentBlockDelta",
+                &json!({ "contentBlockIndex": 1, "delta": { "toolUse": { "input": "gn\": \"WZ" } } }),
+            ),
+            converse_frame(
+                "contentBlockDelta",
+                &json!({ "contentBlockIndex": 1, "delta": { "toolUse": { "input": "PZ\"}" } } }),
+            ),
+            converse_frame("contentBlockStop", &json!({ "contentBlockIndex": 1 })),
+            converse_frame("messageStop", &json!({ "stopReason": "tool_use" })),
+            converse_frame(
+                "metadata",
+                &json!({ "usage": { "inputTokens": 412, "outputTokens": 58, "totalTokens": 470 },
+                         "metrics": { "latencyMs": 930 } }),
+            ),
+        ]
+    }
+
+    /// `frames` as a body read in pieces that cut through frames, as TCP
+    /// reads do.
+    fn in_pieces(frames: &[Vec<u8>]) -> reqwest::Response {
+        streamed(
+            frames
+                .concat()
+                .chunks(13)
+                .map(bytes::Bytes::copy_from_slice)
+                .collect(),
+        )
+    }
+
+    fn deadlines() -> Deadlines {
+        Deadlines {
+            idle: Duration::from_secs(5),
+            max: Duration::from_secs(30),
+            client_write: Duration::from_secs(5),
+            keepalive: Duration::from_secs(10),
+        }
+    }
+
+    /// The JSON chunks of a Chat Completions stream, `[DONE]` left out.
+    fn chat_chunks(sent: &str) -> Vec<serde_json::Value> {
+        sent.split("\n\n")
+            .filter_map(|frame| frame.strip_prefix("data: "))
+            .filter(|payload| *payload != "[DONE]")
+            .map(|payload| serde_json::from_str(payload).expect("a chunk"))
+            .collect()
+    }
+
+    #[test]
+    fn a_converse_stream_is_read_by_its_event_names_not_as_invoke_s_envelope() {
+        let frames = converse_answer("top_song").concat();
+        let mut buf = frames.clone();
+        let payloads = take_payloads(&mut buf, Framing::AwsConverseStream);
+        assert!(buf.is_empty());
+        assert_eq!(payloads.len(), 11);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payloads[1]).expect("JSON"),
+            serde_json::json!({ "contentBlockDelta": {
+                "contentBlockIndex": 0, "delta": { "text": "Let me " }, "p": "ab" } })
+        );
+        // Read as `InvokeModel`'s stream the same bytes say nothing at all:
+        // no `bytes` envelope in any of them.
+        let mut as_invoke = frames;
+        assert!(take_payloads(&mut as_invoke, Framing::AwsEventStream).is_empty());
+    }
+
+    /// The stream a Chat Completions client is shown from a Converse upstream:
+    /// the text, a tool call opened with its id and name and then its
+    /// arguments a fragment at a time, and the bill on the chunk that ends
+    /// the answer, before `[DONE]`.
+    #[tokio::test]
+    async fn a_converse_stream_reaches_a_chat_completions_client_as_its_own_chunks() {
+        let (tx, mut rx) = mpsc::channel(256);
+        let outcome = pump(
+            in_pieces(&converse_answer("top_song")),
+            converse(),
+            tx,
+            deadlines(),
+            Egress::ChatCompletions {
+                request_id: "r1".to_owned(),
+                model: "t9/llama".to_owned(),
+            },
+        )
+        .await;
+        assert_eq!(outcome.error, None);
+        assert!(outcome.ttft.is_some(), "the text timed the first token");
+
+        let sent = drain(&mut rx).await;
+        let chunks = chat_chunks(&sent);
+        let delta = |c: &serde_json::Value| c["choices"][0]["delta"].clone();
+        let text: String = chunks
+            .iter()
+            .filter_map(|c| delta(c)["content"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(text, "Let me look.");
+
+        let opened = chunks
+            .iter()
+            .find(|c| delta(c)["tool_calls"][0]["id"] == "tooluse_1")
+            .expect("the call opens with its id");
+        assert_eq!(
+            delta(opened)["tool_calls"][0]["function"]["name"],
+            "top_song"
+        );
+        let fragments: Vec<String> = chunks
+            .iter()
+            .filter_map(|c| {
+                delta(c)["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .filter(|a| !a.is_empty())
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(
+            fragments,
+            ["{\"si", "gn\": \"WZ", "PZ\"}"],
+            "a fragment at a time"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fragments.concat()).expect("whole JSON"),
+            serde_json::json!({ "sign": "WZPZ" })
+        );
+
+        let last = chunks.last().expect("chunks");
+        assert_eq!(last["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(last["usage"]["prompt_tokens"], 412, "{last}");
+        assert_eq!(last["usage"]["completion_tokens"], 58, "{last}");
+        assert_eq!(
+            chunks.iter().filter(|c| c.get("usage").is_some()).count(),
+            1,
+            "one bill, on the chunk that ends the answer"
+        );
+        assert!(
+            sent.trim_end().ends_with("data: [DONE]"),
+            "and only the sentinel after it: {sent}"
+        );
+
+        assert_eq!(outcome.accumulator.usage().input_tokens, 412);
+        assert_eq!(outcome.accumulator.usage().output_tokens, 58);
+        assert_eq!(
+            outcome.accumulator.stop_reason(),
+            Some(oag_proto::StopReason::ToolUse)
+        );
+        assert_eq!(outcome.accumulator.quality_gate(), None);
+    }
+
+    #[tokio::test]
+    async fn a_converse_stream_hands_the_client_back_its_own_tool_name() {
+        // Converse refuses `user-Github.get_file`, so the codec sent
+        // `user-Github_get_file`, and that is what the model calls.
+        let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "read it" }],
+            "tools": [{ "type": "function", "function": {
+                "name": "user-Github.get_file", "parameters": { "type": "object" } } }],
+        }))
+        .expect("parses");
+        let (tx, mut rx) = mpsc::channel(256);
+        let outcome = pump_with(
+            in_pieces(&converse_answer("user-Github_get_file")),
+            converse(),
+            tx,
+            deadlines(),
+            Egress::ChatCompletions {
+                request_id: "r1".to_owned(),
+                model: "t9/llama".to_owned(),
+            },
+            FunctionNameMap::from_request(&canonical),
+            None,
+        )
+        .await;
+        assert_eq!(outcome.error, None);
+        let chunks = chat_chunks(&drain(&mut rx).await);
+        let names: Vec<&str> = chunks
+            .iter()
+            .filter_map(|c| c["choices"][0]["delta"]["tool_calls"][0]["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, ["user-Github.get_file"]);
+    }
+
+    #[tokio::test]
+    async fn an_exception_inside_a_converse_stream_is_the_reason_and_reaches_the_client() {
+        let mut frames = converse_answer("top_song")[..3].to_vec();
+        frames.push(converse_exception(
+            "throttlingException",
+            "Too many tokens, please wait before trying again.",
+        ));
+        let (tx, mut rx) = mpsc::channel(256);
+        let outcome = pump(
+            in_pieces(&frames),
+            converse(),
+            tx,
+            deadlines(),
+            Egress::ChatCompletions {
+                request_id: "r1".to_owned(),
+                model: "t9/llama".to_owned(),
+            },
+        )
+        .await;
+
+        let error = outcome.error.expect("the stream failed");
+        assert!(
+            error.contains("throttlingException: Too many tokens"),
+            "the provider's own words, kind and all: {error}"
+        );
+        let sent = drain(&mut rx).await;
+        let errors: Vec<serde_json::Value> = chat_chunks(&sent)
+            .into_iter()
+            .filter(|c| c.get("error").is_some())
+            .collect();
+        assert_eq!(errors.len(), 1, "one failure, one frame: {sent}");
+        assert!(
+            errors[0]["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("throttlingException: ")),
+            "{sent}"
+        );
+        assert!(!sent.contains("[DONE]"), "the answer did not end: {sent}");
+    }
+
+    #[tokio::test]
+    async fn a_converse_stream_cut_off_before_its_bill_is_not_complete() {
+        // `messageStop` arrived and `metadata` did not. The stop is held for
+        // the bill, so the answer never ended: the client is told so, and is
+        // not handed a `[DONE]` that says it is whole.
+        let mut frames = converse_answer("top_song");
+        frames.pop();
+        let (tx, mut rx) = mpsc::channel(256);
+        let outcome = pump(
+            in_pieces(&frames),
+            converse(),
+            tx,
+            deadlines(),
+            Egress::ChatCompletions {
+                request_id: "r1".to_owned(),
+                model: "t9/llama".to_owned(),
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("upstream closed before the response was complete")
+        );
+        assert_eq!(outcome.accumulator.stop_reason(), None);
+        let sent = drain(&mut rx).await;
+        assert!(!sent.contains("[DONE]"), "{sent}");
+        assert!(
+            sent.contains("closed before the response was complete"),
+            "{sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_reads_a_converse_body_and_restores_the_clients_tool_names() {
+        let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "read it" }],
+            "tools": [{ "type": "function", "function": {
+                "name": "user-Github.get_file", "parameters": { "type": "object" } } }],
+        }))
+        .expect("parses");
+        let (_, events, acc) = collect_with(
+            body(
+                r#"{
+                    "output": { "message": { "role": "assistant", "content": [
+                        { "text": "Reading it." },
+                        { "toolUse": { "toolUseId": "tooluse_1",
+                                       "name": "user-Github_get_file",
+                                       "input": { "path": "a.rs" } } }
+                    ]}},
+                    "stopReason": "tool_use",
+                    "usage": { "inputTokens": 1200, "outputTokens": 142, "totalTokens": 19642,
+                               "cacheReadInputTokens": 18000, "cacheWriteInputTokens": 300 },
+                    "metrics": { "latencyMs": 1275 }
+                }"#,
+            ),
+            Dialect::BedrockConverse,
+            &FunctionNameMap::from_request(&canonical),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("collects");
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::ToolUseStart { name, .. } if name == "user-Github.get_file"
+            )),
+            "{events:?}"
+        );
+        // Converse reports the cache beside the prompt, as Anthropic does.
+        assert_eq!(acc.usage().input_tokens, 1_200);
+        assert_eq!(acc.usage().cache_read_tokens, 18_000);
+        assert_eq!(acc.usage().cache_write_tokens, 300);
+        assert_eq!(acc.usage().output_tokens, 142);
+        assert_eq!(acc.stop_reason(), Some(oag_proto::StopReason::ToolUse));
+        assert_eq!(acc.quality_gate(), None);
     }
 
     // ── non-streamed bodies ──────────────────────────────────────────────────

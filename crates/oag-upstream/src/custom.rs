@@ -7,10 +7,18 @@
 //! as every provider's does, and reaches the adapter per request. A System One
 //! endpoint is not a chat upstream, so it gets the upstream the System One
 //! route calls instead, from [`system_one`].
+//!
+//! An endpoint on the `aws` platform is Bedrock in a region of the operator's
+//! choosing, and its adapter is a Bedrock one: Claude through `InvokeModel`,
+//! or every other model Bedrock serves through `Converse`.
 
 use crate::adapter::ProviderAdapter;
 use crate::listing::ModelSource;
-use crate::{AnthropicAdapter, GeminiAdapter, JevUpstream, OpenAICompatAdapter};
+use crate::{
+    AnthropicAdapter, BedrockAdapter, ConverseAdapter, GeminiAdapter, JevUpstream,
+    OpenAICompatAdapter,
+};
+use oag_core::endpoint::is_aws_region;
 use oag_core::provider::{AuthStyle, Dialect, Endpoint, Platform};
 use oag_core::{Error, Provider, Result};
 use reqwest::RequestBuilder;
@@ -34,6 +42,9 @@ pub struct EndpointSpec {
     /// Whether its adapter answers `served_models` by reading the endpoint's
     /// model list: the row's `discover_models`.
     discover: bool,
+    /// The region an `aws` endpoint's requests go to and are signed for; see
+    /// [`EndpointSpec::with_region`].
+    region: Option<String>,
 }
 
 impl EndpointSpec {
@@ -65,6 +76,7 @@ impl EndpointSpec {
             auth,
             extra_headers,
             discover: false,
+            region: None,
         })
     }
 
@@ -137,6 +149,18 @@ impl EndpointSpec {
         self.extra_headers.apply(builder).build().map_err(|e| {
             Error::Internal(format!("building the model list request for `{name}`: {e}"))
         })
+    }
+
+    /// This spec, with the region its platform builds a host from.
+    ///
+    /// An `aws` endpoint needs one: the region names its host,
+    /// `bedrock-runtime.{region}.amazonaws.com`, and the scope its requests
+    /// are signed for, which a base URL does not change. Its base URL may be
+    /// empty, which means that regional host.
+    #[must_use]
+    pub fn with_region(mut self, region: Option<String>) -> Self {
+        self.region = region;
+        self
     }
 }
 
@@ -245,13 +269,16 @@ pub(crate) fn authenticate(
 /// discovery, and not the rule that Anthropic's key goes in `x-api-key`. It
 /// discovers models only when the spec says to, from the endpoint's own list.
 ///
-/// Only the plain platform is served so far. An endpoint on AWS, GCP or Azure
-/// is refused rather than sent a request built for a plain host, which its
-/// platform would reject for want of a signature, a minted token or a
-/// deployment path.
+/// The plain and aws platforms are served (`aws` below says how the second
+/// is). An endpoint on GCP or Azure is refused rather than sent a request built
+/// for a plain host, which its platform would reject for want of a minted token
+/// or a deployment path.
 pub fn adapter(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
     let endpoint = spec.endpoint;
     let name = endpoint.name();
+    if endpoint.platform() == Platform::Aws {
+        return aws(spec);
+    }
     plain(endpoint)?;
 
     let base = spec.base_url.clone();
@@ -288,6 +315,45 @@ pub fn adapter(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
     Ok(adapter)
 }
 
+/// The adapter for an endpoint on the aws platform: Bedrock's runtime API in
+/// the endpoint's own region, every request signed with `SigV4` for that
+/// region.
+///
+/// The `anthropic` dialect is Claude in Anthropic's body through `InvokeModel`,
+/// as the built-in Bedrock provider sends it; `bedrock_converse` is every other
+/// model Bedrock serves, through `Converse`. Either way the request goes to the
+/// region's own host unless the endpoint names a base URL (a VPC endpoint, a
+/// proxy, a stand-in), and the signature is scoped to the region regardless.
+/// No header carries a key: the signature is the credential, made from the
+/// `access_key:secret[:session_token]` the endpoint's account holds.
+///
+/// The region is the spec's and never the gateway's: `gateway.bedrock_region`
+/// is the built-in provider's alone.
+fn aws(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
+    let endpoint = spec.endpoint;
+    let name = endpoint.name();
+    let region = spec
+        .region
+        .as_deref()
+        .filter(|region| is_aws_region(region))
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "endpoint `{name}` is on the aws platform, and names no AWS region"
+            ))
+        })?;
+    // An empty base URL is no override: the region's own host.
+    let runtime = BedrockAdapter::for_endpoint(endpoint, region)
+        .with_endpoint(Some(spec.base_url.clone()))
+        .with_headers(spec.extra_headers.clone());
+    match endpoint.dialect() {
+        Dialect::AnthropicMessages => Ok(Arc::new(runtime)),
+        Dialect::BedrockConverse => Ok(Arc::new(ConverseAdapter::new(runtime))),
+        other => Err(Error::Config(format!(
+            "endpoint `{name}` speaks {other}, which the aws platform does not serve"
+        ))),
+    }
+}
+
 /// The upstream that serves `spec`'s System One endpoint: Jev's two requests,
 /// at the endpoint's base URL, with its key where it was registered to go and
 /// its extra headers on both.
@@ -315,10 +381,11 @@ pub fn system_one(spec: &EndpointSpec, path: Option<&str>) -> Result<JevUpstream
     ))
 }
 
-/// Refuses an endpoint on any platform but plain.
+/// Refuses an endpoint on any platform but plain, where only a plain one is
+/// served: a chat endpoint on GCP or Azure, and a System One endpoint on any
+/// platform but plain.
 ///
-/// Only the plain platform is served so far. An endpoint on AWS, GCP or Azure
-/// is refused rather than sent a request built for a plain host, which its
+/// Refused rather than sent a request built for a plain host, which another
 /// platform would reject for want of a signature, a minted token or a
 /// deployment path.
 fn plain(endpoint: Endpoint) -> Result<()> {
@@ -326,8 +393,7 @@ fn plain(endpoint: Endpoint) -> Result<()> {
         Platform::Plain => Ok(()),
         platform @ (Platform::Aws | Platform::Gcp | Platform::Azure) => {
             Err(Error::Config(format!(
-                "endpoint `{}` is on the {} platform, which is not supported yet; \
-             only plain endpoints are served",
+                "endpoint `{}` is on the {} platform, which is not supported yet",
                 endpoint.name(),
                 platform.as_str()
             )))
@@ -730,7 +796,6 @@ mod tests {
     #[test]
     fn an_endpoint_on_a_cloud_platform_is_refused_until_one_serves_it() {
         for (platform, dialect) in [
-            (Platform::Aws, Dialect::AnthropicMessages),
             (Platform::Gcp, Dialect::GeminiGenerateContent),
             (Platform::Azure, Dialect::OpenAIChatCompletions),
         ] {
@@ -747,6 +812,236 @@ mod tests {
                 "{err}"
             );
             assert!(err.contains(&name), "{err}");
+        }
+    }
+
+    // ── the aws platform ─────────────────────────────────────────────────────
+
+    /// An aws endpoint's key, packed as Bedrock's are. Obviously not one.
+    const AWS_KEY: &str = "TESTACCESSKEY:TESTSECRETKEY";
+
+    fn aws_spec(name: &str, dialect: Dialect, region: &str, base_url: &str) -> EndpointSpec {
+        EndpointSpec::new(
+            endpoint(name, dialect, Platform::Aws),
+            base_url,
+            AuthStyle::None,
+            EXTRA,
+        )
+        .unwrap()
+        .with_region(Some(region.to_owned()))
+    }
+
+    /// What `spec`'s adapter builds for one request, not streamed.
+    fn build_aws(spec: &EndpointSpec) -> reqwest::Request {
+        let adapter = adapter(spec).expect("an aws endpoint has an adapter");
+        let (canonical, model) = (request(), model(spec.endpoint));
+        let mut credential = credential();
+        AWS_KEY.clone_into(&mut credential.access_token);
+        adapter
+            .build(&UpstreamRequest {
+                canonical: &canonical,
+                model: &model,
+                credential: &credential,
+                session: None,
+            })
+            .expect("builds")
+    }
+
+    /// The region and the service a `SigV4` `authorization` is scoped to.
+    fn signed_for(authorization: &str) -> (String, String) {
+        let scope = authorization
+            .strip_prefix("AWS4-HMAC-SHA256 Credential=TESTACCESSKEY/")
+            .and_then(|rest| rest.split(',').next())
+            .unwrap_or_else(|| panic!("not a SigV4 authorization: {authorization}"));
+        // `{date}/{region}/{service}/aws4_request`
+        let parts: Vec<&str> = scope.split('/').collect();
+        assert_eq!(parts.len(), 4, "{scope}");
+        assert_eq!(parts[3], "aws4_request", "{scope}");
+        (parts[1].to_owned(), parts[2].to_owned())
+    }
+
+    /// An aws endpoint is Bedrock in the region it names, whichever model
+    /// family it serves.
+    ///
+    /// Neither region is `us-east-1`, the built-in's default, and the regional
+    /// host and the signature's scope are both asserted: an adapter built for
+    /// any region but the endpoint's own, the gateway's included, fails here.
+    #[test]
+    fn an_aws_endpoint_is_bedrock_in_its_own_region_whichever_model_family() {
+        for (dialect, region, framing, action) in [
+            (
+                Dialect::AnthropicMessages,
+                "eu-west-3",
+                Framing::AwsEventStream,
+                "invoke",
+            ),
+            (
+                Dialect::BedrockConverse,
+                "ap-northeast-2",
+                Framing::AwsConverseStream,
+                "converse",
+            ),
+        ] {
+            let name = format!("t9-aws-{region}");
+            // No base URL: the region's own host.
+            let spec = aws_spec(&name, dialect, region, "");
+            let adapter = adapter(&spec).expect("the aws platform is served");
+            assert_eq!(
+                adapter.provider(),
+                Provider::Custom(spec.endpoint),
+                "{name}"
+            );
+            assert_eq!(adapter.dialect(), dialect, "{name}");
+            assert_eq!(adapter.framing(), framing, "{name}");
+            assert!(!adapter.always_streams(), "{name}");
+
+            let built = build_aws(&spec);
+            assert_eq!(
+                built.url().as_str(),
+                format!("https://bedrock-runtime.{region}.amazonaws.com/model/some-model/{action}")
+            );
+            let authorization = built.headers()["authorization"].to_str().unwrap();
+            assert_eq!(
+                signed_for(authorization),
+                (region.to_owned(), "bedrock".to_owned()),
+                "{name}"
+            );
+            for header in ["x-api-key", "x-goog-api-key", "api-key"] {
+                assert!(built.headers().get(header).is_none(), "{name}: {header}");
+            }
+        }
+    }
+
+    /// Two aws endpoints in two regions, each with a stand-in of its own: each
+    /// stand-in is sent only its endpoint's request, signed for its region,
+    /// with a signature that holds over what actually arrived.
+    #[tokio::test]
+    async fn two_aws_endpoints_in_two_regions_are_each_signed_for_their_own() {
+        let (paris, sydney) = (MockServer::start().await, MockServer::start().await);
+        let endpoints = [
+            (
+                aws_spec(
+                    "t9-aws-paris",
+                    Dialect::BedrockConverse,
+                    "eu-west-3",
+                    &paris.uri(),
+                ),
+                &paris,
+                "eu-west-3",
+                "/model/some-model/converse",
+            ),
+            (
+                aws_spec(
+                    "t9-aws-sydney",
+                    Dialect::AnthropicMessages,
+                    "ap-southeast-2",
+                    &sydney.uri(),
+                ),
+                &sydney,
+                "ap-southeast-2",
+                "/model/some-model/invoke",
+            ),
+        ];
+        for (_, server, _, at) in &endpoints {
+            Mock::given(method("POST"))
+                .and(path(*at))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+        let transport =
+            HttpTransport::new(None, Duration::from_secs(5), Duration::from_secs(5)).unwrap();
+        for (spec, _, _, at) in &endpoints {
+            let answered = transport.execute(build_aws(spec)).await.expect("answers");
+            assert_eq!(
+                answered.status(),
+                200,
+                "{}: missed {at}",
+                spec.endpoint.name()
+            );
+        }
+
+        for (spec, server, region, _) in &endpoints {
+            let name = spec.endpoint.name();
+            server.verify().await;
+            let received = server.received_requests().await.expect("recording is on");
+            let [sent] = received.as_slice() else {
+                panic!("{name}: {received:?}");
+            };
+            let header = |name: &str| sent.headers[name].to_str().unwrap().to_owned();
+            let authorization = header("authorization");
+            assert_eq!(
+                signed_for(&authorization),
+                ((*region).to_owned(), "bedrock".to_owned()),
+                "{name}"
+            );
+            let at = time::PrimitiveDateTime::parse(
+                &header("x-amz-date"),
+                &time::macros::format_description!("[year][month][day]T[hour][minute][second]Z"),
+            )
+            .unwrap()
+            .assume_utc();
+            let recomputed = crate::sigv4::sign(
+                &BedrockAdapter::credentials(AWS_KEY).unwrap(),
+                region,
+                "bedrock",
+                crate::sigv4::SigningRequest {
+                    method: "POST",
+                    path: sent.url.path(),
+                    host: &header("host"),
+                    body: &sent.body,
+                },
+                at,
+            );
+            assert_eq!(authorization, recomputed.authorization, "{name}");
+            for (extra, value) in EXTRA {
+                assert_eq!(header(extra), value, "{name}: the operator's {extra}");
+            }
+            for key in ["x-api-key", "x-goog-api-key", "api-key"] {
+                assert!(sent.headers.get(key).is_none(), "{name}: {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_aws_endpoint_without_an_aws_region_is_refused() {
+        for region in [None, Some("us-central1"), Some("eu-west-3.evil.example")] {
+            let spec = EndpointSpec::new(
+                endpoint("t9-aws-nowhere", Dialect::BedrockConverse, Platform::Aws),
+                "",
+                AuthStyle::None,
+                EXTRA,
+            )
+            .unwrap()
+            .with_region(region.map(str::to_owned));
+            let err = adapter(&spec).expect_err("no host to send to").to_string();
+            assert!(
+                err.contains(
+                    "endpoint `t9-aws-nowhere` is on the aws platform, and names no AWS region"
+                ),
+                "{region:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_aws_endpoint_in_a_dialect_bedrock_does_not_speak_is_refused() {
+        // The platform matrix never pairs these with aws, and this does not
+        // take the matrix's word for it.
+        for dialect in [
+            Dialect::OpenAIChatCompletions,
+            Dialect::GeminiGenerateContent,
+            Dialect::SystemOne,
+        ] {
+            let spec = aws_spec("t9-aws-wrong", dialect, "us-west-2", "");
+            let err = adapter(&spec).expect_err("not Bedrock's").to_string();
+            assert!(
+                err.contains(&format!(
+                    "speaks {dialect}, which the aws platform does not serve"
+                )),
+                "{err}"
+            );
         }
     }
 

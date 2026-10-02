@@ -48,6 +48,8 @@ http-body-util.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 # Stand-in upstreams for the operator-registered endpoints in tests/.
 wiremock.workspace = true
+# `eventstream::encode`, for a stand-in Bedrock's binary stream.
+oag-upstream = { workspace = true, features = ["test-fixtures"] }
 
 [lints]
 workspace = true
