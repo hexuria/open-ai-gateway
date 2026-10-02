@@ -512,6 +512,10 @@ mod tests {
     /// command said. With a pool that cannot connect, the command fails before
     /// any request is sent; a dispatcher that answered `Ok` without running it
     /// would pass for a working one.
+    ///
+    /// And the error is the command's own, its first read of the endpoint:
+    /// one that failed for any other reason, a parse or a wrong command, on
+    /// the way to it would pass a bare `expect_err` as well as this does.
     #[tokio::test]
     async fn the_dispatchers_surface_the_commands_error() {
         let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag_g0", 1).expect("lazy pool");
@@ -526,8 +530,13 @@ mod tests {
         let cmd = AdminCli::try_parse_from(["admin", "endpoint", "sync", "merge"])
             .expect("parses")
             .cmd;
-        crate::admin::run(cmd, &db, &kek, "redis://127.0.0.1:1", &config)
+        let err = crate::admin::run(cmd, &db, &kek, "redis://127.0.0.1:1", &config)
             .await
             .expect_err("no database to read the endpoint from");
+        assert!(
+            matches!(&err, oag_core::Error::Internal(message)
+                if message.starts_with("loading endpoint:")),
+            "the sync's own read of `merge`, and not some other failure: {err}"
+        );
     }
 }

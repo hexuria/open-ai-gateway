@@ -400,11 +400,17 @@ async fn refused_by_the_compliance_guard(gw: &Gateway, anth: &MockServer) {
             &json!({"model": "mockanth/m-anth", "messages": [{"role": "user", "content": "hi"}]}),
         )
         .await;
-    assert_ne!(
-        res.status(),
-        200,
-        "{}",
-        res.text().await.unwrap_or_default()
+    // The refusal for a model the gateway does not serve, and no other: any
+    // status but 200 would let a 500 from a half-served endpoint pass as one.
+    let status = res.status();
+    let body: Value = res.json().await.expect("a JSON refusal");
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["type"], "no_viable_model", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("can serve 'mockanth/m-anth'")),
+        "{body}"
     );
     assert_eq!(
         anth.received_requests().await.expect("recording").len(),
