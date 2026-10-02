@@ -249,11 +249,13 @@ fn a_listing_names_every_setting_and_counts_what_names_each_endpoint() {
         ["no endpoints; register one with `oag admin endpoint add`"]
     );
 
-    let azure = EndpointRow {
-        name: "t5-azure".to_owned(),
-        platform: "azure".to_owned(),
-        base_url: Some("https://res.openai.azure.com".to_owned()),
-        auth: "api_key_header".to_owned(),
+    let gcp = EndpointRow {
+        name: "t5-gcp".to_owned(),
+        dialect: "gemini".to_owned(),
+        platform: "gcp".to_owned(),
+        base_url: None,
+        region: Some("us-central1".to_owned()),
+        project: Some("acme".to_owned()),
         extra_headers: json!({}),
         ..stored()
     };
@@ -276,7 +278,7 @@ fn a_listing_names_every_setting_and_counts_what_names_each_endpoint() {
             on_ladder: 3,
         },
     )]);
-    let lines = list_lines(&[stored(), azure, aws], &refs);
+    let lines = list_lines(&[stored(), gcp, aws], &refs);
     assert!(lines[0].starts_with("NAME"), "{lines:?}");
     assert!(
         lines[1].starts_with("merge ")
@@ -302,7 +304,7 @@ fn a_listing_names_every_setting_and_counts_what_names_each_endpoint() {
         lines
             .iter()
             .any(|l| l.contains("not served") && l.contains("not supported yet")),
-        "the azure row is valid and unserved: {lines:?}"
+        "the gcp row is valid and unserved: {lines:?}"
     );
     assert!(
         lines

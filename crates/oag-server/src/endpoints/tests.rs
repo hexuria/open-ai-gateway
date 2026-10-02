@@ -318,18 +318,20 @@ fn a_refused_store_write_is_answered_as_the_callers_mistake_or_the_databases() {
 #[test]
 fn the_reloads_answer_is_asked_of_one_row() {
     assert_eq!(refusal(&row(&draft("t5-served"))), None);
-    let azure = row(&Draft {
-        platform: "azure".to_owned(),
-        base_url: Some("https://res.openai.azure.com".to_owned()),
-        auth: "api_key_header".to_owned(),
-        ..draft("t5-unserved-azure")
+    let gcp = row(&Draft {
+        dialect: "gemini".to_owned(),
+        platform: "gcp".to_owned(),
+        base_url: None,
+        region: Some("us-central1".to_owned()),
+        project: Some("acme".to_owned()),
+        ..draft("t5-unserved-gcp")
     });
-    let unsupported = refusal(&azure).expect("a valid row this build has no adapter for");
+    let unsupported = refusal(&gcp).expect("a valid row this build has no adapter for");
     assert_eq!(unsupported.reason, Reason::Unsupported);
     assert!(
         unsupported
             .message
-            .starts_with("endpoint `t5-unserved-azure` is on the azure platform"),
+            .starts_with("endpoint `t5-unserved-gcp` is on the gcp platform"),
         "the words an operator reads, with no `configuration: ` before them: {unsupported}"
     );
     let compliance = row(&Draft {

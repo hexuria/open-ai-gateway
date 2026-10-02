@@ -11,6 +11,10 @@
 //! An endpoint on the `aws` platform is Bedrock in a region of the operator's
 //! choosing, and its adapter is a Bedrock one: Claude through `InvokeModel`,
 //! or every other model Bedrock serves through `Converse`.
+//!
+//! An endpoint on the `azure` platform speaks `OpenAI`'s dialect at an Azure
+//! resource, whose URLs and key header are Azure's own, so it gets an adapter
+//! of its own: [`crate::azure::AzureOpenAIAdapter`].
 
 use crate::adapter::ProviderAdapter;
 use crate::listing::ModelSource;
@@ -38,6 +42,9 @@ pub struct EndpointSpec {
     endpoint: Endpoint,
     base_url: String,
     auth: AuthStyle,
+    /// The version of Azure's deployments API an `azure` endpoint asks for;
+    /// see [`EndpointSpec::with_api_version`].
+    api_version: Option<String>,
     extra_headers: ExtraHeaders,
     /// Whether its adapter answers `served_models` by reading the endpoint's
     /// model list: the row's `discover_models`.
@@ -74,6 +81,7 @@ impl EndpointSpec {
             endpoint,
             base_url: base_url.into(),
             auth,
+            api_version: None,
             extra_headers,
             discover: false,
             region: None,
@@ -160,6 +168,18 @@ impl EndpointSpec {
     #[must_use]
     pub fn with_region(mut self, region: Option<String>) -> Self {
         self.region = region;
+        self
+    }
+
+    /// This spec, with the API version an `azure` endpoint names.
+    ///
+    /// On Azure it picks the URL: `None` is Azure's v1 API, and a version is
+    /// its deployments API at that version, sent as each request's
+    /// `api-version`. Used as given; a stored one has passed
+    /// [`oag_core::endpoint::is_api_version`]. No other platform reads it.
+    #[must_use]
+    pub fn with_api_version(mut self, api_version: Option<String>) -> Self {
+        self.api_version = api_version;
         self
     }
 }
@@ -269,15 +289,18 @@ pub(crate) fn authenticate(
 /// discovery, and not the rule that Anthropic's key goes in `x-api-key`. It
 /// discovers models only when the spec says to, from the endpoint's own list.
 ///
-/// The plain and aws platforms are served (`aws` below says how the second
-/// is). An endpoint on GCP or Azure is refused rather than sent a request built
-/// for a plain host, which its platform would reject for want of a minted token
-/// or a deployment path.
+/// The plain, aws and azure platforms are served (`aws` and `azure` below say
+/// how the second and third are). An endpoint on GCP is refused rather than
+/// sent a request built for a plain host, which its platform would reject for
+/// want of a minted token.
 pub fn adapter(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
     let endpoint = spec.endpoint;
     let name = endpoint.name();
     if endpoint.platform() == Platform::Aws {
         return aws(spec);
+    }
+    if endpoint.platform() == Platform::Azure {
+        return azure(spec);
     }
     plain(endpoint)?;
 
@@ -382,8 +405,8 @@ pub fn system_one(spec: &EndpointSpec, path: Option<&str>) -> Result<JevUpstream
 }
 
 /// Refuses an endpoint on any platform but plain, where only a plain one is
-/// served: a chat endpoint on GCP or Azure, and a System One endpoint on any
-/// platform but plain.
+/// served: a chat endpoint on GCP (an aws or azure one never gets here), and
+/// a System One endpoint on any platform but plain.
 ///
 /// Refused rather than sent a request built for a plain host, which another
 /// platform would reject for want of a signature, a minted token or a
@@ -399,6 +422,39 @@ fn plain(endpoint: Endpoint) -> Result<()> {
             )))
         }
     }
+}
+
+/// The adapter for an endpoint on the azure platform: Chat Completions at its
+/// Azure resource, with its key in `api-key`, posted to Azure's v1 API or, when
+/// the spec names an API version, to its deployments API at that version. See
+/// [`crate::azure::AzureOpenAIAdapter`].
+///
+/// The platform matrix gives Azure the `OpenAI` dialect alone, and `api-key`
+/// as the one way it takes a key, and the loader holds a row to both. This
+/// does not take the loader's word for either: a spec built some other way is
+/// refused rather than sent a request Azure would not read.
+fn azure(spec: &EndpointSpec) -> Result<Arc<dyn ProviderAdapter>> {
+    let endpoint = spec.endpoint;
+    let name = endpoint.name();
+    if endpoint.dialect() != Dialect::OpenAIChatCompletions {
+        return Err(Error::Config(format!(
+            "endpoint `{name}` speaks {}, which the azure platform does not serve",
+            endpoint.dialect()
+        )));
+    }
+    if !spec.auth.suits(Platform::Azure) {
+        return Err(Error::Config(format!(
+            "endpoint `{name}` is on the azure platform, which takes its key in `api-key` \
+             (auth api_key_header), not {}",
+            spec.auth.as_str()
+        )));
+    }
+    Ok(Arc::new(crate::azure::AzureOpenAIAdapter::for_endpoint(
+        endpoint,
+        spec.base_url.clone(),
+        spec.api_version.clone(),
+        spec.extra_headers.clone(),
+    )))
 }
 
 #[cfg(test)]
@@ -797,7 +853,6 @@ mod tests {
     fn an_endpoint_on_a_cloud_platform_is_refused_until_one_serves_it() {
         for (platform, dialect) in [
             (Platform::Gcp, Dialect::GeminiGenerateContent),
-            (Platform::Azure, Dialect::OpenAIChatCompletions),
         ] {
             let name = format!("t3-cloud-{}", platform.as_str());
             let spec = plain_spec(
