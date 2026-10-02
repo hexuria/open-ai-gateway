@@ -532,7 +532,8 @@ the model (a prefill, a transcript resumed part way) is sent a `(continued)`
 user turn in front of it. Blank text, which Converse refuses wherever it
 appears, is left out (the empty `content` a Chat Completions client sends with
 its tool calls is one), and a tool result with nothing in it says
-`(no output)`.
+`(no output)`. A temperature past 1 is sent as 1, the most Converse takes where
+Chat Completions takes 2, and an empty stop sequence is dropped.
 
 **Streams.** `ConverseStream` sends AWS event-stream messages whose payload is
 the event itself, named by a header (see [Framing](#framing)). It announces the

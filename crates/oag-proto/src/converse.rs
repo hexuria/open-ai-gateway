@@ -96,10 +96,16 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
 
     let mut inference = json!({ "maxTokens": req.max_tokens });
     if let Some(t) = req.temperature {
-        inference["temperature"] = json!(t);
+        // Converse takes 0 to 1, where Chat Completions takes 0 to 2, and
+        // refuses the rest with a 400. A client past 1 asked for as much
+        // randomness as it could have, and 1 is the most there is here.
+        inference["temperature"] = json!(t.clamp(0.0, 1.0));
     }
-    if !req.stop.is_empty() {
-        inference["stopSequences"] = json!(req.stop);
+    // A stop sequence holds at least one character, and an empty one could
+    // stop nothing anyway.
+    let stop: Vec<&String> = req.stop.iter().filter(|s| !s.is_empty()).collect();
+    if !stop.is_empty() {
+        inference["stopSequences"] = json!(stop);
     }
 
     let mut body = json!({
@@ -1964,6 +1970,43 @@ mod tests {
                 ]},
                 { "role": "user", "content": [no_output("t1"), no_output("t2"), no_output("t3")] },
             ])
+        );
+    }
+
+    /// Converse takes a temperature of 0 to 1, where Chat Completions takes
+    /// 0 to 2, and each stop sequence must hold at least one character.
+    #[test]
+    fn temperature_is_kept_within_converses_range_and_empty_stops_are_dropped() {
+        for (asked, sent) in [
+            (1.7_f32, 1.0),
+            (2.0, 1.0),
+            (1.0, 1.0),
+            (0.5, 0.5),
+            (0.0, 0.0),
+            (-0.5, 0.0),
+        ] {
+            let body = render_request(&request(|r| r.temperature = Some(asked))).expect("renders");
+            assert_eq!(
+                body["inferenceConfig"]["temperature"],
+                json!(sent),
+                "{asked}"
+            );
+        }
+
+        let stops = |stop: &[&str]| {
+            render_request(&request(|r| {
+                r.stop = stop.iter().map(|s| (*s).to_owned()).collect();
+            }))
+            .expect("renders")
+        };
+        assert_eq!(
+            stops(&["", "END", ""])["inferenceConfig"]["stopSequences"],
+            json!(["END"])
+        );
+        let body = stops(&[""]);
+        assert!(
+            body["inferenceConfig"].get("stopSequences").is_none(),
+            "{body}"
         );
     }
 
