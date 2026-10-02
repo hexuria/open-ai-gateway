@@ -716,7 +716,8 @@ page walks through, and which regions serve which model is Google's
 page to say.
 
 **The token.** A credential's key signs a JWT (RS256, scope
-`https://www.googleapis.com/auth/cloud-platform`, valid for an hour), which the
+`https://www.googleapis.com/auth/cloud-platform`, dated thirty seconds back to
+allow for a host clock a little ahead of Google's, valid for an hour), which the
 gateway trades at `gateway.gcp_token_url`, Google's
 `https://oauth2.googleapis.com/token` unless it is set, for an access token:
 https, or http only to this machine's loopback, and the assertion is addressed

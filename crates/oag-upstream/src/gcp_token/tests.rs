@@ -166,8 +166,8 @@ async fn a_mint_posts_a_jwt_bearer_grant_signed_by_the_key() {
             "iss": EMAIL,
             "scope": "https://www.googleapis.com/auth/cloud-platform",
             "aud": "https://oauth2.googleapis.com/token",
-            "iat": T0,
-            "exp": T0 + 3600,
+            "iat": T0 - 30,
+            "exp": T0 - 30 + 3600,
         })
     );
     assert_eq!(
@@ -256,7 +256,7 @@ async fn a_token_within_five_minutes_of_expiry_is_minted_again() {
     assert_eq!(grants.len(), 2);
     assert_eq!(
         claims(&grants[1])["iat"],
-        T0 + 3300,
+        T0 + 3300 - 30,
         "signed at the new time"
     );
     server.verify().await;
@@ -547,8 +547,8 @@ async fn the_default_clock_is_the_system_clock() {
         .as_i64()
         .expect("iat");
     assert!(
-        (before..=after).contains(&iat),
-        "{before} <= {iat} <= {after}"
+        (before - 30..=after - 30).contains(&iat),
+        "{before} - 30 <= {iat} <= {after} - 30"
     );
 }
 
@@ -692,4 +692,20 @@ fn a_token_url_off_loopback_must_be_https() {
     ] {
         GcpTokenCache::new(good).expect(good);
     }
+}
+
+/// A host whose clock runs a little ahead of Google's would sign an `iat`
+/// Google reads as the future, and be refused `invalid_grant`. The assertion
+/// is dated thirty seconds back, and lives the full hour from then.
+#[tokio::test]
+async fn an_assertion_is_dated_thirty_seconds_back_for_an_hour() {
+    let server = token_endpoint(granted("ya29.dated"), 1).await;
+    cache(&server)
+        .token(AccountId::new(), &key_json().to_string(), None)
+        .await
+        .expect("a token");
+    let claims = claims(&grants(&server).await[0]);
+    assert_eq!(claims["iat"], T0 - 30);
+    assert_eq!(claims["exp"], T0 - 30 + 3600);
+    server.verify().await;
 }

@@ -77,6 +77,13 @@ const AUDIENCE: &str = "https://oauth2.googleapis.com/token";
 /// How long a signed assertion is valid. Google refuses anything longer.
 const ASSERTION_LIFETIME_SECS: i64 = 3600;
 
+/// How far back an assertion is dated. A host whose clock runs ahead of
+/// Google's would otherwise sign an `iat` Google reads as the future, and be
+/// refused `invalid_grant` ("Token must be a short-lived token (60 minutes)
+/// and in a reasonable timeframe"). Google's own Go library dates its
+/// assertions back for the same reason.
+const CLOCK_SKEW_SECS: i64 = 30;
+
 /// Mint again this long before the cached token expires, so no request sets
 /// out with a token that dies on the way. The same margin `gateway::refresh`
 /// gives an OAuth token.
@@ -153,9 +160,11 @@ impl ServiceAccountKey {
     }
 
     /// The signed JWT that is traded for an access token, addressed to
-    /// [`AUDIENCE`].
+    /// [`AUDIENCE`], issued [`CLOCK_SKEW_SECS`] before `now` and valid for the
+    /// hour Google allows from then.
     fn sign_assertion(&self, now: i64) -> Result<String> {
         let key_pair = self.key_pair()?;
+        let issued = now - CLOCK_SKEW_SECS;
 
         let header = serde_json::json!({
             "alg": "RS256",
@@ -166,8 +175,8 @@ impl ServiceAccountKey {
             "iss": &self.client_email,
             "scope": SCOPE,
             "aud": AUDIENCE,
-            "iat": now,
-            "exp": now + ASSERTION_LIFETIME_SECS,
+            "iat": issued,
+            "exp": issued + ASSERTION_LIFETIME_SECS,
         });
         let signing_input = format!(
             "{}.{}",
