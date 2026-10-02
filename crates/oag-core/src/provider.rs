@@ -1,17 +1,26 @@
 //! Upstream providers.
 
 use crate::credential::CredentialKind;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 
 /// An upstream inference provider.
 ///
 /// Deliberately a closed enum rather than a string: adding a provider means
 /// writing an adapter, and the compiler should make you notice every match arm
-/// that needs a new case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// that needs a new case. [`Provider::Custom`] is the one open door, and it
+/// needs no adapter of its own: an operator's endpoint speaks a dialect one
+/// already serves.
+///
+/// Serialises as its name, the string `Display`, the CLI and the
+/// `account.provider` column already use, and deserialises through
+/// [`FromStr`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum Provider {
     Anthropic,
@@ -25,6 +34,9 @@ pub enum Provider {
     /// Jev, from `TypeSafe` AI, which answers System One questions. Not a
     /// chat upstream: see [`Dialect::SystemOne`].
     Jev,
+    /// An endpoint an operator registered; see [`Endpoint`]. Declared last,
+    /// so every built-in sorts before every endpoint.
+    Custom(Endpoint),
 }
 
 impl Provider {
@@ -47,6 +59,7 @@ impl Provider {
             }
             Self::Gemini => Dialect::GeminiGenerateContent,
             Self::Jev => Dialect::SystemOne,
+            Self::Custom(endpoint) => endpoint.dialect,
         }
     }
 
@@ -62,10 +75,13 @@ impl Provider {
             Self::XAI => "xai",
             Self::Bedrock => "bedrock",
             Self::Jev => "jev",
+            Self::Custom(endpoint) => endpoint.name,
         }
     }
 
-    /// Every variant, in declaration order.
+    /// Every built-in provider, in declaration order. No endpoint is listed:
+    /// which ones exist is the operator's business, and the
+    /// [`EndpointRegistry`] holds them.
     ///
     /// Hand-written because the language offers no way to enumerate an enum,
     /// and a `strum`-style derive is a dependency for one list. What keeps it
@@ -232,6 +248,39 @@ impl Provider {
                      model, so a route's Jev key is never chosen for a chat request.",
                 ),
             },
+            // An endpoint takes the one kind its platform signs requests
+            // with, and never a seat: nobody's subscription is an endpoint.
+            Self::Custom(endpoint) => ProviderSupport {
+                provider: self,
+                display_name: endpoint.name,
+                aliases: &[],
+                credential_kinds: match endpoint.platform {
+                    Platform::Plain | Platform::Azure => &[CredentialKind::ApiKey],
+                    Platform::Aws => &[CredentialKind::Bedrock],
+                    Platform::Gcp => &[CredentialKind::ServiceAccount],
+                },
+                subscription: SubscriptionSupport::NotOffered {
+                    why: NoSubscription::NoImporter,
+                },
+                note: None,
+            },
+        }
+    }
+
+    /// The built-in provider a name or alias spells. Never an endpoint, which
+    /// is what lets [`Endpoint::validate_name`] ask it.
+    fn builtin(s: &str) -> Option<Self> {
+        match s {
+            "anthropic" => Some(Self::Anthropic),
+            "openai" => Some(Self::OpenAI),
+            "gemini" => Some(Self::Gemini),
+            "kimi" | "moonshot" => Some(Self::Kimi),
+            "deepseek" => Some(Self::DeepSeek),
+            "zhipu" | "glm" => Some(Self::Zhipu),
+            "xai" | "grok" => Some(Self::XAI),
+            "bedrock" => Some(Self::Bedrock),
+            "jev" | "typesafe" => Some(Self::Jev),
+            _ => None,
         }
     }
 }
@@ -245,19 +294,31 @@ impl fmt::Display for Provider {
 impl FromStr for Provider {
     type Err = crate::Error;
 
+    /// The built-ins first, then the [`EndpointRegistry`], so a built-in's
+    /// name always means the built-in.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "anthropic" => Ok(Self::Anthropic),
-            "openai" => Ok(Self::OpenAI),
-            "gemini" => Ok(Self::Gemini),
-            "kimi" | "moonshot" => Ok(Self::Kimi),
-            "deepseek" => Ok(Self::DeepSeek),
-            "zhipu" | "glm" => Ok(Self::Zhipu),
-            "xai" | "grok" => Ok(Self::XAI),
-            "bedrock" => Ok(Self::Bedrock),
-            "jev" | "typesafe" => Ok(Self::Jev),
-            other => Err(crate::Error::UnknownProvider(other.to_owned())),
-        }
+        Self::builtin(s)
+            .or_else(|| EndpointRegistry::global().get(s).map(Self::Custom))
+            .ok_or_else(|| crate::Error::UnknownProvider(s.to_owned()))
+    }
+}
+
+/// A provider on the wire is its name. Written by hand because the derive
+/// spelled a variant by splitting its identifier (`OpenAI` came out as
+/// `open_a_i`, a string nothing else uses) and cannot spell an endpoint.
+impl Serialize for Provider {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Through [`FromStr`], so a name reads back exactly as the CLI parses it:
+/// aliases included, and an endpoint only while it is registered.
+impl<'de> Deserialize<'de> for Provider {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -320,9 +381,9 @@ impl fmt::Display for Dialect {
 
 /// What one provider supports, as [`Provider::support`] reports it.
 ///
-/// `Serialize` but not `Deserialize`: every field is a `&'static str` compiled
-/// into the binary, and nothing reads a matrix back in. It is produced from the
-/// enum or it does not exist.
+/// `Serialize` but not `Deserialize`: every field is a `&'static str`, compiled
+/// into the binary or an endpoint's interned name, and nothing reads a matrix
+/// back in. It is produced from the enum or it does not exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct ProviderSupport {
@@ -412,6 +473,279 @@ pub enum NoSubscription {
     },
     /// No importer exists. Nothing forbids one; nobody has needed it.
     NoImporter,
+}
+
+/// Where an endpoint runs, which decides how its URLs are built, how its
+/// requests are signed, and so which credential kind it takes.
+///
+/// Not `#[non_exhaustive]`: every match on a platform builds a URL or signs a
+/// request, and a platform added without an arm in each is an endpoint that
+/// cannot be reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    /// Any host that serves a dialect the way its vendor does.
+    Plain,
+    /// AWS Bedrock, signed with `SigV4`.
+    Aws,
+    /// Google Vertex AI, with a bearer token minted from a service account.
+    Gcp,
+    /// Azure `OpenAI`, keyed by its `api-key` header.
+    Azure,
+}
+
+impl Platform {
+    /// The spelling an operator types and the schema stores.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Aws => "aws",
+            Self::Gcp => "gcp",
+            Self::Azure => "azure",
+        }
+    }
+}
+
+impl FromStr for Platform {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "plain" => Ok(Self::Plain),
+            "aws" => Ok(Self::Aws),
+            "gcp" => Ok(Self::Gcp),
+            "azure" => Ok(Self::Azure),
+            other => Err(format!(
+                "unknown platform `{other}`: use plain, aws, gcp or azure"
+            )),
+        }
+    }
+}
+
+/// How a request presents an endpoint's key: named for the header, because
+/// the header is what a provider's documentation tells you to send.
+///
+/// Not `#[non_exhaustive]`, for the reason [`Platform`] is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthStyle {
+    /// `Authorization: Bearer <key>`, as `OpenAI` and most hosts that copy it
+    /// take it.
+    Bearer,
+    /// `x-api-key: <key>`, Anthropic's header.
+    XApiKey,
+    /// `x-goog-api-key: <key>`, the Gemini API's header.
+    XGoogApiKey,
+    /// `api-key: <key>`, Azure's header.
+    ApiKeyHeader,
+    /// No key at all: a server that trusts the network it is on.
+    None,
+}
+
+impl AuthStyle {
+    /// The spelling an operator types and the schema stores.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::XApiKey => "x_api_key",
+            Self::XGoogApiKey => "x_goog_api_key",
+            Self::ApiKeyHeader => "api_key_header",
+            Self::None => "none",
+        }
+    }
+}
+
+impl FromStr for AuthStyle {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "bearer" => Ok(Self::Bearer),
+            "x_api_key" => Ok(Self::XApiKey),
+            "x_goog_api_key" => Ok(Self::XGoogApiKey),
+            "api_key_header" => Ok(Self::ApiKeyHeader),
+            "none" => Ok(Self::None),
+            other => Err(format!(
+                "unknown auth style `{other}`: use bearer, x_api_key, x_goog_api_key, \
+                 api_key_header or none"
+            )),
+        }
+    }
+}
+
+/// An upstream an operator registered: a name, the dialect it speaks, and the
+/// platform it runs on.
+///
+/// The name is its identity: the `account.provider` its keys are filed under
+/// and the prefix of its models (`groq/llama-…`). So equality, hashing and
+/// order look at the name alone, and two endpoints with one name are one
+/// endpoint, whatever a stale copy says about the rest.
+///
+/// `Copy`, like the [`Provider`] it sits in, because the name is interned. The
+/// fields are private so that [`Endpoint::new`] is the only way to make one,
+/// which means every endpoint has a well-formed name that no built-in uses.
+#[derive(Debug, Clone, Copy)]
+pub struct Endpoint {
+    name: &'static str,
+    dialect: Dialect,
+    platform: Platform,
+}
+
+impl Endpoint {
+    /// Names taken by something that is not a provider: `oag` is the provider
+    /// the listing reports for the gateway's own models (`oag/auto`,
+    /// `oag/<tier>`), and `codex` names the `OpenAI` seat, both its import
+    /// (`--from codex`) and its config section.
+    const RESERVED: &'static [&'static str] = &["oag", "codex"];
+
+    /// The longest name, in bytes. A name may only hold ASCII, so this is its
+    /// length in characters too.
+    const MAX_NAME: usize = 32;
+
+    /// An endpoint, if `name` is one an endpoint may have (see
+    /// [`Endpoint::validate_name`]).
+    ///
+    /// The name is interned: the first endpoint to use it leaks one copy, and
+    /// every later one gets that same copy back. Reloading the same endpoints
+    /// forever therefore costs their names' memory once.
+    pub fn new(name: &str, dialect: Dialect, platform: Platform) -> Result<Self, String> {
+        Self::validate_name(name)?;
+        Ok(Self {
+            name: intern(name),
+            dialect,
+            platform,
+        })
+    }
+
+    /// Whether `name` may name an endpoint: it matches
+    /// `^[a-z0-9][a-z0-9_-]{0,31}$`, and it is not a built-in provider's name
+    /// or alias, `oag` or `codex`.
+    ///
+    /// Asks the built-ins and never the registry, so an endpoint's own name
+    /// still passes when its row is loaded again.
+    pub fn validate_name(name: &str) -> Result<(), String> {
+        let mut bytes = name.bytes();
+        let well_formed = name.len() <= Self::MAX_NAME
+            && bytes
+                .next()
+                .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && bytes
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+        if !well_formed {
+            return Err(format!(
+                "endpoint name `{name}` must be 1 to 32 characters from a-z, 0-9, `_` \
+                 and `-`, starting with a letter or a digit"
+            ));
+        }
+        if Provider::builtin(name).is_some() || Self::RESERVED.contains(&name) {
+            return Err(format!(
+                "endpoint name `{name}` is reserved: a built-in provider, one of its \
+                 aliases, `oag` or `codex` already means it"
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn dialect(self) -> Dialect {
+        self.dialect
+    }
+
+    #[must_use]
+    pub const fn platform(self) -> Platform {
+        self.platform
+    }
+}
+
+impl PartialEq for Endpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for Endpoint {}
+
+impl Hash for Endpoint {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl PartialOrd for Endpoint {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Endpoint {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name.cmp(other.name)
+    }
+}
+
+/// One leaked copy of `name`, and the same copy for every call that passes it.
+///
+/// Leaked so an [`Endpoint`] can be `Copy` and hand out a `&'static str` as
+/// the built-ins do. Bounded because [`Endpoint::new`] is the only caller,
+/// and only with a name it has validated: one copy per distinct endpoint name
+/// this process has ever seen, each at most 32 bytes.
+fn intern(name: &str) -> &'static str {
+    static NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut names = NAMES
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(&interned) = names.get(name) {
+        return interned;
+    }
+    let leaked: &'static str = Box::leak(Box::from(name));
+    names.insert(leaked);
+    leaked
+}
+
+/// The endpoints this process resolves by name: one snapshot, replaced whole.
+///
+/// A reload builds its set before it takes the lock and swaps it in with one
+/// assignment, so a parse never sees half a set and waits on nothing longer
+/// than that swap. Nothing is merged: an endpoint missing from the new set is
+/// gone.
+#[derive(Debug, Default)]
+pub struct EndpointRegistry {
+    snapshot: RwLock<Arc<HashMap<&'static str, Endpoint>>>,
+}
+
+impl EndpointRegistry {
+    /// The registry [`Provider`]'s `FromStr` reads after the built-ins.
+    pub fn global() -> &'static Self {
+        static GLOBAL: OnceLock<EndpointRegistry> = OnceLock::new();
+        GLOBAL.get_or_init(Self::default)
+    }
+
+    /// Make `endpoints` the whole set. One left out stops resolving, which is
+    /// how an endpoint is removed.
+    pub fn install(&self, endpoints: Vec<Endpoint>) {
+        let next = Arc::new(endpoints.into_iter().map(|e| (e.name, e)).collect());
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = next;
+    }
+
+    /// The endpoint installed under `name`, if there is one.
+    pub fn get(&self, name: &str) -> Option<Endpoint> {
+        self.snapshot
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .copied()
+    }
 }
 
 #[cfg(test)]
@@ -580,5 +914,370 @@ mod tests {
         for &p in Provider::ALL {
             assert_eq!(p.support().dialect(), p.native_dialect());
         }
+    }
+
+    /// The endpoints the parse tests share: name, dialect, platform, and the
+    /// credential kinds that platform takes. One on each platform, and a
+    /// System One host.
+    const ENDPOINTS: &[(&str, Dialect, Platform, &[CredentialKind])] = &[
+        (
+            "t1-groq",
+            Dialect::OpenAIChatCompletions,
+            Platform::Plain,
+            &[CredentialKind::ApiKey],
+        ),
+        (
+            "t1-azure",
+            Dialect::OpenAIChatCompletions,
+            Platform::Azure,
+            &[CredentialKind::ApiKey],
+        ),
+        (
+            "t1-bedrock-eu",
+            Dialect::AnthropicMessages,
+            Platform::Aws,
+            &[CredentialKind::Bedrock],
+        ),
+        (
+            "t1-vertex",
+            Dialect::GeminiGenerateContent,
+            Platform::Gcp,
+            &[CredentialKind::ServiceAccount],
+        ),
+        (
+            "t1-jev_2",
+            Dialect::SystemOne,
+            Platform::Plain,
+            &[CredentialKind::ApiKey],
+        ),
+    ];
+
+    /// Installs [`ENDPOINTS`] into the global registry, once.
+    ///
+    /// Once, and no test installs anything else there: `install` replaces the
+    /// whole set and tests run in parallel, so a test installing a set of its
+    /// own would unregister another test's endpoints between that test's
+    /// install and its parse.
+    fn install_endpoints() {
+        static ONCE: OnceLock<()> = OnceLock::new();
+        ONCE.get_or_init(|| {
+            EndpointRegistry::global().install(
+                ENDPOINTS
+                    .iter()
+                    .map(|&(name, dialect, platform, _)| {
+                        Endpoint::new(name, dialect, platform).unwrap()
+                    })
+                    .collect(),
+            );
+        });
+    }
+
+    #[test]
+    fn a_name_nobody_registered_is_an_unknown_provider() {
+        // The registry holds endpoints, only not this one.
+        install_endpoints();
+        let refused = "t1-unregistered".parse::<Provider>().unwrap_err();
+        assert!(
+            matches!(&refused, crate::Error::UnknownProvider(name) if name == "t1-unregistered"),
+            "{refused}"
+        );
+        let refused = serde_json::from_str::<Provider>(r#""t1-unregistered""#).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .starts_with("unknown provider: t1-unregistered"),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn a_registered_endpoint_parses_to_itself_with_its_dialect_and_platform() {
+        install_endpoints();
+        for &(name, dialect, platform, kinds) in ENDPOINTS {
+            let provider: Provider = name.parse().unwrap_or_else(|e| panic!("{name}: {e}"));
+            let Provider::Custom(endpoint) = provider else {
+                panic!("{name} parsed as the built-in {provider}");
+            };
+            assert_eq!(endpoint.name(), name);
+            assert_eq!(endpoint.dialect(), dialect, "{name}");
+            assert_eq!(endpoint.platform(), platform, "{name}");
+            assert_eq!(provider.native_dialect(), dialect, "{name}");
+            assert_eq!(provider.to_string(), name);
+
+            // What `account add` checks a key against: the one kind the
+            // platform signs with, and never a seat.
+            let support = provider.support();
+            assert_eq!(support.provider, provider);
+            assert_eq!(support.credential_kinds, kinds, "{name}");
+            assert_eq!(support.display_name, name);
+            assert!(support.aliases.is_empty(), "{name}");
+            assert_eq!(
+                support.subscription,
+                SubscriptionSupport::NotOffered {
+                    why: NoSubscription::NoImporter
+                },
+                "{name}"
+            );
+            assert_eq!(support.note, None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_registered_endpoint_round_trips_through_serde_as_its_bare_name() {
+        install_endpoints();
+        for &(name, dialect, platform, _) in ENDPOINTS {
+            let provider: Provider = name.parse().unwrap();
+            let json = serde_json::to_string(&provider).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            let back: Provider = serde_json::from_str(&json).unwrap();
+            // Equality is by name, so look at the rest as well.
+            let Provider::Custom(endpoint) = back else {
+                panic!("{name} came back as the built-in {back}");
+            };
+            assert_eq!(endpoint.name(), name);
+            assert_eq!(
+                (endpoint.dialect(), endpoint.platform()),
+                (dialect, platform)
+            );
+        }
+    }
+
+    /// Every built-in's name, as the `account.provider` column, the CLI and
+    /// the admin API already spell it. Literals, so the table cannot agree
+    /// with `as_str` by reading it.
+    #[test]
+    fn a_built_in_provider_serialises_as_the_name_it_has_everywhere_else() {
+        let table = [
+            (Provider::Anthropic, "anthropic"),
+            (Provider::OpenAI, "openai"),
+            (Provider::Gemini, "gemini"),
+            (Provider::Kimi, "kimi"),
+            (Provider::DeepSeek, "deepseek"),
+            (Provider::Zhipu, "zhipu"),
+            (Provider::XAI, "xai"),
+            (Provider::Bedrock, "bedrock"),
+            (Provider::Jev, "jev"),
+        ];
+        assert_eq!(table.map(|(p, _)| p).as_slice(), Provider::ALL);
+        for (provider, name) in table {
+            assert_eq!(provider.as_str(), name);
+            assert_eq!(
+                serde_json::to_string(&provider).unwrap(),
+                format!("\"{name}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<Provider>(&format!("\"{name}\"")).unwrap(),
+                provider
+            );
+        }
+        // An alias reads back as its provider, exactly as the CLI parses it.
+        assert_eq!(
+            serde_json::from_str::<Provider>(r#""grok""#).unwrap(),
+            Provider::XAI
+        );
+    }
+
+    #[test]
+    fn an_endpoint_name_is_refused_when_reserved_or_malformed() {
+        let mut reserved = vec!["oag", "codex"];
+        for &p in Provider::ALL {
+            reserved.push(p.as_str());
+            reserved.extend(p.support().aliases);
+        }
+        for name in reserved {
+            let refused = Endpoint::validate_name(name).expect_err(name);
+            assert!(refused.contains("reserved"), "{name}: {refused}");
+            assert!(
+                Endpoint::new(name, Dialect::OpenAIChatCompletions, Platform::Plain).is_err(),
+                "{name}"
+            );
+        }
+
+        let too_long = "a".repeat(33);
+        for name in [
+            "",
+            "-groq",
+            "_groq",
+            "Groq",
+            "grOq",
+            "my/endpoint",
+            "key@sub",
+            "dot.ted",
+            "two words",
+            "grøq",
+            too_long.as_str(),
+        ] {
+            let refused = Endpoint::validate_name(name).expect_err(name);
+            assert!(refused.contains("must be"), "{name}: {refused}");
+            assert!(
+                Endpoint::new(name, Dialect::OpenAIChatCompletions, Platform::Plain).is_err(),
+                "{name}"
+            );
+        }
+
+        let longest = "a".repeat(32);
+        for name in [
+            "groq",
+            "0x",
+            "9",
+            "my_end-point",
+            "oag-prod",
+            "openai2",
+            longest.as_str(),
+        ] {
+            assert_eq!(Endpoint::validate_name(name), Ok(()), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_registered_name_still_validates_when_its_row_is_loaded_again() {
+        // Every reload validates every row. If validation asked the registry,
+        // an endpoint would pass on its first load and be refused on every
+        // reload after it.
+        install_endpoints();
+        assert!(matches!(
+            "t1-groq".parse::<Provider>(),
+            Ok(Provider::Custom(_))
+        ));
+        assert_eq!(Endpoint::validate_name("t1-groq"), Ok(()));
+    }
+
+    #[test]
+    fn every_built_in_sorts_before_every_endpoint() {
+        // `aaa` comes before `anthropic` by name, so ordering by name alone
+        // would put this endpoint first.
+        let first = Endpoint::new("aaa", Dialect::AnthropicMessages, Platform::Plain).unwrap();
+        let last = Endpoint::new("zzz", Dialect::AnthropicMessages, Platform::Plain).unwrap();
+        let mut sorted = vec![Provider::Custom(last), Provider::Custom(first)];
+        sorted.extend(Provider::ALL.iter().rev());
+        sorted.sort();
+        let (built_in, custom) = sorted.split_at(Provider::ALL.len());
+        assert_eq!(
+            built_in,
+            Provider::ALL,
+            "the built-ins keep their own order"
+        );
+        assert_eq!(
+            custom,
+            [Provider::Custom(first), Provider::Custom(last)],
+            "endpoints sort among themselves by name"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_is_compared_hashed_and_ordered_by_its_name_alone() {
+        use std::hash::{BuildHasher, RandomState};
+
+        let one =
+            Endpoint::new("t1-same", Dialect::OpenAIChatCompletions, Platform::Plain).unwrap();
+        let stale = Endpoint::new("t1-same", Dialect::AnthropicMessages, Platform::Aws).unwrap();
+        let other =
+            Endpoint::new("t1-samf", Dialect::OpenAIChatCompletions, Platform::Plain).unwrap();
+
+        assert_eq!(one, stale);
+        assert_ne!(one, other);
+        assert_eq!(one.cmp(&stale), Ordering::Equal);
+        assert_eq!(one.cmp(&other), Ordering::Less);
+        assert_eq!(other.cmp(&one), Ordering::Greater);
+        assert!(one < other && other > stale);
+
+        let hasher = RandomState::new();
+        assert_eq!(hasher.hash_one(one), hasher.hash_one(stale));
+        assert_eq!(
+            hasher.hash_one(one),
+            hasher.hash_one("t1-same"),
+            "an endpoint hashes as its name"
+        );
+    }
+
+    #[test]
+    fn a_name_is_leaked_once_however_often_it_is_interned() {
+        let first = intern("t1-interned");
+        let owned = String::from("t1-interned");
+        assert!(
+            std::ptr::eq(first, intern(&owned)),
+            "a second call leaked a second copy"
+        );
+        assert_eq!(first, "t1-interned");
+        assert!(!std::ptr::eq(first, intern("t1-interned-2")));
+        // The constructor is the interner's only caller.
+        let endpoint =
+            Endpoint::new(&owned, Dialect::OpenAIChatCompletions, Platform::Plain).unwrap();
+        assert!(std::ptr::eq(endpoint.name(), first));
+    }
+
+    #[test]
+    fn installing_a_set_replaces_the_previous_one_whole() {
+        // A registry of its own: the global one is shared with the parse tests.
+        let registry = EndpointRegistry::default();
+        let kept = Endpoint::new("t1-kept", Dialect::GeminiGenerateContent, Platform::Gcp).unwrap();
+        let dropped = Endpoint::new(
+            "t1-dropped",
+            Dialect::OpenAIChatCompletions,
+            Platform::Plain,
+        )
+        .unwrap();
+        assert_eq!(registry.get("t1-kept"), None);
+
+        registry.install(vec![kept, dropped]);
+        assert_eq!(
+            registry.get("t1-dropped").map(Endpoint::platform),
+            Some(Platform::Plain)
+        );
+
+        registry.install(vec![kept]);
+        assert_eq!(
+            registry.get("t1-kept").map(Endpoint::dialect),
+            Some(Dialect::GeminiGenerateContent)
+        );
+        assert_eq!(
+            registry.get("t1-dropped"),
+            None,
+            "an endpoint left out of a reload must stop resolving"
+        );
+    }
+
+    #[test]
+    fn a_platform_and_an_auth_style_each_have_one_spelling() {
+        // What the CLI parses, the schema stores and a JSON body carries.
+        for (platform, word) in [
+            (Platform::Plain, "plain"),
+            (Platform::Aws, "aws"),
+            (Platform::Gcp, "gcp"),
+            (Platform::Azure, "azure"),
+        ] {
+            assert_eq!(platform.as_str(), word);
+            assert_eq!(word.parse::<Platform>(), Ok(platform));
+            assert_eq!(serde_json::to_value(platform).unwrap(), word);
+            assert_eq!(
+                serde_json::from_value::<Platform>(word.into()).unwrap(),
+                platform
+            );
+        }
+        for (auth, word) in [
+            (AuthStyle::Bearer, "bearer"),
+            (AuthStyle::XApiKey, "x_api_key"),
+            (AuthStyle::XGoogApiKey, "x_goog_api_key"),
+            (AuthStyle::ApiKeyHeader, "api_key_header"),
+            (AuthStyle::None, "none"),
+        ] {
+            assert_eq!(auth.as_str(), word);
+            assert_eq!(word.parse::<AuthStyle>(), Ok(auth));
+            assert_eq!(serde_json::to_value(auth).unwrap(), word);
+            assert_eq!(
+                serde_json::from_value::<AuthStyle>(word.into()).unwrap(),
+                auth
+            );
+        }
+        assert!(
+            "vertex"
+                .parse::<Platform>()
+                .is_err_and(|e| e.contains("`vertex`"))
+        );
+        assert!(
+            "api-key"
+                .parse::<AuthStyle>()
+                .is_err_and(|e| e.contains("`api-key`"))
+        );
     }
 }
