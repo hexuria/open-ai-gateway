@@ -143,6 +143,15 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
         Ok(Cow::Borrowed(stored))
     }
 
+    /// Told that the upstream refused, with a 401, `refused`: the credential
+    /// this adapter prepared for `account`.
+    ///
+    /// For an adapter that keeps what [`ProviderAdapter::prepare_credential`]
+    /// made, so it can let it go and the next request prepares it afresh,
+    /// rather than being handed the credential just refused. A no-op by
+    /// default, for every adapter that sends what is stored.
+    async fn credential_refused(&self, _account: AccountId, _refused: &SecretMaterial) {}
+
     /// Which models this *credential* can be used with, as the provider's own
     /// upstream names.
     ///

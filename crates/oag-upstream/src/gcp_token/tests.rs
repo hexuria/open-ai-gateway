@@ -920,3 +920,47 @@ async fn a_token_outlives_a_failed_refresh_until_its_last_thirty_seconds() {
     assert!(err.to_string().contains("503"), "{err}");
     server.verify().await;
 }
+
+/// A token the upstream refused is dropped, so the next caller mints a new
+/// one; but only if it is still the one refused, so a token another request
+/// minted in the meantime is kept.
+#[tokio::test]
+async fn forgetting_a_token_keeps_a_newer_one() {
+    static NOW: AtomicI64 = AtomicI64::new(T0);
+    fn now() -> i64 {
+        NOW.load(Ordering::SeqCst)
+    }
+    let server = MockServer::start().await;
+    for (token, once) in [("ya29.refused", true), ("ya29.fresh", false)] {
+        let mock = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(granted(token))
+            .expect(1);
+        let mock = if once { mock.up_to_n_times(1) } else { mock };
+        mock.mount(&server).await;
+    }
+    let cache = GcpTokenCache::new(token_url(&server))
+        .expect("a client")
+        .with_clock(now);
+    let (account, key) = (AccountId::new(), key_json().to_string());
+
+    assert_eq!(
+        cache.token(account, &key, None).await.expect("minted"),
+        "ya29.refused"
+    );
+    cache.forget(account, "ya29.refused").await;
+    assert_eq!(
+        cache
+            .token(account, &key, None)
+            .await
+            .expect("minted again"),
+        "ya29.fresh"
+    );
+    // A late word about the old token leaves the new one where it is.
+    cache.forget(account, "ya29.refused").await;
+    assert_eq!(
+        cache.token(account, &key, None).await.expect("kept"),
+        "ya29.fresh"
+    );
+    server.verify().await;
+}

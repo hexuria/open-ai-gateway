@@ -574,6 +574,25 @@ impl GcpTokenCache {
         })
     }
 
+    /// Drop `account`'s token if it is still `refused`, so the next caller
+    /// mints a new one. A token another caller minted since is kept: it is
+    /// not the one refused.
+    ///
+    /// For a token the upstream answered 401: revoked, or its service
+    /// account's key disabled under it, and of no use for the rest of its
+    /// hour.
+    pub async fn forget(&self, account: AccountId, refused: &str) {
+        let slot = self.slot(account);
+        let mut held = slot.lock().await;
+        if held
+            .minted
+            .as_ref()
+            .is_some_and(|m| m.access_token == refused)
+        {
+            held.minted = None;
+        }
+    }
+
     fn slot(&self, account: AccountId) -> Slot {
         // A panic cannot leave the map half-written: it is only ever read and
         // inserted into. So a poisoned lock is recovered, not given up on.

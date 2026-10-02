@@ -733,6 +733,8 @@ credential's `proxy_url` when it has one, as its requests do.
 
 The mint happens on the request path, just before the request is built, while
 the request holds its slot on that credential; one takes at most ten seconds.
+A token Vertex answers 401 (revoked, or its service account's key disabled) is
+dropped, and the next request on that credential mints a new one.
 
 **When a mint fails.** A key Google refuses (`invalid_grant`: the key or its
 service account was deleted or disabled, or this host's clock is far enough off

@@ -2162,6 +2162,143 @@ async fn a_credential_that_cannot_mint_sits_out_a_cooldown() {
     }
 }
 
+/// A token Vertex refuses with a 401 is not sent again: the next request on
+/// that credential mints a new one. Without that, the refused token was
+/// handed back from the cache for the rest of its hour, every request on the
+/// credential refused in turn.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_token_vertex_refuses_is_minted_again_for_the_next_request() {
+    use oag_core::provider::{AuthStyle, Endpoint, EndpointRegistry, Platform};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (google, vertex) = (MockServer::start().await, MockServer::start().await);
+    for (token, once) in [("ya29.t13-refused", true), ("ya29.t13-fresh", false)] {
+        let mock = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": token,
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            })))
+            .expect(1);
+        let mock = if once { mock.up_to_n_times(1) } else { mock };
+        mock.mount(&google).await;
+    }
+    let at = "/v1/projects/oag-test/locations/global/publishers/google/models/m:generateContent";
+    Mock::given(method("POST"))
+        .and(path(at))
+        .and(header("authorization", "Bearer ya29.t13-refused"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": { "code": 401, "status": "UNAUTHENTICATED",
+                       "message": "Request had invalid authentication credentials." }
+        })))
+        .expect(1)
+        .mount(&vertex)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(at))
+        .and(header("authorization", "Bearer ya29.t13-fresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hello again"}]},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5}
+        })))
+        .expect(1)
+        .mount(&vertex)
+        .await;
+
+    let state = crate::testing::state(&format!(
+        "gateway:\n  gcp_token_url: \"{}/token\"\n",
+        google.uri()
+    ));
+    let endpoint = Endpoint::new(
+        "t13-refused-vertex",
+        Dialect::GeminiGenerateContent,
+        Platform::Gcp,
+    )
+    .expect("a name");
+    let spec = oag_upstream::custom::EndpointSpec::new(
+        endpoint,
+        vertex.uri(),
+        AuthStyle::Bearer,
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .expect("no headers to refuse")
+    .with_region(Some("global".to_owned()))
+    .with_project(Some("oag-test".to_owned()))
+    .with_gcp_tokens(Arc::clone(&state.gcp_tokens));
+    let adapter = oag_upstream::custom::adapter(&spec).expect("a gcp adapter");
+    state.apply_endpoints(
+        &EndpointRegistry::default(),
+        vec![(endpoint, crate::state::Served::Chat(adapter))],
+    );
+
+    let sa_json = serde_json::json!({
+        "type": "service_account",
+        "private_key_id": "t13",
+        "private_key": oag_upstream::gcp_token::TEST_KEY_PEM,
+        "client_email": "t13-refused@oag-test.invalid",
+    })
+    .to_string();
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let mut lease = select::testing::lease(&slots);
+    let sealed = state
+        .kek
+        .seal_json(&oag_core::credential::SecretMaterial {
+            access_token: sa_json,
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        })
+        .expect("seals");
+    lease.account.provider = endpoint.name().to_owned();
+    lease.account.kind = "service_account".to_owned();
+    lease.account.credentials_sealed = sealed.ciphertext;
+    lease.account.credentials_nonce = sealed.nonce;
+
+    let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+        "model": "t13-refused-vertex/m",
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .expect("parses");
+    let decision = decision_for(oag_core::Provider::Custom(endpoint));
+    let attempt = || {
+        super::failover::try_credential(
+            &state,
+            &decision,
+            &canonical,
+            &lease,
+            RequestId::new(),
+            0,
+            uuid::Uuid::nil(),
+        )
+    };
+    let refused = attempt().await;
+    assert!(
+        matches!(
+            refused,
+            Outcome::Switch(Error::Upstream { status: 401, .. })
+        ),
+        "the 401 moves the request on"
+    );
+    let Outcome::Ok(answered) = attempt().await else {
+        panic!("the next request was sent the refused token again");
+    };
+    assert!(matches!(
+        *answered,
+        super::failover::Attempt::Collected { .. }
+    ));
+    google.verify().await;
+    vertex.verify().await;
+}
+
 /// A Vertex endpoint's request through `try_credential`, against a stand-in
 /// token endpoint and a stand-in Vertex, with no database behind it: the
 /// stored service-account key is minted into a token through the state's one

@@ -551,6 +551,11 @@ pub(super) async fn try_credential(
 
             Ok(response) => {
                 let status = response.status().as_u16();
+                // A credential the adapter prepared and the upstream refused
+                // (a minted token, revoked) is not to be handed out again.
+                if status == 401 {
+                    adapter.credential_refused(account, &credential).await;
+                }
                 // Read before the body is consumed: `text()` takes the whole
                 // response, headers included.
                 let retry_after = upstream_retry_after(response.headers());
