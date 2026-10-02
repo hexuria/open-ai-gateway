@@ -857,7 +857,9 @@ To price its answers, add a catalog row whose provider is `merge-decisions`,
 whose upstream name is Merge's model id, `typesafe/jev-1.13`, and whose id is
 the two joined: `merge-decisions/typesafe/jev-1.13`. An id may hold several
 `/`: the endpoint's name is what comes before the first, and everything after it
-is the host's own name for the model.
+is the host's own name for the model. A host's model is asked only once such a
+row prices it: the host bills for its answer, and an answer the ledger could
+not price would be spend nobody sees.
 
 **Which host answers** is the request's `model` to say, read in this order:
 
@@ -865,9 +867,11 @@ is the host's own name for the model.
 2. an id in System One's catalog: that row's provider, sent the row's upstream
    name — `merge-decisions/typesafe/jev-1.13` reaches Merge as
    `typesafe/jev-1.13`, and `jev/jev-latest` reaches Jev as `jev-latest`;
-3. `<endpoint>/<name>` for a System One host this gateway serves: that host,
-   sent `<name>`, so a model its listing shows can be asked before anyone
-   prices it;
+3. `<endpoint>/<name>` for a System One host this gateway serves, where one of
+   that host's catalog rows has `<name>` as its upstream name: that host, sent
+   `<name>`, and priced by the row. With no such row it is 400
+   `no_viable_model`, saying to price it with `catalog add` first, and nothing
+   is sent: a model the host lists is not askable before anyone prices it;
 4. a name with no provider in it (`jev-latest`), or Jev's (`jev/…`, or
    `typesafe/…`, its alias and Merge's spelling of Jev's models): Jev, sent the
    body as it arrived — everything this route took before hosts existed;

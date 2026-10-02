@@ -308,6 +308,20 @@ async fn unknown_models(gw: &Gateway, hosts: &Hosts) {
             "{body}"
         );
     }
+    // A host's model nobody has priced (C4): what the host would charge for
+    // its answer could not be metered, so it is not asked.
+    for model in ["merge-decisions/typesafe/jev-9", "selfjev/jev-1.13.0"] {
+        let res = gw.ask(&gw.key, &questions(model, "")).await;
+        assert_eq!(res.status(), 400, "{model}");
+        let body = json_of(res).await;
+        assert_eq!(body["error"]["type"], "no_viable_model", "{model}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(&format!("'{model}' is not in the catalog"))),
+            "{body}"
+        );
+    }
     for (model, whose) in [("jev-latest", "Jev"), (MERGE_MODEL, "merge-decisions")] {
         let res = gw.ask(&gw.bare_key, &questions(model, "")).await;
         assert_eq!(res.status(), 503, "{model}");

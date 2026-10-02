@@ -9,9 +9,9 @@
 //! credential for the one a request names refuses, and says so.
 //!
 //! Which one that is, the request's model says ([`resolve`]): a System One
-//! catalog id is its row's provider, `<endpoint>/<name>` is that endpoint's,
-//! and a model named by no provider, or by none at all, is Jev's, as it always
-//! was.
+//! catalog id is its row's provider, `<endpoint>/<name>` is that endpoint's
+//! once a catalog row prices it, and a model named by no provider, or by none
+//! at all, is Jev's, as it always was.
 //!
 //! What it does share with the chat path is everything about the credential.
 //! The caller's key, rate limit and spend caps admit it; an account of that
@@ -215,9 +215,12 @@ struct Target {
 /// 2. An id in System One's catalog: its row's provider, sent the row's
 ///    upstream name. `merge/typesafe/jev-1.13` reaches Merge as
 ///    `typesafe/jev-1.13`, and `jev/jev-latest` reaches Jev as `jev-latest`.
-/// 3. `<endpoint>/<name>`, where the endpoint is a System One host in `hosts`:
-///    that endpoint's, sent `<name>`. A name its host lists is askable before
-///    anyone has priced it, as a Jev model always was.
+/// 3. `<endpoint>/<name>`, where the endpoint is a System One host in `hosts`
+///    and a catalog row of that host's has `<name>` as its upstream name:
+///    that endpoint's, sent `<name>`, and priced by that row. A name of a
+///    host's that no row prices is refused: the host bills for its answer,
+///    and an answer the ledger could not price would be spend nobody sees.
+///    Jev's are not, because Jev has always been asked by any name.
 /// 4. A name with no provider in it, or Jev's (`jev/…`, `typesafe/…`): Jev's,
 ///    sent as it arrived, which is all this route did before endpoints.
 /// 5. Anything else — a chat provider's model, or an endpoint's that is not
@@ -250,13 +253,21 @@ fn resolve(model: Option<&str>, catalog: &Catalog, hosts: &[Provider]) -> Result
         .iter()
         .find(|host| matches!(host, Provider::Custom(_)) && host.as_str() == prefix)
     {
+        let Some(spec) = catalog
+            .iter()
+            .find(|spec| spec.provider == host && spec.upstream_name == name)
+        else {
+            return Err(Error::NoViableModel(format!(
+                "'{model}' is not in the catalog, so what {prefix} charges for its answer \
+                 could not be metered, and it is not sent there. Price it first: oag admin \
+                 catalog add --id {model} --upstream {name} --input-per-mtok <usd> \
+                 --output-per-mtok <usd> --context <tokens> --max-output <tokens>"
+            )));
+        };
         return Ok(Target {
             provider: host,
             upstream_model: Some(name.to_owned()),
-            spec: catalog
-                .iter()
-                .find(|spec| spec.provider == host && spec.upstream_name == name)
-                .cloned(),
+            spec: Some(spec.clone()),
         });
     }
     if prefix.parse::<Provider>().is_ok_and(|p| p == Provider::Jev) {
@@ -865,6 +876,8 @@ fn relay<T>(reply: Reply<T>, model: Option<&str>, request_id: RequestId) -> Resp
 /// Merge Gateway, asked for `typesafe/jev-1.13`, answers as `jev-1.13.0`, the
 /// concrete version, and the row that prices it is the one it was asked by.
 ///
+/// Only Jev's answers reach the stand-in: a request for another host's model
+/// is refused unless a row prices it ([`resolve`]), so it always has `asked`.
 /// Unpriced rather than refused: the answer has been given and billed either
 /// way, and a row with no cost is a pricing gap the dashboard shows, where no
 /// row at all is spend nobody sees.

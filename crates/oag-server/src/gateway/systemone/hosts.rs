@@ -83,8 +83,8 @@ fn what_jev_always_answered_still_goes_to_jev() {
     );
 }
 
-/// A host's model by its catalog id, by `<host>/<name>` with or without a row,
-/// and never a bare name, which stays Jev's.
+/// A host's model by its catalog id, or by `<host>/<name>` where a row of the
+/// host's has that upstream name, and never a bare name, which stays Jev's.
 #[test]
 fn a_host_s_model_goes_to_that_host_by_its_own_name() {
     let (catalog, hosts) = (catalog(), hosts());
@@ -97,11 +97,6 @@ fn a_host_s_model_goes_to_that_host_by_its_own_name() {
             Some("t7-merge/typesafe/jev-1.13")
         ),
         "an id with several slashes is still one catalog id"
-    );
-    assert_eq!(
-        resolve("t7-merge/typesafe/jev-2"),
-        target(host("t7-merge"), Some("typesafe/jev-2"), None),
-        "a model its host lists and nobody has priced"
     );
     assert_eq!(
         resolve("t7-selfhost/jev-latest"),
@@ -120,6 +115,46 @@ fn a_host_s_model_goes_to_that_host_by_its_own_name() {
             Some("t7-selfhost/fast")
         ),
         "and reached by that id too"
+    );
+}
+
+/// C4. A host's model that no row prices is refused before any credential is
+/// leased, as `no_viable_model`: the host bills for its answer, and one the
+/// ledger could not price would be spend nobody sees. Jev's are not: Jev has
+/// always been asked by any name, and its unpriced answers are rows the
+/// dashboard shows at zero.
+#[test]
+fn a_host_s_model_nobody_priced_is_refused_and_jev_s_is_not() {
+    let (catalog, hosts) = (catalog(), hosts());
+    for (model, host, name) in [
+        ("t7-merge/typesafe/jev-2", "t7-merge", "typesafe/jev-2"),
+        ("t7-selfhost/jev-1.13.0", "t7-selfhost", "jev-1.13.0"),
+    ] {
+        let refused = resolve(Some(model), &catalog, &hosts).expect_err(model);
+        assert!(
+            matches!(refused, Error::NoViableModel(_)),
+            "{model}: {refused}"
+        );
+        let message = refused.to_string();
+        assert!(
+            message.contains(&format!("'{model}' is not in the catalog")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("what {host} charges")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "oag admin catalog add --id {model} --upstream {name}"
+            )),
+            "{message}"
+        );
+    }
+    assert_eq!(
+        resolve(Some("jev/jev-9000"), &catalog, &hosts).expect("Jev's"),
+        target(Provider::Jev, None, None),
+        "Jev is asked by a name no row has, as it always was"
     );
 }
 
