@@ -1241,9 +1241,10 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     };
     let early = write(own, "1.25", "2.00");
     record_usage(&db, &early).await.expect("record");
-    // Three days old: inside the week and the month, outside the day. Without a spend
-    // between the two bounds, `day_usd` and `seven_day_usd` hold the same figure and a
-    // day window widened to seven days passes every assertion here — which it did.
+    // Three days old: inside the week, outside the day, and inside the month after its
+    // third day. Without a spend between the two bounds, `day_usd` and `seven_day_usd`
+    // hold the same figure and a day window widened to seven days passes every assertion
+    // here — which it did.
     let older = write(own, "0.25", "0.40");
     record_usage(&db, &older).await.expect("record");
     record_usage(&db, &write(own, "0.50", "0.80"))
@@ -1268,6 +1269,41 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     .execute(db.pool())
     .await
     .expect("backdate");
+    // The month is the calendar month, so in its first three days the
+    // three-day-old spend belongs to the month before, and in its first six
+    // hours the six-hour-old one does too. Which of them this month holds is
+    // read off the clock the windows read, so every month figure below is the
+    // right one on any day. The rolling windows do not care.
+    let in_month = |request: Uuid| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT occurred_at >= date_trunc('month', now()) FROM usage_event \
+                 WHERE request_id = $1",
+            )
+            .bind(request)
+            .fetch_one(db.pool())
+            .await
+            .expect("a backdated row")
+        }
+    };
+    let (early_in, older_in) = (
+        in_month(early.request_id).await,
+        in_month(older.request_id).await,
+    );
+    // The just-now spend, plus each backdated one the month still holds.
+    let month = |early_part: Decimal, older_part: Decimal, now_part: Decimal| {
+        now_part
+            + if early_in { early_part } else { Decimal::ZERO }
+            + if older_in { older_part } else { Decimal::ZERO }
+    };
+    let month_usd = month(dec!(1.25), dec!(0.25), dec!(0.50));
+    let month_list_usd = month(dec!(2.00), dec!(0.40), dec!(0.80));
+    let month_requests = 1 + i64::from(early_in) + i64::from(older_in);
+    // List price over R = 0.20, in points: 2.00, 0.40 and 0.80 make 10, 2
+    // and 4 million.
+    let month_points =
+        4_000_000 + if early_in { 10_000_000 } else { 0 } + if older_in { 2_000_000 } else { 0 };
 
     let usage = key_usage(&db, own, Some(dec!(0.20)))
         .await
@@ -1282,12 +1318,8 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
         dec!(2.000000),
         "the counter the cap is enforced against"
     );
-    assert_eq!(
-        usage.month_to_date_usd,
-        dec!(2.000000),
-        "this key's rows only"
-    );
-    assert_eq!(usage.requests, 3);
+    assert_eq!(usage.month_to_date_usd, month_usd, "this key's rows only");
+    assert_eq!(usage.requests, month_requests);
     assert_windows(&usage);
     assert_eq!(
         usage.five_hour_requests, 1,
@@ -1295,8 +1327,7 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     );
     assert_eq!(usage.seven_day_requests, 3);
     assert_eq!(
-        usage.month_counterfactual_usd,
-        dec!(3.200000),
+        usage.month_counterfactual_usd, month_list_usd,
         "the list-price bill the same tokens would have carried"
     );
     assert_eq!(usage.five_hour_counterfactual_usd, dec!(0.800000));
@@ -1310,8 +1341,8 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     // Points at R = 0.20: list price × 1e6 / 0.20, per request, summed.
     assert_eq!(
         usage.month_points,
-        Some(16_000_000),
-        "2.00, 0.80 and 0.40 at list price"
+        Some(month_points),
+        "this month's share of 2.00, 0.80 and 0.40 at list price"
     );
     assert_eq!(usage.five_hour_points, Some(4_000_000));
     assert_eq!(usage.day_points, Some(14_000_000));
@@ -1328,15 +1359,15 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     .expect("by model");
     assert_eq!(by_model.len(), 1);
     assert_eq!(by_model[0].model_id, "kimi-k2");
-    // The month, so all three of this key's spends.
-    assert_eq!(by_model[0].requests, 3);
+    // The month, so every one of this key's spends it holds.
+    assert_eq!(by_model[0].requests, month_requests);
     assert_eq!(
         (by_model[0].input_tokens, by_model[0].output_tokens),
-        (30, 15)
+        (10 * month_requests, 5 * month_requests)
     );
-    assert_eq!(by_model[0].cost_usd, dec!(2.000000));
-    assert_eq!(by_model[0].list_usd, dec!(3.200000));
-    assert_eq!(by_model[0].points, Some(16_000_000));
+    assert_eq!(by_model[0].cost_usd, month_usd);
+    assert_eq!(by_model[0].list_usd, month_list_usd);
+    assert_eq!(by_model[0].points, Some(month_points));
     let recent = key_usage_by_model(
         &db,
         own,
@@ -1362,7 +1393,11 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     .await
     .expect("points");
     let of = |key: Uuid| pool.iter().find(|(k, _)| *k == key).map(|(_, p)| *p);
-    assert_eq!(of(own), Some(16_000_000), "2.00, 0.80 and 0.40 over 0.20");
+    assert_eq!(
+        of(own),
+        Some(month_points),
+        "this month's share of 2.00, 0.80 and 0.40 over 0.20"
+    );
     assert_eq!(of(theirs), Some(45_000_000), "9.00 at list price over 0.20");
 
     let other = key_usage(&db, theirs, None)
