@@ -1222,12 +1222,13 @@ fn auth_context() -> oag_store::AuthContext {
 
 #[tokio::test]
 async fn streaming_adapter_or_egress_error_releases_slot() {
-    // A provider whose adapter is missing makes the streaming arm fail
-    // *after* a credential has been leased — the same shape as a dialect pair
-    // with no renderer. Both used to return past every release, stranding the
-    // slot for the whole SLOT_TTL; eight of those on one credential and it
-    // answers AtCapacity with nothing in flight.
-    let state = crate::testing::state_without_adapter(oag_core::Provider::Gemini);
+    // A dialect pair with no renderer makes the streaming arm fail *after* a
+    // credential has been leased. That used to return past every release,
+    // stranding the slot for the whole SLOT_TTL; eight of those on one
+    // credential and it answers AtCapacity with nothing in flight. A missing
+    // adapter was the other way there; the attempt now carries the adapter
+    // that sent the request, so there is no lookup left to fail.
+    let state = state();
     let slots = Arc::new(select::testing::CountingSlots::default());
 
     let result = stream_response(
@@ -1235,17 +1236,23 @@ async fn streaming_adapter_or_egress_error_releases_slot() {
         reqwest::Response::from(http::Response::new("stub")),
         select::testing::lease(&slots),
         &auth_context(),
-        &decision_for(oag_core::Provider::Gemini),
+        &decision_for(oag_core::Provider::Anthropic),
         RequestId::new(),
         Instant::now(),
         0,
-        Dialect::AnthropicMessages,
+        Dialect::SystemOne,
         None,
         state.lifecycle.track(),
         oag_proto::FunctionNameMap::identity(),
+        state
+            .adapter(oag_core::Provider::Anthropic)
+            .expect("a built-in adapter"),
     );
 
-    assert!(result.is_err(), "there is no adapter for gemini here");
+    assert!(
+        result.is_err(),
+        "no renderer from Anthropic's dialect into System One's"
+    );
     assert_eq!(slots.settled().await, 1, "and the slot came back");
 }
 
@@ -1278,10 +1285,252 @@ async fn a_live_stream_keeps_its_slot_until_the_pump_is_done() {
         None,
         state.lifecycle.track(),
         oag_proto::FunctionNameMap::identity(),
+        state
+            .adapter(oag_core::Provider::Anthropic)
+            .expect("a built-in adapter"),
     );
 
     assert!(result.is_ok());
     assert_eq!(slots.settled().await, 0, "still in flight");
+}
+
+/// An endpoint whose credential has a request in flight, removed from the
+/// state while the upstream is still answering, and the lease that request
+/// holds: a stand-in that answers `/v1/chat/completions` as `answer` says,
+/// an OpenAI-dialect endpoint in front of it, and its key sealed into the
+/// lease.
+async fn removable_endpoint(
+    name: &str,
+    answer: wiremock::ResponseTemplate,
+    slots: &Arc<select::testing::CountingSlots>,
+) -> (
+    Arc<AppState>,
+    wiremock::MockServer,
+    oag_core::Provider,
+    select::Lease,
+) {
+    use oag_core::provider::{AuthStyle, Endpoint, EndpointRegistry, Platform};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer};
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(answer)
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let state = state();
+    let endpoint =
+        Endpoint::new(name, Dialect::OpenAIChatCompletions, Platform::Plain).expect("a name");
+    let spec = oag_upstream::custom::EndpointSpec::new(
+        endpoint,
+        format!("{}/v1", upstream.uri()),
+        AuthStyle::Bearer,
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .expect("no headers to refuse");
+    let adapter = oag_upstream::custom::adapter(&spec).expect("an adapter");
+    state.apply_endpoints(
+        &EndpointRegistry::default(),
+        vec![(endpoint, crate::state::Served::Chat(adapter))],
+    );
+
+    let mut lease = select::testing::lease(slots);
+    let sealed = state
+        .kek
+        .seal_json(&oag_core::credential::SecretMaterial {
+            access_token: "t5-endpoint-key".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        })
+        .expect("seals");
+    lease.account.provider = name.to_owned();
+    lease.account.credentials_sealed = sealed.ciphertext;
+    lease.account.credentials_nonce = sealed.nonce;
+    (state, upstream, oag_core::Provider::Custom(endpoint), lease)
+}
+
+/// Once the stand-in has the request, and before it answers: the endpoint
+/// is gone from the state, as a reload that no longer finds its row leaves
+/// it.
+async fn remove_once_sent(state: &AppState, upstream: &wiremock::MockServer) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(20);
+    while upstream
+        .received_requests()
+        .await
+        .is_none_or(|received| received.is_empty())
+    {
+        assert!(Instant::now() < deadline, "the request was never sent");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    state.apply_endpoints(&oag_core::provider::EndpointRegistry::default(), Vec::new());
+}
+
+fn chat(model: &str, stream: bool) -> oag_proto::CanonicalRequest {
+    oag_proto::openai::parse_request(&serde_json::json!({
+        "model": model,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .expect("parses")
+}
+
+/// C5. An endpoint removed between sending a request and its answer: the
+/// answer is read by the adapter that sent it, and handed on with its usage
+/// to be metered. Looked up again, the adapter was gone, and the request
+/// switched to another credential after a generation the upstream had
+/// already billed, which no ledger row then counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_is_read_by_the_adapter_that_sent_it_after_its_endpoint_is_removed() {
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let (state, upstream, provider, lease) = removable_endpoint(
+        "t5-removed-midway",
+        wiremock::ResponseTemplate::new(200)
+            .set_delay(std::time::Duration::from_secs(2))
+            .set_body_json(serde_json::json!({
+                "id": "chatcmpl-t5",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "billed once"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+            })),
+        &slots,
+    )
+    .await;
+    let decision = decision_for(provider);
+    let canonical = chat("t5-removed-midway/m", false);
+
+    let sending = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            super::failover::try_credential(
+                &state,
+                &decision,
+                &canonical,
+                &lease,
+                RequestId::new(),
+                0,
+                uuid::Uuid::nil(),
+            )
+            .await
+        })
+    };
+    remove_once_sent(&state, &upstream).await;
+    assert!(state.adapter(provider).is_err(), "removed from the state");
+
+    let attempt = match sending.await.expect("joins") {
+        Outcome::Ok(attempt) => attempt,
+        Outcome::Switch(e) | Outcome::Lost(e, _) | Outcome::Escalate(e) | Outcome::Fatal(e) => {
+            panic!("a billed answer was not handed on: {e}")
+        }
+        Outcome::Raced => panic!("raced"),
+    };
+    let super::failover::Attempt::Collected {
+        events,
+        accumulator,
+        ..
+    } = *attempt
+    else {
+        panic!("a JSON answer is collected");
+    };
+    assert!(format!("{events:?}").contains("billed once"), "{events:?}");
+    assert_eq!(
+        accumulator.usage().output_tokens,
+        2,
+        "with the usage the ledger meters"
+    );
+    upstream.verify().await;
+}
+
+/// C5, streamed: the stream is relayed by the adapter that sent the request,
+/// though its endpoint was removed while the upstream was generating. Looked
+/// up again, the adapter was gone, and a stream the upstream was already
+/// billing was refused, with nothing metered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_is_relayed_by_the_adapter_that_sent_it_after_its_endpoint_is_removed() {
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let sse = concat!(
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"streamed once\"},",
+        "\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",",
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
+        "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (state, upstream, provider, lease) = removable_endpoint(
+        "t5-removed-streaming",
+        wiremock::ResponseTemplate::new(200)
+            .set_delay(std::time::Duration::from_secs(2))
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(sse),
+        &slots,
+    )
+    .await;
+    let decision = decision_for(provider);
+    let canonical = chat("t5-removed-streaming/m", true);
+
+    let sending = {
+        let (state, decision) = (Arc::clone(&state), decision.clone());
+        tokio::spawn(async move {
+            super::failover::try_credential(
+                &state,
+                &decision,
+                &canonical,
+                &lease,
+                RequestId::new(),
+                0,
+                uuid::Uuid::nil(),
+            )
+            .await
+        })
+    };
+    remove_once_sent(&state, &upstream).await;
+
+    let Outcome::Ok(attempt) = sending.await.expect("joins") else {
+        panic!("a streamed answer is handed on");
+    };
+    let super::failover::Attempt::Streaming {
+        response,
+        lease,
+        attempt,
+        names,
+        adapter,
+    } = *attempt
+    else {
+        panic!("a stream is not collected");
+    };
+    let relayed = stream_response(
+        &state,
+        response,
+        lease,
+        &auth_context(),
+        &decision,
+        RequestId::new(),
+        Instant::now(),
+        attempt,
+        Dialect::OpenAIChatCompletions,
+        None,
+        state.lifecycle.track(),
+        names,
+        adapter,
+    )
+    .expect("relayed though its endpoint is gone");
+    let body = axum::body::to_bytes(relayed.into_body(), 1 << 20)
+        .await
+        .expect("the whole stream");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("streamed once"), "{text}");
+    upstream.verify().await;
 }
 
 #[test]

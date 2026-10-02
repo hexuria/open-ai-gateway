@@ -15,6 +15,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 /// What one forwarding attempt produced.
+///
+/// Each answer carries the adapter that built and sent its request. The
+/// answer is read in that adapter's dialect and framing, and rendered for the
+/// client from them, and that is not a fact to look up a second time: a
+/// reload between the send and the answer can leave the provider with a new
+/// adapter, or with none, and a lookup then misreads an answer the upstream
+/// has already generated and billed, or throws it away.
 pub(super) enum Attempt {
     /// Handed to the client as a stream. Nothing further can be decided.
     Streaming {
@@ -24,6 +31,8 @@ pub(super) enum Attempt {
         attempt: u8,
         /// Original ↔ wire function names, for restoring `tool_calls`.
         names: FunctionNameMap,
+        /// The adapter that sent the request, which reads the stream.
+        adapter: Arc<dyn oag_upstream::ProviderAdapter>,
     },
     /// Read in full, so the answer can still be judged and retried.
     Collected {
@@ -38,6 +47,9 @@ pub(super) enum Attempt {
         lease: select::Lease,
         /// Which dispatch of this request produced it; see [`Dispatches`].
         attempt: u8,
+        /// The adapter that sent the request and read the answer, whose
+        /// dialect and framing decide how the client's body is made.
+        adapter: Arc<dyn oag_upstream::ProviderAdapter>,
     },
     /// The model refused the request itself — too long, or beyond what it can
     /// do. No credential can help and the lease is already released, but a
@@ -539,6 +551,7 @@ pub(super) async fn try_credential(
                     canonical.stream,
                     ordinal,
                     names,
+                    adapter,
                 )
                 .await;
             }
@@ -633,7 +646,10 @@ pub(super) async fn try_credential(
 /// Turn a successful response into the attempt the caller returns.
 ///
 /// The body is collected here unless the client asked for a stream: only a
-/// streaming client can be handed the upstream body as it arrives.
+/// streaming client can be handed the upstream body as it arrives. Either way
+/// it is read by `adapter`, the one that sent the request, and the attempt
+/// carries it on.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn succeeded(
     state: &Arc<AppState>,
     provider: oag_core::Provider,
@@ -642,6 +658,7 @@ pub(super) async fn succeeded(
     stream: bool,
     attempt: u8,
     names: FunctionNameMap,
+    adapter: Arc<dyn oag_upstream::ProviderAdapter>,
 ) -> Outcome {
     let account = lease.account.account_id();
     // No `touch_account` here any more. It was a Postgres write awaited
@@ -664,6 +681,7 @@ pub(super) async fn succeeded(
             lease: lease.clone(),
             attempt,
             names,
+            adapter,
         }));
     }
     // The ADAPTER's facts, not the provider's: a Codex seat is
@@ -673,14 +691,15 @@ pub(super) async fn succeeded(
     // the 200 that reached a client as "no completion in it". And asking the
     // client's `stream` flag whether the upstream streamed read that stream
     // as a JSON body, handed the raw `data:` lines back, and metered zero.
-    let adapter = match adapter_for(state, provider, &lease.account) {
-        Ok(adapter) => adapter,
-        Err(e) => return Outcome::Switch(e),
-    };
+    //
+    // And the adapter that sent the request, not one looked up again: an
+    // endpoint removed while its upstream was answering had no adapter left
+    // to find, so a generation already billed was switched away from, sent
+    // to a second credential, and metered once for twice the spend.
     let collected = if adapter.always_streams() {
         let idle = state.config.gateway.stream_idle_timeout;
         let max = state.config.gateway.max_stream_duration;
-        match sse::collect_stream_with(response, adapter, idle, max, names).await {
+        match sse::collect_stream_with(response, Arc::clone(&adapter), idle, max, names).await {
             Ok((events, accumulator)) => Ok((bytes::Bytes::new(), events, accumulator)),
             Err(failure) => return collect_failed(failure),
         }
@@ -700,6 +719,7 @@ pub(super) async fn succeeded(
             accumulator,
             lease: lease.clone(),
             attempt,
+            adapter,
         })),
         Err(e) => Outcome::Switch(e),
     }

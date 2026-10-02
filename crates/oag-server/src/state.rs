@@ -63,11 +63,11 @@ pub struct AppState {
     /// Swapped whole on every reload, like the catalog, and never edited in
     /// place. A lookup clones the adapter it finds, and whoever holds the
     /// clone keeps it whatever a reload does. A request looks its adapter up
-    /// more than once, though: to build and send, and again once the upstream
-    /// answers, for the dialect and framing it reads the answer in. An endpoint
-    /// whose settings changed in between answers the second lookup with a new
-    /// adapter of the same dialect and framing; one removed in between answers
-    /// it with an error, and that request fails.
+    /// once, to build and send, and its answer is read by that same clone,
+    /// which the attempt carries (`gateway::failover::Attempt`): an endpoint
+    /// whose settings changed, or that was removed, while its upstream was
+    /// answering still has that answer read in the dialect and framing it was
+    /// asked in, and metered.
     ///
     /// A std lock: it is held only to clone the `Arc` inside, never across an
     /// `.await`. See [`AppState::apply_endpoints`] for the order the swaps
@@ -379,16 +379,6 @@ impl AppState {
             system_one: Arc::new(RwLock::new(Arc::new(Catalog::new()))),
             readiness: Arc::new(tokio::sync::Mutex::new(None)),
         })
-    }
-
-    /// This state with `provider`'s adapter taken out, so a test can reach the
-    /// "leased a credential, then found no adapter" arm now that every provider
-    /// in the enum has one.
-    #[cfg(test)]
-    pub(crate) fn without_adapter(mut self, provider: Provider) -> Self {
-        Arc::make_mut(&mut self.builtins).remove(&provider);
-        self.set_adapters(Arc::clone(&self.builtins));
-        self
     }
 
     /// The adapter for a provider, or an error naming the provider we lack.

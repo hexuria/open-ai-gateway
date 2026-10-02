@@ -2,7 +2,7 @@
 
 use super::climb::meter_context;
 use super::failover::egress_for;
-use super::{adapter_for, meter, select, sse};
+use super::{meter, select, sse};
 use crate::AppState;
 use axum::body::Body;
 use axum::http::{StatusCode, header};
@@ -171,12 +171,16 @@ pub(super) fn identity_headers(
 /// Hand the upstream stream to the client.
 ///
 /// Takes the lease by value, and resolves everything that can still fail before
-/// committing it to the pump task. Both of those failures used to happen with
-/// the lease held by somebody else: the adapter lookup `?`d out of the caller
-/// and the renderer returned a response from here, and neither released the
-/// credential's slot — so the slot sat there for the full `SLOT_TTL` while
-/// nothing was in flight. Now they are two `?`s over an owned lease, and the
-/// lease's guard hands the slot back on the way out.
+/// committing it to the pump task. That failure used to happen with the lease
+/// held by somebody else: the renderer returned a response from here without
+/// releasing the credential's slot, so the slot sat there for the full
+/// `SLOT_TTL` while nothing was in flight. Now it is a `?` over an owned
+/// lease, and the lease's guard hands the slot back on the way out.
+///
+/// `adapter` is the one that sent the request, which the attempt carries:
+/// the stream is read in its framing and dialect, and it is not looked up
+/// again. A lookup here found nothing for an endpoint removed while its
+/// upstream was generating, and refused a stream already billed.
 #[allow(clippy::too_many_arguments)]
 ///
 /// `triggering_gate` is the gate that *caused* an escalation, if one happened
@@ -199,12 +203,12 @@ pub(super) fn stream_response(
     triggering_gate: Option<oag_router::QualityGate>,
     guard: crate::shutdown::InFlightGuard,
     names: FunctionNameMap,
+    adapter: Arc<dyn oag_upstream::ProviderAdapter>,
 ) -> Result<Response> {
-    // The adapter this lease actually gets, not the provider's default one:
+    // The adapter this lease actually got, not the provider's default one:
     // both the framing and the dialect below are facts about that adapter, and
     // asking the provider is what forwarded Responses bytes to a Chat
     // Completions client as a 200 it could not read.
-    let adapter = adapter_for(state, decision.model.provider, &lease.account)?;
     let egress = egress_for(
         ingress,
         decision,

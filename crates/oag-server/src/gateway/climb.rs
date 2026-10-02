@@ -3,7 +3,7 @@
 use super::failover::{Attempt, forward_with_failover};
 use super::plan::Plan;
 use super::respond::{json_response, stream_response};
-use super::{adapter_for, meter, select};
+use super::{meter, select};
 use crate::AppState;
 use axum::response::Response;
 use oag_core::provider::Dialect;
@@ -230,6 +230,7 @@ pub(super) async fn run_with_escalation(
                 lease,
                 attempt,
                 names,
+                adapter,
             } => {
                 // Empty as the code stands: `Outcome::Lost` is produced only
                 // after `succeeded` has decided the client did not ask for a
@@ -251,6 +252,7 @@ pub(super) async fn run_with_escalation(
                     triggering_gate,
                     guard,
                     names,
+                    adapter,
                 );
             }
             Attempt::Rejected(e) => Err(e),
@@ -260,7 +262,8 @@ pub(super) async fn run_with_escalation(
                 accumulator,
                 lease,
                 attempt,
-            } => Ok((body, events, accumulator, lease, attempt)),
+                adapter,
+            } => Ok((body, events, accumulator, lease, attempt, adapter)),
         };
 
         let gate = match &answer {
@@ -268,7 +271,7 @@ pub(super) async fn run_with_escalation(
             // and nothing reached the client, so this is the one escalation a
             // streaming request can also take.
             Err(_) => Some(oag_router::QualityGate::ContextOverflow),
-            Ok((_, _, accumulator, _, _)) => accumulator.quality_gate(),
+            Ok((_, _, accumulator, _, _, _)) => accumulator.quality_gate(),
         };
 
         // Retry one rung up when the answer was unusable and a rung is left.
@@ -310,7 +313,7 @@ pub(super) async fn run_with_escalation(
             // Released here rather than left to the drop, and awaited: the
             // rung above may pick this same credential, and a release still
             // in flight would look like a credential with no room.
-            if let Ok((_, _, accumulator, lease, attempt)) = &answer {
+            if let Ok((_, _, accumulator, lease, attempt, _)) = &answer {
                 abandoned = Some(meter::abandon(
                     meter_context(auth, &decision, lease, request_id, started, *attempt),
                     accumulator,
@@ -364,7 +367,7 @@ pub(super) async fn run_with_escalation(
         // The attempts made to get here were still generated and invoiced, and
         // with no served row coming this is their last chance to reach the
         // ledger — exactly as when the retry itself died above.
-        let (body, events, accumulator, lease, attempt) = match answer {
+        let (body, events, accumulator, lease, attempt, adapter) = match answer {
             Ok(answer) => answer,
             Err(e) => {
                 spawn_unserved(state, abandoned, lost);
@@ -376,15 +379,11 @@ pub(super) async fn run_with_escalation(
         // way: a gate we could not act on is exactly the signal that a rung is
         // mis-set for this workload.
         let ctx = meter_context(auth, &decision, &lease, request_id, started, attempt);
-        // Read while the lease is still here: both are facts about the adapter
-        // this account got, and `release` below takes the account with it.
-        // Falling back to the provider's dialect once it is gone is exactly the
-        // bug this call site had.
-        let (upstream_dialect, always_streams) =
-            adapter_for(state, decision.model.provider, &lease.account).map_or_else(
-                |_| (decision.model.provider.native_dialect(), false),
-                |a| (a.dialect(), a.always_streams()),
-            );
+        // Both facts about the adapter that sent the request and read its
+        // answer, which the attempt carries. Looked up again here, a reload
+        // in between answered with another adapter or none, and the fallback
+        // to the provider's dialect is exactly the bug this call site had.
+        let (upstream_dialect, always_streams) = (adapter.dialect(), adapter.always_streams());
         let rewrite_tool_names = accumulator.function_names().rewrites();
         // Before the ledger write, which is ours rather than the credential's.
         lease.release().await;

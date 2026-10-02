@@ -401,8 +401,10 @@ signatures, of their own.
 A request already sent when its endpoint's settings change is not moved: it was
 built for the old base URL and headers and is answered from there, and the next
 request gets the new settings. A request in flight when its endpoint is removed
-can fail once its answer arrives, so remove an endpoint's keys, and let their
-requests finish, before the endpoint itself.
+is answered too: its answer is read, relayed and metered by the adapter that
+sent it, whatever the reload did meanwhile. The next request for that
+endpoint's models finds nothing to serve them, so remove an endpoint's keys and
+models before the endpoint itself.
 
 ### An endpoint's models
 
