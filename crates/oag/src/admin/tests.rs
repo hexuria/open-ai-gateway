@@ -2220,3 +2220,64 @@ fn catalog_add_refuses_a_zero_price_unless_it_is_free() {
     };
     assert!(super::catalog::model_row(&labelled, merge).is_err());
 }
+
+/// C11. A price is rounded to the catalog's six places, half away from zero
+/// as Postgres rounds a `numeric(12,6)`, before any rule judges it: what rounds
+/// to zero is a zero, what rounds to a million is past the ceiling, and the row
+/// holds the price as it will be stored.
+#[test]
+fn a_catalog_price_is_rounded_as_it_will_be_stored_before_it_is_judged() {
+    use oag_core::Provider;
+    use oag_core::provider::{Dialect, Endpoint, Platform};
+    let merge = Provider::Custom(
+        Endpoint::new("merge", Dialect::OpenAIChatCompletions, Platform::Plain).expect("merge"),
+    );
+    let priced = |input: &str, output: &str| {
+        let (input, output) = (
+            format!("--input-per-mtok={input}"),
+            format!("--output-per-mtok={output}"),
+        );
+        catalog_add(&[&input, &output]).unwrap_or_else(|e| panic!("{e}"))
+    };
+    let exact = |s: &str| Decimal::from_str_exact(s).expect("decimal");
+
+    let zero = super::catalog::model_row(&priced("0.0000004", "0.00000049"), merge)
+        .expect_err("both round to zero, and nobody said --free")
+        .to_string();
+    assert!(zero.contains("--free"), "{zero}");
+    let free = CatalogAddArgs {
+        input_per_mtok: Some(exact("0.0000004")),
+        ..catalog_add(&["--free"]).expect("free")
+    };
+    super::catalog::model_row(&free, merge).expect("--free, and a price that rounds to zero");
+
+    let ceiling = super::catalog::model_row(&priced("999999.9999995", "1"), merge)
+        .expect_err("rounds to a million")
+        .to_string();
+    assert!(ceiling.contains("must be under 1000000"), "{ceiling}");
+
+    let row = super::catalog::model_row(&priced("0.0000005", "1.0000025"), merge)
+        .expect("each rounds away from zero");
+    assert_eq!(
+        (row.input_per_mtok, row.output_per_mtok),
+        (exact("0.000001"), exact("1.000003")),
+        "half away from zero, as Postgres rounds, not half to even"
+    );
+    let cached = catalog_add(&[
+        "--input-per-mtok",
+        "1",
+        "--output-per-mtok",
+        "1",
+        "--cache-read-per-mtok",
+        "0.12345649",
+        "--cache-write-per-mtok=-0.0000004",
+    ])
+    .expect("clap takes it");
+    let row = super::catalog::model_row(&cached, merge).expect("a cache price rounds too");
+    assert_eq!(row.cache_read_per_mtok, Some(exact("0.123456")));
+    assert_eq!(
+        row.cache_write_per_mtok,
+        Some(Decimal::ZERO),
+        "a negative that rounds to nothing is a zero"
+    );
+}

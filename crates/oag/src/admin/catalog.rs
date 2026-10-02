@@ -4,7 +4,7 @@ use super::accounts::{parse_provider, price_account, register_endpoints};
 use super::{CatalogAddArgs, CatalogCommand};
 use oag_core::{Kek, Provider, Result, credential::SecretMaterial};
 use oag_store::{Db, ModelRow, repo};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 
 pub(super) async fn catalog_cmd(db: &Db, kek: &Kek, cmd: CatalogCommand) -> Result<()> {
     match cmd {
@@ -184,8 +184,21 @@ pub(super) fn split_model_id(id: &str) -> Result<(&str, &str)> {
 /// One more than the most a price column holds: they are `numeric(12,6)`.
 const PRICE_CEILING: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
 
-/// A price the catalog can hold, or why not.
+/// A price the catalog can hold, as it will hold it, or why not.
+///
+/// Rounded first, to the column's six places and half away from zero, which
+/// is how Postgres rounds a value into a `numeric(12,6)`, so every rule below
+/// judges the price that will be stored. Judged as typed, `0.0000004` passed as
+/// a price and was stored as zero, a free model nobody said `--free` for, and
+/// `999999.9999995` passed the ceiling and was refused by the database.
 fn price(flag: &str, value: Decimal) -> Result<Decimal> {
+    let value = value.round_dp_with_strategy(6, RoundingStrategy::MidpointAwayFromZero);
+    // A negative that rounds to nothing is a zero, and is stored as one.
+    let value = if value.is_zero() {
+        Decimal::ZERO
+    } else {
+        value
+    };
     if value < Decimal::ZERO {
         return Err(oag_core::Error::Config(format!(
             "--{flag} cannot be negative"
