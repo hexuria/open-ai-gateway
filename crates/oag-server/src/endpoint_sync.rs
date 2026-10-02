@@ -15,7 +15,7 @@
 use oag_core::credential::SecretMaterial;
 use oag_core::provider::{AuthStyle, Platform};
 use oag_core::{Error, Kek, Result};
-use oag_store::{Db, ModelRow, StoredModelRow, repo};
+use oag_store::{Db, EndpointSync, ModelRow, StoredModelRow, repo};
 use oag_upstream::custom::EndpointSpec;
 use oag_upstream::listing::{self, ListedModel, Offer, PriceChoice, Skip};
 use std::collections::{HashMap, HashSet};
@@ -199,20 +199,27 @@ pub async fn sync(db: &Db, kek: &Kek, endpoint: &str, options: &SyncOptions) -> 
     }
 
     let done = repo::sync_endpoint_models(db, &reader.name, &writes, &remove).await?;
-    // Held between the plan's look and the write: not written, so not added
-    // or updated.
+    settle(&mut report, done, remove);
+    Ok(report)
+}
+
+/// The plan's report, corrected by what the write found: the rows as they
+/// stood when it ran, not when the plan looked.
+///
+/// An id another provider's row came to hold in between was not written, so
+/// it is neither added nor updated but held. A stale row a ladder came to name
+/// was not removed, so it is kept.
+fn settle(report: &mut SyncReport, done: EndpointSync, remove: Vec<String>) {
     for id in done.held {
         report.added.retain(|a| *a != id);
         report.updated.retain(|u| *u != id);
         report.held.push(id);
     }
-    // A ladder that came to name a stale row after the plan looked keeps it.
     let removed: HashSet<&String> = done.removed.iter().collect();
     let (gone, kept): (Vec<String>, Vec<String>) =
         remove.into_iter().partition(|id| removed.contains(id));
     report.removed = gone;
     report.kept_on_ladder.extend(kept);
-    Ok(report)
 }
 
 /// What a sync would write and remove, before it does.
@@ -371,34 +378,35 @@ impl Filter<'_> {
 }
 
 /// Whether `text` matches `pattern`, where `*` is any run of characters and
-/// `?` any one. A mismatch backtracks to the last `*` alone, which is enough
-/// when those are the only wildcards.
+/// `?` any one.
+///
+/// One pass per pattern character, each over the text once, keeping which
+/// prefixes of the text the pattern so far matches. A fixed number of steps
+/// for any input, so no pattern can make it spin: there is no loop here whose
+/// end depends on what the loop does.
 fn glob(pattern: &str, text: &str) -> bool {
-    let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
-    let (mut pi, mut ti) = (0, 0);
-    // The last `*` seen, and where in `text` it was last tried from.
-    let mut star: Option<(usize, usize)> = None;
-    while ti < t.len() {
-        match p.get(pi) {
-            Some('*') => {
-                star = Some((pi, ti));
-                pi += 1;
+    let text: Vec<char> = text.chars().collect();
+    // `matched[j]`: the pattern so far matches the first `j` characters.
+    let mut matched = vec![false; text.len() + 1];
+    matched[0] = true;
+    for p in pattern.chars() {
+        let mut next = vec![false; text.len() + 1];
+        if p == '*' {
+            // Matches the first `j` characters when what came before it
+            // matched the first `j` or fewer.
+            let mut before = false;
+            for (j, slot) in next.iter_mut().enumerate() {
+                before |= matched[j];
+                *slot = before;
             }
-            Some(&c) if c == '?' || c == t[ti] => {
-                pi += 1;
-                ti += 1;
+        } else {
+            for (j, &c) in text.iter().enumerate() {
+                next[j + 1] = matched[j] && (p == '?' || p == c);
             }
-            _ => match star {
-                Some((sp, st)) => {
-                    pi = sp + 1;
-                    ti = st + 1;
-                    star = Some((sp, st + 1));
-                }
-                None => return false,
-            },
         }
+        matched = next;
     }
-    p[pi..].iter().all(|&c| c == '*')
+    matched[text.len()]
 }
 
 /// What `oag admin endpoint models` prints: the endpoint's list as discovery

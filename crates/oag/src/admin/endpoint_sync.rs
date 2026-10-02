@@ -413,6 +413,8 @@ mod tests {
             "  unchanged         1  merge/anthropic/claude-sonnet-4.5",
             "  removed           2  merge/old/a, merge/old/b",
             "  kept (ladder)     1  merge/old/c",
+            "                 no longer offered by the list, and kept because a route's ladder \
+             names them",
             "  skipped           3",
             "    not a chat model: 2 (openai/gpt-image-1, google/veo-3)",
             "    deprecated or unavailable: 1 (mistral/large)",
@@ -428,6 +430,13 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("held"), "nothing held, nothing said: {text}");
+        let mut none_kept = report(false);
+        none_kept.kept_on_ladder.clear();
+        let none_kept = sync_lines(&none_kept, Duration::from_mins(1)).join("\n");
+        assert!(
+            !none_kept.contains("no longer offered"),
+            "nothing kept, nothing explained: {none_kept}"
+        );
 
         let off = sync_lines(&report(false), Duration::ZERO).join("\n");
         assert!(off.contains("catalog_refresh_interval: 0"), "{off}");
@@ -485,10 +494,12 @@ mod tests {
         );
     }
 
-    /// The dispatcher hands back what the command said. With a pool that
-    /// cannot connect, the command fails before any request is sent.
+    /// Both dispatchers, `admin::run` and this module's, hand back what the
+    /// command said. With a pool that cannot connect, the command fails before
+    /// any request is sent; a dispatcher that answered `Ok` without running it
+    /// would pass for a working one.
     #[tokio::test]
-    async fn the_dispatcher_surfaces_the_commands_error() {
+    async fn the_dispatchers_surface_the_commands_error() {
         let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag_g0", 1).expect("lazy pool");
         let kek = Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=").expect("kek");
         let config = oag_core::config::Config::from_yaml(
@@ -498,13 +509,11 @@ mod tests {
              \"MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\"\n",
         )
         .expect("a minimal config");
-        run(
-            &db,
-            &kek,
-            &config,
-            parse(&["endpoint", "sync", "merge"]).expect("parses"),
-        )
-        .await
-        .expect_err("no database to read the endpoint from");
+        let cmd = AdminCli::try_parse_from(["admin", "endpoint", "sync", "merge"])
+            .expect("parses")
+            .cmd;
+        crate::admin::run(cmd, &db, &kek, "redis://127.0.0.1:1", &config)
+            .await
+            .expect_err("no database to read the endpoint from");
     }
 }
