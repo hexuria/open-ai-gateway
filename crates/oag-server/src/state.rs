@@ -1101,6 +1101,33 @@ mod tests {
         }
     }
 
+    /// `AppState` shows up in panics and `tracing` fields, so its `Debug` is
+    /// what an operator reads: it names the providers this replica can call,
+    /// and nothing it holds a secret for.
+    #[tokio::test]
+    async fn debug_names_the_callable_providers_and_no_secret() {
+        let config = crate::testing::config("");
+        let kek = config.security.credential_kek.clone();
+        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
+        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
+        let shown = format!("{:?}", AppState::new(config, db, cache).expect("state"));
+        assert!(shown.starts_with("AppState"), "{shown}");
+        for provider in oag_core::Provider::ALL {
+            assert!(
+                shown.contains(&format!("{provider:?}")),
+                "{provider} missing: {shown}"
+            );
+        }
+        assert!(
+            !kek.is_empty(),
+            "the test config must carry a KEK to look for"
+        );
+        assert!(
+            !shown.contains(&kek),
+            "the credential KEK leaked into Debug"
+        );
+    }
+
     /// A stream ceiling may outlive the slot lease: the guard heartbeats.
     ///
     /// G8 used to refuse `max_stream_duration >= SLOT_TTL` at startup because a
