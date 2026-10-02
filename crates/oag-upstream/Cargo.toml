@@ -28,6 +28,7 @@ typesafe-sdk.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+wiremock.workspace = true
 
 [lints]
 workspace = true

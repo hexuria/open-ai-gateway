@@ -1,14 +1,23 @@
 //! The Anthropic adapter.
 
 use crate::adapter::{ProviderAdapter, UpstreamRequest};
+use crate::custom::ExtraHeaders;
 use async_trait::async_trait;
+use oag_core::provider::{AuthStyle, Endpoint};
 use oag_core::{Provider, Result};
 use oag_proto::{StreamAccumulator, StreamEvent, anthropic};
 
-/// Talks to the Anthropic Messages API.
+/// Talks to the Anthropic Messages API, or to an endpoint that speaks it.
 #[derive(Debug, Clone)]
 pub struct AnthropicAdapter {
+    /// `Provider::Anthropic` from [`AnthropicAdapter::new`], and the endpoint
+    /// from [`AnthropicAdapter::for_endpoint`]: nothing else.
+    provider: Provider,
     base_url: String,
+    /// `XApiKey` for Anthropic; an endpoint's own otherwise.
+    auth: AuthStyle,
+    /// Added to every request. None for Anthropic.
+    headers: ExtraHeaders,
 }
 
 impl Default for AnthropicAdapter {
@@ -21,7 +30,32 @@ impl AnthropicAdapter {
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
+            provider: Provider::Anthropic,
             base_url: base_url.into(),
+            auth: AuthStyle::XApiKey,
+            headers: ExtraHeaders::default(),
+        }
+    }
+
+    /// For an endpoint that speaks the Messages API: its name, its base URL,
+    /// the header its key goes in and the headers its operator added.
+    ///
+    /// Takes an [`Endpoint`] rather than any provider, so the adapter it
+    /// makes is always `Provider::Custom` and the only one serving
+    /// `Provider::Anthropic` is the one [`AnthropicAdapter::new`] makes, which
+    /// sends `x-api-key` whatever it is given.
+    #[must_use]
+    pub fn for_endpoint(
+        endpoint: Endpoint,
+        base_url: impl Into<String>,
+        auth: AuthStyle,
+        headers: ExtraHeaders,
+    ) -> Self {
+        Self {
+            provider: Provider::Custom(endpoint),
+            base_url: base_url.into(),
+            auth,
+            headers,
         }
     }
 }
@@ -29,21 +63,21 @@ impl AnthropicAdapter {
 #[async_trait]
 impl ProviderAdapter for AnthropicAdapter {
     fn provider(&self) -> Provider {
-        Provider::Anthropic
+        self.provider
     }
 
     fn build(&self, req: &UpstreamRequest<'_>) -> Result<reqwest::Request> {
         let body = anthropic::render_request(req.canonical, &req.model.upstream_name)?;
         let url = format!("{}/v1/messages", self.base_url);
 
-        let mut builder = crate::builder_client()?
+        let builder = crate::builder_client()?
             .post(&url)
             .header("content-type", "application/json")
             .header("anthropic-version", anthropic::API_VERSION)
             .json(&body);
 
-        // `x-api-key`, always. Anthropic credentials in this gateway are API
-        // keys and only API keys.
+        // `x-api-key`, always, for Anthropic. Anthropic credentials in this
+        // gateway are API keys and only API keys.
         //
         // There used to be a bearer-token branch here, taken when the
         // credential carried a refresh token — for a Claude.ai subscription
@@ -61,9 +95,20 @@ impl ProviderAdapter for AnthropicAdapter {
         // Dead code that looks like a supported path is worse than no code:
         // it is the first thing someone reads when asking whether seats work
         // here, and it answers yes.
-        builder = builder.header("x-api-key", &req.credential.access_token);
+        //
+        // An endpoint that speaks this dialect is not Anthropic, and sends its
+        // key in whichever header it was registered with, a bearer token
+        // included. `new` sets `XApiKey` and nothing changes it; only
+        // `for_endpoint` sets another, and its provider is always
+        // `Provider::Custom`. Neither path reads the credential's refresh
+        // token, and neither refreshes: no endpoint takes an `oauth` row
+        // (`Provider::support`), so no seat reaches it. Keeping an endpoint off
+        // Anthropic's own hosts has to happen where its base URL is accepted:
+        // this adapter cannot tell one opaque key from another.
+        let builder = crate::custom::authenticate(builder, self.auth, &req.credential.access_token);
 
-        builder
+        self.headers
+            .apply(builder)
             .build()
             .map_err(|e| oag_core::Error::Internal(format!("building anthropic request: {e}")))
     }

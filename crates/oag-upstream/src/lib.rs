@@ -6,6 +6,7 @@ pub mod adapter;
 pub mod anthropic;
 pub mod bedrock;
 pub mod codex;
+pub mod custom;
 pub mod eventstream;
 pub mod gemini;
 pub mod jev;
@@ -92,6 +93,11 @@ pub(crate) fn builder_client() -> oag_core::Result<reqwest::Client> {
 /// per request, and caching per proxy string would be a map to invalidate for
 /// no measurable gain.
 ///
+/// Follows no redirect, for the reason the transport follows none: every call
+/// made with it carries a credential, a bearer token in a header or a refresh
+/// token in a form body, and a 307 or 308 posts that body again to wherever
+/// `Location` points.
+///
 /// # Errors
 ///
 /// If the proxy URL is unusable or the client cannot be built.
@@ -99,7 +105,9 @@ pub(crate) fn side_channel_client(
     proxy: Option<&str>,
     timeout: std::time::Duration,
 ) -> oag_core::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(timeout);
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(url) = proxy.map(str::trim).filter(|u| !u.is_empty()) {
         let proxy = reqwest::Proxy::all(url).map_err(|e| {
             oag_core::Error::Config(format!("credential proxy_url {url} is unusable: {e}"))
@@ -161,5 +169,50 @@ mod side_channel_tests {
         let err =
             side_channel_client(Some("not a url"), Duration::from_secs(20)).expect_err("refused");
         assert!(err.to_string().contains("proxy_url"), "{err}");
+    }
+
+    /// Every call through this client carries a credential: a bearer token,
+    /// or a refresh token in a form body, which a 307 or 308 posts again to
+    /// wherever `Location` points. xAI's refresh checks that its token
+    /// endpoint shares the discovery's origin, and a followed redirect would
+    /// have taken the token past that check.
+    #[tokio::test]
+    async fn a_side_channel_call_is_never_redirected() {
+        use wiremock::matchers::{any, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for status in [307u16, 308, 301, 302, 303] {
+            let elsewhere = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&elsewhere)
+                .await;
+            let token_endpoint = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/oauth/token"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("location", format!("{}/oauth/token", elsewhere.uri())),
+                )
+                .expect(1)
+                .mount(&token_endpoint)
+                .await;
+
+            let response = side_channel_client(None, Duration::from_secs(5))
+                .expect("client")
+                .post(format!("{}/oauth/token", token_endpoint.uri()))
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", "rt-secret"),
+                ])
+                .send()
+                .await
+                .expect("the token endpoint answered");
+
+            elsewhere.verify().await;
+            token_endpoint.verify().await;
+            assert_eq!(response.status().as_u16(), status);
+        }
     }
 }
