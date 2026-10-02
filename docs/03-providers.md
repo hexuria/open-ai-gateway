@@ -739,10 +739,10 @@ service account was deleted or disabled, or this host's clock is far enough off
 to make the assertion look wrong), a token endpoint that cannot be reached, or
 an answer that is not a token, is that credential failing. The request moves to
 the endpoint's next credential, as it does when a refresh fails, and the log
-names the status and the OAuth error code. A failure is not remembered, so the
-next request tries that key again. When no credential can mint, the client is
-answered 500 `internal_error`. No log line and no answer holds the key, the
-signed assertion or a token.
+names the status, the OAuth error code and Google's description of it. A
+failure is not remembered, so the next request tries that key again. When no
+credential can mint, the client is answered 500 `internal_error`. No log line
+and no answer holds the key, the signed assertion or a token.
 
 ## Which dialect reaches which upstream
 

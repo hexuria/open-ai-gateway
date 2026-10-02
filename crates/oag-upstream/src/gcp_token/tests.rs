@@ -402,8 +402,8 @@ async fn a_refused_grant_is_an_error_that_names_the_code() {
     assert!(matches!(err, Error::Internal(_)), "{err:?}");
     let message = err.to_string();
     assert!(
-        message.contains("400") && message.contains("(invalid_grant)"),
-        "{message}"
+        message.contains("400") && message.contains("(invalid_grant: Invalid JWT Signature.)"),
+        "Google's own words for why: {message}"
     );
     let sent = grants(&server).await;
     assert_quotes_nothing(&message, &[sent[0]["assertion"].as_str()]);
@@ -708,4 +708,42 @@ async fn an_assertion_is_dated_thirty_seconds_back_for_an_hour() {
     assert_eq!(claims["iat"], T0 - 30);
     assert_eq!(claims["exp"], T0 - 30 + 3600);
     server.verify().await;
+}
+
+/// What a token endpoint writes in `error_description` reaches the error
+/// only when it can do no harm there: a known code's, within RFC 6749's
+/// characters and a line long, and holding no part of the assertion just
+/// sent. An endpoint that echoes the grant back has it dropped.
+#[tokio::test]
+async fn a_description_that_echoes_the_assertion_or_breaks_the_rfc_is_dropped() {
+    type Describe = fn(&str) -> String;
+    let cases: [(&str, Describe); 4] = [
+        ("the whole assertion", |assertion| assertion.to_owned()),
+        ("a piece of it", |assertion| {
+            format!("Invalid JWT {}", &assertion[assertion.len() - 40..])
+        }),
+        ("a quote", |_| "the \"key\" is bad".to_owned()),
+        ("a page of it", |_| "x".repeat(201)),
+    ];
+    for (case, describe) in cases {
+        let echo = move |request: &Request| {
+            let form: HashMap<String, String> = url::form_urlencoded::parse(&request.body)
+                .into_owned()
+                .collect();
+            ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_grant",
+                "error_description": describe(&form["assertion"]),
+            }))
+        };
+        let server = token_endpoint(echo, 1).await;
+        let err = cache(&server)
+            .token(AccountId::new(), &key_json().to_string(), None)
+            .await
+            .expect_err(case);
+        let message = err.to_string();
+        assert!(message.ends_with("(invalid_grant)"), "{case}: {message}");
+        let sent = grants(&server).await;
+        assert_quotes_nothing(&message, &[sent[0]["assertion"].as_str()]);
+        server.verify().await;
+    }
 }

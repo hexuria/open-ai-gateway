@@ -249,29 +249,37 @@ struct TokenResponse {
 }
 
 /// Why a token endpoint's answer was not a token, for the error message.
-fn refusal(status: reqwest::StatusCode, body: &[u8]) -> String {
+///
+/// `assertion` is the one just sent, which nothing quoted may hold.
+fn refusal(status: reqwest::StatusCode, body: &[u8], assertion: &str) -> String {
     if status.is_redirection() {
         return format!(
             "the Google token endpoint answered {status}, and the redirect was not \
              followed: a signed assertion goes to the configured token URL or nowhere"
         );
     }
-    match oauth_error(body) {
-        Some(code) => format!("the Google token endpoint answered {status} ({code})"),
+    match oauth_error(body, assertion) {
+        Some((code, Some(description))) => {
+            format!("the Google token endpoint answered {status} ({code}: {description})")
+        }
+        Some((code, None)) => format!("the Google token endpoint answered {status} ({code})"),
         None => format!("the Google token endpoint answered {status}"),
     }
 }
 
 /// The error code in a token endpoint's refusal (RFC 6749 §5.2), if it is one
-/// of the registered ones.
+/// of the registered ones, and its description, if that can be shown.
 ///
-/// Only the code, and only a known one. The rest of the body is whatever the
-/// endpoint chose to write, and this message is logged. A stand-in, a proxy or
-/// a mistyped token URL can put anything there, the assertion it was just sent
-/// included. `invalid_grant` is the one an operator sees most: the key or its
-/// service account was deleted or disabled, or this host's clock is off by
-/// enough that the assertion's `iat` looks wrong to Google.
-fn oauth_error(body: &[u8]) -> Option<&'static str> {
+/// Only a known code. `invalid_grant` is the one an operator sees most: the
+/// key or its service account was deleted or disabled, the signature is
+/// wrong, or this host's clock is off by enough that the assertion's `iat`
+/// looks wrong to Google, and Google's `error_description` is what tells
+/// those apart ("Invalid JWT Signature."). So the description is kept, when
+/// [`presentable`] says it can do no harm in a logged message: the rest of
+/// the body is whatever the endpoint chose to write, and a stand-in, a proxy
+/// or a mistyped token URL can write anything, the assertion it was just
+/// sent included.
+fn oauth_error(body: &[u8], assertion: &str) -> Option<(&'static str, Option<String>)> {
     const CODES: [&str; 6] = [
         "invalid_request",
         "invalid_client",
@@ -282,7 +290,35 @@ fn oauth_error(body: &[u8]) -> Option<&'static str> {
     ];
     let body: serde_json::Value = serde_json::from_slice(body).ok()?;
     let code = body.get("error")?.as_str()?;
-    CODES.into_iter().find(|known| *known == code)
+    let code = CODES.into_iter().find(|known| *known == code)?;
+    let description = body
+        .get("error_description")
+        .and_then(serde_json::Value::as_str)
+        .filter(|description| presentable(description, assertion))
+        .map(str::to_owned);
+    Some((code, description))
+}
+
+/// The longest description a message quotes: a line, as Google's are.
+const DESCRIPTION_MAX: usize = 200;
+
+/// Whether `description` can go in an error message: at most
+/// [`DESCRIPTION_MAX`] bytes, all of them in the set RFC 6749 §5.2 allows a
+/// description (printable ASCII but `"` and `\`), and none of `assertion`
+/// in it — not the whole, and not any sixteen bytes of it, so an echo cut
+/// short or a piece of the signature is caught as well as the rest.
+fn presentable(description: &str, assertion: &str) -> bool {
+    const WINDOW: usize = 16;
+    let bytes = description.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= DESCRIPTION_MAX
+        && bytes
+            .iter()
+            .all(|b| matches!(*b, 0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+        && !assertion
+            .as_bytes()
+            .windows(WINDOW)
+            .any(|piece| bytes.windows(WINDOW).any(|quoted| quoted == piece))
 }
 
 /// One account's minted token.
@@ -423,7 +459,11 @@ impl GcpTokenCache {
         if !status.is_success() {
             // The status is the finding; a body that failed to arrive only
             // costs the error code that might have come with it.
-            return Err(Error::Internal(refusal(status, &body.unwrap_or_default())));
+            return Err(Error::Internal(refusal(
+                status,
+                &body.unwrap_or_default(),
+                assertion,
+            )));
         }
         let body = body.map_err(|e| Error::Internal(format!("the Google token endpoint: {e}")))?;
 
