@@ -529,7 +529,10 @@ that takes any object. A tool call's id outside Converse's pattern,
 respelled the same way in the call and in its result, and the client's own id
 comes back on anything Converse answers with. A conversation that opens with
 the model (a prefill, a transcript resumed part way) is sent a `(continued)`
-user turn in front of it.
+user turn in front of it. Blank text, which Converse refuses wherever it
+appears, is left out (the empty `content` a Chat Completions client sends with
+its tool calls is one), and a tool result with nothing in it says
+`(no output)`.
 
 **Streams.** `ConverseStream` sends AWS event-stream messages whose payload is
 the event itself, named by a header (see [Framing](#framing)). It announces the

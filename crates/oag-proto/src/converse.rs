@@ -108,13 +108,13 @@ pub fn render_request(req: &CanonicalRequest) -> Result<Value> {
     });
 
     // Text only, one block each: a `SystemContentBlock` holds nothing else
-    // canonical could put here. An empty one is left out rather than sent,
-    // because the field refuses an empty string and the block says nothing.
+    // canonical could put here. A blank one is left out rather than sent,
+    // because the field refuses one and the block says nothing.
     let system: Vec<Value> = req
         .system
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text, .. } if !text.is_empty() => Some(json!({ "text": text })),
+            ContentBlock::Text { text, .. } if !is_blank(text) => Some(json!({ "text": text })),
             _ => None,
         })
         .collect();
@@ -195,6 +195,17 @@ fn render_messages(messages: &[Message], names: &FunctionNameMap, ids: &ToolUseI
         .collect()
 }
 
+/// What a tool result that came back with nothing says, where Converse needs
+/// it to say something.
+const NO_OUTPUT: &str = "(no output)";
+
+/// Whether `text` is nothing but whitespace, which Converse refuses as a text
+/// block's content ("text content blocks must be non-empty") wherever one
+/// appears: a turn, the system prompt, a tool result.
+fn is_blank(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
 fn render_block(b: &ContentBlock, names: &FunctionNameMap, ids: &ToolUseIds) -> Option<Value> {
     match b {
         // A cache breakpoint is dropped. Converse spells one as a `cachePoint`
@@ -202,7 +213,10 @@ fn render_block(b: &ContentBlock, names: &FunctionNameMap, ids: &ToolUseIds) -> 
         // and for any other it is at best ignored. Losing the breakpoint costs
         // money, not the answer — as it does on the Chat Completions and
         // Gemini wires, which have nowhere to put one.
-        ContentBlock::Text { text, .. } => Some(json!({ "text": text })),
+        //
+        // A blank one is left out: Converse refuses it, and it says nothing.
+        // A Chat Completions client sends one beside its tool calls.
+        ContentBlock::Text { text, .. } => (!is_blank(text)).then(|| json!({ "text": text })),
         ContentBlock::Image { media_type, data } => Some(image(media_type, data)),
         ContentBlock::ToolUse { id, name, input } => Some(json!({
             "toolUse": { "toolUseId": ids.wire(id), "name": names.wire(name), "input": input }
@@ -240,18 +254,32 @@ fn render_block(b: &ContentBlock, names: &FunctionNameMap, ids: &ToolUseIds) -> 
 /// changes what the model is shown. Blocks keep their shape where Converse has
 /// one — text, and the image a screenshot tool hands back, which the
 /// string-only dialects have to flatten away.
+///
+/// Blank text is left out, as in a turn. A result left with nothing — a tool
+/// that printed nothing — says [`NO_OUTPUT`] instead: Converse needs content
+/// in a result, and the call still needs its answer.
 fn tool_result_content(content: &ToolResultContent) -> Vec<Value> {
-    match content {
-        ToolResultContent::Text(text) => vec![json!({ "text": text })],
+    let blocks: Vec<Value> = match content {
+        ToolResultContent::Text(text) => (!is_blank(text))
+            .then(|| json!({ "text": text }))
+            .into_iter()
+            .collect(),
         ToolResultContent::Blocks(blocks) => blocks
             .iter()
             .filter_map(|b| match b {
-                ContentBlock::Text { text, .. } => Some(json!({ "text": text })),
+                ContentBlock::Text { text, .. } => {
+                    (!is_blank(text)).then(|| json!({ "text": text }))
+                }
                 ContentBlock::Image { media_type, data } => Some(image(media_type, data)),
                 // A result cannot hold a call, another result, or reasoning.
                 _ => None,
             })
             .collect(),
+    };
+    if blocks.is_empty() {
+        vec![json!({ "text": NO_OUTPUT })]
+    } else {
+        blocks
     }
 }
 
@@ -1883,6 +1911,59 @@ mod tests {
         assert_eq!(
             render_request(&req).expect("renders")["messages"],
             json!([{ "role": "user", "content": [{ "text": "hi" }] }])
+        );
+    }
+
+    /// Converse refuses a text block with nothing in it, in a turn, in the
+    /// system prompt and in a tool result ("text content blocks must be
+    /// non-empty"), and a tool result needs content. Blank text is left out,
+    /// and a result left with nothing says so.
+    #[test]
+    fn blank_text_is_left_out_and_an_empty_tool_result_says_so() {
+        let call = |id: &str| ContentBlock::ToolUse {
+            id: id.to_owned(),
+            name: "run".to_owned(),
+            input: json!({}),
+        };
+        let result = |id: &str, content: ToolResultContent| ContentBlock::ToolResult {
+            tool_use_id: id.to_owned(),
+            content,
+            is_error: false,
+        };
+        let req = request(|r| {
+            r.system = vec![text(" \n ")];
+            r.messages = vec![
+                turn(Role::User, vec![text("run them"), text("")]),
+                // What a Chat Completions client sends with its calls.
+                turn(
+                    Role::Assistant,
+                    vec![text(""), call("t1"), call("t2"), call("t3")],
+                ),
+                turn(
+                    Role::User,
+                    vec![
+                        result("t1", ToolResultContent::Text(String::new())),
+                        result("t2", ToolResultContent::Text(" \t\n".to_owned())),
+                        result("t3", ToolResultContent::Blocks(vec![text(""), text("  ")])),
+                    ],
+                ),
+                turn(Role::User, vec![text("   ")]),
+            ];
+        });
+        let body = render_request(&req).expect("renders");
+        assert!(body.get("system").is_none(), "{body}");
+        let no_output = |id: &str| json!({ "toolResult": { "toolUseId": id, "content": [{ "text": "(no output)" }] } });
+        assert_eq!(
+            body["messages"],
+            json!([
+                { "role": "user", "content": [{ "text": "run them" }] },
+                { "role": "assistant", "content": [
+                    { "toolUse": { "toolUseId": "t1", "name": "run", "input": {} } },
+                    { "toolUse": { "toolUseId": "t2", "name": "run", "input": {} } },
+                    { "toolUse": { "toolUseId": "t3", "name": "run", "input": {} } },
+                ]},
+                { "role": "user", "content": [no_output("t1"), no_output("t2"), no_output("t3")] },
+            ])
         );
     }
 
