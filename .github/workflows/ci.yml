@@ -249,18 +249,23 @@ jobs:
   # and fails if the tests still pass. That is how `claim_slot` shipped with
   # its refusal branch unexercised. Diff-scoped so the cost follows the PR;
   # with the backends bound, because a gated test that skips kills nothing.
-  # Sharded: a whole train of PRs (#140: 1065 mutants at 10-22 s each) cannot
-  # finish in one 60-minute job, and a cancelled job tests nothing. Ten shards
-  # keep each one well inside the limit; `mutants` below is the one check the
+  # Sharded: a whole train of PRs (#140: ~1070 mutants) cannot finish in one
+  # 60-minute job, and a cancelled job tests nothing. Twenty shards, dealt
+  # round-robin so the slow oag-server mutants (each rebuilds the server and
+  # its end-to-end tests) spread evenly instead of piling into a few slices,
+  # two mutants at a time per runner. `mutants` below is the one check the
   # branch requires, and it is green only when every shard is.
   mutants-shard:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read # to fetch this branch's previous mutants results
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     services:
       postgres:
         image: postgres:18-alpine
@@ -294,6 +299,11 @@ jobs:
         with:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # One cache for every shard, saved even when a shard finds a survivor:
+          # a mutants run that fails is the common case on a branch being fixed.
+          shared-key: mutants
+          cache-on-failure: true
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-mutants
@@ -310,8 +320,30 @@ jobs:
       # --cap-lints: this workflow sets RUSTFLAGS=-D warnings, so a mutant that
       # leaves an argument unused failed to build and was counted "unviable"
       # instead of tested -- 27 of 29 on #97, against 6 of 29 locally.
+      - name: reuse the last run's outcomes on this branch
+        # A caught or unviable mutant stays so while its code is unchanged, so
+        # `--iterate` below skips what this branch's previous run settled and
+        # tests the rest: never reached (a shard ran out of time), missed, timed
+        # out. A mutant whose code moved or changed has a new name
+        # (file:line:col), so it is tested again. A branch's first run, or one
+        # whose previous results cannot be fetched, tests everything.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          out="$RUNNER_TEMP/mutants.out"
+          mkdir -p "$out"
+          prev=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci --branch "$HEAD_REF" \
+            --json databaseId,headSha,status --limit 20 \
+            --jq "[.[] | select(.headSha != \"$GITHUB_SHA\" and .status == \"completed\")][0].databaseId // empty")
+          if [ -n "$prev" ] && gh run download "$prev" -R "$GITHUB_REPOSITORY" -p 'mutants.out-*' -D "$RUNNER_TEMP/prev"; then
+            cat "$RUNNER_TEMP"/prev/*/caught.txt 2>/dev/null | sort -u > "$out/caught.txt"
+            cat "$RUNNER_TEMP"/prev/*/unviable.txt 2>/dev/null | sort -u > "$out/unviable.txt"
+          fi
+          touch "$out/caught.txt" "$out/unviable.txt"
+          echo "reusing $(wc -l < "$out/caught.txt") caught and $(wc -l < "$out/unviable.txt") unviable from run ${prev:-none}"
       - name: cargo mutants
-        run: cargo mutants --no-shuffle --cap-lints true --shard "${SHARD}/10" --in-diff "$RUNNER_TEMP/pr.diff" -o "$RUNNER_TEMP"
+        run: cargo mutants --no-shuffle --cap-lints true --iterate --jobs 2 --sharding round-robin --shard "${SHARD}/20" --in-diff "$RUNNER_TEMP/pr.diff" -o "$RUNNER_TEMP"
         env:
           SHARD: ${{ matrix.shard }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

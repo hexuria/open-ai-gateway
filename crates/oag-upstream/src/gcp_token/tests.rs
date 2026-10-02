@@ -911,6 +911,13 @@ async fn a_token_outlives_a_failed_refresh_until_its_last_thirty_seconds() {
             .expect("still the token in hand"),
         "ya29.first"
     );
+    // Exactly thirty left: the boundary itself is already too few.
+    NOW.store(T0 + 3570, Ordering::SeqCst);
+    let err = cache
+        .token(account, &key, None)
+        .await
+        .expect_err("thirty seconds is not more than thirty");
+    assert!(err.to_string().contains("503"), "{err}");
     // Twenty-nine left: too few to set out with.
     NOW.store(T0 + 3571, Ordering::SeqCst);
     let err = cache

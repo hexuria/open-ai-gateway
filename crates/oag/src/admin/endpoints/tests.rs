@@ -725,6 +725,123 @@ async fn a_set_that_lost_a_race_reads_the_row_again_and_keeps_both_changes() {
     );
 }
 
+/// Wait until backend `waiter` is blocked by backend `holder`. False if it
+/// never is, which the caller turns into a failure: a race whose
+/// interleaving never happened has proved nothing.
+async fn blocked_by(db: &Db, waiter: i32, holder: i32) -> bool {
+    for _ in 0..400 {
+        let blocked: bool = sqlx::query_scalar("SELECT $2 = ANY (pg_blocking_pids($1))")
+            .bind(waiter)
+            .bind(holder)
+            .fetch_one(db.pool())
+            .await
+            .expect("pg_blocking_pids");
+        if blocked {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// C9's limit. A `set` that loses the race on the row it read again as well
+/// gives up: nothing of its own is written, the other writer's change
+/// stands, and the error says to look and run it again. Once, as `set_from`
+/// says, because a row rewritten in the time one write takes is a row
+/// being rewritten in a loop.
+///
+/// The second change is held open until the write made from the row read
+/// again waits on it, so that write is the one that loses.
+#[tokio::test]
+async fn a_set_that_loses_the_race_twice_writes_nothing_and_says_so() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 4).expect("connect");
+    db.migrate().await.expect("migrate");
+    let _endpoints = ENDPOINT_ROWS.lock().await;
+    let name = fresh();
+    run(
+        &db,
+        &[
+            "endpoint",
+            "add",
+            "--name",
+            &name,
+            "--dialect",
+            "openai",
+            "--platform",
+            "plain",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+        ],
+    )
+    .await
+    .expect("added");
+    let stale = repo::get_endpoint(&db, &name)
+        .await
+        .expect("read")
+        .expect("stored");
+    // The first race, lost before anything waits: a change made after
+    // `stale` was read.
+    run(&db, &["endpoint", "set", &name, "--display-name", "Theirs"])
+        .await
+        .expect("their change");
+    // The second: another change, not yet committed, holding the row.
+    let mut other = db.pool().begin().await.expect("begin");
+    let other_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *other)
+        .await
+        .expect("pid");
+    sqlx::query(
+        "UPDATE endpoint SET display_name = 'Later', \
+         updated_at = updated_at + interval '1 second' WHERE name = $1",
+    )
+    .bind(&name)
+    .execute(&mut *other)
+    .await
+    .expect("their second change, held open");
+
+    // One connection, so the backend asked about is the one `set_from`
+    // writes on.
+    let setter = Db::connect(&url, 1).expect("connect");
+    let setter_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(setter.pool())
+        .await
+        .expect("pid");
+    let mut args = set_args(&["--discover"]);
+    args.name.clone_from(&name);
+    let written = tokio::spawn(async move { set_from(&setter, stale, &args).await });
+    let waited = blocked_by(&db, setter_pid, other_pid).await;
+    other.commit().await.expect("commit");
+    let written = written.await.expect("task");
+    let after = repo::get_endpoint(&db, &name)
+        .await
+        .expect("read")
+        .expect("stored");
+    run(&db, &["endpoint", "remove", &name])
+        .await
+        .expect("removed");
+
+    assert!(
+        waited,
+        "the write made from the row read again never waited on the other change, so this run \
+         proved nothing"
+    );
+    let refused = written.expect_err("lost twice, and not tried a third time");
+    assert!(
+        refused.to_string().contains("changed by someone else"),
+        "{refused}"
+    );
+    assert!(!after.discover_models, "nothing of this change was written");
+    assert_eq!(
+        after.display_name.as_deref(),
+        Some("Later"),
+        "and the other writer's change stands"
+    );
+}
+
 /// C1. `set --base-url` on an endpoint with a credential is refused without
 /// `--yes-move-keys`, and nothing is written, since the key would go to the
 /// new URL; any other setting still changes, and with the flag the URL moves.
@@ -817,11 +934,15 @@ async fn a_base_url_moves_keys_only_with_yes_move_keys() {
 }
 
 /// C1. A `set` that moved an endpoint's keys says so, and where they go now.
+/// One that moved an endpoint no credential is filed under moved no key, and
+/// says nothing of keys.
 #[test]
 fn a_set_that_moved_keys_says_where_they_go_now() {
     let row = stored();
     let quiet = set_lines(&row, None);
     assert!(!quiet.join("\n").contains("warning"), "{quiet:?}");
+    let keyless = set_lines(&row, Some((Some("http://127.0.0.1:9/v1"), 0)));
+    assert!(!keyless.join("\n").contains("warning"), "{keyless:?}");
     let moved = set_lines(&row, Some((Some("http://127.0.0.1:9/v1"), 2)));
     assert!(
         moved.iter().any(|line| line

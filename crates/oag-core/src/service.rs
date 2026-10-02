@@ -309,6 +309,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn each_ipv6_rule_refuses_on_its_own() {
+        // One address per arm of `v6_is_denied`, each matching that arm and no
+        // other, so a mutant that joins two arms with `&&` is caught by the
+        // address only the dropped arm refuses.
+        for (ip, rule) in [
+            ("fe80::1", "unicast link-local"),
+            ("::", "unspecified"),
+            ("ff02::1", "multicast"),
+            ("fd00:ec2::254", "cloud metadata"),
+            ("::ffff:169.254.169.254", "IPv4-mapped link-local"),
+        ] {
+            let ip: IpAddr = ip.parse().expect("an address");
+            assert!(ip_is_denied(ip), "{ip} ({rule}) must be refused");
+        }
+        let ip: IpAddr = "2001:db8::1".parse().expect("an address");
+        assert!(!ip_is_denied(ip), "a global unicast address is not refused");
+    }
+
     /// The metadata services that are not on a link-local address: AWS's and
     /// GCP's over IPv6, which sit in the unique-local range an operator's own
     /// network may use, and Alibaba Cloud's, in the shared address space.

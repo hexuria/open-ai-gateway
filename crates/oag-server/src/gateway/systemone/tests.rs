@@ -889,6 +889,38 @@ async fn a_breaker_that_trips_mid_request_stops_the_retries() {
     assert_eq!(body["error"]["upstream_status"], 408);
 }
 
+/// An answer counts for the key that gave it, as a chat answer does: it
+/// clears the breaker's run of failures. A key one failure short of the
+/// threshold before an answer is a whole threshold short after it, so the
+/// next failure leaves it in rotation, where the same failures with no
+/// answer between them take a key out.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_clears_the_breakers_run_of_failures() {
+    let Some(gw) = Gateway::start(CHAT_LADDER, None).await else {
+        return;
+    };
+    let answered = AccountId::from_uuid(gw.add_jev_key("jev-key-a", 0).await);
+    let unanswered = AccountId::from_uuid(uuid::Uuid::new_v4());
+    // One short of the threshold, so the next failure opens it.
+    for _ in 0..4 {
+        gw.state.breakers.record_failure(answered);
+        gw.state.breakers.record_failure(unanswered);
+    }
+
+    assert_eq!(gw.ask(QUESTIONS).await.status(), 200);
+    gw.state.breakers.record_failure(answered);
+    gw.state.breakers.record_failure(unanswered);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    assert!(
+        gw.state.breakers.permits(answered, now),
+        "one failure since the answer, not five in a row"
+    );
+    assert!(
+        !gw.state.breakers.permits(unanswered, now),
+        "the premise: five in a row open a breaker"
+    );
+}
+
 /// A 429 benches the key for as long as Jev said, and the next key serves.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_429_parks_the_key_for_its_retry_after_and_moves_on() {

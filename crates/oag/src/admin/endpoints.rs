@@ -374,7 +374,6 @@ async fn set(db: &Db, args: EndpointSetArgs) -> Result<()> {
             from.base_url.as_deref(),
             repo::endpoint_account_count(db, &row.name).await?,
         ))
-        .filter(|(_, accounts)| *accounts > 0)
     } else {
         None
     };
@@ -437,8 +436,9 @@ pub(super) async fn set_from(
 }
 
 /// What `set` prints once the change is written. `moved` is the base URL the
-/// endpoint had and how many credentials' keys now go to the one it has, when
-/// the change moved it with credentials filed under it.
+/// endpoint had and how many credentials are filed under it, when the change
+/// moved it; their keys now go to the one it has, which is warned of when
+/// there are any.
 pub(super) fn set_lines(row: &EndpointRow, moved: Option<(Option<&str>, i64)>) -> Vec<String> {
     let mut lines = vec![format!(
         "endpoint {} updated: {} on {} at {}",
@@ -447,7 +447,7 @@ pub(super) fn set_lines(row: &EndpointRow, moved: Option<(Option<&str>, i64)>) -
         row.platform,
         place(row)
     )];
-    if let Some((from, accounts)) = moved {
+    if let Some((from, accounts)) = moved.filter(|(_, accounts)| *accounts > 0) {
         lines.push(format!(
             "  warning: the keys of {accounts} credential(s) filed under {} now go to {}, \
              no longer to {}",

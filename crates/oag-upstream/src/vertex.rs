@@ -703,6 +703,61 @@ mod tests {
         }
     }
 
+    /// A token Vertex refused is dropped from the cache by the adapter that
+    /// sent it, so the next `prepare_credential` mints again. A refusal of a
+    /// token the cache no longer holds changes nothing.
+    #[tokio::test]
+    async fn a_refused_token_is_minted_again_by_the_next_prepare() {
+        let google = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "ya29.vertex-minted",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            })))
+            .expect(2)
+            .mount(&google)
+            .await;
+        let endpoint = Endpoint::new("t10-vertex", Dialect::GeminiGenerateContent, Platform::Gcp)
+            .expect("a name");
+        let adapter = VertexAdapter::for_endpoint(
+            endpoint,
+            None,
+            "us-central1",
+            "oag-test",
+            ExtraHeaders::default(),
+            tokens(&format!("{}/token", google.uri())),
+        )
+        .expect("a gcp adapter");
+        let (account, stored) = (AccountId::new(), stored());
+
+        let first = adapter
+            .prepare_credential(account, &stored, None)
+            .await
+            .expect("minted");
+        let first = first.into_owned();
+        // A token the cache does not hold: ignored, the cached one stays.
+        adapter
+            .credential_refused(account, &minted("ya29.someone-else"))
+            .await;
+        adapter
+            .prepare_credential(account, &stored, None)
+            .await
+            .expect("still cached");
+        assert_eq!(
+            google.received_requests().await.expect("recording").len(),
+            1
+        );
+        // The token it holds: dropped, so the next prepare mints again.
+        adapter.credential_refused(account, &first).await;
+        adapter
+            .prepare_credential(account, &stored, None)
+            .await
+            .expect("minted again");
+        google.verify().await;
+    }
+
     /// The credential's proxy carries its mint. The token URL is a closed
     /// port, so a token at all came through the proxy.
     #[tokio::test]

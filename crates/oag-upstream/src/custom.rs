@@ -883,6 +883,23 @@ mod tests {
         }
     }
 
+    /// The check a writer runs before storing a row refuses what the spec
+    /// would refuse, naming the endpoint, and passes what it would keep.
+    #[test]
+    fn checking_extra_headers_refuses_what_the_spec_refuses() {
+        let err = EndpointSpec::check_extra_headers(
+            "t7-check",
+            Platform::Plain,
+            [("Authorization", "Bearer smuggled")],
+        )
+        .expect_err("a second auth header is refused");
+        assert!(err.starts_with("endpoint `t7-check`: "), "{err}");
+        assert!(
+            EndpointSpec::check_extra_headers("t7-check", Platform::Plain, [("x-team", "core")])
+                .is_ok()
+        );
+    }
+
     #[test]
     fn a_header_that_only_resembles_a_refused_one_is_kept() {
         // The refusal is by exact name, and by prefix only for `proxy-`.

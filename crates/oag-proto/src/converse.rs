@@ -369,12 +369,6 @@ impl ToolUseIds {
     pub fn original<'a>(&'a self, wire: &'a str) -> &'a str {
         self.from_wire.get(wire).map_or(wire, String::as_str)
     }
-
-    /// Whether every id is sent as it is.
-    #[must_use]
-    pub fn is_identity(&self) -> bool {
-        self.to_wire.is_empty()
-    }
 }
 
 /// The longest `toolUseId` Converse takes.
@@ -397,6 +391,17 @@ fn tool_use_id_byte(b: u8) -> bool {
 /// the cut, or only in what was replaced, are still told apart. FNV-1a: not
 /// for secrecy, only a stable spread that is the same on every replica and
 /// every turn. Should even that be taken, the hash is taken again, salted.
+///
+/// The salts tried stop at `taken.len()`, so the search ends whatever
+/// `taken` holds, and one of them is free: `taken` cannot hold all of
+/// `taken.len() + 1` spellings that differ, and these do. Two salts under
+/// 256 differ only in the first of their bytes FNV-1a takes, where the two
+/// hashes part, and each step after it takes the same byte into both, a
+/// bijection, so they stay apart; past 256 they differ unless two 64-bit
+/// hashes collide. Should every one be taken even so, which takes such a
+/// collision or a history built to make one, `id` goes as the client sent
+/// it, for Converse to refuse: a turn refused says what is wrong, where a
+/// spelling two ids shared could pair a call with another's result.
 fn respell_tool_use_id(id: &str, taken: &HashSet<String>) -> String {
     let plain: String = id
         .bytes()
@@ -413,14 +418,10 @@ fn respell_tool_use_id(id: &str, taken: &HashSet<String>) -> String {
     }
     // ASCII by construction, so any byte offset is a character boundary.
     let stem = &plain[..plain.len().min(TOOL_USE_ID_MAX - 17)];
-    let mut salt = 0u64;
-    loop {
-        let candidate = format!("{stem}_{:016x}", fnv1a(id.as_bytes(), salt));
-        if !taken.contains(&candidate) {
-            return candidate;
-        }
-        salt = salt.wrapping_add(1);
-    }
+    (0..=taken.len() as u64)
+        .map(|salt| format!("{stem}_{:016x}", fnv1a(id.as_bytes(), salt)))
+        .find(|candidate| !taken.contains(candidate))
+        .unwrap_or_else(|| id.to_owned())
 }
 
 /// 64-bit FNV-1a over `bytes`, then `salt`'s.
@@ -1864,6 +1865,95 @@ mod tests {
             render_request(&req).expect("renders"),
             body,
             "the same every turn"
+        );
+    }
+
+    /// A call the client never answered, and a result whose call was trimmed
+    /// from the front of the history, carry an id with nothing to pair it,
+    /// and Converse holds each to its pattern all the same. Each is
+    /// respelled though nothing else in the request names it.
+    #[test]
+    fn an_unpaired_tool_use_id_is_respelled_too() {
+        let req = request(|r| {
+            r.messages = vec![
+                turn(
+                    Role::User,
+                    vec![ContentBlock::ToolResult {
+                        tool_use_id: "read_file#0".to_owned(),
+                        content: ToolResultContent::Text("old".to_owned()),
+                        is_error: false,
+                    }],
+                ),
+                turn(
+                    Role::Assistant,
+                    vec![ContentBlock::ToolUse {
+                        id: "read_file#1".to_owned(),
+                        name: "read_file".to_owned(),
+                        input: json!({}),
+                    }],
+                ),
+                turn(Role::User, vec![text("never mind")]),
+            ];
+        });
+        let body = render_request(&req).expect("renders");
+        assert_eq!(
+            body["messages"][0]["content"][0]["toolResult"]["toolUseId"], "read_file_0",
+            "a result whose call is gone"
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0]["toolUse"]["toolUseId"], "read_file_1",
+            "a call never answered"
+        );
+    }
+
+    /// What a history's ids are sent as does not change with a deploy, or
+    /// from one replica to another a build behind, so a conversation's
+    /// cached prompt prefix outlives both. Pinned, against FNV-1a computed
+    /// apart from this code: over the id's bytes, then the salt's eight,
+    /// little-endian. With the readable spelling taken, the hash is the
+    /// salt-0 one; with that taken too, by an id the client sent, which
+    /// keeps its seat, the salt-1 one.
+    #[test]
+    fn a_respelling_is_pinned_and_steps_around_a_legal_id_in_its_way() {
+        let sent = |ids: &[&str]| -> Vec<String> {
+            let req = request(|r| {
+                r.messages = vec![
+                    turn(Role::User, vec![text("read them")]),
+                    turn(
+                        Role::Assistant,
+                        ids.iter()
+                            .map(|id| ContentBlock::ToolUse {
+                                id: (*id).to_owned(),
+                                name: "read_file".to_owned(),
+                                input: json!({}),
+                            })
+                            .collect(),
+                    ),
+                ];
+            });
+            render_request(&req).expect("renders")["messages"][1]["content"]
+                .as_array()
+                .expect("blocks")
+                .iter()
+                .map(|b| {
+                    b["toolUse"]["toolUseId"]
+                        .as_str()
+                        .expect("an id")
+                        .to_owned()
+                })
+                .collect()
+        };
+        assert_eq!(
+            sent(&["read_file#1", "read_file_1"]),
+            ["read_file_1_cb37256298d8f1c0", "read_file_1"]
+        );
+        assert_eq!(
+            sent(&["read_file#1", "read_file_1", "read_file_1_cb37256298d8f1c0"]),
+            [
+                "read_file_1_ea31ec6ba3c83be1",
+                "read_file_1",
+                "read_file_1_cb37256298d8f1c0"
+            ]
         );
     }
 

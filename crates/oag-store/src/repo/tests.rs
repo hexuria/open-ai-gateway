@@ -4533,7 +4533,8 @@ async fn an_operators_model_is_written_whole_and_a_seed_leaves_it() {
 /// Each endpoint is counted by what names it: its credentials and the ones in
 /// rotation, its catalog models and the ones an active route's ladder names. A
 /// ladder shaped wrong by hand counts as naming nothing, and an endpoint
-/// nothing names counts zero everywhere.
+/// nothing names counts zero everywhere. `endpoint_account_count`, the one
+/// count a base-URL move asks for, agrees with the first.
 // Long for its fixture: two endpoints, three routes, two credentials and three
 // models, all removed again before asserting.
 #[allow(clippy::too_many_lines)]
@@ -4608,6 +4609,10 @@ async fn each_endpoint_is_counted_by_what_names_it() {
     }
 
     let counted = endpoint_references(&db).await;
+    // And one endpoint's credentials alone, as a move of its base URL counts
+    // them: in rotation or not, since a key out of rotation still moves.
+    let named_accounts = endpoint_account_count(&db, &named).await;
+    let idle_accounts = endpoint_account_count(&db, &idle).await;
 
     sqlx::query("DELETE FROM account WHERE provider = $1")
         .bind(&named)
@@ -4646,4 +4651,6 @@ async fn each_endpoint_is_counted_by_what_names_it() {
         Some(EndpointReferences::default()),
         "an endpoint nothing names is listed, at zero"
     );
+    assert_eq!(named_accounts.expect("the count"), 2);
+    assert_eq!(idle_accounts.expect("the count"), 0);
 }

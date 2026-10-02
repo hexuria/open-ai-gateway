@@ -2166,8 +2166,13 @@ fn catalog_add_refuses_a_zero_price_unless_it_is_free() {
         .to_string();
     assert!(err.contains("--free says the model costs nothing"), "{err}");
 
-    // One side free is a price, not a free model.
-    super::catalog::model_row(&priced("0", "2"), merge).expect("free input only");
+    // One side free is a price, not a free model, and is not printed as one.
+    for (input, output) in [("0", "2"), ("2", "0")] {
+        let one_side = super::catalog::model_row(&priced(input, output), merge)
+            .unwrap_or_else(|e| panic!("free on one side only ({input}, {output}): {e}"));
+        let lines = super::catalog::added_model_lines(&one_side).join("\n");
+        assert!(!lines.contains("free on purpose"), "{lines}");
+    }
 
     for (input, says) in [
         ("-1", "cannot be negative"),
