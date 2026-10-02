@@ -7,7 +7,7 @@
 # Each architecture is instead built natively on its own runner and the two are
 # merged into one manifest list (see .github/workflows/release.yml), so there is
 # no cross-compilation and no QEMU, both of which are painful for Rust.
-FROM rust:1.95-alpine AS builder
+FROM rust:1.99-alpine AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 

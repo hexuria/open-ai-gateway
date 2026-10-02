@@ -79,6 +79,7 @@ pub fn describe() {
     // line over clippy's cap. Shortening the text would hide why the loss is
     // counted at all.
     describe_vendor_fields();
+    describe_endpoints();
     describe_counter!(
         "oag_client_disconnects_total",
         "Requests where the client hung up before the upstream finished."
@@ -148,6 +149,16 @@ fn describe_vendor_fields() {
     );
 }
 
+fn describe_endpoints() {
+    metrics::describe_counter!(
+        "oag_endpoint_invalid_total",
+        "Endpoint rows a catalog reload skipped, by the rule each broke. Counted on \
+         every reload the row is still bad, so a steady rate is a row waiting to be \
+         fixed; the warning logged with it names the endpoint. `unsupported` is a \
+         valid row this build has no adapter for."
+    );
+}
+
 fn describe_slot_metrics() {
     metrics::describe_counter!(
         "oag_slot_ghost_total",
@@ -205,6 +216,8 @@ mod tests {
             include_str!("lib.rs"),
             include_str!("health.rs"),
             include_str!("state.rs"),
+            include_str!("egress.rs"),
+            include_str!("endpoint_sync.rs"),
             include_str!("usage_poll.rs"),
             include_str!("breakers.rs"),
             include_str!("shutdown.rs"),

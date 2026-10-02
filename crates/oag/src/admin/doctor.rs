@@ -11,13 +11,14 @@ use oag_store::Db;
 /// which the reporting queries group on and the importer writes. 0017 re-keys
 /// the rows a Claude Code import already wrote, so a binary on the old schema
 /// re-imports the whole corpus the first time anybody runs `usage import`.
-/// 0020 adds the `endpoint` table that `repo::endpoints` reads and writes.
+/// 0020 adds the `endpoint` table that `repo::endpoints` reads and writes, and
+/// 0021 its `path` column, which every one of those queries now names.
 ///
 /// Raise this with every migration that existing queries depend on. The test
 /// below counts the files rather than trusting this line, because the number
 /// that matters is the one on disk and a constant is exactly the thing that
 /// gets forgotten.
-const EXPECTED_MIGRATIONS: usize = 20;
+const EXPECTED_MIGRATIONS: usize = 22;
 
 pub async fn run(db: &Db, config: &Config, route: &str) -> Result<()> {
     conclude(problems(db, config, route).await?)
@@ -29,6 +30,7 @@ async fn problems(db: &Db, config: &Config, route: &str) -> Result<u32> {
 
     failed += check_migrations(db).await?;
     failed += check_catalog(db).await?;
+    failed += check_endpoints(db).await?;
     let Some((_mode, rungs)) = check_route(db, route).await? else {
         return Ok(failed + 1);
     };
@@ -146,6 +148,107 @@ async fn check_catalog(db: &Db) -> Result<u32> {
         println!("ok   catalog     {n} models");
         Ok(0)
     }
+}
+
+/// Every registered endpoint, asked what stops it serving: whether this build
+/// serves its row, whether a request could lease a key for it, whether it
+/// has a model, and whether a ladder names one. Not per route: an endpoint is
+/// every route's, and a broken one is broken for all of them.
+async fn check_endpoints(db: &Db) -> Result<u32> {
+    let rows = oag_store::repo::list_endpoints(db).await?;
+    let refs = oag_store::repo::endpoint_references(db).await?;
+    let mut failed = 0;
+    for row in &rows {
+        let (lines, problems) = endpoint_report(
+            &row.name,
+            &row.platform,
+            oag_server::endpoints::refusal(row).map(|refusal| refusal.message),
+            refs.get(&row.name).copied().unwrap_or_default(),
+        );
+        for line in lines {
+            println!("{line}");
+        }
+        failed += problems;
+    }
+    Ok(failed)
+}
+
+/// What doctor says about one endpoint, and how many problems that is.
+///
+/// A model on no ladder is a warning, not a problem: a request naming it still
+/// reaches it, and an endpoint kept for such requests is a choice, not a
+/// fault. Failing `doctor` over it would make `doctor` unusable in CI for
+/// whoever made that choice, as an unpriced seat would.
+fn endpoint_report(
+    name: &str,
+    platform: &str,
+    problem: Option<String>,
+    refs: oag_store::repo::EndpointReferences,
+) -> (Vec<String>, u32) {
+    if let Some(problem) = problem {
+        return (
+            vec![
+                format!(
+                    "FAIL endpoint    {name} is not served, so its credentials and models \
+                     serve nothing: {problem}"
+                ),
+                format!("     fix: oag admin endpoint set {name} (or remove it and add it again)"),
+            ],
+            1,
+        );
+    }
+    let mut failed = 0;
+    let mut lines = Vec::new();
+    if refs.schedulable == 0 {
+        failed += 1;
+        if refs.accounts == 0 {
+            lines.push(format!(
+                "FAIL endpoint    {name} has no credential, so a request routed to it fails"
+            ));
+            lines.push(format!(
+                "     fix: oag admin account add --name {name}-1 --provider {name} {}",
+                super::endpoints::secret_flag(platform)
+            ));
+        } else {
+            lines.push(format!(
+                "FAIL endpoint    {name} has {} credential(s) and none in rotation, so a \
+                 request routed to it fails",
+                refs.accounts
+            ));
+            lines.push("     fix: oag admin account enable <credential>".to_owned());
+        }
+    }
+    if refs.models == 0 {
+        failed += 1;
+        lines.push(format!(
+            "FAIL endpoint    {name} has no model in the catalog, so nothing routes to it"
+        ));
+        lines.push(format!(
+            "     fix: oag admin catalog add --id {name}/<model> --upstream <model> \
+             --input-per-mtok <usd> --output-per-mtok <usd> --context <tokens> --max-output <tokens>"
+        ));
+    } else if refs.on_ladder == 0 {
+        lines.push(format!(
+            "WARN endpoint    {name}: none of its {} model(s) is on a ladder, so only a \
+             request naming one reaches it",
+            refs.models
+        ));
+        lines.push(
+            "     fix: oag admin route tiers, which sets a route's whole ladder \
+             (`oag admin route show` prints the one it has)"
+                .to_owned(),
+        );
+    }
+    if failed == 0 {
+        lines.insert(
+            0,
+            format!(
+                "ok   endpoint    {name}  {} credential(s) in rotation, {} model(s), {} on a ladder",
+                refs.schedulable, refs.models, refs.on_ladder
+            ),
+        );
+    }
+    (lines, failed)
 }
 
 async fn check_route(
@@ -857,9 +960,185 @@ mod tests {
         .expect("attach");
 
         let _rows = SCHEMA_ROWS.lock().await;
-        let schema = check_migrations(&db).await.expect("m") + check_catalog(&db).await.expect("c");
+        // Endpoints are counted before the route, and other tests in this
+        // binary register some; held so none appears or goes mid-count.
+        let _endpoints = crate::admin::tests::ENDPOINT_ROWS.lock().await;
+        let schema = check_migrations(&db).await.expect("m")
+            + check_catalog(&db).await.expect("c")
+            + check_endpoints(&db).await.expect("e");
         assert_eq!(problems(&db, &config, &good).await.expect("good"), schema);
         assert_eq!(problems(&db, &config, &bad).await.expect("bad"), schema + 2);
+    }
+
+    /// Each question doctor asks an endpoint is its own problem, a model on no
+    /// ladder is only a warning, and an endpoint the build does not serve is
+    /// one problem whatever else is true of it.
+    #[test]
+    fn each_thing_an_endpoint_lacks_is_its_own_problem() {
+        use oag_store::repo::EndpointReferences;
+        let whole = EndpointReferences {
+            accounts: 2,
+            schedulable: 1,
+            models: 3,
+            on_ladder: 1,
+        };
+        let (lines, failed) = endpoint_report("merge", "plain", None, whole);
+        assert_eq!(failed, 0);
+        assert_eq!(
+            lines,
+            ["ok   endpoint    merge  1 credential(s) in rotation, 3 model(s), 1 on a ladder"]
+        );
+
+        let says = |refs, problem: Option<&str>| {
+            let (lines, failed) =
+                endpoint_report("merge", "plain", problem.map(str::to_owned), refs);
+            (lines.join("\n"), failed)
+        };
+        let (text, failed) = says(EndpointReferences::default(), None);
+        assert_eq!(failed, 2, "no credential and no model: {text}");
+        assert!(
+            text.contains("FAIL endpoint    merge has no credential"),
+            "{text}"
+        );
+        assert!(text.contains("--provider merge --secret <key>"), "{text}");
+        // A gcp endpoint's key is a service account's JSON, read from its file.
+        let (vertex, _) = endpoint_report("vertex", "gcp", None, EndpointReferences::default());
+        assert!(
+            vertex.join("\n").contains(
+                "fix: oag admin account add --name vertex-1 --provider vertex \
+                 --secret-file <service-account.json>"
+            ),
+            "{vertex:?}"
+        );
+        assert!(text.contains("has no model in the catalog"), "{text}");
+        assert!(text.contains("catalog add --id merge/<model>"), "{text}");
+        assert!(!text.contains("ok   endpoint"), "{text}");
+
+        let (text, failed) = says(
+            EndpointReferences {
+                schedulable: 0,
+                ..whole
+            },
+            None,
+        );
+        assert_eq!(failed, 1, "{text}");
+        assert!(
+            text.contains("has 2 credential(s) and none in rotation"),
+            "{text}"
+        );
+        assert!(text.contains("account enable"), "{text}");
+
+        let (text, failed) = says(
+            EndpointReferences {
+                on_ladder: 0,
+                ..whole
+            },
+            None,
+        );
+        assert_eq!(failed, 0, "reachable by name, so a warning: {text}");
+        assert!(text.starts_with("ok   endpoint    merge"), "{text}");
+        assert!(
+            text.contains("WARN endpoint    merge: none of its 3 model(s) is on a ladder"),
+            "{text}"
+        );
+
+        let (text, failed) = says(whole, Some("the base URL's host is openai.com"));
+        assert_eq!(failed, 1, "{text}");
+        assert!(
+            text.contains("FAIL endpoint    merge is not served"),
+            "{text}"
+        );
+        assert!(text.contains("openai.com"), "{text}");
+        assert!(!text.contains("ok   endpoint"), "{text}");
+    }
+
+    /// `doctor` counts an endpoint's problems against the database: one with
+    /// nothing is two problems, and giving it a credential and a model on a
+    /// ladder clears both.
+    #[tokio::test]
+    async fn an_unfinished_endpoint_is_counted_until_it_can_serve() {
+        let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        db.migrate().await.expect("migrate");
+        let _endpoints = crate::admin::tests::ENDPOINT_ROWS.lock().await;
+        let before = check_endpoints(&db).await.expect("before");
+
+        let name = format!("t5d-{}", &uuid::Uuid::new_v4().simple().to_string()[..20]);
+        oag_store::repo::insert_endpoint(
+            &db,
+            &oag_store::NewEndpoint {
+                name: &name,
+                dialect: "openai",
+                platform: "plain",
+                base_url: Some("http://127.0.0.1:9/v1"),
+                auth: "bearer",
+                region: None,
+                project: None,
+                api_version: None,
+                path: None,
+                extra_headers: &serde_json::json!({}),
+                display_name: None,
+                discover_models: false,
+            },
+        )
+        .await
+        .expect("an endpoint");
+        let unfinished = check_endpoints(&db).await;
+
+        let model = format!("{name}/m");
+        let route = format!("t5d-{}", uuid::Uuid::new_v4());
+        let finish = async {
+            sqlx::query(
+                "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+                 credentials_nonce) VALUES (gen_random_uuid(), $1, $1, 'api_key', '\\x00', '\\x00')",
+            )
+            .bind(&name)
+            .execute(db.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO model_catalog (id, provider, upstream_name, input_per_mtok, \
+                 output_per_mtok, context_window, max_output_tokens) \
+                 VALUES ($1, $2, 'm', 1, 2, 1000, 100)",
+            )
+            .bind(&model)
+            .bind(&name)
+            .execute(db.pool())
+            .await?;
+            sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, $2)")
+                .bind(&route)
+                .bind(serde_json::json!([{"name": "cheap", "models": [model]}]))
+                .execute(db.pool())
+                .await?;
+            Ok::<_, sqlx::Error>(())
+        }
+        .await;
+        let finished = check_endpoints(&db).await;
+
+        sqlx::query("DELETE FROM route WHERE name = $1")
+            .bind(&route)
+            .execute(db.pool())
+            .await
+            .expect("clean up the route");
+        sqlx::query("DELETE FROM model_catalog WHERE provider = $1")
+            .bind(&name)
+            .execute(db.pool())
+            .await
+            .expect("clean up the model");
+        sqlx::query("DELETE FROM account WHERE provider = $1")
+            .bind(&name)
+            .execute(db.pool())
+            .await
+            .expect("clean up the credential");
+        oag_store::repo::delete_endpoint(&db, &name)
+            .await
+            .expect("clean up the endpoint");
+
+        finish.expect("the fixture");
+        assert_eq!(unfinished.expect("unfinished"), before + 2);
+        assert_eq!(finished.expect("finished"), before);
     }
 
     /// The note on a failed rung names only credentials that serve one

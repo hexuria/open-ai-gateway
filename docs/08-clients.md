@@ -230,6 +230,12 @@ route". The gateway already retries and fails over between Jev keys, so a
 client retrying on top of it multiplies the attempts; `RetryPolicy::disabled()`
 leaves that to the gateway.
 
+The same client reaches any other System One host the operator registered, such
+as Merge Gateway's Decisions API, by naming the host's model:
+`SystemOneOpts { model: Some("merge-decisions/typesafe/jev-1.13".into()), .. }`,
+or `TYPESAFE_DEFAULT_MODEL`. `client.models()` lists them, named that way, beside
+Jev's ([03-providers.md](03-providers.md#system-one-hosts)).
+
 ## curl, in both dialects
 
 Anthropic:
@@ -391,7 +397,7 @@ it. Run it before reading further.
 | A model you own is missing from `/v1/models` | not on the ladder, below the key's floor tier, owned by another principal, every credential for it is rate limited / reserved-out / spent, or this key's quota is exhausted | `GET /v1/models` `.oag.providers[].reason` and `.oag.budget.pressure`; `oag admin doctor` |
 | Wrong model served | managed mode, or a floor tier | see the section above; check `x-oag-model` and `selection_reason` |
 | A Codex seat imports, then every request fails | `gateway.codex.instructions` (or `instructions_path`) unset — the backend refuses and it reads as a dead credential | `oag admin doctor` names it; `deploy/codex-instructions.txt` is a starting file |
-| `system_one_not_configured` (503) | a System One request on a route with no Jev key; there is no chat fallback | `oag admin account add --provider jev --route <route> ...` |
+| `system_one_not_configured` (503) | a System One request on a route with no key for the provider its model names (Jev, or the System One host the message names); there is no chat fallback | `oag admin account add --provider <the provider named> --route <route> ...` |
 | `unsupported_field` (400) | the request set a field the chosen upstream's dialect cannot express; refused rather than silently dropped, because a dropped field is indistinguishable from a model ignoring it | drop the field, or pin the request to a provider whose dialect has it |
 | 429 with `Retry-After` | the route's rpm limit, or the upstream's own throttle forwarded with the provider's body nested under `error.upstream` | wait the header out; `oag admin account list` shows a parked seat |
 | Streaming works locally, 504s in production | a proxy hop between the client and the gateway | [01-deployment.md](01-deployment.md), the seven things that break streaming |

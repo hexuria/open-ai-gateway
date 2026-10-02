@@ -161,8 +161,10 @@ pub fn health_url(base: &str, path: &str) -> Result<Url, crate::Error> {
 /// Addresses we will not send a health check to.
 ///
 /// Link-local (including the cloud metadata well-known `169.254.169.254`),
-/// unspecified, multicast, and broadcast. Not loopback and not RFC1918 —
-/// those are where the catalog's own backends actually run.
+/// unspecified, multicast, and broadcast, and the metadata services the
+/// clouds put anywhere else: [`METADATA_V4`] and [`METADATA_V6`]. Not
+/// loopback and not RFC1918 — those are where the catalog's own backends
+/// actually run.
 #[must_use]
 pub fn ip_is_denied(ip: IpAddr) -> bool {
     match ip {
@@ -171,20 +173,45 @@ pub fn ip_is_denied(ip: IpAddr) -> bool {
     }
 }
 
+/// Alibaba Cloud's metadata service, in the shared address space (RFC 6598)
+/// rather than link-local.
+pub const METADATA_V4: [Ipv4Addr; 1] = [Ipv4Addr::new(100, 100, 100, 200)];
+
+/// The IPv6 addresses of AWS's instance metadata service (`fd00:ec2::254`)
+/// and of GCP's metadata server (`fd20:ce::254`).
+///
+/// Both are unique-local, a range an operator's own network may use, so each
+/// is refused by its address and the range is left alone.
+pub const METADATA_V6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+    Ipv6Addr::new(0xfd20, 0x00ce, 0, 0, 0, 0, 0, 0x0254),
+];
+
 fn v4_is_denied(ip: Ipv4Addr) -> bool {
-    ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast()
+    ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || METADATA_V4.contains(&ip)
 }
 
 fn v6_is_denied(ip: Ipv6Addr) -> bool {
-    if ip.is_unicast_link_local() || ip.is_unspecified() || ip.is_multicast() {
+    if ip.is_unicast_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || METADATA_V6.contains(&ip)
+    {
         return true;
     }
     ip.to_ipv4_mapped().is_some_and(v4_is_denied)
 }
 
 fn is_metadata_host(name: &str) -> bool {
-    // Compared case-insensitively; DNS is.
-    let name = name.to_ascii_lowercase();
+    // Compared case-insensitively, as DNS compares names, and without the
+    // trailing dots that make a name fully qualified: DNS reads
+    // `metadata.google.internal.` as `metadata.google.internal`, so it is the
+    // same metadata server.
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
     matches!(
         name.as_str(),
         "metadata" | "metadata.google.internal" | "metadata.google.com" | "metadata.azure.com"
@@ -283,6 +310,63 @@ mod tests {
     }
 
     #[test]
+    fn each_ipv6_rule_refuses_on_its_own() {
+        // One address per arm of `v6_is_denied`, each matching that arm and no
+        // other, so a mutant that joins two arms with `&&` is caught by the
+        // address only the dropped arm refuses.
+        for (ip, rule) in [
+            ("fe80::1", "unicast link-local"),
+            ("::", "unspecified"),
+            ("ff02::1", "multicast"),
+            ("fd00:ec2::254", "cloud metadata"),
+            ("::ffff:169.254.169.254", "IPv4-mapped link-local"),
+        ] {
+            let ip: IpAddr = ip.parse().expect("an address");
+            assert!(ip_is_denied(ip), "{ip} ({rule}) must be refused");
+        }
+        let ip: IpAddr = "2001:db8::1".parse().expect("an address");
+        assert!(!ip_is_denied(ip), "a global unicast address is not refused");
+    }
+
+    /// The metadata services that are not on a link-local address: AWS's and
+    /// GCP's over IPv6, which sit in the unique-local range an operator's own
+    /// network may use, and Alibaba Cloud's, in the shared address space.
+    /// Refused by address, as a literal and as an IPv4-mapped one; their
+    /// neighbours stay usable.
+    #[test]
+    fn the_metadata_services_off_link_local_are_refused() {
+        for ip in [
+            "fd00:ec2::254",
+            "fd20:ce::254",
+            "100.100.100.200",
+            "::ffff:100.100.100.200",
+        ] {
+            let ip: IpAddr = ip.parse().expect("an address");
+            assert!(ip_is_denied(ip), "{ip}");
+        }
+        for raw in [
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://[FD00:EC2:0::254]:80/",
+            "http://[fd20:ce::254]/computeMetadata/v1/",
+            "http://100.100.100.200/latest/meta-data/",
+            "http://[::ffff:100.100.100.200]/",
+        ] {
+            let err = catalog_url(raw).unwrap_err().to_string();
+            assert!(err.contains("link-local or cloud-metadata"), "{raw}: {err}");
+        }
+        for ip in [
+            "fd00:ec2::253",
+            "fd20:ce::1",
+            "fd12:3456::254",
+            "100.100.100.199",
+            "100.64.0.1",
+        ] {
+            let ip: IpAddr = ip.parse().expect("an address");
+            assert!(!ip_is_denied(ip), "{ip} is someone's own network");
+        }
+    }
+
+    #[test]
     fn well_known_metadata_hostnames_are_refused() {
         for raw in [
             "http://metadata.google.internal/",
@@ -294,6 +378,25 @@ mod tests {
                 "{raw} is a metadata hostname and must fail closed"
             );
         }
+    }
+
+    /// A metadata server's name with the trailing dot that makes it fully
+    /// qualified names the same server: DNS reads `metadata.google.internal.`
+    /// as `metadata.google.internal`, and so must this.
+    #[test]
+    fn a_metadata_hostname_is_refused_with_its_trailing_dot() {
+        for raw in [
+            "http://metadata.google.internal./computeMetadata/v1/",
+            "http://METADATA.Google.Internal./",
+            "http://metadata.google.com./",
+            "http://metadata.azure.com./metadata/instance",
+            "http://metadata./",
+        ] {
+            let err = catalog_url(raw).unwrap_err().to_string();
+            assert!(err.contains("link-local or cloud-metadata"), "{raw}: {err}");
+        }
+        // A name that only ends like one is someone else's.
+        catalog_url("http://metadata.google.internal.example./").unwrap();
     }
 
     #[test]

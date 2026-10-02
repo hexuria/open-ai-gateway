@@ -3,39 +3,47 @@
 //!
 //! The store persists what it is given. Parsing the dialect, platform and auth
 //! style, and refusing a built-in provider's name, is the caller's job. The
-//! schema's CHECKs (migration 0020) are the second line, and a write they refuse
-//! comes back as [`Error::Config`] naming the constraint that refused it.
+//! schema's CHECKs (migrations 0020 and 0021) are the second line, and a write
+//! they refuse comes back as [`Error::Config`] naming the constraint that
+//! refused it.
 
 use crate::Db;
 use crate::rows::EndpointRow;
 use oag_core::{Error, Result};
+use std::collections::HashMap;
+use time::OffsetDateTime;
 
 const LIST_ENDPOINTS_SQL: &str = concat!(
     "SELECT ",
-    "name, dialect, platform, base_url, auth, region, project, api_version, ",
+    "name, dialect, platform, base_url, auth, region, project, api_version, path, ",
     "extra_headers, display_name, discover_models, created_at, updated_at ",
     "FROM endpoint ORDER BY name"
 );
 const ENDPOINT_BY_NAME_SQL: &str = concat!(
     "SELECT ",
-    "name, dialect, platform, base_url, auth, region, project, api_version, ",
+    "name, dialect, platform, base_url, auth, region, project, api_version, path, ",
     "extra_headers, display_name, discover_models, created_at, updated_at ",
     "FROM endpoint WHERE name = $1"
 );
 const INSERT_ENDPOINT_SQL: &str = concat!(
     "INSERT INTO endpoint (",
     "name, dialect, platform, base_url, auth, region, project, api_version, ",
-    "extra_headers, display_name, discover_models",
-    ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING ",
-    "name, dialect, platform, base_url, auth, region, project, api_version, ",
+    "extra_headers, display_name, discover_models, path",
+    ") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING ",
+    "name, dialect, platform, base_url, auth, region, project, api_version, path, ",
     "extra_headers, display_name, discover_models, created_at, updated_at"
 );
+// Written only over the row as the writer read it (`updated_at = $11`), and
+// always to a later `updated_at` than the one it replaces, even within one
+// microsecond of that write or against a clock that stepped back: a stamp
+// that could come out equal is one a stale `seen` could match.
 const UPDATE_ENDPOINT_SQL: &str = concat!(
     "UPDATE endpoint SET ",
     "base_url = $2, auth = $3, region = $4, project = $5, api_version = $6, ",
-    "extra_headers = $7, display_name = $8, discover_models = $9, updated_at = now() ",
-    "WHERE name = $1 RETURNING ",
-    "name, dialect, platform, base_url, auth, region, project, api_version, ",
+    "extra_headers = $7, display_name = $8, discover_models = $9, path = $10, ",
+    "updated_at = greatest(now(), updated_at + interval '1 microsecond') ",
+    "WHERE name = $1 AND updated_at = $11 RETURNING ",
+    "name, dialect, platform, base_url, auth, region, project, api_version, path, ",
     "extra_headers, display_name, discover_models, created_at, updated_at"
 );
 
@@ -50,6 +58,9 @@ pub struct NewEndpoint<'a> {
     pub region: Option<&'a str>,
     pub project: Option<&'a str>,
     pub api_version: Option<&'a str>,
+    /// Where a `system_one` endpoint takes a question set, beneath its base
+    /// URL. `None` is `/v1/systemone`; any other dialect must leave it `None`.
+    pub path: Option<&'a str>,
     /// A JSON object of headers that carry no authority. Never a key.
     pub extra_headers: &'a serde_json::Value,
     pub display_name: Option<&'a str>,
@@ -69,9 +80,104 @@ pub struct EndpointUpdate<'a> {
     pub region: Option<&'a str>,
     pub project: Option<&'a str>,
     pub api_version: Option<&'a str>,
+    /// A setting, not part of what the endpoint is: a System One host that
+    /// moves its path is the same host.
+    pub path: Option<&'a str>,
     pub extra_headers: &'a serde_json::Value,
     pub display_name: Option<&'a str>,
     pub discover_models: bool,
+    /// The `updated_at` of the row these settings were made from. The update
+    /// is written only while the row still has it, so a writer that read the
+    /// row before someone else changed it cannot put back what they changed:
+    /// it gets [`EndpointUpdated::Changed`] instead.
+    pub seen: OffsetDateTime,
+}
+
+/// What [`update_endpoint`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EndpointUpdated {
+    /// Written, and this is the row now. Boxed: a whole row beside two
+    /// empty variants would make every answer as large.
+    Updated(Box<EndpointRow>),
+    /// There is no endpoint by that name: the caller's 404.
+    NotFound,
+    /// Someone wrote the endpoint after the caller read it, so its
+    /// `updated_at` is no longer `seen`, and nothing was written: the caller's
+    /// 409, or its cue to read the row again.
+    Changed,
+}
+
+/// What names one endpoint: its credentials, its catalog models, and the places
+/// those models hold on a ladder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EndpointReferences {
+    /// Credentials filed under the endpoint's name.
+    pub accounts: i64,
+    /// Of those, the ones in rotation.
+    pub schedulable: i64,
+    /// Catalog models whose provider is the endpoint.
+    pub models: i64,
+    /// Of those, the ones some active route's ladder names.
+    pub on_ladder: i64,
+}
+
+/// Every model id an active route's ladder names, and each endpoint's four
+/// counts against it. A route's `tiers` is JSON a hand-written row can shape
+/// any way, so anything that is not a list of rungs holding a list of models
+/// counts as naming nothing rather than failing the read.
+const ENDPOINT_REFERENCES_SQL: &str = r"
+    WITH laddered AS (
+        SELECT jsonb_array_elements_text(
+                   CASE WHEN jsonb_typeof(rung -> 'models') = 'array'
+                        THEN rung -> 'models' ELSE '[]'::jsonb END
+               ) AS id
+        FROM route r,
+             jsonb_array_elements(
+                 CASE WHEN jsonb_typeof(r.tiers) = 'array'
+                      THEN r.tiers ELSE '[]'::jsonb END
+             ) AS rung
+        WHERE r.active
+    )
+    SELECT e.name,
+           (SELECT count(*) FROM account a WHERE a.provider = e.name),
+           (SELECT count(*) FROM account a WHERE a.provider = e.name AND a.schedulable),
+           (SELECT count(*) FROM model_catalog m WHERE m.provider = e.name),
+           (SELECT count(*) FROM model_catalog m
+             WHERE m.provider = e.name AND m.id IN (SELECT id FROM laddered))
+    FROM endpoint e
+";
+
+/// Each endpoint's [`EndpointReferences`], by name. One read for all of them:
+/// a listing shows every endpoint's counts, and there are few endpoints.
+pub async fn endpoint_references(db: &Db) -> Result<HashMap<String, EndpointReferences>> {
+    let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(ENDPOINT_REFERENCES_SQL)
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("counting what names each endpoint: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, accounts, schedulable, models, on_ladder)| {
+            (
+                name,
+                EndpointReferences {
+                    accounts,
+                    schedulable,
+                    models,
+                    on_ladder,
+                },
+            )
+        })
+        .collect())
+}
+
+/// How many credentials are filed under the endpoint `name`, in rotation or
+/// not: the keys a request to it can carry.
+pub async fn endpoint_account_count(db: &Db, name: &str) -> Result<i64> {
+    sqlx::query_scalar("SELECT count(*) FROM account WHERE provider = $1")
+        .bind(name)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("counting {name}'s credentials: {e}")))
 }
 
 /// What [`delete_endpoint`] did.
@@ -119,19 +225,27 @@ pub async fn insert_endpoint(db: &Db, e: &NewEndpoint<'_>) -> Result<EndpointRow
         .bind(e.extra_headers)
         .bind(e.display_name)
         .bind(e.discover_models)
+        .bind(e.path)
         .fetch_one(db.pool())
         .await
         .map_err(|err| endpoint_write_error("registering endpoint", e.name, &err))
 }
 
-/// Replace an endpoint's settings and stamp `updated_at`. Returns `None` when
-/// there is no endpoint by that name, which is the caller's 404.
+/// Replace an endpoint's settings and stamp `updated_at`, if the row is still
+/// the one the settings were made from (`e.seen`).
+///
+/// Optimistic: nothing is locked between the caller's read and this write, so
+/// two writers never wait on each other, and the second to write finds the
+/// first one's stamp where it expected its own read's. Which of the two
+/// arrived first is the database's to say: an update that waits on another's
+/// row lock reads the row again once that one commits, and its `seen` no
+/// longer matches.
 pub async fn update_endpoint(
     db: &Db,
     name: &str,
     e: &EndpointUpdate<'_>,
-) -> Result<Option<EndpointRow>> {
-    sqlx::query_as::<_, EndpointRow>(UPDATE_ENDPOINT_SQL)
+) -> Result<EndpointUpdated> {
+    let updated = sqlx::query_as::<_, EndpointRow>(UPDATE_ENDPOINT_SQL)
         .bind(name)
         .bind(e.base_url)
         .bind(e.auth)
@@ -141,9 +255,26 @@ pub async fn update_endpoint(
         .bind(e.extra_headers)
         .bind(e.display_name)
         .bind(e.discover_models)
+        .bind(e.path)
+        .bind(e.seen)
         .fetch_optional(db.pool())
         .await
-        .map_err(|err| endpoint_write_error("updating endpoint", name, &err))
+        .map_err(|err| endpoint_write_error("updating endpoint", name, &err))?;
+    if let Some(row) = updated {
+        return Ok(EndpointUpdated::Updated(Box::new(row)));
+    }
+    // Nothing matched: either there is no such endpoint, or there is and it
+    // has moved on from `seen`.
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM endpoint WHERE name = $1)")
+        .bind(name)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|err| Error::Internal(format!("reading endpoint after an update: {err}")))?;
+    Ok(if exists {
+        EndpointUpdated::Changed
+    } else {
+        EndpointUpdated::NotFound
+    })
 }
 
 /// Remove an endpoint, unless a credential or a catalog model still names it.

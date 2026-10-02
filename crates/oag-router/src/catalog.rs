@@ -307,6 +307,15 @@ impl Catalog {
     /// upstream name when it is unambiguous. Ambiguity resolves to `None`
     /// rather than guessing: silently picking one of two providers for
     /// `gpt-5` would route spend somewhere the operator did not choose.
+    ///
+    /// The convenience is the built-in providers' alone: the row of an
+    /// endpoint an operator registered is reached by its id and never by its
+    /// upstream name, and does not make a built-in's name ambiguous. An
+    /// endpoint that fronts other vendors takes their names as its upstream
+    /// names — Merge's `openai/gpt-5.4` is the row `merge/openai/gpt-5.4` —
+    /// so through the fallback a request for `OpenAI`'s model went to an
+    /// endpoint the caller never named, and registering one changed what a
+    /// name already in use meant.
     #[must_use]
     pub fn resolve(&self, name: &str) -> Option<&ModelSpec> {
         // `Borrow<str>` on the key rather than `ModelId::new(name)`, which
@@ -315,10 +324,16 @@ impl Catalog {
         if let Some(spec) = self.models.get(name) {
             return Some(spec);
         }
-        // Exactly one catalogue id spells this upstream name, or nothing:
-        // two is the ambiguity the doc above refuses to guess at.
-        match self.by_upstream.get(name).map(Vec::as_slice) {
-            Some([only]) => self.models.get(only),
+        // Exactly one built-in's catalogue id spells this upstream name, or
+        // nothing: two is the ambiguity the doc above refuses to guess at.
+        let mut built_in = self
+            .by_upstream
+            .get(name)?
+            .iter()
+            .filter_map(|id| self.models.get(id))
+            .filter(|spec| !matches!(spec.provider, Provider::Custom(_)));
+        match (built_in.next(), built_in.next()) {
+            (Some(only), None) => Some(only),
             _ => None,
         }
     }
@@ -470,6 +485,46 @@ mod tests {
         // Guessing here would route spend to a provider the operator did not pick.
         assert!(catalog.resolve("gpt-5").is_none());
         assert!(catalog.resolve("openai/gpt-5").is_some());
+    }
+
+    /// C8. An endpoint's row is reached by its id alone. Its upstream name,
+    /// which for an endpoint that resells other vendors is that vendor's own
+    /// `provider/model`, never resolves to it, and never makes a built-in's
+    /// bare name ambiguous.
+    #[test]
+    fn an_upstream_name_never_resolves_to_an_endpoints_row() {
+        use oag_core::provider::{Dialect, Endpoint, Platform};
+        let endpoint = |name| {
+            Provider::Custom(
+                Endpoint::new(name, Dialect::OpenAIChatCompletions, Platform::Plain)
+                    .expect("a name"),
+            )
+        };
+        let (merge, azure) = (endpoint("t8-merge"), endpoint("t8-azure"));
+        let catalog = Catalog::from_entries([
+            spec("t8-merge/openai/gpt-5.4", merge, "openai/gpt-5.4", 400_000),
+            spec("t8-merge/llama-t8", merge, "llama-t8", 128_000),
+            spec("openai/gpt-5", Provider::OpenAI, "gpt-5", 400_000),
+            spec("t8-azure/gpt-5", azure, "gpt-5", 400_000),
+        ]);
+        let resolved = |name| catalog.resolve(name).map(|s| s.id.as_str());
+
+        assert_eq!(
+            resolved("openai/gpt-5.4"),
+            None,
+            "OpenAI's model, which this catalog does not have, and not Merge's resale of it"
+        );
+        assert_eq!(resolved("llama-t8"), None, "a bare name of an endpoint's");
+        assert_eq!(
+            resolved("t8-merge/openai/gpt-5.4"),
+            Some("t8-merge/openai/gpt-5.4"),
+            "by its id"
+        );
+        assert_eq!(
+            resolved("gpt-5"),
+            Some("openai/gpt-5"),
+            "an endpoint's row neither takes a built-in's bare name nor makes it ambiguous"
+        );
     }
 
     #[test]

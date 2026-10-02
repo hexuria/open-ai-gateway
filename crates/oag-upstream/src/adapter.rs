@@ -8,9 +8,10 @@
 
 use async_trait::async_trait;
 use oag_core::provider::Dialect;
-use oag_core::{Provider, Result, credential::SecretMaterial};
+use oag_core::{AccountId, Provider, Result, credential::SecretMaterial};
 use oag_proto::{CanonicalRequest, StreamAccumulator, StreamEvent};
 use oag_router::ModelSpec;
+use std::borrow::Cow;
 
 /// Everything needed to call an upstream, once routing has decided.
 #[derive(Debug, Clone)]
@@ -38,6 +39,10 @@ pub enum Framing {
     /// AWS `vnd.amazon.eventstream`: length-prefixed binary messages whose
     /// payload carries the provider's own event, base64-encoded.
     AwsEventStream,
+    /// The same binary messages as Bedrock's `ConverseStream` sends them: the
+    /// payload is one Converse event's JSON as it is, and which event it is
+    /// is said only by the message's `:event-type` header.
+    AwsConverseStream,
 }
 
 #[async_trait]
@@ -113,6 +118,40 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
         Ok(None)
     }
 
+    /// The credential a request to this adapter is built with, from the one
+    /// stored for `account`.
+    ///
+    /// For almost every adapter that is the stored one, unchanged, which the
+    /// default hands back without a copy. It differs where what is stored is
+    /// not what goes on the wire: a Google service account is a JSON key, and
+    /// a request carries a short-lived token minted from it. `account` names
+    /// whose credential this is, for an adapter that keeps what it minted.
+    ///
+    /// Called on the request path once per credential tried, after `refresh`
+    /// and before [`ProviderAdapter::build`], which receives what this
+    /// returns. An error here is the credential's: the request moves on to the
+    /// next one, as it does when a refresh fails.
+    ///
+    /// `proxy` is the credential's own `proxy_url`, as for `refresh`: a call
+    /// made to prepare a credential is one made with it.
+    async fn prepare_credential<'a>(
+        &'a self,
+        _account: AccountId,
+        stored: &'a SecretMaterial,
+        _proxy: Option<&str>,
+    ) -> Result<Cow<'a, SecretMaterial>> {
+        Ok(Cow::Borrowed(stored))
+    }
+
+    /// Told that the upstream refused, with a 401, `refused`: the credential
+    /// this adapter prepared for `account`.
+    ///
+    /// For an adapter that keeps what [`ProviderAdapter::prepare_credential`]
+    /// made, so it can let it go and the next request prepares it afresh,
+    /// rather than being handed the credential just refused. A no-op by
+    /// default, for every adapter that sends what is stored.
+    async fn credential_refused(&self, _account: AccountId, _refused: &SecretMaterial) {}
+
     /// Which models this *credential* can be used with, as the provider's own
     /// upstream names.
     ///
@@ -133,5 +172,60 @@ pub trait ProviderAdapter: Send + Sync + std::fmt::Debug {
         _proxy: Option<&str>,
     ) -> Result<Option<Vec<String>>> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An adapter that overrides nothing it does not have to.
+    #[derive(Debug)]
+    struct Defaults;
+
+    #[async_trait]
+    impl ProviderAdapter for Defaults {
+        fn provider(&self) -> Provider {
+            Provider::OpenAI
+        }
+
+        fn build(&self, _req: &UpstreamRequest<'_>) -> Result<reqwest::Request> {
+            Err(oag_core::Error::Internal("never built".to_owned()))
+        }
+
+        fn parse_event(
+            &self,
+            _raw: &str,
+            _acc: &mut StreamAccumulator,
+        ) -> Result<Vec<StreamEvent>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn by_default_a_request_is_built_with_the_stored_credential_itself() {
+        let stored = SecretMaterial {
+            access_token: "stored-key".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 3,
+            client_id: None,
+            account_id: None,
+        };
+        let prepared = Defaults
+            .prepare_credential(
+                AccountId::from_uuid(uuid::Uuid::nil()),
+                &stored,
+                Some("http://127.0.0.1:3128"),
+            )
+            .await
+            .expect("the default never fails");
+        let Cow::Borrowed(same) = prepared else {
+            panic!("the default copied the credential it was handed");
+        };
+        assert!(
+            std::ptr::eq(same, &raw const stored),
+            "the default hands back the very credential it was given"
+        );
     }
 }

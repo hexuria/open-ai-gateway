@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Cheapest check first: a formatting failure should not wait on a build.
@@ -110,7 +110,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-audit,cargo-deny
@@ -160,7 +160,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo run -p oag -- migrate
       # Migrations are idempotent and advisory-locked: running twice must be a
@@ -225,7 +225,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -249,10 +249,23 @@ jobs:
   # and fails if the tests still pass. That is how `claim_slot` shipped with
   # its refusal branch unexercised. Diff-scoped so the cost follows the PR;
   # with the backends bound, because a gated test that skips kills nothing.
-  mutants:
+  # Sharded: a whole train of PRs (#140: ~1070 mutants) cannot finish in one
+  # 60-minute job, and a cancelled job tests nothing. Twenty shards, dealt
+  # round-robin so the slow oag-server mutants (each rebuilds the server and
+  # its end-to-end tests) spread evenly instead of piling into a few slices,
+  # two mutants at a time per runner. `mutants` below is the one check the
+  # branch requires, and it is green only when every shard is.
+  mutants-shard:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read # to fetch this branch's previous mutants results
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     services:
       postgres:
         image: postgres:18-alpine
@@ -284,8 +297,13 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: stable
+          toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # One cache for every shard, saved even when a shard finds a survivor:
+          # a mutants run that fails is the common case on a branch being fixed.
+          shared-key: mutants
+          cache-on-failure: true
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-mutants
@@ -302,10 +320,46 @@ jobs:
       # --cap-lints: this workflow sets RUSTFLAGS=-D warnings, so a mutant that
       # leaves an argument unused failed to build and was counted "unviable"
       # instead of tested -- 27 of 29 on #97, against 6 of 29 locally.
+      - name: reuse the last run's outcomes on this branch
+        # A caught or unviable mutant stays so while its code is unchanged, so
+        # `--iterate` below skips what this branch's previous run settled and
+        # tests the rest: never reached (a shard ran out of time), missed, timed
+        # out. A mutant whose code moved or changed has a new name
+        # (file:line:col), so it is tested again. A branch's first run, or one
+        # whose previous results cannot be fetched, tests everything.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          out="$RUNNER_TEMP/mutants.out"
+          mkdir -p "$out"
+          # Each run records only the mutants it tested, so the union of the
+          # last few runs is what this branch has settled.
+          runs=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci --branch "$HEAD_REF" \
+            --json databaseId,headSha,status --limit 30 \
+            --jq "[.[] | select(.headSha != \"$GITHUB_SHA\" and .status == \"completed\")][:5][].databaseId")
+          for run in $runs; do
+            gh run download "$run" -R "$GITHUB_REPOSITORY" -p 'mutants.out-*' -D "$RUNNER_TEMP/prev/$run" || true
+          done
+          find "$RUNNER_TEMP/prev" -name caught.txt -exec cat {} + 2>/dev/null | sort -u > "$out/caught.txt"
+          find "$RUNNER_TEMP/prev" -name unviable.txt -exec cat {} + 2>/dev/null | sort -u > "$out/unviable.txt"
+          echo "reusing $(wc -l < "$out/caught.txt") caught and $(wc -l < "$out/unviable.txt") unviable from runs:" $runs
       - name: cargo mutants
-        run: cargo mutants --no-shuffle --cap-lints true --in-diff "$RUNNER_TEMP/pr.diff" -o "$RUNNER_TEMP"
+        run: cargo mutants --no-shuffle --cap-lints true --iterate --jobs 2 --sharding round-robin --shard "${SHARD}/20" --in-diff "$RUNNER_TEMP/pr.diff" -o "$RUNNER_TEMP"
+        env:
+          SHARD: ${{ matrix.shard }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: mutants.out
+          name: mutants.out-${{ matrix.shard }}
           path: ${{ runner.temp }}/mutants.out
+
+  mutants:
+    if: always() && github.event_name == 'pull_request'
+    needs: mutants-shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: every shard passed
+        run: test "$RESULT" = success
+        env:
+          RESULT: ${{ needs.mutants-shard.result }}

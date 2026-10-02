@@ -13,6 +13,11 @@ use clap::Parser;
 use oag_store::repo;
 use uuid::Uuid;
 
+/// Held by every test in this binary that registers an endpoint, and by the
+/// doctor tests that count them: `doctor` asks every endpoint in the database,
+/// so one registered mid-count would be counted by a test that never made it.
+pub(crate) static ENDPOINT_ROWS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// C13. "No xai models" and "no models" are different answers.
 ///
 /// `catalog list --provider xai` against a catalog full of Anthropic models
@@ -253,6 +258,377 @@ async fn a_duplicate_credential_name_is_refused_and_renaming_is_the_way_out() {
     assert!(
         rename_account(&db, &freed, &name).await.is_err(),
         "renaming onto a name in use would recreate the pair"
+    );
+}
+
+/// `account add --provider <endpoint>` files the key under the endpoint, as
+/// the one kind its platform takes, and refuses an endpoint the gateway would
+/// not serve with the reason it would not.
+///
+/// Gated on Postgres: the endpoints are rows, read through the same mapping
+/// the gateway's reload uses. The process-wide registry is only ever
+/// installed from the table here, and every row this test writes is in it.
+// Long for its setup: three endpoint rows, a route, and cleaning all of it up
+// before asserting.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_key_is_filed_under_an_endpoint_as_the_kind_its_platform_takes() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 2).expect("connect");
+    db.migrate().await.expect("migrate");
+    let kek =
+        oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=").expect("kek");
+    let _endpoints = ENDPOINT_ROWS.lock().await;
+
+    let tag = Uuid::new_v4().simple().to_string()[..10].to_owned();
+    let route = format!("t4-{tag}");
+    sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]')")
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("route");
+    let (plain, aws, refused) = (
+        format!("t4p-{tag}"),
+        format!("t4a-{tag}"),
+        format!("t4r-{tag}"),
+    );
+    let none = serde_json::json!({});
+    for (name, dialect, platform, base_url, auth, region) in [
+        (
+            &plain,
+            "openai",
+            "plain",
+            Some("http://127.0.0.1:9/v1"),
+            "bearer",
+            None,
+        ),
+        (&aws, "anthropic", "aws", None, "none", Some("us-east-1")),
+        // The schema takes it; the compliance guard does not.
+        (
+            &refused,
+            "openai",
+            "plain",
+            Some("https://api.openai.com/v1"),
+            "bearer",
+            None,
+        ),
+    ] {
+        repo::insert_endpoint(
+            &db,
+            &oag_store::NewEndpoint {
+                name,
+                dialect,
+                platform,
+                base_url,
+                auth,
+                region,
+                project: None,
+                api_version: None,
+                path: None,
+                extra_headers: &none,
+                display_name: None,
+                discover_models: false,
+            },
+        )
+        .await
+        .expect("the schema admits every one of these");
+    }
+
+    let add = |endpoint: &str, secret: &str| {
+        let (db, kek, route) = (db.clone(), kek.clone(), route.clone());
+        let (name, endpoint, secret) = (
+            format!("{endpoint}-key"),
+            endpoint.to_owned(),
+            secret.to_owned(),
+        );
+        async move {
+            add_account(
+                &db, &kek, &name, &endpoint, &secret, &route, 4, 0, None, None,
+            )
+            .await
+        }
+    };
+    let outcome = async {
+        add(&plain, "t4-not-a-real-key").await?;
+        add(&aws, "AKIDEXAMPLE:not-a-real-secret").await?;
+        let err = add(&refused, "t4-not-a-real-key")
+            .await
+            .expect_err("the gateway would never serve it");
+        let kinds: Vec<(String, String)> = sqlx::query_as(
+            "SELECT provider, kind FROM account WHERE provider = ANY($1) ORDER BY provider",
+        )
+        .bind(vec![plain.clone(), aws.clone(), refused.clone()])
+        .fetch_all(db.pool())
+        .await
+        .map_err(|e| oag_core::Error::Internal(e.to_string()))?;
+        Ok::<_, oag_core::Error>((err, kinds))
+    }
+    .await;
+
+    // Cleaned up before asserting, so a failure leaves nothing behind.
+    sqlx::query("DELETE FROM account WHERE provider = ANY($1)")
+        .bind(vec![plain.clone(), aws.clone(), refused.clone()])
+        .execute(db.pool())
+        .await
+        .expect("remove the keys");
+    for name in [&plain, &aws, &refused] {
+        assert_eq!(
+            repo::delete_endpoint(&db, name).await.expect("delete"),
+            oag_store::EndpointDeletion::Deleted,
+            "{name}"
+        );
+    }
+    sqlx::query("DELETE FROM route WHERE name = $1")
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("remove the route");
+
+    let (err, kinds) = outcome.expect("both served endpoints take a key");
+    assert_eq!(
+        kinds,
+        [
+            (aws.clone(), "bedrock".to_owned()),
+            (plain, "api_key".to_owned())
+        ],
+        "each key is the kind its endpoint's platform signs with, and none was \
+         filed under the refused one"
+    );
+    let err = err.to_string();
+    assert!(
+        err.contains(&format!(
+            "endpoint '{refused}' is registered but not served"
+        )),
+        "{err}"
+    );
+    assert!(err.contains("openai.com"), "and it says which rule: {err}");
+}
+
+/// A gcp endpoint's key is a service account's JSON, read whole from a file,
+/// checked as the gateway's mint reads it, and filed as a `service_account`.
+/// A secret that could never mint is refused before anything is stored, and
+/// the refusal quotes none of it.
+///
+/// Gated on Postgres, as the test above is: the endpoint is a row.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_service_account_key_is_read_from_a_file_and_checked_before_it_is_filed() {
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 2).expect("connect");
+    db.migrate().await.expect("migrate");
+    let kek =
+        oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=").expect("kek");
+    let _endpoints = ENDPOINT_ROWS.lock().await;
+
+    let tag = Uuid::new_v4().simple().to_string()[..10].to_owned();
+    let (route, vertex) = (format!("t10-{tag}"), format!("t10v-{tag}"));
+    sqlx::query("INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, '[]')")
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("route");
+    repo::insert_endpoint(
+        &db,
+        &oag_store::NewEndpoint {
+            name: &vertex,
+            dialect: "gemini",
+            platform: "gcp",
+            base_url: None,
+            auth: "bearer",
+            region: Some("us-central1"),
+            project: Some("oag-test"),
+            api_version: None,
+            path: None,
+            extra_headers: &serde_json::json!({}),
+            display_name: None,
+            discover_models: false,
+        },
+    )
+    .await
+    .expect("a gcp endpoint");
+
+    let key = serde_json::json!({
+        "type": "service_account",
+        "project_id": "oag-test",
+        "private_key_id": "t10",
+        "private_key": oag_upstream::gcp_token::TEST_KEY_PEM,
+        "client_email": "t10-cli@oag-test.invalid",
+    });
+    // Over many lines, as Google's download is.
+    let pretty = serde_json::to_string_pretty(&key).expect("JSON");
+    let file = std::env::temp_dir().join(format!("oag-t10-{tag}.json"));
+    std::fs::write(&file, &pretty).expect("a key file");
+    let mut wrong_type = key.clone();
+    wrong_type["type"] = serde_json::json!("authorized_user");
+    let refused = [
+        ("an API key", "AIza-t10-not-a-service-account".to_owned()),
+        ("another kind of Google key", wrong_type.to_string()),
+    ];
+
+    let filed = format!("{vertex}-sa");
+    let outcome = async {
+        let cli = AdminCli::try_parse_from([
+            "admin",
+            "account",
+            "add",
+            "--name",
+            &filed,
+            "--provider",
+            &vertex,
+            "--secret-file",
+            file.to_str().expect("a UTF-8 path"),
+            "--route",
+            &route,
+        ])
+        .expect("parses");
+        let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+            panic!("expected an account add");
+        };
+        add_account_from_args(&db, &kek, args).await?;
+
+        let mut refusals = Vec::new();
+        for (case, secret) in &refused {
+            let name = format!("{vertex}-refused");
+            let err = add_account(&db, &kek, &name, &vertex, secret, &route, 4, 0, None, None)
+                .await
+                .expect_err(case);
+            refusals.push((*case, err));
+        }
+        let rows: Vec<(Uuid, String, String)> =
+            sqlx::query_as("SELECT id, name, kind FROM account WHERE provider = $1")
+                .bind(&vertex)
+                .fetch_all(db.pool())
+                .await
+                .map_err(|e| oag_core::Error::Internal(e.to_string()))?;
+        let stored = match rows.first() {
+            Some((id, _, _)) => repo::account_by_id(&db, oag_core::AccountId::from_uuid(*id))
+                .await?
+                .map(|row| kek.open_json::<oag_core::credential::SecretMaterial>(&row.sealed()))
+                .transpose()?
+                .map(|material| material.access_token.clone()),
+            None => None,
+        };
+        Ok::<_, oag_core::Error>((refusals, rows, stored))
+    }
+    .await;
+
+    // Cleaned up before asserting, so a failure leaves nothing behind.
+    let _ = std::fs::remove_file(&file);
+    sqlx::query("DELETE FROM account WHERE provider = $1")
+        .bind(&vertex)
+        .execute(db.pool())
+        .await
+        .expect("remove the keys");
+    assert_eq!(
+        repo::delete_endpoint(&db, &vertex).await.expect("delete"),
+        oag_store::EndpointDeletion::Deleted
+    );
+    sqlx::query("DELETE FROM route WHERE name = $1")
+        .bind(&route)
+        .execute(db.pool())
+        .await
+        .expect("remove the route");
+
+    let (refusals, rows, stored) = outcome.expect("the key in the file is filed");
+    assert_eq!(
+        rows.iter()
+            .map(|(_, name, kind)| (name.as_str(), kind.as_str()))
+            .collect::<Vec<_>>(),
+        [(filed.as_str(), "service_account")],
+        "the file's key, as the kind a gcp endpoint takes, and no refused one"
+    );
+    assert_eq!(
+        stored.as_deref(),
+        Some(pretty.as_str()),
+        "sealed as the file holds it"
+    );
+    for (case, err) in refusals {
+        assert!(matches!(err, oag_core::Error::Config(_)), "{case}: {err:?}");
+        let message = err.to_string();
+        assert!(
+            !message.contains("AIza-t10") && !message.contains("BEGIN PRIVATE KEY"),
+            "{case}: {message}"
+        );
+        for line in oag_upstream::gcp_token::TEST_KEY_PEM.lines() {
+            assert!(!message.contains(line), "{case}: {message}");
+        }
+    }
+}
+
+/// `--secret-file` is a third way to give a secret, and never beside another
+/// or beside an import, which takes its credential from a session file.
+#[test]
+fn a_secret_file_is_one_way_to_give_the_secret_and_never_beside_another() {
+    let parse = |extra: &[&str]| {
+        let mut argv = vec!["admin", "account", "add", "--name", "vertex-sa"];
+        argv.extend_from_slice(extra);
+        AdminCli::try_parse_from(argv)
+    };
+    let cli = parse(&["--provider", "vertex", "--secret-file", "/keys/sa.json"])
+        .expect("a provider and a key file");
+    let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+        panic!("expected an account add");
+    };
+    assert_eq!(args.secret_file.as_deref(), Some("/keys/sa.json"));
+    assert!(args.secret.is_none());
+
+    for clash in [
+        &[
+            "--provider",
+            "vertex",
+            "--secret-file",
+            "/keys/sa.json",
+            "--secret",
+            "typed",
+        ][..],
+        &["--from", "codex", "--secret-file", "/keys/sa.json"],
+    ] {
+        let err = parse(clash).expect_err("two sources for one secret");
+        assert!(
+            err.to_string().contains("--secret-file"),
+            "{clash:?}: {err}"
+        );
+    }
+}
+
+/// A key file that cannot be read is refused, naming the path, before the
+/// database is asked anything: the pool here points at a closed port.
+#[tokio::test]
+async fn an_unreadable_secret_file_is_refused_before_any_query() {
+    let missing =
+        std::env::temp_dir().join(format!("oag-t10-missing-{}.json", Uuid::new_v4().simple()));
+    let missing = missing.to_str().expect("a UTF-8 path");
+    let cli = AdminCli::try_parse_from([
+        "admin",
+        "account",
+        "add",
+        "--name",
+        "vertex-sa",
+        "--provider",
+        "vertex",
+        "--secret-file",
+        missing,
+    ])
+    .expect("parses");
+    let AdminCommand::Account(AccountCommand::Add { args }) = cli.cmd else {
+        panic!("expected an account add");
+    };
+    let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag_g0", 1).expect("lazy pool");
+    let kek =
+        oag_core::Kek::from_base64("b2FnLWRldi1vbmx5LWtlay0zMi1ieXRlcy0wMDAwMDA=").expect("kek");
+    let err = add_account_from_args(&db, &kek, args)
+        .await
+        .expect_err("no such file");
+    let message = err.to_string();
+    assert!(
+        message.contains("reading --secret-file") && message.contains(missing),
+        "{message}"
     );
 }
 
@@ -1488,4 +1864,425 @@ fn a_seat_defaults_to_two_requests_in_flight_and_a_key_to_eight() {
     };
     assert_eq!(parsed(&[]), None, "no flag, so the default decides");
     assert_eq!(parsed(&["--max-concurrency", "5"]), Some(5));
+}
+
+/// `endpoint add` takes every setting as a flag; the dialect, platform and
+/// auth are the column spellings, with the hyphenated ones as aliases.
+#[test]
+fn endpoint_add_parses_every_setting() {
+    match parse(&[
+        "endpoint",
+        "add",
+        "--name",
+        "merge",
+        "--dialect",
+        "openai",
+        "--platform",
+        "plain",
+        "--base-url",
+        "https://api-gateway.merge.dev/v1/openai",
+        "--header",
+        "X-Project-Id=p-1",
+        "--header",
+        "X-Title=oag",
+        "--display-name",
+        "Merge Gateway",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"))
+    {
+        AdminCommand::Endpoint(EndpointCommand::Add { args }) => {
+            assert_eq!(args.name, "merge");
+            assert_eq!(args.dialect, DialectArg::Openai);
+            assert_eq!(args.platform, PlatformArg::Plain);
+            assert_eq!(args.auth, None, "the platform's default decides");
+            assert_eq!(args.headers, ["X-Project-Id=p-1", "X-Title=oag"]);
+            assert!(!args.discover);
+        }
+        other => panic!("expected endpoint add, got {other:?}"),
+    }
+    for (spelt, dialect) in [
+        ("system_one", DialectArg::SystemOne),
+        ("system-one", DialectArg::SystemOne),
+        ("anthropic", DialectArg::Anthropic),
+        ("gemini", DialectArg::Gemini),
+        ("bedrock_converse", DialectArg::BedrockConverse),
+        ("bedrock-converse", DialectArg::BedrockConverse),
+    ] {
+        match parse(&[
+            "endpoint",
+            "add",
+            "--name",
+            "e",
+            "--dialect",
+            spelt,
+            "--platform",
+            "aws",
+            "--auth",
+            "x-api-key",
+        ])
+        .unwrap_or_else(|e| panic!("{spelt}: {e}"))
+        {
+            AdminCommand::Endpoint(EndpointCommand::Add { args }) => {
+                assert_eq!(args.dialect, dialect, "{spelt}");
+                assert_eq!(args.auth, Some(AuthArg::XApiKey));
+            }
+            other => panic!("expected endpoint add, got {other:?}"),
+        }
+    }
+    // Each spelling names the column value the shared rules read.
+    for dialect in [
+        DialectArg::Openai,
+        DialectArg::Anthropic,
+        DialectArg::Gemini,
+        DialectArg::SystemOne,
+        DialectArg::BedrockConverse,
+    ] {
+        let parsed = oag_core::provider::Dialect::from_endpoint_column(dialect.column())
+            .unwrap_or_else(|e| panic!("{dialect:?}: {e}"));
+        assert_eq!(parsed.endpoint_column(), Some(dialect.column()));
+    }
+    for (auth, style) in [
+        (AuthArg::Bearer, "bearer"),
+        (AuthArg::XApiKey, "x_api_key"),
+        (AuthArg::XGoogApiKey, "x_goog_api_key"),
+        (AuthArg::ApiKeyHeader, "api_key_header"),
+        (AuthArg::None, "none"),
+    ] {
+        assert_eq!(auth.style().as_str(), style);
+    }
+    for (platform, spelt) in [
+        (PlatformArg::Plain, "plain"),
+        (PlatformArg::Aws, "aws"),
+        (PlatformArg::Gcp, "gcp"),
+        (PlatformArg::Azure, "azure"),
+    ] {
+        assert_eq!(platform.platform().as_str(), spelt);
+    }
+    // The platform is not optional.
+    assert!(parse(&["endpoint", "add", "--name", "e", "--dialect", "openai"]).is_err());
+}
+
+/// `endpoint set` has no `--dialect` and no `--platform`: clap refuses both,
+/// because changing either makes it a different endpoint.
+#[test]
+fn endpoint_set_refuses_the_dialect_and_the_platform() {
+    for flag in [["--dialect", "anthropic"], ["--platform", "azure"]] {
+        let err = parse(&["endpoint", "set", "merge", flag[0], flag[1]])
+            .expect_err("not a setting that changes");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::UnknownArgument,
+            "{flag:?}: {err}"
+        );
+    }
+    match parse(&[
+        "endpoint",
+        "set",
+        "merge",
+        "--base-url",
+        "",
+        "--unset-header",
+        "X-Old",
+        "--discover",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"))
+    {
+        AdminCommand::Endpoint(EndpointCommand::Set { args }) => {
+            assert_eq!(args.name, "merge");
+            assert_eq!(args.base_url.as_deref(), Some(""), "an empty value clears");
+            assert_eq!(args.unset_headers, ["X-Old"]);
+            assert_eq!(args.discover, Some(true));
+        }
+        other => panic!("expected endpoint set, got {other:?}"),
+    }
+    for (given, discover) in [(&["--discover", "false"][..], Some(false)), (&[][..], None)] {
+        let mut argv = vec!["endpoint", "set", "merge"];
+        argv.extend_from_slice(given);
+        match parse(&argv).unwrap_or_else(|e| panic!("{e}")) {
+            AdminCommand::Endpoint(EndpointCommand::Set { args }) => {
+                assert_eq!(args.discover, discover, "{given:?}");
+            }
+            other => panic!("expected endpoint set, got {other:?}"),
+        }
+    }
+    for verb in ["show", "remove", "check"] {
+        assert!(
+            parse(&["endpoint", verb, "merge"]).is_ok(),
+            "{verb} takes the name positionally"
+        );
+        assert!(parse(&["endpoint", verb]).is_err(), "{verb} needs a name");
+    }
+    assert!(matches!(
+        parse(&["endpoint", "list"]).unwrap_or_else(|e| panic!("{e}")),
+        AdminCommand::Endpoint(EndpointCommand::List)
+    ));
+}
+
+fn catalog_add(extra: &[&str]) -> std::result::Result<CatalogAddArgs, clap::Error> {
+    let mut argv = vec![
+        "catalog",
+        "add",
+        "--id",
+        "merge/zai/glm-5.3-flash",
+        "--upstream",
+        "zai/glm-5.3-flash",
+        "--context",
+        "128000",
+        "--max-output",
+        "8192",
+    ];
+    argv.extend_from_slice(extra);
+    match parse(&argv)? {
+        AdminCommand::Catalog(CatalogCommand::Add { args }) => Ok(args),
+        other => panic!("expected catalog add, got {other:?}"),
+    }
+}
+
+/// `catalog add` needs both prices unless the model is `--free`, and a window
+/// and an output limit of at least one token.
+#[test]
+fn catalog_add_parses_prices_limits_and_capabilities() {
+    let args = catalog_add(&[
+        "--input-per-mtok",
+        "0.10",
+        "--output-per-mtok",
+        "0.40",
+        "--cache-read-per-mtok",
+        "0.01",
+        "--tools",
+        "--reasoning",
+        "--display-label",
+        "GLM Flash",
+    ])
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(args.id, "merge/zai/glm-5.3-flash");
+    assert_eq!(args.upstream, "zai/glm-5.3-flash");
+    assert_eq!(
+        (args.input_per_mtok, args.output_per_mtok),
+        (
+            Some(Decimal::from_str_exact("0.10").expect("decimal")),
+            Some(Decimal::from_str_exact("0.40").expect("decimal"))
+        )
+    );
+    assert_eq!(args.cache_write_per_mtok, None);
+    assert_eq!((args.context, args.max_output), (128_000, 8_192));
+    assert!(args.tools && args.reasoning && !args.vision && !args.prompt_cache);
+    assert!(!args.free);
+
+    assert!(
+        catalog_add(&["--input-per-mtok", "1"]).is_err(),
+        "no output price"
+    );
+    assert!(catalog_add(&[]).is_err(), "no prices and not free");
+    let free = catalog_add(&["--free"]).expect("free needs no prices");
+    assert_eq!((free.input_per_mtok, free.output_per_mtok), (None, None));
+    assert!(
+        parse(&[
+            "catalog",
+            "add",
+            "--id",
+            "a/b",
+            "--upstream",
+            "b",
+            "--free",
+            "--context",
+            "0",
+            "--max-output",
+            "1",
+        ])
+        .is_err(),
+        "a window of no tokens fits no request"
+    );
+}
+
+/// A model id's provider is everything before the FIRST slash: an endpoint
+/// that fronts other vendors names its models `vendor/model`.
+#[test]
+fn a_model_id_splits_at_its_first_slash() {
+    assert_eq!(
+        super::catalog::split_model_id("merge/zai/glm-5.3-flash").expect("split"),
+        ("merge", "zai/glm-5.3-flash")
+    );
+    assert_eq!(
+        super::catalog::split_model_id("xai/grok-4.6").expect("split"),
+        ("xai", "grok-4.6")
+    );
+    for bad in ["merge", "/glm", "merge/", "merge/glm 5", "", "merge/\tglm"] {
+        let err = super::catalog::split_model_id(bad).expect_err(bad);
+        assert!(
+            err.to_string().contains("<provider>/<model>"),
+            "{bad:?}: {err}"
+        );
+    }
+}
+
+/// `catalog add`'s row: a zero price needs `--free`, `--free` needs a zero
+/// price, and the id names its provider as the provider spells itself.
+#[test]
+fn catalog_add_refuses_a_zero_price_unless_it_is_free() {
+    use oag_core::Provider;
+    use oag_core::provider::{Dialect, Endpoint, Platform};
+    let merge = Provider::Custom(
+        Endpoint::new("merge", Dialect::OpenAIChatCompletions, Platform::Plain).expect("merge"),
+    );
+    // `=`, so a negative price is a value rather than a flag.
+    let priced = |input: &str, output: &str| {
+        let (input, output) = (
+            format!("--input-per-mtok={input}"),
+            format!("--output-per-mtok={output}"),
+        );
+        catalog_add(&[&input, &output]).unwrap_or_else(|e| panic!("{e}"))
+    };
+
+    let row = super::catalog::model_row(&priced("0.1", "0.4"), merge).expect("a row");
+    assert_eq!(row.id, "merge/zai/glm-5.3-flash");
+    assert_eq!(row.provider, "merge");
+    assert_eq!(row.upstream_name, "zai/glm-5.3-flash");
+    assert_eq!(row.context_window, 128_000);
+
+    let zero = super::catalog::model_row(&priced("0", "0.000"), merge)
+        .expect_err("zero without --free")
+        .to_string();
+    assert!(zero.contains("wins every cost comparison"), "{zero}");
+    assert!(zero.contains("--free"), "{zero}");
+
+    let free = catalog_add(&["--free"]).expect("free");
+    let row = super::catalog::model_row(&free, merge).expect("free on purpose");
+    assert!(row.input_per_mtok.is_zero() && row.output_per_mtok.is_zero());
+    let lines = super::catalog::added_model_lines(&row).join("\n");
+    assert!(lines.contains("free on purpose"), "{lines}");
+    assert!(lines.contains("an operator override"), "{lines}");
+    let paid = super::catalog::model_row(&priced("0.1", "0.4"), merge).expect("a row");
+    assert!(
+        !super::catalog::added_model_lines(&paid)
+            .join("\n")
+            .contains("free on purpose")
+    );
+
+    let both = catalog_add(&["--free", "--input-per-mtok", "1", "--output-per-mtok", "0"])
+        .expect("clap takes both");
+    let err = super::catalog::model_row(&both, merge)
+        .expect_err("free with a price")
+        .to_string();
+    assert!(err.contains("--free says the model costs nothing"), "{err}");
+
+    // One side free is a price, not a free model, and is not printed as one.
+    for (input, output) in [("0", "2"), ("2", "0")] {
+        let one_side = super::catalog::model_row(&priced(input, output), merge)
+            .unwrap_or_else(|e| panic!("free on one side only ({input}, {output}): {e}"));
+        let lines = super::catalog::added_model_lines(&one_side).join("\n");
+        assert!(!lines.contains("free on purpose"), "{lines}");
+    }
+
+    for (input, says) in [
+        ("-1", "cannot be negative"),
+        ("1000000", "must be under 1000000"),
+    ] {
+        let err = super::catalog::model_row(&priced(input, "1"), merge)
+            .expect_err(input)
+            .to_string();
+        assert!(err.contains(says), "{input}: {err}");
+    }
+    super::catalog::model_row(&priced("999999.999999", "1"), merge).expect("the most it holds");
+    let cached = catalog_add(&[
+        "--input-per-mtok",
+        "1",
+        "--output-per-mtok",
+        "1",
+        "--cache-write-per-mtok=-0.5",
+    ])
+    .expect("clap takes it");
+    let err = super::catalog::model_row(&cached, merge)
+        .expect_err("a negative cache price")
+        .to_string();
+    assert!(
+        err.contains("--cache-write-per-mtok cannot be negative"),
+        "{err}"
+    );
+
+    let err = super::catalog::model_row(
+        &CatalogAddArgs {
+            id: "grok/grok-4.6".to_owned(),
+            ..catalog_add(&["--free"]).expect("free")
+        },
+        Provider::XAI,
+    )
+    .expect_err("an alias in the id")
+    .to_string();
+    assert!(err.contains("use --id xai/grok-4.6"), "{err}");
+
+    let blank = CatalogAddArgs {
+        upstream: "  ".to_owned(),
+        ..catalog_add(&["--free"]).expect("free")
+    };
+    assert!(
+        super::catalog::model_row(&blank, merge).is_err(),
+        "no upstream name"
+    );
+    let labelled = CatalogAddArgs {
+        display_label: Some("two\nlines".to_owned()),
+        ..catalog_add(&["--free"]).expect("free")
+    };
+    assert!(super::catalog::model_row(&labelled, merge).is_err());
+}
+
+/// C11. A price is rounded to the catalog's six places, half away from zero
+/// as Postgres rounds a `numeric(12,6)`, before any rule judges it: what rounds
+/// to zero is a zero, what rounds to a million is past the ceiling, and the row
+/// holds the price as it will be stored.
+#[test]
+fn a_catalog_price_is_rounded_as_it_will_be_stored_before_it_is_judged() {
+    use oag_core::Provider;
+    use oag_core::provider::{Dialect, Endpoint, Platform};
+    let merge = Provider::Custom(
+        Endpoint::new("merge", Dialect::OpenAIChatCompletions, Platform::Plain).expect("merge"),
+    );
+    let priced = |input: &str, output: &str| {
+        let (input, output) = (
+            format!("--input-per-mtok={input}"),
+            format!("--output-per-mtok={output}"),
+        );
+        catalog_add(&[&input, &output]).unwrap_or_else(|e| panic!("{e}"))
+    };
+    let exact = |s: &str| Decimal::from_str_exact(s).expect("decimal");
+
+    let zero = super::catalog::model_row(&priced("0.0000004", "0.00000049"), merge)
+        .expect_err("both round to zero, and nobody said --free")
+        .to_string();
+    assert!(zero.contains("--free"), "{zero}");
+    let free = CatalogAddArgs {
+        input_per_mtok: Some(exact("0.0000004")),
+        ..catalog_add(&["--free"]).expect("free")
+    };
+    super::catalog::model_row(&free, merge).expect("--free, and a price that rounds to zero");
+
+    let ceiling = super::catalog::model_row(&priced("999999.9999995", "1"), merge)
+        .expect_err("rounds to a million")
+        .to_string();
+    assert!(ceiling.contains("must be under 1000000"), "{ceiling}");
+
+    let row = super::catalog::model_row(&priced("0.0000005", "1.0000025"), merge)
+        .expect("each rounds away from zero");
+    assert_eq!(
+        (row.input_per_mtok, row.output_per_mtok),
+        (exact("0.000001"), exact("1.000003")),
+        "half away from zero, as Postgres rounds, not half to even"
+    );
+    let cached = catalog_add(&[
+        "--input-per-mtok",
+        "1",
+        "--output-per-mtok",
+        "1",
+        "--cache-read-per-mtok",
+        "0.12345649",
+        "--cache-write-per-mtok=-0.0000004",
+    ])
+    .expect("clap takes it");
+    let row = super::catalog::model_row(&cached, merge).expect("a cache price rounds too");
+    assert_eq!(row.cache_read_per_mtok, Some(exact("0.123456")));
+    assert_eq!(
+        row.cache_write_per_mtok,
+        Some(Decimal::ZERO),
+        "a negative that rounds to nothing is a zero"
+    );
 }

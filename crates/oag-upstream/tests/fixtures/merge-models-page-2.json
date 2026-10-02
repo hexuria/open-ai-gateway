@@ -1,0 +1,123 @@
+{
+  "data": [
+    {
+      "model": "deepseek/deepseek-v3.2",
+      "display_name": "DeepSeek V3.2",
+      "availability_status": "available",
+      "access_required": false,
+      "vendors": {
+        "fireworks": {
+          "context_window": 163840,
+          "max_output_tokens": 16384,
+          "availability_status": "unavailable",
+          "capabilities": {
+            "input": ["text"],
+            "output": ["text"],
+            "supports_tool_calling": true,
+            "supports_reasoning": true
+          },
+          "pricing": {
+            "input_per_million": 0.2,
+            "output_per_million": 0.3,
+            "cache_read_per_million": null,
+            "cache_write_per_million": null
+          }
+        },
+        "deepseek": {
+          "context_window": 128000,
+          "max_output_tokens": 8192,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text"],
+            "output": ["text"],
+            "supports_tool_calling": true,
+            "supports_reasoning": true
+          },
+          "pricing": {
+            "input_per_million": 0.28,
+            "output_per_million": 0.42,
+            "cache_read_per_million": 0.028,
+            "cache_write_per_million": null
+          }
+        }
+      }
+    },
+    {
+      "model": "openai/o3-deep-research",
+      "display_name": "o3 Deep Research",
+      "availability_status": "available",
+      "access_required": true,
+      "vendors": {
+        "openai": {
+          "context_window": 200000,
+          "max_output_tokens": 100000,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text", "image"],
+            "output": ["text"],
+            "supports_tool_calling": true,
+            "supports_reasoning": true
+          },
+          "pricing": {
+            "input_per_million": 10,
+            "output_per_million": 40,
+            "cache_read_per_million": 2.5,
+            "cache_write_per_million": null
+          }
+        }
+      }
+    },
+    {
+      "model": "meta/llama-4-scout",
+      "display_name": "Llama 4 Scout",
+      "availability_status": "available",
+      "access_required": false,
+      "vendors": {
+        "groq": {
+          "context_window": 131072,
+          "max_output_tokens": 8192,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text", "image"],
+            "output": ["text"],
+            "supports_tool_calling": true,
+            "supports_reasoning": false
+          },
+          "pricing": {
+            "input_per_million": null,
+            "output_per_million": null,
+            "cache_read_per_million": null,
+            "cache_write_per_million": null
+          }
+        }
+      }
+    },
+    {
+      "model": "moonshot/kimi-k2-free",
+      "display_name": "Kimi K2 (free)",
+      "availability_status": "available",
+      "access_required": false,
+      "vendors": {
+        "moonshot": {
+          "context_window": 131072,
+          "max_output_tokens": 16384,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text"],
+            "output": ["text"],
+            "supports_tool_calling": true,
+            "supports_reasoning": false
+          },
+          "pricing": {
+            "input_per_million": 0,
+            "output_per_million": 0,
+            "cache_read_per_million": null,
+            "cache_write_per_million": null
+          }
+        }
+      }
+    }
+  ],
+  "has_more": false,
+  "next_cursor": null
+}

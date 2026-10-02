@@ -4,29 +4,37 @@
 
 pub mod adapter;
 pub mod anthropic;
+pub mod azure;
 pub mod bedrock;
 pub mod codex;
+pub mod converse;
 pub mod custom;
 pub mod eventstream;
+pub mod gcp_token;
 pub mod gemini;
 pub mod jev;
+pub mod listing;
 pub mod openai;
 pub mod openai_oauth;
 pub mod pricing;
 pub mod sigv4;
 pub mod transport;
 pub mod usage;
+pub mod vertex;
 pub mod xai_models;
 pub mod xai_oauth;
 
 pub use adapter::{Framing, ProviderAdapter, UpstreamRequest};
 pub use anthropic::AnthropicAdapter;
+pub use azure::AzureOpenAIAdapter;
 pub use bedrock::BedrockAdapter;
 pub use codex::CodexAdapter;
+pub use converse::ConverseAdapter;
 pub use gemini::GeminiAdapter;
 pub use jev::JevUpstream;
 pub use openai::OpenAICompatAdapter;
 pub use transport::{HttpTransport, Transport, TransportKey, TransportPool};
+pub use vertex::VertexAdapter;
 
 /// The `reqwest::Client` every adapter builds its requests through.
 ///

@@ -46,6 +46,10 @@ base64.workspace = true
 http-body-util.workspace = true
 # A paused clock, so the 30s slot heartbeat can be driven in a test.
 tokio = { workspace = true, features = ["test-util"] }
+# Stand-in upstreams for the operator-registered endpoints in tests/.
+wiremock.workspace = true
+# `eventstream::encode`, for a stand-in Bedrock's binary stream.
+oag-upstream = { workspace = true, features = ["test-fixtures"] }
 
 [lints]
 workspace = true

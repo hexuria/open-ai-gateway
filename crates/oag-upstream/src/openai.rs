@@ -23,6 +23,9 @@ pub struct OpenAICompatAdapter {
     auth: AuthStyle,
     /// Added to every request. None for a built-in.
     headers: ExtraHeaders,
+    /// Whether `served_models` reads `{base}/models`. Only an endpoint whose
+    /// operator asked for it; a built-in never.
+    discover: bool,
 }
 
 impl OpenAICompatAdapter {
@@ -34,6 +37,7 @@ impl OpenAICompatAdapter {
             auth_base: crate::xai_oauth::DEFAULT_AUTH_BASE.to_owned(),
             auth: AuthStyle::Bearer,
             headers: ExtraHeaders::default(),
+            discover: false,
         }
     }
 
@@ -56,6 +60,13 @@ impl OpenAICompatAdapter {
     #[must_use]
     pub fn with_headers(mut self, headers: ExtraHeaders) -> Self {
         self.headers = headers;
+        self
+    }
+
+    /// Answer `served_models` from the endpoint's own `{base}/models`.
+    #[must_use]
+    pub fn with_discovery(mut self, discover: bool) -> Self {
+        self.discover = discover;
         self
     }
 
@@ -136,6 +147,18 @@ impl ProviderAdapter for OpenAICompatAdapter {
         credential: &oag_core::credential::SecretMaterial,
         proxy: Option<&str>,
     ) -> Result<Option<Vec<String>>> {
+        // An endpoint that discovers says what it serves at its own list, in
+        // the header it takes its key in.
+        if self.discover {
+            let source = crate::listing::ModelSource {
+                dialect: oag_core::provider::Dialect::OpenAIChatCompletions,
+                base_url: &self.base_url,
+                auth: self.auth,
+                headers: &self.headers,
+            };
+            let served = crate::listing::served(&source, &credential.access_token, proxy).await?;
+            return Ok(Some(served.models));
+        }
         // The other four providers behind this adapter have no model list we
         // can ask. xAI does, and the host depends on the credential: a seat
         // token is refused by api.x.ai, an API key is the only thing that

@@ -763,4 +763,168 @@ mod tests {
         );
         assert_eq!(endpoints, 0, "and nothing is registered yet");
     }
+
+    /// 0021 applies over a database at 0020 that already holds endpoints, and
+    /// is expand-only: every row keeps its columns and gets no path, and the
+    /// 0020 release's own INSERT, which names no path, still goes through.
+    /// Its two CHECKs hold for rows written after it.
+    #[tokio::test]
+    async fn the_endpoint_path_migration_applies_over_a_database_at_0020() {
+        let Some((url, name)) = scratch_database().await else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        // What the 0020 release writes: it names every column but `path`.
+        let insert_as_0020 = "INSERT INTO endpoint (name, dialect, platform, base_url, auth, \
+             region, project, api_version, extra_headers, display_name, discover_models) \
+             VALUES ($1, $2, 'plain', 'http://127.0.0.1:9', 'bearer', NULL, NULL, NULL, \
+             '{}', NULL, false)";
+        let result = async {
+            sqlx::migrate!("../../migrations")
+                .run_to(20, db.pool())
+                .await
+                .map_err(|e| format!("migrating to 0020: {e}"))?;
+            for (endpoint, dialect) in [("jevish", "system_one"), ("chat", "openai")] {
+                sqlx::query(insert_as_0020)
+                    .bind(endpoint)
+                    .bind(dialect)
+                    .execute(db.pool())
+                    .await
+                    .map_err(|e| format!("seeding 0020's rows: {e}"))?;
+            }
+
+            db.migrate().await.map_err(|e| e.to_string())?;
+
+            sqlx::query(insert_as_0020)
+                .bind("after")
+                .bind("system_one")
+                .execute(db.pool())
+                .await
+                .map_err(|e| format!("the 0020 release's insert, after 0021: {e}"))?;
+            let paths: Vec<(String, String, Option<String>)> =
+                sqlx::query_as("SELECT name, dialect, path FROM endpoint ORDER BY name")
+                    .fetch_all(db.pool())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let moved =
+                sqlx::query("UPDATE endpoint SET path = '/v1/decisions' WHERE name = 'jevish'")
+                    .execute(db.pool())
+                    .await
+                    .map(|done| done.rows_affected())
+                    .map_err(|e| e.to_string());
+            let on_chat =
+                sqlx::query("UPDATE endpoint SET path = '/v1/decisions' WHERE name = 'chat'")
+                    .execute(db.pool())
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+            let with_query =
+                sqlx::query("UPDATE endpoint SET path = '/v1/decisions?x=1' WHERE name = 'jevish'")
+                    .execute(db.pool())
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+            Ok::<_, String>((paths, moved, on_chat, with_query))
+        }
+        .await;
+        drop(db);
+        drop_database(&name).await;
+
+        let (paths, moved, on_chat, with_query) = result.expect("0021 over a database at 0020");
+        let paths: Vec<(&str, &str, Option<&str>)> = paths
+            .iter()
+            .map(|(n, d, p)| (n.as_str(), d.as_str(), p.as_deref()))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                ("after", "system_one", None),
+                ("chat", "openai", None),
+                ("jevish", "system_one", None),
+            ],
+            "every endpoint 0020 held is still there, with no path: Jev's own"
+        );
+        assert_eq!(moved, Ok(1), "a System One row takes a path");
+        let on_chat = on_chat.expect_err("a chat row takes none");
+        assert!(on_chat.contains("endpoint_path_dialect_check"), "{on_chat}");
+        let with_query = with_query.expect_err("nor a query");
+        assert!(with_query.contains("endpoint_path_check"), "{with_query}");
+    }
+
+    /// 0022 applies over a database at 0021 that already holds catalog rows,
+    /// and is expand-only: every row gets no `synced_by`, which no sync
+    /// removes, and the 0021 release's sync write, which names no
+    /// `synced_by`, still goes through, both as a new row and as a rewrite
+    /// that leaves a mark where it was.
+    #[tokio::test]
+    async fn the_synced_by_migration_applies_over_a_database_at_0021() {
+        let Some((url, name)) = scratch_database().await else {
+            eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+            return;
+        };
+        let db = Db::connect(&url, 2).expect("connect");
+        // What the 0021 release's sync writes: every column but `synced_by`.
+        let sync_as_0021 = "INSERT INTO model_catalog (id, provider, upstream_name, \
+             input_per_mtok, output_per_mtok, context_window, max_output_tokens, is_override) \
+             VALUES ($1, 'e', $2, $3, 2, 1000, 100, true) ON CONFLICT (id) DO UPDATE SET \
+             input_per_mtok = EXCLUDED.input_per_mtok, updated_at = now() \
+             WHERE model_catalog.provider = EXCLUDED.provider";
+        let result = async {
+            sqlx::migrate!("../../migrations")
+                .run_to(21, db.pool())
+                .await
+                .map_err(|e| format!("migrating to 0021: {e}"))?;
+            for id in ["e/before", "e/marked"] {
+                sqlx::query(sync_as_0021)
+                    .bind(id)
+                    .bind(id.trim_start_matches("e/"))
+                    .bind(rust_decimal::Decimal::from(1))
+                    .execute(db.pool())
+                    .await
+                    .map_err(|e| format!("seeding 0021's rows: {e}"))?;
+            }
+
+            db.migrate().await.map_err(|e| e.to_string())?;
+
+            // A row a sync of this release marked, rewritten by the last one's.
+            sqlx::query("UPDATE model_catalog SET synced_by = 'e' WHERE id = 'e/marked'")
+                .execute(db.pool())
+                .await
+                .map_err(|e| e.to_string())?;
+            for id in ["e/marked", "e/after"] {
+                sqlx::query(sync_as_0021)
+                    .bind(id)
+                    .bind(id.trim_start_matches("e/"))
+                    .bind(rust_decimal::Decimal::from(5))
+                    .execute(db.pool())
+                    .await
+                    .map_err(|e| format!("the 0021 release's sync, after 0022: {e}"))?;
+            }
+            sqlx::query_as::<_, (String, Option<String>, i64)>(
+                "SELECT id, synced_by, input_per_mtok::bigint FROM model_catalog ORDER BY id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .map_err(|e| e.to_string())
+        }
+        .await;
+        drop(db);
+        drop_database(&name).await;
+
+        let rows = result.expect("0022 over a database at 0021");
+        let rows: Vec<(&str, Option<&str>, i64)> = rows
+            .iter()
+            .map(|(id, by, price)| (id.as_str(), by.as_deref(), *price))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("e/after", None, 5),
+                ("e/before", None, 1),
+                ("e/marked", Some("e"), 5),
+            ],
+            "a row 0021 held is no sync's, and the old sync's writes go through"
+        );
+    }
 }

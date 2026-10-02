@@ -256,5 +256,17 @@
         "message": "upstream sent no response within 90s"
       }
     }
+  },
+  {
+    "type": "upstream_unavailable",
+    "status": 503,
+    "variant": "UpstreamUnavailable",
+    "body": {
+      "type": "error",
+      "error": {
+        "type": "upstream_unavailable",
+        "message": "the upstream is unavailable: the Google token endpoint answered 503 Service Unavailable"
+      }
+    }
   }
 ]

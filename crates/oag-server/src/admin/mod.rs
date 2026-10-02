@@ -14,9 +14,10 @@
 //! [`crate::admin_routes`] rather than by a call inside each handler, because a
 //! handler that forgets the call is silently public and nothing about it looks
 //! wrong. Reads live here; incident writes are in [`write`]; the service
-//! catalog is in [`services`].
+//! catalog is in [`services`]; registered upstreams are in [`endpoints`].
 
 pub mod auth;
+pub mod endpoints;
 pub mod models;
 pub mod period;
 pub mod points;
@@ -24,6 +25,9 @@ pub mod services;
 pub mod write;
 
 pub use auth::{AdminActor, require_admin_layer};
+pub use endpoints::{
+    check_endpoint, create_endpoint, delete_endpoint, get_endpoint, list_endpoints, update_endpoint,
+};
 pub use models::{list_models, update_model};
 pub use period::{Window, WindowView};
 pub use points::{
@@ -928,14 +932,38 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
 
     let adapters = state.providers();
 
-    let out: Vec<ProviderView> = oag_core::Provider::ALL
+    Json(provider_rows(&adapters, &counts)).into_response()
+}
+
+/// One matrix row per built-in provider, then one per endpoint the gateway
+/// serves, by name.
+///
+/// An endpoint is listed from `adapters` rather than from the registry: on
+/// this process an endpoint is registered only while it has an adapter (for a
+/// System One endpoint, the upstream the System One route calls), and a row
+/// the last reload skipped has neither, so it is not listed.
+fn provider_rows(
+    adapters: &[oag_core::Provider],
+    counts: &[ProviderCountTuple],
+) -> Vec<ProviderView> {
+    let mut endpoints: Vec<oag_core::Provider> = adapters
         .iter()
-        .map(|&p| {
+        .copied()
+        .filter(|p| matches!(p, oag_core::Provider::Custom(_)))
+        .collect();
+    endpoints.sort_unstable();
+
+    oag_core::Provider::ALL
+        .iter()
+        .copied()
+        .chain(endpoints)
+        .map(|p| {
             let s = p.support();
-            // A `provider` string the enum does not know has no row here: it
-            // cannot be routed either, so the matrix has nothing to say about
-            // it. `oag admin account add` parses the flag, so producing one
-            // takes a hand-written INSERT.
+            // A `provider` string that names no built-in and no endpoint this
+            // process serves has no row here: it cannot be routed either, so
+            // the matrix has nothing to say about it. `oag admin account add`
+            // parses the flag, so producing one takes a hand-written INSERT or
+            // an endpoint whose row stopped loading.
             let mine = counts.iter().filter(|c| c.0 == p.as_str());
             let by_kind: Vec<KindCount> = mine
                 .clone()
@@ -959,9 +987,7 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Response {
                 by_kind,
             }
         })
-        .collect();
-
-    Json(out).into_response()
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -1551,6 +1577,67 @@ mod tests {
             "a seat's cost_usd is truthfully zero, so the pay-per-token bill it \
              displaced is the only counterfactual that means anything beside a \
              metered row: {selected:?}"
+        );
+    }
+
+    /// The matrix lists every built-in in its own order and then each endpoint
+    /// the gateway serves, by name, with its credentials counted like any
+    /// provider's.
+    #[test]
+    fn the_provider_matrix_lists_each_served_endpoint_after_the_built_ins() {
+        use oag_core::Provider;
+        use oag_core::provider::{Dialect, Endpoint, Platform};
+
+        let endpoint = |name: &str, dialect: Dialect| {
+            Provider::Custom(Endpoint::new(name, dialect, Platform::Plain).expect("a name"))
+        };
+        let (zed, able) = (
+            endpoint("t4-matrix-zed", Dialect::GeminiGenerateContent),
+            endpoint("t4-matrix-able", Dialect::AnthropicMessages),
+        );
+        // What `AppState::providers` returns: unordered, Jev included, and
+        // every built-in but Gemini's adapter, to see the flag follow it.
+        let mut adapters: Vec<Provider> = Provider::ALL
+            .iter()
+            .copied()
+            .filter(|p| *p != Provider::Gemini)
+            .collect();
+        adapters.extend([zed, able]);
+        let counts = [
+            ("t4-matrix-able".to_owned(), "api_key".to_owned(), 2),
+            ("t4-matrix-gone".to_owned(), "api_key".to_owned(), 5),
+            ("openai".to_owned(), "oauth".to_owned(), 1),
+        ];
+
+        let rows = super::provider_rows(&adapters, &counts);
+        let names: Vec<&str> = rows.iter().map(|r| r.provider.as_str()).collect();
+        let mut expected: Vec<&str> = Provider::ALL.iter().map(|p| p.as_str()).collect();
+        expected.extend(["t4-matrix-able", "t4-matrix-zed"]);
+        assert_eq!(names, expected, "built-ins first, then endpoints by name");
+
+        let able = &rows[Provider::ALL.len()];
+        assert_eq!(able.display_name, "t4-matrix-able");
+        assert_eq!(able.dialect, "Anthropic Messages");
+        assert_eq!(able.credential_kinds, ["api_key"]);
+        assert!(able.adapter);
+        assert_eq!(able.accounts, 2);
+        assert_eq!(able.by_kind.len(), 1);
+        let zed = &rows[Provider::ALL.len() + 1];
+        assert_eq!((zed.accounts, zed.adapter), (0, true));
+
+        let gemini = rows
+            .iter()
+            .find(|r| r.provider == "gemini")
+            .expect("listed without an adapter");
+        assert!(!gemini.adapter);
+        let openai = rows
+            .iter()
+            .find(|r| r.provider == "openai")
+            .expect("listed");
+        assert_eq!(openai.accounts, 1);
+        assert!(
+            rows.iter().all(|r| r.provider != "t4-matrix-gone"),
+            "credentials under a name nothing serves get no row"
         );
     }
 }

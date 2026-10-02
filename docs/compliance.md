@@ -108,6 +108,48 @@ inference, refresh and the usage poll alike, but nothing in the CLI sets it
 yet: `UPDATE account SET proxy_url = 'http://proxy.internal:3128' WHERE name =
 '<seat>'`.
 
+## A plain endpoint cannot reach a provider's own API
+
+An endpoint — an upstream you register rather than one built in; see
+[03-providers.md](03-providers.md#registered-endpoints) — files its keys as
+ordinary pooled `api_key` credentials, and nothing reads what such a key is.
+Pointed at a provider this gateway already serves, an endpoint would be a way
+around every rule above: a Claude subscription token filed as a key under an
+endpoint named `claude-direct` would reach `api.anthropic.com` past the refusal
+migration 0018 puts on the `anthropic` provider, and a ChatGPT or Grok seat's
+token would serve a pool instead of its one owner.
+
+So an endpoint on the `plain` platform may not have a base URL whose host is, or
+is under, any of these:
+
+| Hosts | Served instead by |
+|---|---|
+| `anthropic.com`, `claude.ai`, `claude.com` | the built-in `anthropic` provider, for API keys; a Claude subscription is never served |
+| `chatgpt.com`, `openai.com` | `openai` for API keys; a Codex seat through `--from codex`, bound to its owner |
+| `x.ai`, `grok.com` | `xai` for API keys; a Grok seat through `--from grok`, bound to its owner |
+| `googleapis.com`, `amazonaws.com`, `azure.com` | the built-in Gemini and Bedrock providers, and the `gcp`, `aws` and `azure` platforms, which sign a request the way each cloud expects |
+
+The host is compared as a URL parser reads it, so case, a trailing dot, a port,
+percent-encoding and a full-width dot do not get around it, and a name that only
+ends in the same letters (`notopenai.com`) is not under one of these. An IP
+literal carries no name, so the guard cannot say whose address it is and does
+not apply to one; the link-local and cloud-metadata refusal still does. Loopback
+and private addresses stay allowed, so a model server on your own network can be
+registered. A server of your own reachable only at a cloud's hostname under one
+of these domains (an AWS load balancer's `*.elb.amazonaws.com`, say) needs a DNS
+name of its own to be registered as a plain endpoint.
+
+The list is applied when an endpoint is written: `oag admin endpoint add` and
+`set` refuse such a URL, and `/admin/api/endpoints` answers 400. The gateway
+applies it again every time it loads endpoints, because the schema does not know
+it, so a row written by hand is refused when it is loaded. A refused row serves
+nothing, is logged with the reason on every refresh and counted in
+`oag_endpoint_invalid_total{reason="compliance"}`, and `oag admin account add`
+will not file a key under it.
+
+What no URL check can see is a proxy you run that forwards to one of these
+hosts. Traffic through it is yours to keep within the rules above.
+
 ## Practical guidance
 
 If you want colleagues to reach frontier models through this gateway, the two

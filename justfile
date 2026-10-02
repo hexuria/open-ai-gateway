@@ -306,6 +306,13 @@ verify-translate:
 verify-systemone:
     @./deploy/test/systemone-verify.sh
 
+# Operator-registered endpoints end to end: the real CLI and gateway against
+# stand-ins for every dialect and platform (plain, aws, gcp; azure refusal),
+# Merge sync, System One hosts, failover, the ledger and the admin API. No keys.
+verify-endpoints-live:
+    cargo build -q -p oag
+    @./deploy/test/custom-endpoints-live.sh
+
 # Used by local-verify.sh. Kept here so there is one definition of the dev
 # environment rather than a second copy inside a shell script.
 _verify-env:

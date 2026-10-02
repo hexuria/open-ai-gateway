@@ -1269,6 +1269,44 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     .await
     .expect("backdate");
 
+    // Which backdated spends this calendar month holds, asked of the rows by
+    // the bound `key_usage` uses. In a month's first three days the
+    // three-day-old spend is last month's, and in its first six hours so is
+    // the six-hour-old one. Fixed at "all three", this failed on the 1st to
+    // the 3rd of every month. The rolling windows never move; the month's
+    // figures are this month's rows and no others.
+    let this_month = |request_id: Uuid| {
+        let db = db.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT occurred_at >= date_trunc('month', now()) FROM usage_event \
+                 WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("a backdated row")
+        }
+    };
+    let (early_this_month, older_this_month) = (
+        this_month(early.request_id).await,
+        this_month(older.request_id).await,
+    );
+    // Cost, list price and points at R = 0.20 of each spend the month holds.
+    // The one written last was never backdated, so it is always among them.
+    let month: Vec<(Decimal, Decimal, i64)> = [
+        (true, dec!(0.50), dec!(0.80), 4_000_000),
+        (early_this_month, dec!(1.25), dec!(2.00), 10_000_000),
+        (older_this_month, dec!(0.25), dec!(0.40), 2_000_000),
+    ]
+    .into_iter()
+    .filter_map(|(held, cost, list, points)| held.then_some((cost, list, points)))
+    .collect();
+    let month_cost: Decimal = month.iter().map(|m| m.0).sum();
+    let month_list: Decimal = month.iter().map(|m| m.1).sum();
+    let month_points: i64 = month.iter().map(|m| m.2).sum();
+    let month_requests = i64::try_from(month.len()).expect("three at most");
+
     let usage = key_usage(&db, own, Some(dec!(0.20)))
         .await
         .expect("usage")
@@ -1282,12 +1320,8 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
         dec!(2.000000),
         "the counter the cap is enforced against"
     );
-    assert_eq!(
-        usage.month_to_date_usd,
-        dec!(2.000000),
-        "this key's rows only"
-    );
-    assert_eq!(usage.requests, 3);
+    assert_eq!(usage.month_to_date_usd, month_cost, "this key's rows only");
+    assert_eq!(usage.requests, month_requests);
     assert_windows(&usage);
     assert_eq!(
         usage.five_hour_requests, 1,
@@ -1295,8 +1329,7 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     );
     assert_eq!(usage.seven_day_requests, 3);
     assert_eq!(
-        usage.month_counterfactual_usd,
-        dec!(3.200000),
+        usage.month_counterfactual_usd, month_list,
         "the list-price bill the same tokens would have carried"
     );
     assert_eq!(usage.five_hour_counterfactual_usd, dec!(0.800000));
@@ -1310,8 +1343,8 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     // Points at R = 0.20: list price × 1e6 / 0.20, per request, summed.
     assert_eq!(
         usage.month_points,
-        Some(16_000_000),
-        "2.00, 0.80 and 0.40 at list price"
+        Some(month_points),
+        "2.00, 0.80 and 0.40 at list price, as far as the month holds them"
     );
     assert_eq!(usage.five_hour_points, Some(4_000_000));
     assert_eq!(usage.day_points, Some(14_000_000));
@@ -1328,15 +1361,15 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     .expect("by model");
     assert_eq!(by_model.len(), 1);
     assert_eq!(by_model[0].model_id, "kimi-k2");
-    // The month, so all three of this key's spends.
-    assert_eq!(by_model[0].requests, 3);
+    // The month, so every one of this key's spends the month holds.
+    assert_eq!(by_model[0].requests, month_requests);
     assert_eq!(
         (by_model[0].input_tokens, by_model[0].output_tokens),
-        (30, 15)
+        (10 * month_requests, 5 * month_requests)
     );
-    assert_eq!(by_model[0].cost_usd, dec!(2.000000));
-    assert_eq!(by_model[0].list_usd, dec!(3.200000));
-    assert_eq!(by_model[0].points, Some(16_000_000));
+    assert_eq!(by_model[0].cost_usd, month_cost);
+    assert_eq!(by_model[0].list_usd, month_list);
+    assert_eq!(by_model[0].points, Some(month_points));
     let recent = key_usage_by_model(
         &db,
         own,
@@ -1362,7 +1395,11 @@ async fn key_usage_reads_one_keys_ledger_and_its_cap() {
     .await
     .expect("points");
     let of = |key: Uuid| pool.iter().find(|(k, _)| *k == key).map(|(_, p)| *p);
-    assert_eq!(of(own), Some(16_000_000), "2.00, 0.80 and 0.40 over 0.20");
+    assert_eq!(
+        of(own),
+        Some(month_points),
+        "2.00, 0.80 and 0.40 over 0.20, as far as the month holds them"
+    );
     assert_eq!(of(theirs), Some(45_000_000), "9.00 at list price over 0.20");
 
     let other = key_usage(&db, theirs, None)
@@ -3389,6 +3426,7 @@ fn plain_endpoint<'a>(name: &'a str, headers: &'a serde_json::Value) -> NewEndpo
         region: None,
         project: None,
         api_version: None,
+        path: None,
         extra_headers: headers,
         display_name: None,
         discover_models: false,
@@ -3421,6 +3459,7 @@ async fn each_endpoint_check_refuses_what_the_matrix_does_not_serve() {
     let string = serde_json::json!("x-org: acme");
     let null = serde_json::Value::Null;
     let too_long = "a".repeat(33);
+    let long_path = format!("/{}", "a".repeat(128));
     let ok = plain_endpoint(&name, &object);
     let pair = "endpoint_platform_dialect_check";
     let base_url = "endpoint_base_url_check";
@@ -3642,6 +3681,42 @@ async fn each_endpoint_check_refuses_what_the_matrix_does_not_serve() {
             },
             headers,
         ),
+        // 0021.
+        (
+            "a path on a chat dialect",
+            NewEndpoint {
+                path: Some("/v1/decisions"),
+                ..ok.clone()
+            },
+            "endpoint_path_dialect_check",
+        ),
+        (
+            "a path without its leading slash",
+            NewEndpoint {
+                dialect: "system_one",
+                path: Some("v1/decisions"),
+                ..ok.clone()
+            },
+            "endpoint_path_check",
+        ),
+        (
+            "a path with a query",
+            NewEndpoint {
+                dialect: "system_one",
+                path: Some("/v1/decisions?x=1"),
+                ..ok.clone()
+            },
+            "endpoint_path_check",
+        ),
+        (
+            "a 129-character path",
+            NewEndpoint {
+                dialect: "system_one",
+                path: Some(&long_path),
+                ..ok.clone()
+            },
+            "endpoint_path_check",
+        ),
     ];
     for (what, row, constraint) in refused {
         match insert_endpoint(&db, &row).await {
@@ -3657,7 +3732,7 @@ async fn each_endpoint_check_refuses_what_the_matrix_does_not_serve() {
     // A full UUID is 32 characters, the most a name may have.
     let longest = Uuid::new_v4().simple().to_string();
     let marked = format!("{}_a-b", &Uuid::new_v4().simple().to_string()[..20]);
-    let names: Vec<String> = (0..7).map(|_| endpoint_name()).collect();
+    let names: Vec<String> = (0..8).map(|_| endpoint_name()).collect();
     let served = [
         NewEndpoint {
             name: &longest,
@@ -3680,6 +3755,13 @@ async fn each_endpoint_check_refuses_what_the_matrix_does_not_serve() {
             dialect: "system_one",
             base_url: Some("http://127.0.0.1:9"),
             auth: "none",
+            ..ok.clone()
+        },
+        NewEndpoint {
+            name: &names[7],
+            dialect: "system_one",
+            base_url: Some("https://api-gateway.merge.dev"),
+            path: Some("/v1/decisions"),
             ..ok.clone()
         },
         NewEndpoint {
@@ -3761,6 +3843,7 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
             region: Some("eu"),
             project: Some("acme"),
             api_version: Some("2023-06-01"),
+            path: None,
             extra_headers: &headers,
             display_name: Some("Example"),
             discover_models: true,
@@ -3820,6 +3903,11 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
         .execute(db.pool())
         .await
         .expect("backdate");
+    let backdated = get_endpoint(&db, &name)
+        .await
+        .expect("get")
+        .expect("there")
+        .updated_at;
     let beta = serde_json::json!({ "anthropic-beta": "tools-2024-04-04" });
     let settings = EndpointUpdate {
         base_url: Some("https://eu.llm.example.test"),
@@ -3827,14 +3915,19 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
         region: None,
         project: None,
         api_version: None,
+        path: None,
         extra_headers: &beta,
         display_name: None,
         discover_models: false,
+        seen: backdated,
     };
-    let updated = update_endpoint(&db, &name, &settings)
+    let EndpointUpdated::Updated(updated) = update_endpoint(&db, &name, &settings)
         .await
         .expect("update")
-        .expect("exists");
+    else {
+        panic!("written over the row it was made from");
+    };
+    let updated = *updated;
     assert_eq!(
         (updated.dialect.as_str(), updated.platform.as_str()),
         ("anthropic", "plain"),
@@ -3879,6 +3972,7 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
         &name,
         &EndpointUpdate {
             base_url: None,
+            seen: updated.updated_at,
             ..settings.clone()
         },
     )
@@ -3890,8 +3984,26 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
     );
     assert_eq!(
         get_endpoint(&db, &name).await.expect("get"),
-        Some(updated),
+        Some(updated.clone()),
         "a refused update changes nothing"
+    );
+
+    // Made from the row before the update above: refused, and nothing changes.
+    let stale = update_endpoint(
+        &db,
+        &name,
+        &EndpointUpdate {
+            display_name: Some("Stale"),
+            ..settings.clone()
+        },
+    )
+    .await
+    .expect("a stale update is an answer, not an error");
+    assert_eq!(stale, EndpointUpdated::Changed);
+    assert_eq!(
+        get_endpoint(&db, &name).await.expect("get"),
+        Some(updated),
+        "a stale update changes nothing"
     );
 
     let nobody = endpoint_name();
@@ -3899,7 +4011,7 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
         update_endpoint(&db, &nobody, &settings)
             .await
             .expect("update"),
-        None
+        EndpointUpdated::NotFound
     );
     assert_eq!(get_endpoint(&db, &nobody).await.expect("get"), None);
 
@@ -3922,9 +4034,100 @@ async fn an_endpoint_round_trips_and_an_update_keeps_what_it_is() {
             defaults.auth.as_str(),
             &defaults.extra_headers,
             defaults.discover_models,
+            defaults.path.as_deref(),
         ),
-        ("plain", "bearer", &serde_json::json!({}), false)
+        ("plain", "bearer", &serde_json::json!({}), false, None)
     );
+}
+
+/// 0021: a System One endpoint's path is stored, read back, listed, moved and
+/// cleared like any other setting, and a write the path CHECKs refuse changes
+/// nothing.
+#[tokio::test]
+async fn a_system_one_path_round_trips_and_an_update_moves_or_clears_it() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let name = endpoint_name();
+    let headers = serde_json::json!({});
+    let row = insert_endpoint(
+        &db,
+        &NewEndpoint {
+            dialect: "system_one",
+            base_url: Some("https://decisions.example.test"),
+            path: Some("/v1/decisions"),
+            ..plain_endpoint(&name, &headers)
+        },
+    )
+    .await
+    .expect("insert");
+    assert_eq!(row.path.as_deref(), Some("/v1/decisions"));
+    assert_eq!(
+        get_endpoint(&db, &name).await.expect("get"),
+        Some(row.clone())
+    );
+    assert!(list_endpoints(&db).await.expect("list").contains(&row));
+
+    let settings = EndpointUpdate {
+        base_url: Some("https://decisions.example.test"),
+        auth: "bearer",
+        region: None,
+        project: None,
+        api_version: None,
+        path: Some("/v2/decide"),
+        extra_headers: &headers,
+        display_name: None,
+        discover_models: false,
+        seen: row.updated_at,
+    };
+    let EndpointUpdated::Updated(moved) = update_endpoint(&db, &name, &settings)
+        .await
+        .expect("update")
+    else {
+        panic!("written over the row it was made from");
+    };
+    let moved = *moved;
+    assert_eq!(moved.path.as_deref(), Some("/v2/decide"));
+    let settings = EndpointUpdate {
+        seen: moved.updated_at,
+        ..settings
+    };
+
+    let refused = update_endpoint(
+        &db,
+        &name,
+        &EndpointUpdate {
+            path: Some("/v2/decide#frag"),
+            ..settings.clone()
+        },
+    )
+    .await
+    .expect_err("a path with a fragment");
+    assert!(
+        matches!(&refused, Error::Config(m) if m.contains("endpoint_path_check")),
+        "{refused}"
+    );
+    assert_eq!(
+        get_endpoint(&db, &name).await.expect("get"),
+        Some(moved),
+        "a refused update changes nothing"
+    );
+
+    let EndpointUpdated::Updated(cleared) = update_endpoint(
+        &db,
+        &name,
+        &EndpointUpdate {
+            path: None,
+            ..settings
+        },
+    )
+    .await
+    .expect("update") else {
+        panic!("written over the row it was made from");
+    };
+    assert_eq!(cleared.path, None, "back to Jev's own path");
 }
 
 /// A credential or a catalog model that names an endpoint keeps it. The delete
@@ -4234,4 +4437,220 @@ async fn a_service_account_credential_needs_no_owner() {
         (row.kind.as_str(), row.owner_principal_id),
         ("service_account", None)
     );
+}
+
+/// One catalog row, read the way the gateway reads them all.
+async fn catalog_row(db: &Db, id: &str) -> ModelRow {
+    catalog(db)
+        .await
+        .expect("catalog")
+        .into_iter()
+        .find(|m| m.id == id)
+        .expect("the row")
+}
+
+/// Whether the catalog row `id` is marked as an operator's.
+async fn is_override(db: &Db, id: &str) -> bool {
+    sqlx::query_scalar("SELECT is_override FROM model_catalog WHERE id = $1")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .expect("the row")
+}
+
+/// `override_model` writes the operator's row whole and marks it theirs, over
+/// a seeded row and over their own earlier write alike, and a seed after it
+/// leaves it alone. `upsert_model(.., true)` did neither: it skipped a row
+/// already overridden and never set the flag on a seeded one.
+#[tokio::test]
+async fn an_operators_model_is_written_whole_and_a_seed_leaves_it() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+
+    // A seeded row, which the operator has named.
+    let seeded = format!("xai/grok-{}", Uuid::new_v4());
+    upsert_model(&db, &seed_model(&seeded, dec!(3)), false)
+        .await
+        .expect("seed");
+    set_model_label(&db, &seeded, Some("Grok, as named"))
+        .await
+        .expect("label");
+
+    // The operator reprices it, saying nothing about the label.
+    let mut theirs = seed_model(&seeded, dec!(9));
+    theirs.context_window = 64_000;
+    theirs.supports_tools = true;
+    override_model(&db, &theirs).await.expect("override");
+    let written = catalog_row(&db, &seeded).await;
+    assert_eq!(
+        (
+            written.input_per_mtok,
+            written.context_window,
+            written.supports_tools
+        ),
+        (dec!(9), 64_000, true),
+        "every column is the operator's"
+    );
+    assert_eq!(written.display_label.as_deref(), Some("Grok, as named"));
+    assert!(
+        is_override(&db, &seeded).await,
+        "and the row is marked theirs"
+    );
+
+    // A seed after that leaves it where the operator put it.
+    upsert_model(&db, &seed_model(&seeded, dec!(5)), false)
+        .await
+        .expect("reseed");
+    assert_eq!(catalog_row(&db, &seeded).await.input_per_mtok, dec!(9));
+
+    // A second write of theirs is not skipped as somebody's override, and a
+    // label they give replaces the one before.
+    let mut again = seed_model(&seeded, dec!(11));
+    again.display_label = Some("Grok, renamed".to_owned());
+    override_model(&db, &again).await.expect("override again");
+    let written = catalog_row(&db, &seeded).await;
+    assert_eq!(written.input_per_mtok, dec!(11));
+    assert_eq!(written.display_label.as_deref(), Some("Grok, renamed"));
+
+    // A model nobody seeded is inserted as the operator's.
+    let fresh = format!("xai/grok-{}", Uuid::new_v4());
+    override_model(&db, &seed_model(&fresh, dec!(2)))
+        .await
+        .expect("insert");
+    assert!(is_override(&db, &fresh).await);
+    assert_eq!(catalog_row(&db, &fresh).await.output_per_mtok, dec!(8));
+
+    sqlx::query("DELETE FROM model_catalog WHERE id = ANY($1)")
+        .bind(vec![seeded, fresh])
+        .execute(db.pool())
+        .await
+        .expect("clean up");
+}
+
+/// Each endpoint is counted by what names it: its credentials and the ones in
+/// rotation, its catalog models and the ones an active route's ladder names. A
+/// ladder shaped wrong by hand counts as naming nothing, and an endpoint
+/// nothing names counts zero everywhere. `endpoint_account_count`, the one
+/// count a base-URL move asks for, agrees with the first.
+// Long for its fixture: two endpoints, three routes, two credentials and three
+// models, all removed again before asserting.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn each_endpoint_is_counted_by_what_names_it() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let object = serde_json::json!({});
+    let (named, idle) = (endpoint_name(), endpoint_name());
+    for name in [&named, &idle] {
+        insert_endpoint(&db, &plain_endpoint(name, &object))
+            .await
+            .expect("an endpoint");
+    }
+
+    let models: Vec<String> = ["laddered", "benched", "unlisted"]
+        .iter()
+        .map(|m| format!("{named}/{m}"))
+        .collect();
+    for id in &models {
+        let mut model = seed_model(id, dec!(1));
+        model.provider.clone_from(&named);
+        upsert_model(&db, &model, false).await.expect("a model");
+    }
+    let routes: Vec<String> = (0..3)
+        .map(|i| format!("t5-refs-{i}-{}", Uuid::new_v4()))
+        .collect();
+    for (route, tiers, active) in [
+        (
+            &routes[0],
+            serde_json::json!([
+                {"name": "cheap", "models": ["xai/grok-4.6", models[0]]},
+                {"name": "odd", "models": "not a list"},
+                "not a rung",
+            ]),
+            true,
+        ),
+        // An inactive route's ladder serves nothing.
+        (
+            &routes[1],
+            serde_json::json!([{"name": "cheap", "models": [models[1]]}]),
+            false,
+        ),
+        // Not a list of rungs at all.
+        (&routes[2], serde_json::json!({"cheap": [models[1]]}), true),
+    ] {
+        sqlx::query(
+            "INSERT INTO route (id, name, tiers, active) VALUES (gen_random_uuid(), $1, $2, $3)",
+        )
+        .bind(route)
+        .bind(tiers)
+        .bind(active)
+        .execute(db.pool())
+        .await
+        .expect("a route");
+    }
+    for (key, schedulable) in [("on", true), ("off", false)] {
+        sqlx::query(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce, schedulable) \
+             VALUES (gen_random_uuid(), $1, $2, 'api_key', '\\x00', '\\x00', $3)",
+        )
+        .bind(format!("{named}-{key}"))
+        .bind(&named)
+        .bind(schedulable)
+        .execute(db.pool())
+        .await
+        .expect("a credential");
+    }
+
+    let counted = endpoint_references(&db).await;
+    // And one endpoint's credentials alone, as a move of its base URL counts
+    // them: in rotation or not, since a key out of rotation still moves.
+    let named_accounts = endpoint_account_count(&db, &named).await;
+    let idle_accounts = endpoint_account_count(&db, &idle).await;
+
+    sqlx::query("DELETE FROM account WHERE provider = $1")
+        .bind(&named)
+        .execute(db.pool())
+        .await
+        .expect("clean up credentials");
+    sqlx::query("DELETE FROM model_catalog WHERE provider = $1")
+        .bind(&named)
+        .execute(db.pool())
+        .await
+        .expect("clean up models");
+    sqlx::query("DELETE FROM route WHERE name = ANY($1)")
+        .bind(&routes)
+        .execute(db.pool())
+        .await
+        .expect("clean up routes");
+    for name in [&named, &idle] {
+        assert_eq!(
+            delete_endpoint(&db, name).await.expect("delete"),
+            EndpointDeletion::Deleted
+        );
+    }
+
+    let counted = counted.expect("the read");
+    assert_eq!(
+        counted.get(&named).copied(),
+        Some(EndpointReferences {
+            accounts: 2,
+            schedulable: 1,
+            models: 3,
+            on_ladder: 1,
+        })
+    );
+    assert_eq!(
+        counted.get(&idle).copied(),
+        Some(EndpointReferences::default()),
+        "an endpoint nothing names is listed, at zero"
+    );
+    assert_eq!(named_accounts.expect("the count"), 2);
+    assert_eq!(idle_accounts.expect("the count"), 0);
 }

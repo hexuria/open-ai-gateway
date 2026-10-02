@@ -12,6 +12,7 @@
 //! original back on `tool_calls` so the client can still dispatch.
 
 use crate::canonical::{CanonicalRequest, ContentBlock, ToolChoice};
+use crate::converse::ToolUseIds;
 use crate::stream::StreamEvent;
 use std::collections::{HashMap, HashSet};
 
@@ -70,6 +71,9 @@ pub fn sanitize_openai_function_name(name: &str) -> String {
 pub struct FunctionNameMap {
     to_wire: HashMap<String, String>,
     from_wire: HashMap<String, String>,
+    /// Tool-call ids the upstream was sent respelled, for an upstream that
+    /// holds them to a pattern: Converse. The same for every other.
+    tool_use_ids: ToolUseIds,
 }
 
 impl FunctionNameMap {
@@ -130,7 +134,11 @@ impl FunctionNameMap {
             .iter()
             .map(|(orig, wire)| (wire.clone(), orig.clone()))
             .collect();
-        Self { to_wire, from_wire }
+        Self {
+            to_wire,
+            from_wire,
+            tool_use_ids: ToolUseIds::default(),
+        }
     }
 
     /// The name to put on the OpenAI wire for this original.
@@ -143,6 +151,20 @@ impl FunctionNameMap {
     #[must_use]
     pub fn original<'a>(&'a self, wire: &'a str) -> &'a str {
         self.from_wire.get(wire).map_or(wire, String::as_str)
+    }
+
+    /// This map, restoring the tool-call ids `ids` respelled as well.
+    #[must_use]
+    pub fn with_tool_use_ids(mut self, ids: ToolUseIds) -> Self {
+        self.tool_use_ids = ids;
+        self
+    }
+
+    /// The tool-call id the client sent, for one the upstream was sent or
+    /// answers with.
+    #[must_use]
+    pub fn original_tool_use_id<'a>(&'a self, wire: &'a str) -> &'a str {
+        self.tool_use_ids.original(wire)
     }
 
     /// Whether any original was rewritten. Same-dialect passthrough is only
@@ -166,14 +188,23 @@ impl FunctionNameMap {
         pairs
     }
 
-    /// Restore client-facing names on parsed tool-call events.
+    /// Restore client-facing names, and ids, on parsed tool-call events.
+    ///
+    /// Every event is looked at. An identity map hands each name and id back
+    /// as it is, so a shortcut for one would save a lookup or two on an
+    /// answer's few tool events, and one that judged by names alone would
+    /// hand a respelled id to the client.
     pub fn restore_in_events(&self, events: &mut [StreamEvent]) {
-        if self.from_wire.is_empty() {
-            return;
-        }
         for event in events {
-            if let StreamEvent::ToolUseStart { name, .. } = event {
-                *name = self.original(name).to_owned();
+            match event {
+                StreamEvent::ToolUseStart { id, name } => {
+                    *name = self.original(name).to_owned();
+                    *id = self.original_tool_use_id(id).to_owned();
+                }
+                StreamEvent::ToolUseDelta { id, .. } | StreamEvent::ToolUseEnd { id } => {
+                    *id = self.original_tool_use_id(id).to_owned();
+                }
+                _ => {}
             }
         }
     }
@@ -224,7 +255,9 @@ fn truncate_ascii(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::{CanonicalRequest, ContentBlock, Message, Role, Tool, ToolChoice};
+    use crate::canonical::{
+        CanonicalRequest, ContentBlock, Message, Role, Tool, ToolChoice, ToolResultContent,
+    };
     use serde_json::json;
 
     fn legal(name: &str) {
@@ -402,6 +435,63 @@ mod tests {
         assert_eq!(map.wire("user-Github.get_file"), "user-Github_get_file");
         assert_eq!(map.original("namespace_tool"), "namespace.tool");
         assert_eq!(map.original("user-Github_get_file"), "user-Github.get_file");
+    }
+
+    /// A tool-call id Converse was sent respelled is put back as the client
+    /// sent it on each event of a call that carries it: the start, the
+    /// arguments, and the end, so the three still name one call. The map the
+    /// failover builds restores it, and so does one with no name in it at
+    /// all: an id is restored whether or not a name was.
+    #[test]
+    fn a_respelled_tool_use_id_is_restored_on_each_event_of_the_call() {
+        let mut req = req_with_tools(&[]);
+        req.messages = vec![
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: "read_file#1".to_owned(),
+                    name: "read_file".to_owned(),
+                    input: json!({}),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "read_file#1".to_owned(),
+                    content: ToolResultContent::Text("ok".to_owned()),
+                    is_error: false,
+                }],
+            },
+        ];
+        let ids = ToolUseIds::from_request(&req);
+        let wire = ids.wire("read_file#1").to_owned();
+        assert_ne!(
+            wire, "read_file#1",
+            "the premise: Converse was sent another"
+        );
+        let call = |id: &str| {
+            vec![
+                StreamEvent::ToolUseStart {
+                    id: id.to_owned(),
+                    name: "read_file".to_owned(),
+                },
+                StreamEvent::ToolUseDelta {
+                    id: id.to_owned(),
+                    partial_json: "{}".to_owned(),
+                },
+                StreamEvent::ToolUseEnd { id: id.to_owned() },
+            ]
+        };
+
+        for (map, which) in [
+            (FunctionNameMap::from_request(&req), "the failover's map"),
+            (FunctionNameMap::identity(), "a map with no names"),
+        ] {
+            let map = map.with_tool_use_ids(ids.clone());
+            let mut events = call(&wire);
+            map.restore_in_events(&mut events);
+            assert_eq!(events, call("read_file#1"), "{which}");
+        }
     }
 
     #[test]

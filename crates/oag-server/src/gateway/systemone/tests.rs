@@ -889,6 +889,38 @@ async fn a_breaker_that_trips_mid_request_stops_the_retries() {
     assert_eq!(body["error"]["upstream_status"], 408);
 }
 
+/// An answer counts for the key that gave it, as a chat answer does: it
+/// clears the breaker's run of failures. A key one failure short of the
+/// threshold before an answer is a whole threshold short after it, so the
+/// next failure leaves it in rotation, where the same failures with no
+/// answer between them take a key out.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_clears_the_breakers_run_of_failures() {
+    let Some(gw) = Gateway::start(CHAT_LADDER, None).await else {
+        return;
+    };
+    let answered = AccountId::from_uuid(gw.add_jev_key("jev-key-a", 0).await);
+    let unanswered = AccountId::from_uuid(uuid::Uuid::new_v4());
+    // One short of the threshold, so the next failure opens it.
+    for _ in 0..4 {
+        gw.state.breakers.record_failure(answered);
+        gw.state.breakers.record_failure(unanswered);
+    }
+
+    assert_eq!(gw.ask(QUESTIONS).await.status(), 200);
+    gw.state.breakers.record_failure(answered);
+    gw.state.breakers.record_failure(unanswered);
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    assert!(
+        gw.state.breakers.permits(answered, now),
+        "one failure since the answer, not five in a row"
+    );
+    assert!(
+        !gw.state.breakers.permits(unanswered, now),
+        "the premise: five in a row open a breaker"
+    );
+}
+
 /// A 429 benches the key for as long as Jev said, and the next key serves.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_429_parks_the_key_for_its_retry_after_and_moves_on() {
@@ -1059,6 +1091,44 @@ async fn the_route_s_rate_limit_counts_system_one_requests() {
     assert_eq!(gw.mock.calls().len(), 1, "the throttled one never left");
 }
 
+/// C7. A listing that fails benches no key and counts against no breaker:
+/// past the breaker's threshold of failures, every listing still reaches the
+/// key, nothing in the store parks it, and its breaker still admits it. A
+/// host's model list failing says nothing about whether its keys answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_listing_benches_no_key_and_trips_no_breaker() {
+    let Some(gw) = Gateway::start(CHAT_LADDER, None).await else {
+        return;
+    };
+    let key = gw.add_jev_key("jev-key-a", 0).await;
+    gw.mock.behave("jev-key-a", Behaviour::Refuse(500));
+
+    // One more than the breaker's threshold of five. Each is Jev's own 500,
+    // not "no credential": the key was there to ask every time.
+    for listing in 0..6 {
+        let response = gw.post_get("/jev/v1/models").await;
+        assert_eq!(response.status(), 500, "listing {listing}");
+        let body = json_of(response).await;
+        assert_eq!(
+            body["error"]["upstream_status"], 500,
+            "listing {listing}: {body}"
+        );
+    }
+    assert_eq!(
+        gw.mock.calls_with("jev-key-a"),
+        6,
+        "every listing reached the key: none was benched by the one before"
+    );
+    assert_eq!(gw.benched(key).await, (None, None), "nothing parks the key");
+    assert!(
+        gw.state.breakers.permits(
+            AccountId::from_uuid(key),
+            time::OffsetDateTime::now_utc().unix_timestamp()
+        ),
+        "and its breaker never opened"
+    );
+}
+
 /// The listing is Jev's own, unchanged, with its request id.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_jev_listing_passes_through_unchanged() {
@@ -1106,7 +1176,7 @@ async fn a_chat_request_can_never_reach_a_jev_key() {
                 .iter()
                 .filter_map(oag_store::ModelRow::to_spec)
                 .chain([
-                    priced(&Catalog::new(), "jev-latest"),
+                    priced(&Catalog::new(), Provider::Jev, "jev-latest", None),
                     ModelSpec {
                         id: ModelId::new("anthropic/claude-haiku-4.5"),
                         provider: Provider::Anthropic,
@@ -1203,11 +1273,14 @@ fn an_answer_is_priced_by_its_catalog_row_or_left_unpriced() {
         display_label: None,
     };
     let catalog = Catalog::from_entries([priced_row.clone()]);
-    assert_eq!(priced(&catalog, "jev-latest"), priced_row);
+    assert_eq!(
+        priced(&catalog, Provider::Jev, "jev-latest", None),
+        priced_row
+    );
 
     // A model the catalog has never seen — Jev answering with a dated name,
     // say — is still metered, under its own id, at no cost.
-    let stand_in = priced(&catalog, "jev-2026-08-01");
+    let stand_in = priced(&catalog, Provider::Jev, "jev-2026-08-01", None);
     assert_eq!(stand_in.id.as_str(), "jev/jev-2026-08-01");
     assert_eq!(stand_in.provider, Provider::Jev);
     assert_eq!(stand_in.upstream_name, "jev-2026-08-01");

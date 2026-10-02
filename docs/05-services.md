@@ -54,6 +54,9 @@ The check fails closed on:
 - URLs with embedded credentials
 - link-local addresses (`169.254.0.0/16`, `fe80::/10`) and the
   well-known cloud-metadata hostnames
+- the metadata services that sit elsewhere: AWS's and GCP's over IPv6
+  (`fd00:ec2::254`, `fd20:ce::254`) and Alibaba Cloud's (`100.100.100.200`),
+  each by its own address, so the ranges around them stay usable
 - a resolved address that lands on one of those, after DNS
 
 Loopback and RFC1918 are allowed: that is where the organisation's own

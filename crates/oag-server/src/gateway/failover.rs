@@ -15,6 +15,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 /// What one forwarding attempt produced.
+///
+/// Each answer carries the adapter that built and sent its request. The
+/// answer is read in that adapter's dialect and framing, and rendered for the
+/// client from them, and that is not a fact to look up a second time: a
+/// reload between the send and the answer can leave the provider with a new
+/// adapter, or with none, and a lookup then misreads an answer the upstream
+/// has already generated and billed, or throws it away.
 pub(super) enum Attempt {
     /// Handed to the client as a stream. Nothing further can be decided.
     Streaming {
@@ -24,6 +31,8 @@ pub(super) enum Attempt {
         attempt: u8,
         /// Original ↔ wire function names, for restoring `tool_calls`.
         names: FunctionNameMap,
+        /// The adapter that sent the request, which reads the stream.
+        adapter: Arc<dyn oag_upstream::ProviderAdapter>,
     },
     /// Read in full, so the answer can still be judged and retried.
     Collected {
@@ -38,6 +47,9 @@ pub(super) enum Attempt {
         lease: select::Lease,
         /// Which dispatch of this request produced it; see [`Dispatches`].
         attempt: u8,
+        /// The adapter that sent the request and read the answer, whose
+        /// dialect and framing decide how the client's body is made.
+        adapter: Arc<dyn oag_upstream::ProviderAdapter>,
     },
     /// The model refused the request itself — too long, or beyond what it can
     /// do. No credential can help and the lease is already released, but a
@@ -127,17 +139,24 @@ pub(crate) fn adapter_for(
 
 /// Function names as an OpenAI-shaped upstream must see them.
 ///
-/// Canonical keeps the client's names. Only Chat Completions and Responses
-/// rewrite, because those are the dialects whose wire pattern luna enforces
-/// with a 400. Other dialects keep identity, so same-dialect passthrough is
-/// undisturbed.
-fn openai_function_names(
+/// Canonical keeps the client's names. Only Chat Completions, Responses and
+/// Bedrock Converse rewrite, because those are the dialects that hold a name
+/// to the OpenAI function-name pattern and refuse one outside it with a 400.
+/// Converse's codec sanitises the same way, so this map is the one that puts
+/// the client's names back; and it respells a tool call's id its own pattern
+/// refuses, which the map puts back too. Other dialects keep identity, so
+/// same-dialect passthrough is undisturbed.
+pub(super) fn openai_function_names(
     canonical: &oag_proto::CanonicalRequest,
     upstream: Dialect,
 ) -> FunctionNameMap {
     match upstream {
-        Dialect::OpenAIChatCompletions | Dialect::OpenAIResponses => {
-            let names = FunctionNameMap::from_request(canonical);
+        Dialect::OpenAIChatCompletions | Dialect::OpenAIResponses | Dialect::BedrockConverse => {
+            let mut names = FunctionNameMap::from_request(canonical);
+            if upstream == Dialect::BedrockConverse {
+                names = names
+                    .with_tool_use_ids(oag_proto::converse::ToolUseIds::from_request(canonical));
+            }
             if names.rewrites() {
                 for (original, wire) in names.rewritten() {
                     tracing::debug!(original, wire, "sanitized OpenAI function name");
@@ -331,7 +350,8 @@ pub(super) enum Outcome {
     Switch(Error),
     /// Try a different credential, and meter what this one generated first:
     /// the answer was read far enough to cost something before it was lost.
-    Lost(Error, oag_proto::StreamAccumulator),
+    /// Boxed for the same reason `Ok` is.
+    Lost(Error, Box<oag_proto::StreamAccumulator>),
     /// Another request took this credential's half-open probe between
     /// selection and dispatch. Nothing was sent and nothing failed: try a
     /// different credential, and say nothing about this one.
@@ -471,11 +491,22 @@ pub(super) async fn try_credential(
     note_dropped_vendor_fields(canonical, adapter.dialect(), request_id);
     // Refreshes first if the token is close to expiry. A credential that is
     // merely expiring must not be treated as a credential that is broken.
-    let credential = match refresh::ensure_fresh(state, &lease.account).await {
+    let stored = match refresh::ensure_fresh(state, &lease.account).await {
         Ok(c) => c,
         // Broken for everyone, not just this request — but another credential
         // may well work, so switch rather than fail the request outright.
         Err(e) => return Outcome::Switch(e),
+    };
+    // What the request is built with, which is not always what is stored: a
+    // service account's JSON key is exchanged for a token. Failing to make one
+    // is this credential failing, so it is answered as a failed refresh is.
+    // Through the credential's own proxy, as its refresh and its requests go.
+    let credential = match adapter
+        .prepare_credential(account, &stored, lease.account.proxy_url.as_deref())
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return unprepared(state, account, e).await,
     };
 
     let mut last = Error::NoCredential { provider };
@@ -526,12 +557,18 @@ pub(super) async fn try_credential(
                     canonical.stream,
                     ordinal,
                     names,
+                    adapter,
                 )
                 .await;
             }
 
             Ok(response) => {
                 let status = response.status().as_u16();
+                // A credential the adapter prepared and the upstream refused
+                // (a minted token, revoked) is not to be handed out again.
+                if status == 401 {
+                    adapter.credential_refused(account, &credential).await;
+                }
                 // Read before the body is consumed: `text()` takes the whole
                 // response, headers included.
                 let retry_after = upstream_retry_after(response.headers());
@@ -617,10 +654,29 @@ pub(super) async fn try_credential(
     Outcome::Switch(last)
 }
 
+/// A credential whose preparation failed: a service account whose key
+/// Google would not exchange for a token, or a token endpoint that did not
+/// answer.
+///
+/// The request moves on to the next credential, as it always has, and this
+/// one sits out the cooldown its error asks for, through the same
+/// `apply_disposition` an upstream's refusal goes through: ten minutes for a
+/// key Google refuses, thirty seconds for a token endpoint out of reach. So
+/// the requests after this one go to another credential first, instead of
+/// each finding the same thing out. An error that asks for nothing
+/// (`Disposition::Fatal`) writes nothing.
+async fn unprepared(state: &AppState, account: AccountId, e: Error) -> Outcome {
+    apply_disposition(state, account, e.disposition()).await;
+    Outcome::Switch(e)
+}
+
 /// Turn a successful response into the attempt the caller returns.
 ///
 /// The body is collected here unless the client asked for a stream: only a
-/// streaming client can be handed the upstream body as it arrives.
+/// streaming client can be handed the upstream body as it arrives. Either way
+/// it is read by `adapter`, the one that sent the request, and the attempt
+/// carries it on.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn succeeded(
     state: &Arc<AppState>,
     provider: oag_core::Provider,
@@ -629,6 +685,7 @@ pub(super) async fn succeeded(
     stream: bool,
     attempt: u8,
     names: FunctionNameMap,
+    adapter: Arc<dyn oag_upstream::ProviderAdapter>,
 ) -> Outcome {
     let account = lease.account.account_id();
     // No `touch_account` here any more. It was a Postgres write awaited
@@ -651,6 +708,7 @@ pub(super) async fn succeeded(
             lease: lease.clone(),
             attempt,
             names,
+            adapter,
         }));
     }
     // The ADAPTER's facts, not the provider's: a Codex seat is
@@ -660,14 +718,15 @@ pub(super) async fn succeeded(
     // the 200 that reached a client as "no completion in it". And asking the
     // client's `stream` flag whether the upstream streamed read that stream
     // as a JSON body, handed the raw `data:` lines back, and metered zero.
-    let adapter = match adapter_for(state, provider, &lease.account) {
-        Ok(adapter) => adapter,
-        Err(e) => return Outcome::Switch(e),
-    };
+    //
+    // And the adapter that sent the request, not one looked up again: an
+    // endpoint removed while its upstream was answering had no adapter left
+    // to find, so a generation already billed was switched away from, sent
+    // to a second credential, and metered once for twice the spend.
     let collected = if adapter.always_streams() {
         let idle = state.config.gateway.stream_idle_timeout;
         let max = state.config.gateway.max_stream_duration;
-        match sse::collect_stream_with(response, adapter, idle, max, names).await {
+        match sse::collect_stream_with(response, Arc::clone(&adapter), idle, max, names).await {
             Ok((events, accumulator)) => Ok((bytes::Bytes::new(), events, accumulator)),
             Err(failure) => return collect_failed(failure),
         }
@@ -687,6 +746,7 @@ pub(super) async fn succeeded(
             accumulator,
             lease: lease.clone(),
             attempt,
+            adapter,
         })),
         Err(e) => Outcome::Switch(e),
     }
@@ -699,7 +759,7 @@ pub(super) async fn succeeded(
 pub(super) fn collect_failed(failure: sse::StreamFailure) -> Outcome {
     let (e, accumulator) = *failure;
     if accumulator.usage().output_tokens > 0 {
-        Outcome::Lost(e, accumulator)
+        Outcome::Lost(e, Box::new(accumulator))
     } else {
         Outcome::Switch(e)
     }

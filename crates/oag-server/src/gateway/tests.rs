@@ -1,7 +1,7 @@
 use super::climb::{MAX_ESCALATIONS, budget_alone_prevented_the_climb, spawn_unserved};
 use super::failover::{
     MAX_RETRY_AFTER, Outcome, Step, TRANSPORT_COOLDOWN, backoff, collect_failed, egress_for,
-    may_try_another, step_for, transport_failure, upstream_retry_after,
+    may_try_another, openai_function_names, step_for, transport_failure, upstream_retry_after,
 };
 use super::plan::parse_ladder;
 use super::respond::{
@@ -1008,6 +1008,126 @@ fn a_binary_framed_upstream_is_never_passed_through() {
 }
 
 #[test]
+fn a_converse_upstream_is_sent_names_it_takes_and_the_client_gets_its_own_back() {
+    // Converse holds a tool name to the OpenAI pattern and its codec
+    // sanitises one that breaks it, so the map that restores the client's
+    // name on the way back has to be the rewriting one. The identity map
+    // handed a connector tool's caller `user-Github_get_file`, which it
+    // cannot dispatch.
+    let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+        "model": "m",
+        "messages": [{ "role": "user", "content": "read it" }],
+        "tools": [{ "type": "function", "function": {
+            "name": "user-Github.get_file", "parameters": { "type": "object" } } }],
+    }))
+    .expect("parses");
+    for (upstream, rewrites) in [
+        (Dialect::BedrockConverse, true),
+        (Dialect::OpenAIChatCompletions, true),
+        (Dialect::OpenAIResponses, true),
+        (Dialect::AnthropicMessages, false),
+        (Dialect::GeminiGenerateContent, false),
+    ] {
+        let names = openai_function_names(&canonical, upstream);
+        assert_eq!(names.rewrites(), rewrites, "{upstream:?}");
+    }
+    let names = openai_function_names(&canonical, Dialect::BedrockConverse);
+    let sent = oag_proto::converse::render_request(&canonical).expect("renders");
+    let wire = sent["toolConfig"]["tools"][0]["toolSpec"]["name"]
+        .as_str()
+        .expect("a name");
+    assert_eq!(
+        names.wire("user-Github.get_file"),
+        wire,
+        "the codec's spelling"
+    );
+    assert_eq!(names.original(wire), "user-Github.get_file");
+}
+
+#[test]
+fn a_converse_upstream_is_sent_ids_it_takes_and_the_client_gets_its_own_back() {
+    // Gemini names a call by its function and a counter, which Converse's
+    // `toolUseId` pattern refuses, so its codec respells one. The map the
+    // failover path hands the accumulator has to be the one that puts the
+    // client's id back, on a whole answer and on a stream.
+    let original = "read_file#1";
+    let canonical = oag_proto::CanonicalRequest {
+        model: "m".to_owned(),
+        system: vec![],
+        messages: vec![
+            oag_proto::Message {
+                role: oag_proto::Role::User,
+                content: vec![oag_proto::ContentBlock::Text {
+                    text: "read it".to_owned(),
+                    cache_control: None,
+                }],
+            },
+            oag_proto::Message {
+                role: oag_proto::Role::Assistant,
+                content: vec![oag_proto::ContentBlock::ToolUse {
+                    id: original.to_owned(),
+                    name: "read_file".to_owned(),
+                    input: serde_json::json!({}),
+                }],
+            },
+        ],
+        tools: vec![],
+        max_tokens: 64,
+        stream: false,
+        temperature: None,
+        thinking_budget: None,
+        thinking_effort: None,
+        client_session: None,
+        tool_choice: None,
+        response_format: None,
+        stop: Vec::new(),
+        previous_response_id: None,
+        passthrough: None,
+    };
+    let sent = oag_proto::converse::render_request(&canonical).expect("renders");
+    let wire = sent["messages"][1]["content"][0]["toolUse"]["toolUseId"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+    assert_ne!(wire, original, "Converse refuses `#` in a toolUseId");
+
+    let names = openai_function_names(&canonical, Dialect::BedrockConverse);
+    let mut whole = oag_proto::converse::parse_response(&serde_json::json!({
+        "output": { "message": { "role": "assistant", "content": [
+            { "toolUse": { "toolUseId": wire, "name": "read_file", "input": {} } },
+        ]}},
+        "stopReason": "tool_use",
+        "usage": { "inputTokens": 3, "outputTokens": 2, "totalTokens": 5 },
+    }));
+    names.restore_in_events(&mut whole);
+    let ids: Vec<&str> = whole
+        .iter()
+        .filter_map(|e| match e {
+            oag_proto::StreamEvent::ToolUseStart { id, .. }
+            | oag_proto::StreamEvent::ToolUseDelta { id, .. }
+            | oag_proto::StreamEvent::ToolUseEnd { id } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, [original; 3], "{whole:?}");
+
+    let mut acc = oag_proto::StreamAccumulator::new().with_function_names(names);
+    let start = serde_json::json!({ "contentBlockStart": {
+        "start": { "toolUse": { "toolUseId": wire, "name": "read_file" } },
+        "contentBlockIndex": 0,
+    }})
+    .to_string();
+    let streamed = oag_proto::converse::parse_event(&start, &mut acc).expect("parses");
+    assert_eq!(
+        streamed,
+        vec![oag_proto::StreamEvent::ToolUseStart {
+            id: original.to_owned(),
+            name: "read_file".to_owned(),
+        }]
+    );
+}
+
+#[test]
 fn a_cross_dialect_pair_selects_the_client_s_renderer() {
     let d = decision_for(oag_core::Provider::Anthropic);
     let e = egress_for(
@@ -1185,12 +1305,13 @@ fn auth_context() -> oag_store::AuthContext {
 
 #[tokio::test]
 async fn streaming_adapter_or_egress_error_releases_slot() {
-    // A provider whose adapter is missing makes the streaming arm fail
-    // *after* a credential has been leased — the same shape as a dialect pair
-    // with no renderer. Both used to return past every release, stranding the
-    // slot for the whole SLOT_TTL; eight of those on one credential and it
-    // answers AtCapacity with nothing in flight.
-    let state = crate::testing::state_without_adapter(oag_core::Provider::Gemini);
+    // A dialect pair with no renderer makes the streaming arm fail *after* a
+    // credential has been leased. That used to return past every release,
+    // stranding the slot for the whole SLOT_TTL; eight of those on one
+    // credential and it answers AtCapacity with nothing in flight. A missing
+    // adapter was the other way there; the attempt now carries the adapter
+    // that sent the request, so there is no lookup left to fail.
+    let state = state();
     let slots = Arc::new(select::testing::CountingSlots::default());
 
     let result = stream_response(
@@ -1198,17 +1319,23 @@ async fn streaming_adapter_or_egress_error_releases_slot() {
         reqwest::Response::from(http::Response::new("stub")),
         select::testing::lease(&slots),
         &auth_context(),
-        &decision_for(oag_core::Provider::Gemini),
+        &decision_for(oag_core::Provider::Anthropic),
         RequestId::new(),
         Instant::now(),
         0,
-        Dialect::AnthropicMessages,
+        Dialect::SystemOne,
         None,
         state.lifecycle.track(),
         oag_proto::FunctionNameMap::identity(),
+        state
+            .adapter(oag_core::Provider::Anthropic)
+            .expect("a built-in adapter"),
     );
 
-    assert!(result.is_err(), "there is no adapter for gemini here");
+    assert!(
+        result.is_err(),
+        "no renderer from Anthropic's dialect into System One's"
+    );
     assert_eq!(slots.settled().await, 1, "and the slot came back");
 }
 
@@ -1241,10 +1368,252 @@ async fn a_live_stream_keeps_its_slot_until_the_pump_is_done() {
         None,
         state.lifecycle.track(),
         oag_proto::FunctionNameMap::identity(),
+        state
+            .adapter(oag_core::Provider::Anthropic)
+            .expect("a built-in adapter"),
     );
 
     assert!(result.is_ok());
     assert_eq!(slots.settled().await, 0, "still in flight");
+}
+
+/// An endpoint whose credential has a request in flight, removed from the
+/// state while the upstream is still answering, and the lease that request
+/// holds: a stand-in that answers `/v1/chat/completions` as `answer` says,
+/// an OpenAI-dialect endpoint in front of it, and its key sealed into the
+/// lease.
+async fn removable_endpoint(
+    name: &str,
+    answer: wiremock::ResponseTemplate,
+    slots: &Arc<select::testing::CountingSlots>,
+) -> (
+    Arc<AppState>,
+    wiremock::MockServer,
+    oag_core::Provider,
+    select::Lease,
+) {
+    use oag_core::provider::{AuthStyle, Endpoint, EndpointRegistry, Platform};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer};
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(answer)
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let state = state();
+    let endpoint =
+        Endpoint::new(name, Dialect::OpenAIChatCompletions, Platform::Plain).expect("a name");
+    let spec = oag_upstream::custom::EndpointSpec::new(
+        endpoint,
+        format!("{}/v1", upstream.uri()),
+        AuthStyle::Bearer,
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .expect("no headers to refuse");
+    let adapter = oag_upstream::custom::adapter(&spec).expect("an adapter");
+    state.apply_endpoints(
+        &EndpointRegistry::default(),
+        vec![(endpoint, crate::state::Served::Chat(adapter))],
+    );
+
+    let mut lease = select::testing::lease(slots);
+    let sealed = state
+        .kek
+        .seal_json(&oag_core::credential::SecretMaterial {
+            access_token: "t5-endpoint-key".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        })
+        .expect("seals");
+    lease.account.provider = name.to_owned();
+    lease.account.credentials_sealed = sealed.ciphertext;
+    lease.account.credentials_nonce = sealed.nonce;
+    (state, upstream, oag_core::Provider::Custom(endpoint), lease)
+}
+
+/// Once the stand-in has the request, and before it answers: the endpoint
+/// is gone from the state, as a reload that no longer finds its row leaves
+/// it.
+async fn remove_once_sent(state: &AppState, upstream: &wiremock::MockServer) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(20);
+    while upstream
+        .received_requests()
+        .await
+        .is_none_or(|received| received.is_empty())
+    {
+        assert!(Instant::now() < deadline, "the request was never sent");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    state.apply_endpoints(&oag_core::provider::EndpointRegistry::default(), Vec::new());
+}
+
+fn chat(model: &str, stream: bool) -> oag_proto::CanonicalRequest {
+    oag_proto::openai::parse_request(&serde_json::json!({
+        "model": model,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .expect("parses")
+}
+
+/// C5. An endpoint removed between sending a request and its answer: the
+/// answer is read by the adapter that sent it, and handed on with its usage
+/// to be metered. Looked up again, the adapter was gone, and the request
+/// switched to another credential after a generation the upstream had
+/// already billed, which no ledger row then counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_is_read_by_the_adapter_that_sent_it_after_its_endpoint_is_removed() {
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let (state, upstream, provider, lease) = removable_endpoint(
+        "t5-removed-midway",
+        wiremock::ResponseTemplate::new(200)
+            .set_delay(std::time::Duration::from_secs(2))
+            .set_body_json(serde_json::json!({
+                "id": "chatcmpl-t5",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "m",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "billed once"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+            })),
+        &slots,
+    )
+    .await;
+    let decision = decision_for(provider);
+    let canonical = chat("t5-removed-midway/m", false);
+
+    let sending = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            super::failover::try_credential(
+                &state,
+                &decision,
+                &canonical,
+                &lease,
+                RequestId::new(),
+                0,
+                uuid::Uuid::nil(),
+            )
+            .await
+        })
+    };
+    remove_once_sent(&state, &upstream).await;
+    assert!(state.adapter(provider).is_err(), "removed from the state");
+
+    let attempt = match sending.await.expect("joins") {
+        Outcome::Ok(attempt) => attempt,
+        Outcome::Switch(e) | Outcome::Lost(e, _) | Outcome::Escalate(e) | Outcome::Fatal(e) => {
+            panic!("a billed answer was not handed on: {e}")
+        }
+        Outcome::Raced => panic!("raced"),
+    };
+    let super::failover::Attempt::Collected {
+        events,
+        accumulator,
+        ..
+    } = *attempt
+    else {
+        panic!("a JSON answer is collected");
+    };
+    assert!(format!("{events:?}").contains("billed once"), "{events:?}");
+    assert_eq!(
+        accumulator.usage().output_tokens,
+        2,
+        "with the usage the ledger meters"
+    );
+    upstream.verify().await;
+}
+
+/// C5, streamed: the stream is relayed by the adapter that sent the request,
+/// though its endpoint was removed while the upstream was generating. Looked
+/// up again, the adapter was gone, and a stream the upstream was already
+/// billing was refused, with nothing metered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_is_relayed_by_the_adapter_that_sent_it_after_its_endpoint_is_removed() {
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let sse = concat!(
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",",
+        "\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"streamed once\"},",
+        "\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",",
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],",
+        "\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (state, upstream, provider, lease) = removable_endpoint(
+        "t5-removed-streaming",
+        wiremock::ResponseTemplate::new(200)
+            .set_delay(std::time::Duration::from_secs(2))
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(sse),
+        &slots,
+    )
+    .await;
+    let decision = decision_for(provider);
+    let canonical = chat("t5-removed-streaming/m", true);
+
+    let sending = {
+        let (state, decision) = (Arc::clone(&state), decision.clone());
+        tokio::spawn(async move {
+            super::failover::try_credential(
+                &state,
+                &decision,
+                &canonical,
+                &lease,
+                RequestId::new(),
+                0,
+                uuid::Uuid::nil(),
+            )
+            .await
+        })
+    };
+    remove_once_sent(&state, &upstream).await;
+
+    let Outcome::Ok(attempt) = sending.await.expect("joins") else {
+        panic!("a streamed answer is handed on");
+    };
+    let super::failover::Attempt::Streaming {
+        response,
+        lease,
+        attempt,
+        names,
+        adapter,
+    } = *attempt
+    else {
+        panic!("a stream is not collected");
+    };
+    let relayed = stream_response(
+        &state,
+        response,
+        lease,
+        &auth_context(),
+        &decision,
+        RequestId::new(),
+        Instant::now(),
+        attempt,
+        Dialect::OpenAIChatCompletions,
+        None,
+        state.lifecycle.track(),
+        names,
+        adapter,
+    )
+    .expect("relayed though its endpoint is gone");
+    let body = axum::body::to_bytes(relayed.into_body(), 1 << 20)
+        .await
+        .expect("the whole stream");
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("streamed once"), "{text}");
+    upstream.verify().await;
 }
 
 #[test]
@@ -1738,4 +2107,571 @@ fn a_conversation_id_is_stable_and_names_only_its_conversation() {
     assert_ne!(one, conversation_id(&key("alice", "conv-2")));
     assert_ne!(one, conversation_id(&key("bob", "conv-1")));
     assert_eq!(one.get_version_num(), 5, "derived, not random");
+}
+
+/// An endpoint's adapter whose credential is not the one stored: it swaps the
+/// stored key for `prepared`, or fails to, and records what `build` is handed.
+#[derive(Debug)]
+struct Preparing {
+    endpoint: oag_core::provider::Endpoint,
+    prepared: std::result::Result<&'static str, &'static str>,
+    built_with: std::sync::Mutex<Vec<String>>,
+    /// The proxy each preparation was handed.
+    proxied: std::sync::Mutex<Vec<Option<String>>>,
+}
+
+#[async_trait::async_trait]
+impl oag_upstream::ProviderAdapter for Preparing {
+    fn provider(&self) -> oag_core::Provider {
+        oag_core::Provider::Custom(self.endpoint)
+    }
+
+    fn build(&self, req: &oag_upstream::UpstreamRequest<'_>) -> Result<reqwest::Request> {
+        self.built_with
+            .lock()
+            .expect("unpoisoned")
+            .push(req.credential.access_token.clone());
+        Err(Error::Internal("built; nothing to send".to_owned()))
+    }
+
+    fn parse_event(
+        &self,
+        _raw: &str,
+        _acc: &mut oag_proto::StreamAccumulator,
+    ) -> Result<Vec<oag_proto::StreamEvent>> {
+        Ok(Vec::new())
+    }
+
+    async fn prepare_credential<'a>(
+        &'a self,
+        _account: AccountId,
+        stored: &'a oag_core::credential::SecretMaterial,
+        proxy: Option<&str>,
+    ) -> Result<std::borrow::Cow<'a, oag_core::credential::SecretMaterial>> {
+        self.proxied
+            .lock()
+            .expect("unpoisoned")
+            .push(proxy.map(str::to_owned));
+        match self.prepared {
+            Ok(token) => {
+                let mut minted = stored.clone();
+                minted.access_token = token.to_owned();
+                Ok(std::borrow::Cow::Owned(minted))
+            }
+            Err(why) => Err(Error::Internal(why.to_owned())),
+        }
+    }
+}
+
+/// The proxy the credential `try_prepared` leases is configured with.
+const PREPARED_PROXY: &str = "http://t10-proxy.invalid:3128";
+
+/// One `try_credential` over a sealed `stored-key` credential, whose proxy is
+/// [`PREPARED_PROXY`], for an endpoint served by a [`Preparing`] adapter; what
+/// came of it, and every credential `build` was handed.
+async fn try_prepared(
+    prepared: std::result::Result<&'static str, &'static str>,
+) -> (Outcome, Vec<String>) {
+    use oag_core::provider::{Endpoint, EndpointRegistry, Platform};
+    let endpoint = Endpoint::new(
+        "t4-prepare",
+        Dialect::OpenAIChatCompletions,
+        Platform::Plain,
+    )
+    .expect("a name");
+    let adapter = Arc::new(Preparing {
+        endpoint,
+        prepared,
+        built_with: std::sync::Mutex::default(),
+        proxied: std::sync::Mutex::default(),
+    });
+    let state = state();
+    state.apply_endpoints(
+        &EndpointRegistry::default(),
+        vec![(
+            endpoint,
+            crate::state::Served::Chat(
+                Arc::clone(&adapter) as Arc<dyn oag_upstream::ProviderAdapter>
+            ),
+        )],
+    );
+
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let mut lease = select::testing::lease(&slots);
+    let sealed = state
+        .kek
+        .seal_json(&oag_core::credential::SecretMaterial {
+            access_token: "stored-key".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        })
+        .expect("seals");
+    lease.account.provider = endpoint.name().to_owned();
+    lease.account.credentials_sealed = sealed.ciphertext;
+    lease.account.credentials_nonce = sealed.nonce;
+    lease.account.proxy_url = Some(PREPARED_PROXY.to_owned());
+
+    let canonical = oag_proto::CanonicalRequest {
+        model: "t4-prepare/m".to_owned(),
+        system: vec![],
+        messages: vec![],
+        tools: vec![],
+        max_tokens: 16,
+        stream: false,
+        temperature: None,
+        thinking_budget: None,
+        thinking_effort: None,
+        client_session: None,
+        tool_choice: None,
+        response_format: None,
+        stop: Vec::new(),
+        previous_response_id: None,
+        passthrough: None,
+    };
+    let outcome = super::failover::try_credential(
+        &state,
+        &decision_for(oag_core::Provider::Custom(endpoint)),
+        &canonical,
+        &lease,
+        RequestId::new(),
+        0,
+        uuid::Uuid::nil(),
+    )
+    .await;
+    let built_with = adapter.built_with.lock().expect("unpoisoned").clone();
+    // Asked of every preparation, refused or not: a mint is a call made with
+    // the credential, so it leaves through the credential's proxy.
+    assert_eq!(
+        *adapter.proxied.lock().expect("unpoisoned"),
+        [Some(PREPARED_PROXY.to_owned())],
+        "the credential's own proxy is handed to its preparation"
+    );
+    (outcome, built_with)
+}
+
+/// The request is built with the credential the adapter prepared, not the
+/// one stored: what a Vertex endpoint needs, a minted token in place of the
+/// service account's key.
+#[tokio::test]
+async fn a_request_is_built_with_the_credential_its_adapter_prepared() {
+    let (outcome, built_with) = try_prepared(Ok("minted-token")).await;
+    assert_eq!(built_with, ["minted-token"]);
+    assert!(
+        matches!(outcome, Outcome::Fatal(Error::Internal(ref m)) if m == "built; nothing to send"),
+        "the build's own error, so it was the build that stopped it"
+    );
+}
+
+/// A credential that cannot be prepared is a credential that failed: the
+/// request moves on to the next one, and nothing is built with this one.
+#[tokio::test]
+async fn a_credential_that_cannot_be_prepared_fails_over_to_the_next() {
+    let (outcome, built_with) = try_prepared(Err("token mint refused")).await;
+    assert!(built_with.is_empty(), "built with {built_with:?}");
+    assert!(
+        matches!(outcome, Outcome::Switch(Error::Internal(ref m)) if m == "token mint refused"),
+        "a failed preparation switches credentials, carrying its own error"
+    );
+}
+
+/// A credential that cannot mint sits out a cooldown, through the one every
+/// upstream failure writes, so the requests after this one go to another
+/// credential first: ten minutes for a key Google refuses, which stays
+/// refused until an operator replaces it, and thirty seconds for a token
+/// endpoint that could not be reached, which may answer the next time.
+///
+/// Against Postgres, because a cooldown is a row; skipped without one.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_credential_that_cannot_mint_sits_out_a_cooldown() {
+    use oag_core::provider::{AuthStyle, Endpoint, EndpointRegistry, Platform};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let Some(state) = crate::testing::live_state().await else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+        return;
+    };
+    let google = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "Invalid JWT Signature.",
+        })))
+        .mount(&google)
+        .await;
+
+    // The seconds of cooldown each failure earns, give or take a slow
+    // machine: refused by Google, and Google out of reach.
+    for (token_url, cooldown) in [
+        (format!("{}/token", google.uri()), 600),
+        ("http://127.0.0.1:1/token".to_owned(), 30),
+    ] {
+        let endpoint = Endpoint::new(
+            "t2-cooling-vertex",
+            Dialect::GeminiGenerateContent,
+            Platform::Gcp,
+        )
+        .expect("a name");
+        let tokens = Arc::new(
+            oag_upstream::gcp_token::GcpTokenCache::new(token_url.as_str()).expect("a token URL"),
+        );
+        let spec = oag_upstream::custom::EndpointSpec::new(
+            endpoint,
+            "http://127.0.0.1:1",
+            AuthStyle::Bearer,
+            std::iter::empty::<(&str, &str)>(),
+        )
+        .expect("no headers to refuse")
+        .with_region(Some("global".to_owned()))
+        .with_project(Some("oag-test".to_owned()))
+        .with_gcp_tokens(tokens);
+        let adapter = oag_upstream::custom::adapter(&spec).expect("a gcp adapter");
+        state.apply_endpoints(
+            &EndpointRegistry::default(),
+            vec![(endpoint, crate::state::Served::Chat(adapter))],
+        );
+
+        let sealed = state
+            .kek
+            .seal_json(&oag_core::credential::SecretMaterial {
+                access_token: serde_json::json!({
+                    "type": "service_account",
+                    "private_key_id": "t2",
+                    "private_key": oag_upstream::gcp_token::TEST_KEY_PEM,
+                    "client_email": "t2-cooling@oag-test.invalid",
+                })
+                .to_string(),
+                refresh_token: None,
+                expires_at: None,
+                version: 0,
+                client_id: None,
+                account_id: None,
+            })
+            .expect("seals");
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce) VALUES (gen_random_uuid(), 't2-' || gen_random_uuid(), \
+             $1, 'service_account', $2, $3) RETURNING id",
+        )
+        .bind(endpoint.name())
+        .bind(&sealed.ciphertext)
+        .bind(&sealed.nonce)
+        .fetch_one(state.db.pool())
+        .await
+        .expect("an account");
+        let slots = Arc::new(select::testing::CountingSlots::default());
+        let mut lease = select::testing::lease(&slots);
+        lease.account.id = id;
+        lease.account.provider = endpoint.name().to_owned();
+        lease.account.kind = "service_account".to_owned();
+        lease.account.credentials_sealed = sealed.ciphertext;
+        lease.account.credentials_nonce = sealed.nonce;
+
+        let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+            "model": "t2-cooling-vertex/m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("parses");
+        let outcome = super::failover::try_credential(
+            &state,
+            &decision_for(oag_core::Provider::Custom(endpoint)),
+            &canonical,
+            &lease,
+            RequestId::new(),
+            0,
+            uuid::Uuid::nil(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, Outcome::Switch(_)),
+            "a credential that cannot mint moves the request on"
+        );
+
+        let (from, to): (Option<bool>, Option<bool>) = sqlx::query_as(
+            "SELECT cooldown_until > now() + make_interval(secs => $2), \
+                    cooldown_until < now() + make_interval(secs => $3) \
+             FROM account WHERE id = $1",
+        )
+        .bind(id)
+        .bind(f64::from(cooldown) * 0.75)
+        .bind(f64::from(cooldown) * 1.25)
+        .fetch_one(state.db.pool())
+        .await
+        .expect("the account");
+        assert_eq!(
+            (from, to),
+            (Some(true), Some(true)),
+            "{cooldown}s of cooldown, from {token_url}"
+        );
+    }
+}
+
+/// A token Vertex refuses with a 401 is not sent again: the next request on
+/// that credential mints a new one. Without that, the refused token was
+/// handed back from the cache for the rest of its hour, every request on the
+/// credential refused in turn.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_token_vertex_refuses_is_minted_again_for_the_next_request() {
+    use oag_core::provider::{AuthStyle, Endpoint, EndpointRegistry, Platform};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (google, vertex) = (MockServer::start().await, MockServer::start().await);
+    for (token, once) in [("ya29.t13-refused", true), ("ya29.t13-fresh", false)] {
+        let mock = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": token,
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            })))
+            .expect(1);
+        let mock = if once { mock.up_to_n_times(1) } else { mock };
+        mock.mount(&google).await;
+    }
+    let at = "/v1/projects/oag-test/locations/global/publishers/google/models/m:generateContent";
+    Mock::given(method("POST"))
+        .and(path(at))
+        .and(header("authorization", "Bearer ya29.t13-refused"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": { "code": 401, "status": "UNAUTHENTICATED",
+                       "message": "Request had invalid authentication credentials." }
+        })))
+        .expect(1)
+        .mount(&vertex)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(at))
+        .and(header("authorization", "Bearer ya29.t13-fresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hello again"}]},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5}
+        })))
+        .expect(1)
+        .mount(&vertex)
+        .await;
+
+    let state = crate::testing::state(&format!(
+        "gateway:\n  gcp_token_url: \"{}/token\"\n",
+        google.uri()
+    ));
+    let endpoint = Endpoint::new(
+        "t13-refused-vertex",
+        Dialect::GeminiGenerateContent,
+        Platform::Gcp,
+    )
+    .expect("a name");
+    let spec = oag_upstream::custom::EndpointSpec::new(
+        endpoint,
+        vertex.uri(),
+        AuthStyle::Bearer,
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .expect("no headers to refuse")
+    .with_region(Some("global".to_owned()))
+    .with_project(Some("oag-test".to_owned()))
+    .with_gcp_tokens(Arc::clone(&state.gcp_tokens));
+    let adapter = oag_upstream::custom::adapter(&spec).expect("a gcp adapter");
+    state.apply_endpoints(
+        &EndpointRegistry::default(),
+        vec![(endpoint, crate::state::Served::Chat(adapter))],
+    );
+
+    let sa_json = serde_json::json!({
+        "type": "service_account",
+        "private_key_id": "t13",
+        "private_key": oag_upstream::gcp_token::TEST_KEY_PEM,
+        "client_email": "t13-refused@oag-test.invalid",
+    })
+    .to_string();
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let mut lease = select::testing::lease(&slots);
+    let sealed = state
+        .kek
+        .seal_json(&oag_core::credential::SecretMaterial {
+            access_token: sa_json,
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        })
+        .expect("seals");
+    lease.account.provider = endpoint.name().to_owned();
+    lease.account.kind = "service_account".to_owned();
+    lease.account.credentials_sealed = sealed.ciphertext;
+    lease.account.credentials_nonce = sealed.nonce;
+
+    let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+        "model": "t13-refused-vertex/m",
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .expect("parses");
+    let decision = decision_for(oag_core::Provider::Custom(endpoint));
+    let attempt = || {
+        super::failover::try_credential(
+            &state,
+            &decision,
+            &canonical,
+            &lease,
+            RequestId::new(),
+            0,
+            uuid::Uuid::nil(),
+        )
+    };
+    let refused = attempt().await;
+    assert!(
+        matches!(
+            refused,
+            Outcome::Switch(Error::Upstream { status: 401, .. })
+        ),
+        "the 401 moves the request on"
+    );
+    let Outcome::Ok(answered) = attempt().await else {
+        panic!("the next request was sent the refused token again");
+    };
+    assert!(matches!(
+        *answered,
+        super::failover::Attempt::Collected { .. }
+    ));
+    google.verify().await;
+    vertex.verify().await;
+}
+
+/// A Vertex endpoint's request through `try_credential`, against a stand-in
+/// token endpoint and a stand-in Vertex, with no database behind it: the
+/// stored service-account key is minted into a token through the state's one
+/// cache, the token reaches the model's exact path as a bearer, and a second
+/// request on the same credential is sent the same token without a second
+/// mint.
+///
+/// Built through the endpoint factory, as a reload builds it, so a request
+/// that skipped `prepare_credential` would be built with the key: refused by
+/// the adapter, and this test fails.
+// Long for its setup: two stand-ins, an endpoint and a sealed key.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_vertex_request_is_sent_the_token_minted_from_its_key() {
+    use oag_core::provider::{AuthStyle, Endpoint, EndpointRegistry, Platform};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let (google, vertex) = (MockServer::start().await, MockServer::start().await);
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "ya29.t10-failover",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        })))
+        .expect(1)
+        .mount(&google)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/projects/oag-test/locations/global/publishers/google/models/m:generateContent",
+        ))
+        .and(header("authorization", "Bearer ya29.t10-failover"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hello from vertex"}]},
+                "finishReason": "STOP",
+                "index": 0
+            }],
+            "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 4, "totalTokenCount": 7}
+        })))
+        .expect(2)
+        .mount(&vertex)
+        .await;
+
+    let state = crate::testing::state(&format!(
+        "gateway:\n  gcp_token_url: \"{}/token\"\n",
+        google.uri()
+    ));
+    let endpoint = Endpoint::new(
+        "t10-try-vertex",
+        Dialect::GeminiGenerateContent,
+        Platform::Gcp,
+    )
+    .expect("a name");
+    let spec = oag_upstream::custom::EndpointSpec::new(
+        endpoint,
+        vertex.uri(),
+        AuthStyle::Bearer,
+        std::iter::empty::<(&str, &str)>(),
+    )
+    .expect("no headers to refuse")
+    .with_region(Some("global".to_owned()))
+    .with_project(Some("oag-test".to_owned()))
+    .with_gcp_tokens(Arc::clone(&state.gcp_tokens));
+    let adapter = oag_upstream::custom::adapter(&spec).expect("a gcp adapter");
+    state.apply_endpoints(
+        &EndpointRegistry::default(),
+        vec![(endpoint, crate::state::Served::Chat(adapter))],
+    );
+
+    let sa_json = serde_json::json!({
+        "type": "service_account",
+        "private_key_id": "t10",
+        "private_key": oag_upstream::gcp_token::TEST_KEY_PEM,
+        "client_email": "t10-try@oag-test.invalid",
+    })
+    .to_string();
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let mut lease = select::testing::lease(&slots);
+    let sealed = state
+        .kek
+        .seal_json(&oag_core::credential::SecretMaterial {
+            access_token: sa_json,
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        })
+        .expect("seals");
+    lease.account.provider = endpoint.name().to_owned();
+    lease.account.kind = "service_account".to_owned();
+    lease.account.credentials_sealed = sealed.ciphertext;
+    lease.account.credentials_nonce = sealed.nonce;
+
+    let canonical = oag_proto::openai::parse_request(&serde_json::json!({
+        "model": "t10-try-vertex/m",
+        "messages": [{"role": "user", "content": "hi"}],
+    }))
+    .expect("parses");
+    for request in 0..2 {
+        let outcome = super::failover::try_credential(
+            &state,
+            &decision_for(oag_core::Provider::Custom(endpoint)),
+            &canonical,
+            &lease,
+            RequestId::new(),
+            0,
+            uuid::Uuid::nil(),
+        )
+        .await;
+        let Outcome::Ok(attempt) = outcome else {
+            panic!("request {request} was not answered");
+        };
+        let super::failover::Attempt::Collected { events, .. } = *attempt else {
+            panic!("request {request}: a JSON answer is collected");
+        };
+        assert!(
+            format!("{events:?}").contains("hello from vertex"),
+            "request {request}: {events:?}"
+        );
+    }
+    google.verify().await;
+    vertex.verify().await;
 }

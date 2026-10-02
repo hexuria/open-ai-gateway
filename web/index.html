@@ -39,11 +39,11 @@
   .pill { display:inline-block; padding:1px 8px; border-radius:99px;
           font-size:12px; border:1px solid var(--line); }
   .scroll { overflow-x:auto; }
-  input, select { background:var(--panel); border:1px solid var(--line); color:var(--fg);
+  input, select, textarea { background:var(--panel); border:1px solid var(--line); color:var(--fg);
           padding:7px 10px; border-radius:7px; font:inherit; min-width:260px; }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:end; }
   .field { display:flex; flex-direction:column; gap:4px; }
-  .field input, .field select { min-width:160px; }
+  .field input, .field select, .field textarea { min-width:160px; }
   .field .wide { min-width:240px; }
   .note { color:var(--dim); font-size:13px; margin:0 0 12px; }
   a.dash { color:var(--accent); }
@@ -190,6 +190,61 @@
       </div>
     </div>
     <div class="scroll"><table id="services"></table></div>
+
+    <h2>Endpoints</h2>
+    <p class="note">Upstreams you register: any host that speaks a dialect this gateway
+      serves, under a name that becomes its models' prefix (<code>merge/…</code>). Its keys
+      are credentials filed under that name and its models are catalog rows — add them with
+      <code>oag admin account add --provider &lt;name&gt;</code> and
+      <code>oag admin catalog add</code>. Headers are stored in the clear, so never put a key
+      in one. Check asks the endpoint for its model list with no key: most answer 401,
+      which still says the host is there.</p>
+    <div class="card" style="margin-bottom:16px">
+      <div class="row">
+        <div class="field"><label class="label" for="ep-name">Name</label>
+          <input id="ep-name" placeholder="merge"></div>
+        <div class="field"><label class="label" for="ep-dialect">Dialect</label>
+          <select id="ep-dialect">
+            <option value="openai">openai</option>
+            <option value="anthropic">anthropic</option>
+            <option value="gemini">gemini</option>
+            <option value="system_one">system_one</option>
+            <option value="bedrock_converse">bedrock_converse</option>
+          </select></div>
+        <div class="field"><label class="label" for="ep-platform">Platform</label>
+          <select id="ep-platform">
+            <option value="plain">plain</option>
+            <option value="azure">azure</option>
+            <option value="aws">aws</option>
+            <option value="gcp">gcp</option>
+          </select></div>
+        <div class="field"><label class="label" for="ep-base">Base URL</label>
+          <input id="ep-base" class="wide" placeholder="https://api-gateway.merge.dev/v1/openai"></div>
+        <div class="field"><label class="label" for="ep-auth">Auth</label>
+          <select id="ep-auth">
+            <option value="">platform default</option>
+            <option value="bearer">bearer</option>
+            <option value="x_api_key">x_api_key</option>
+            <option value="x_goog_api_key">x_goog_api_key</option>
+            <option value="api_key_header">api_key_header</option>
+            <option value="none">none</option>
+          </select></div>
+        <div class="field"><label class="label" for="ep-headers">Headers</label>
+          <textarea id="ep-headers" class="wide" rows="1"
+            placeholder="X-Project-Id=…  (one per line)"></textarea></div>
+        <div class="field"><label class="label" for="ep-region">Region</label>
+          <input id="ep-region" placeholder="aws and gcp"></div>
+        <div class="field"><label class="label" for="ep-project">Project</label>
+          <input id="ep-project" placeholder="gcp"></div>
+        <div class="field"><label class="label" for="ep-version">API version</label>
+          <input id="ep-version" placeholder="optional"></div>
+        <div class="field"><label class="label" for="ep-display">Display name</label>
+          <input id="ep-display" placeholder="Merge Gateway"></div>
+        <button id="ep-add" type="button">Add</button>
+      </div>
+    </div>
+    <div class="scroll"><table id="endpoints"></table></div>
+    <p class="note" id="ep-result"></p>
 
     <h2>Providers</h2>
     <p class="note">What this build can reach, beside what you have registered.
@@ -347,11 +402,12 @@ function subscription(s) {
 async function load() {
   $('err').textContent = '';
   try {
-    const [s, accounts, keys, routes, usage, services, providers, models] = await Promise.all([
+    const [s, accounts, keys, routes, usage, services, providers, models, endpoints] = await Promise.all([
       get('/admin/api/summary?' + periodQuery()),
       get('/admin/api/accounts'), get('/admin/api/keys'),
       get('/admin/api/routes'), get('/admin/api/usage?limit=25'),
       get('/admin/api/services'), get('/admin/api/providers'), get('/admin/api/models'),
+      get('/admin/api/endpoints'),
     ]);
     localStorage.setItem('oag_key', $('key').value);
     $('periods').hidden = false;
@@ -466,6 +522,33 @@ async function load() {
             : btn('svc-enable', s.id, 'Enable', 'btn-quiet'),
         ].join(' ') },
     ], services);
+
+    // Header names only: the values are the endpoint's business, and a value
+    // whose name looks secret arrives redacted anyway. Keys counts the ones in
+    // rotation over all of them, because a key that is disabled serves nothing.
+    table($('endpoints'), [
+      { h:'Name', f:e => `<code>${esc(e.name)}</code>` +
+          (e.display_name ? `<span class="reason">${esc(e.display_name)}</span>` : '') },
+      { h:'Dialect', f:e => `<span class="pill">${esc(e.dialect)}</span>` },
+      { h:'Platform', f:e => `<span class="pill">${esc(e.platform)}</span>` },
+      { h:'Where', f:e => `<code>${esc(e.base_url
+          || [e.project, e.region].filter(Boolean).join(' in ') || '—')}</code>` },
+      { h:'Auth', f:e => esc(e.auth) },
+      { h:'Headers', f:e => Object.keys(e.extra_headers || {})
+          .map(k => `<span class="pill">${esc(k)}</span>`).join(' ') || '—' },
+      { h:'Keys', f:e => `${e.schedulable_accounts}/${e.accounts}`, num:true },
+      { h:'Models', f:e => e.models, num:true },
+      { h:'On a ladder', f:e => e.on_ladder, num:true },
+      // A row the gateway skips says why, rather than sitting in the table
+      // looking like one that works.
+      { h:'Served', f:e => e.served
+          ? '<span class="pill good">yes</span>'
+          : `<span class="pill bad">no</span><span class="reason">${esc(e.problem)}</span>` },
+      { h:'', f:e => [
+          btn('ep-check', e.name, 'Check', 'btn-quiet'),
+          btn('ep-remove', e.name, 'Remove', 'btn-danger'),
+        ].join(' ') },
+    ], endpoints);
 
     table($('providers'), [
       { h:'Provider', f:p => `${esc(p.display_name)} <code>${esc(p.provider)}</code>` +
@@ -608,6 +691,36 @@ document.querySelector('main').addEventListener('click', async e => {
   }
 });
 
+// The endpoint verbs take a branch of their own too: a check answers with
+// something to show rather than a change to reload, and a removal is a DELETE.
+// A removal an endpoint's keys or models still block comes back 409, and the
+// error bar says what holds it.
+document.querySelector('main').addEventListener('click', async e => {
+  const act = e.target.dataset?.act;
+  if (act !== 'ep-check' && act !== 'ep-remove') return;
+  const name = e.target.dataset.id;
+  const path = '/admin/api/endpoints/' + encodeURIComponent(name);
+  if (act === 'ep-remove' && !confirm(`Remove endpoint ${name}?`)) return;
+  $('err').textContent = '';
+  e.target.disabled = true;
+  try {
+    if (act === 'ep-check') {
+      const r = await send('POST', path + '/check');
+      $('ep-result').textContent = r.ok
+        ? `${name}: answered ${r.status}, ${r.models} model(s) listed` +
+          (r.more ? ', and more on pages not read' : '')
+        : `${name}: ${r.error}`;
+      e.target.disabled = false;
+    } else {
+      await send('DELETE', path);
+      await load();
+    }
+  } catch (err) {
+    $('err').textContent = err.message;
+    e.target.disabled = false;
+  }
+});
+
 document.querySelector('main').addEventListener('click', async e => {
   const act = e.target.dataset?.act;
   if (!act || !ACTIONS[act]) return;
@@ -639,6 +752,47 @@ $('svc-add').addEventListener('click', async () => {
     $('svc-base').value = '';
     $('svc-dash').value = '';
     $('svc-auth').value = '';
+    await load();
+  } catch (err) {
+    $('err').textContent = err.message;
+  }
+});
+
+$('ep-add').addEventListener('click', async () => {
+  $('err').textContent = '';
+  // One header per line, as Name=value. Lines, because a value may hold the
+  // commas and semicolons any other separator would be. A line is never echoed
+  // back: whatever follows its `=` may be something that should not be shown.
+  const headers = {};
+  for (const line of $('ep-headers').value.split('\n')) {
+    if (!line.trim()) continue;
+    const at = line.indexOf('=');
+    if (at < 1 || !line.slice(0, at).trim()) {
+      $('err').textContent = 'every header line is Name=value';
+      return;
+    }
+    headers[line.slice(0, at).trim()] = line.slice(at + 1).trim();
+  }
+  const optional = id => $(id).value.trim() || null;
+  try {
+    await send('POST', '/admin/api/endpoints', {
+      name: $('ep-name').value.trim(),
+      dialect: $('ep-dialect').value,
+      platform: $('ep-platform').value,
+      base_url: optional('ep-base'),
+      // Left out, the platform's own style: bearer on plain and gcp,
+      // api_key_header on azure, none on aws.
+      auth: $('ep-auth').value || null,
+      extra_headers: headers,
+      region: optional('ep-region'),
+      project: optional('ep-project'),
+      api_version: optional('ep-version'),
+      display_name: optional('ep-display'),
+    });
+    for (const id of ['ep-name', 'ep-base', 'ep-headers', 'ep-region', 'ep-project',
+                      'ep-version', 'ep-display']) {
+      $(id).value = '';
+    }
     await load();
   } catch (err) {
     $('err').textContent = err.message;

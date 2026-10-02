@@ -66,7 +66,9 @@ moka = { version = "0.12", features = ["future"] }
 
 # ── serialisation and core types ───────────────────────────────────────────────
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# `raw_value`: the System One route renames a request's model and copies every
+# other member as the bytes it arrived in.
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 serde_yaml_ng = "0.10"
 thiserror = "2"
 async-trait = "0.1"
@@ -90,6 +92,10 @@ chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.10"
 base64 = "0.22"
+# RS256 for the JWT a Google service account signs to get an access token
+# (`oag-upstream/src/gcp_token.rs`). Already in the tree as rustls' crypto
+# provider; named here at the version the lockfile holds, so no crate is added.
+ring = "0.17.14"
 
 # ── observability ──────────────────────────────────────────────────────────────
 tracing = "0.1"
@@ -134,6 +140,9 @@ must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
+# New in 1.99 (pedantic): wants `assert_eq!(x, [] as [T; 0])` for
+# `assert!(x.is_empty())`, which reads worse and drops the message.
+assert_is_empty = "allow"
 
 [profile.release]
 lto = "thin"

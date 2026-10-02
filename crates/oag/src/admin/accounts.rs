@@ -174,6 +174,7 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
         name,
         provider,
         secret,
+        secret_file,
         from,
         from_grok,
         from_codex,
@@ -213,8 +214,13 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
 
     let max_concurrency = max_concurrency.unwrap_or_else(|| default_concurrency(source));
 
-    // Only after the conflict check, so the fallback cannot resurrect it.
-    let secret = secret.or_else(|| std::env::var("OAG_ACCOUNT_SECRET").ok());
+    // Only after the conflict check, so the fallback cannot resurrect it. A
+    // file and a typed secret cannot both be given: clap refuses the pair.
+    let secret = match (secret, secret_file) {
+        (Some(typed), _) => Some(typed),
+        (None, Some(path)) => Some(read_secret_file(&path)?),
+        (None, None) => std::env::var("OAG_ACCOUNT_SECRET").ok(),
+    };
     match source {
         Some(AccountSource::Grok) => {
             import_grok(
@@ -249,7 +255,7 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
                 return Err(oag_core::Error::Config(
                     "--provider and --secret are required without --from. The secret may \
                      come from OAG_ACCOUNT_SECRET instead of the flag, which keeps it out \
-                     of shell history."
+                     of shell history, or from a file with --secret-file."
                         .to_owned(),
                 ));
             };
@@ -268,6 +274,13 @@ pub(super) async fn add_account_from_args(db: &Db, kek: &Kek, args: AccountAddAr
             .await
         }
     }
+}
+
+/// The secret in the file at `path`, whole: a service account's JSON key
+/// spans many lines. Its contents are never part of an error.
+pub(super) fn read_secret_file(path: &str) -> Result<String> {
+    std::fs::read_to_string(path)
+        .map_err(|e| oag_core::Error::Config(format!("reading --secret-file {path}: {e}")))
 }
 
 type AccountListRow = (
@@ -437,7 +450,21 @@ pub(super) async fn add_account(
 ) -> Result<()> {
     // Validate before storing, so a typo fails here rather than on the first
     // request with an opaque upstream 404.
-    let provider: oag_core::Provider = provider.parse()?;
+    let provider = parse_provider(db, provider).await?;
+    // The kind this provider takes a plain secret as: an API key everywhere
+    // but an endpoint on AWS (a packed Bedrock key) or on GCP (a service
+    // account's JSON).
+    let kind = provider.support().credential_kinds[0];
+    // A service account's key is read now as the gateway's mint will read it,
+    // so a key that could never mint a token is refused here rather than on
+    // every request after. What it answers with is the account's email, which
+    // is no secret; nothing of the key is printed.
+    let service_account = if kind == oag_core::credential::CredentialKind::ServiceAccount {
+        Some(oag_upstream::gcp_token::check_key(secret)?)
+    } else {
+        None
+    };
+    let kind = kind.to_string();
 
     let material = SecretMaterial {
         access_token: secret.to_owned(),
@@ -454,7 +481,7 @@ pub(super) async fn add_account(
         kek,
         name,
         provider,
-        "api_key",
+        &kind,
         &material,
         route,
         max_concurrency,
@@ -465,11 +492,58 @@ pub(super) async fn add_account(
     .await?;
 
     println!("account {name} ({provider}) -> {id}");
+    if let Some(email) = service_account {
+        println!("  the service account {email}; its key is never shown");
+    }
     println!(
         "  sealed at rest, attached to route '{route}', {}",
         scope_of(owner_id)
     );
     Ok(())
+}
+
+/// `name` as a provider: a built-in, or an endpoint in the `endpoint` table.
+///
+/// An endpoint's name parses only once it is registered, and a CLI process
+/// registers nothing on its own. So a name no built-in answers to has the
+/// table read first, through the mapping the gateway's reload uses: a row
+/// that breaks one of its rules is not registered here either, and the refusal
+/// names the rule rather than calling the endpoint unknown. Two things the
+/// mapping cannot judge are left to the gateway when it loads the row: whether
+/// each extra header may be sent, and whether this build has an adapter for
+/// the endpoint's platform.
+pub(super) async fn parse_provider(db: &Db, name: &str) -> Result<oag_core::Provider> {
+    if let Ok(provider) = name.parse() {
+        return Ok(provider);
+    }
+    if let Some((_, refusal)) = register_endpoints(db)
+        .await?
+        .into_iter()
+        .find(|(endpoint, _)| endpoint == name)
+    {
+        return Err(oag_core::Error::Config(format!(
+            "endpoint '{name}' is registered but not served, so no key can be filed \
+             under it: {refusal}"
+        )));
+    }
+    name.parse()
+}
+
+/// Register every endpoint row that passes the gateway's mapping, and return
+/// the name of each one that does not with the rule it breaks.
+pub(super) async fn register_endpoints(
+    db: &Db,
+) -> Result<Vec<(String, oag_core::endpoint::Refusal)>> {
+    let mut endpoints = Vec::new();
+    let mut refused = Vec::new();
+    for row in oag_store::repo::list_endpoints(db).await? {
+        match row.to_endpoint() {
+            Ok(config) => endpoints.push(config.endpoint),
+            Err(refusal) => refused.push((row.name, refusal)),
+        }
+    }
+    oag_core::provider::EndpointRegistry::global().install(endpoints);
+    Ok(refused)
 }
 
 /// Import every signed-in Grok CLI session as an xAI OAuth credential.
@@ -912,7 +986,8 @@ pub(super) async fn price_account(
         SELECT id, name, provider, kind, credentials_sealed, credentials_nonce,
                token_version, token_expires_at, owner_principal_id, proxy_url,
                priority, max_concurrency, schedulable, cooldown_until,
-               rate_limited_until, window_resets_at, last_used_at
+               rate_limited_until, window_resets_at,
+               usage_remaining_pct, usage_reserve_pct, last_used_at
         FROM account
         WHERE provider = $1 AND ($2::text IS NULL OR name = $2)
         ORDER BY schedulable DESC, priority DESC, name

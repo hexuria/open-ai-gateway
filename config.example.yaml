@@ -94,6 +94,13 @@ gateway:
   # provider_base_urls:
   #   jev: "https://api.typesafe.ai"
 
+  # Where a Google service account's key is traded for an access token, for
+  # every endpoint on the gcp platform (Vertex AI). Google's own unless you
+  # point it at a stand-in. The token_uri inside a key file is never used, and
+  # a URL that is not https, or http to this machine's loopback, stops the
+  # gateway at startup. See docs/03-providers.md.
+  # gcp_token_url: "https://oauth2.googleapis.com/token"
+
   # Advertise `oag/auto` in /v1/models. Off by default: the classifier behind it
   # picks a rung from the request's SHAPE (token count, tool count, turn count,
   # images, code) and never from what the task is, so the name promises a

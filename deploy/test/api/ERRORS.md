@@ -41,7 +41,7 @@ when the body was truncated and no longer parses.
 | `authentication_error` | 401 | no key, unknown key, revoked key | re-auth; do not retry |
 | `budget_exhausted` | 402 | a key, route or principal cap is spent | stop; surface which scope from the message |
 | `invalid_request` | 400 | the body is not valid JSON for this dialect | fix the request |
-| `no_viable_model` | 400 | nothing on the route's ladder can serve it | fix the model, or the operator fixes the ladder |
+| `no_viable_model` | 400 | nothing on the route's ladder can serve it; on `/jev/v1/systemone`, a model no System One provider this gateway serves answers to | fix the model, or the operator fixes the ladder |
 | `invalid_model_qualifier` | 400 | `@something` is not a qualifier, or that provider cannot be reached that way | drop or correct the qualifier |
 | `unsupported_field` | 400 | a field the chosen upstream's dialect cannot express | drop the field, or pin to a provider that has it |
 | `not_found` | 404 | an action this gateway does not serve | — |
@@ -51,9 +51,10 @@ when the body was truncated and no longer parses.
 | `quota_reserve_held` | 503 | every credential is at its reserve floor | retry after the window resets |
 | `at_capacity` | 503 | every credential is at max concurrency | retry shortly — this one really is transient |
 | `overloaded` | 503 | this replica is at its in-flight ceiling; the request was shed, not queued | **honour `Retry-After`**; a balancer will land the retry on a replica with room |
-| `system_one_not_configured` | 503 | a System One request on a route that holds no Jev key. There is no chat fallback to offer instead | do not retry; the operator adds a Jev key to the route |
+| `system_one_not_configured` | 503 | a System One request on a route that holds no key for the provider its model names: Jev's, or a System One host's, which the message names. There is no chat fallback to offer instead | do not retry; the operator adds that provider's key to the route |
 | `stream_idle` | 504 | the upstream went quiet mid-stream | retry |
 | `upstream_timeout` | 504 | the upstream accepted the connection and never began a response | retry |
+| `upstream_unavailable` | 503 | no credential the route holds for the upstream could be made ready to send: a Vertex service account's key Google's token endpoint refused (the message says why), or a token endpoint out of reach. Each such credential sits out a cooldown, so a retry soon after is `no_credential` | retry later; the operator replaces a refused key |
 | `upstream_error` | *see below* | the provider refused | depends on `upstream_status` |
 | `internal_error` | 500 | a bug | retry once, then report |
 
@@ -207,6 +208,64 @@ Note the mapping is many-to-one: `UnknownProvider`, `Config` and `Internal` all
 render as `internal_error` with the same redacted message, because those can
 carry connection strings and file paths. That is why each entry records its
 `variant` — otherwise the file shows three identical rows and no reason why.
+
+## The admin API's errors
+
+Everything above is the inference envelope. `/admin/api` is not a dialect and
+does not use it: a failure there is `{"error": "<human sentence>"}`, sometimes
+with a `hint` beside it, and the status is the contract.
+
+| status | means |
+|---|---|
+| 400 | the body breaks a rule; `error` names the rule |
+| 401 / 403 | no key, or a key that is not an admin key |
+| 404 | nothing by that id or name |
+| 409 | the write conflicts with what is already there |
+| 415 / 422 | not JSON, or JSON of the wrong shape: a missing field, or one the route does not take (axum's own answer, as plain text) |
+| 500 | the query failed |
+
+The endpoint routes, `/admin/api/endpoints`, use each of them:
+
+- **400** for a registration the gateway would refuse to serve: a link-local or
+  cloud-metadata base URL, as written or as its name resolves now; a host a
+  `plain` endpoint may not name (see `docs/compliance.md`); a header that carries
+  a key; a dialect the platform does not serve. And for a `PATCH` naming
+  `dialect`, `platform` or `name`, which never change: remove the endpoint and
+  register it again.
+- **409** for a name already registered, and for a `DELETE` of an endpoint that
+  credentials or catalog models still name. That one carries the counts:
+
+  ```json
+  { "error": "endpoint merge is still named by 2 credential(s) and 3 catalog model(s), so nothing was removed",
+    "accounts": 2, "models": 3,
+    "hint": "remove its credentials and its catalog models first, and take its models off every ladder" }
+  ```
+
+  And for a `PATCH` that lost a race: someone else changed the endpoint after
+  this request read it, so nothing was written, rather than undoing their
+  change with fields this one copied. Read it again and send the change again.
+
+  ```json
+  { "error": "the endpoint changed since this request read it, so nothing was written",
+    "hint": "read it again, and send the change again if it is still wanted" }
+  ```
+
+  And for a `PATCH` with a new `base_url` while credentials are filed under
+  the endpoint, because every one of their keys would go to the new host. This
+  API cannot read the keys it would be moving; the CLI, which can, moves them:
+
+  ```json
+  { "error": "endpoint merge has 2 credential(s), and every one of their keys would be sent to the new base URL, so nothing was written",
+    "accounts": 2,
+    "hint": "move it with `oag admin endpoint set merge --base-url <url> --yes-move-keys`, which runs with the database and the key-encryption key, or remove the endpoint's credentials first" }
+  ```
+
+- `POST /admin/api/endpoints/{name}/check` is **200 whatever the endpoint
+  answered**, with `ok`, `status`, `models` and `error` saying what that was. A
+  redirect is reported and never followed. Only a name nobody registered is 404.
+
+`errors.json` does not list these. It is generated from `oag_core::Error`, the
+inference path's errors, and no admin answer is one of its variants.
 
 ## Do not branch on the message
 

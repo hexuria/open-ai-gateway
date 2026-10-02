@@ -16,6 +16,9 @@
 
 pub mod admin;
 pub mod breakers;
+pub mod egress;
+pub mod endpoint_sync;
+pub mod endpoints;
 pub mod gateway;
 pub mod health;
 pub mod listen;
@@ -166,6 +169,19 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/services/{id}/disable", post(admin::disable_service))
         .route("/services/{id}/enable", post(admin::enable_service))
         .route("/services/{id}/check", post(admin::check_service))
+        // Operator-registered upstreams. A single-segment `{name}`: an
+        // endpoint's name is `[a-z0-9_-]` and never holds a slash.
+        .route(
+            "/endpoints",
+            get(admin::list_endpoints).post(admin::create_endpoint),
+        )
+        .route(
+            "/endpoints/{name}",
+            get(admin::get_endpoint)
+                .patch(admin::update_endpoint)
+                .delete(admin::delete_endpoint),
+        )
+        .route("/endpoints/{name}/check", post(admin::check_endpoint))
         .route("/catalog/reload", post(admin::reload_catalog))
         .route("/models", get(admin::list_models))
         // A wildcard, unlike every other `{id}` here: a catalog id contains a
@@ -570,18 +586,6 @@ security:
         db.migrate().await.expect("migrate");
         let cache = oag_store::Cache::connect(&redis_url).expect("cache");
         Some(Arc::new(AppState::new(config, db, cache).expect("state")))
-    }
-
-    /// [`state`] with no adapter registered for `provider`.
-    pub(crate) fn state_without_adapter(provider: oag_core::Provider) -> Arc<AppState> {
-        let config = config("");
-        let db = oag_store::Db::connect(&config.database.url, 1).expect("lazy pool");
-        let cache = oag_store::Cache::connect(&config.redis.url).expect("lazy client");
-        Arc::new(
-            AppState::new(config, db, cache)
-                .expect("state")
-                .without_adapter(provider),
-        )
     }
 }
 
@@ -1093,6 +1097,12 @@ mod router_tests {
             "POST",
             "/admin/api/services/00000000-0000-0000-0000-000000000001/check",
         ),
+        ("GET", "/admin/api/endpoints"),
+        ("POST", "/admin/api/endpoints"),
+        ("GET", "/admin/api/endpoints/merge"),
+        ("PATCH", "/admin/api/endpoints/merge"),
+        ("DELETE", "/admin/api/endpoints/merge"),
+        ("POST", "/admin/api/endpoints/merge/check"),
         ("GET", "/admin/api/points/reference"),
         ("PUT", "/admin/api/points/reference"),
         ("GET", "/admin/api/points/models"),

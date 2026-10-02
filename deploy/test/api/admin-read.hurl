@@ -143,6 +143,13 @@ GET {{admin_host}}/admin/api/services
 Authorization: Bearer {{admin_key}}
 HTTP 200
 
+# ── registered endpoints ──
+# Also empty until one is registered. Each carries what names it and, when the
+# gateway skips it, why.
+GET {{admin_host}}/admin/api/endpoints
+Authorization: Bearer {{admin_key}}
+HTTP 200
+
 # ── admin reads need an admin key ──
 GET {{admin_host}}/admin/api/summary
 Authorization: Bearer {{api_key}}

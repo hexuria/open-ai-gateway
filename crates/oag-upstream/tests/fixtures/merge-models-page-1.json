@@ -1,0 +1,190 @@
+{
+  "data": [
+    {
+      "model": "zai/glm-5.3-flash",
+      "display_name": "GLM 5.3 Flash",
+      "availability_status": "available",
+      "access_required": false,
+      "vendors": {
+        "zai": {
+          "context_window": 200000,
+          "max_output_tokens": 128000,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text"],
+            "output": ["text"],
+            "supports_tool_calling": true,
+            "supports_reasoning": true
+          },
+          "pricing": {
+            "input_per_million": 0.1,
+            "output_per_million": 0.4,
+            "cache_read_per_million": 0.02,
+            "cache_write_per_million": null
+          }
+        },
+        "particle": {
+          "context_window": 131072,
+          "max_output_tokens": 32768,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text"],
+            "output": ["text"],
+            "supports_tool_calling": true,
+            "supports_reasoning": false
+          },
+          "pricing": {
+            "input_per_million": 0.06,
+            "output_per_million": 0.22,
+            "cache_read_per_million": null,
+            "cache_write_per_million": null
+          }
+        },
+        "together": {
+          "context_window": 131072,
+          "max_output_tokens": 16384,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text"],
+            "output": ["text"],
+            "supports_tool_calling": false,
+            "supports_reasoning": false
+          },
+          "pricing": {
+            "input_per_million": 0.08,
+            "output_per_million": 0.3,
+            "cache_read_per_million": null,
+            "cache_write_per_million": null
+          }
+        }
+      }
+    },
+    {
+      "model": "anthropic/claude-sonnet-4.5",
+      "display_name": "Claude Sonnet 4.5",
+      "availability_status": "available",
+      "access_required": false,
+      "vendors": {
+        "anthropic": {
+          "context_window": 200000,
+          "max_output_tokens": 64000,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text", "image"],
+            "output": ["text"],
+            "supports_tool_calling": true,
+            "supports_reasoning": true
+          },
+          "pricing": {
+            "input_per_million": 3,
+            "output_per_million": 15,
+            "cache_read_per_million": 0.3,
+            "cache_write_per_million": 3.75
+          }
+        }
+      }
+    },
+    {
+      "model": "openai/gpt-4o-mini-tts",
+      "display_name": "GPT-4o mini TTS",
+      "availability_status": "available",
+      "access_required": false,
+      "vendors": {
+        "openai": {
+          "context_window": 2000,
+          "max_output_tokens": null,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text"],
+            "output": ["audio"],
+            "supports_tool_calling": false,
+            "supports_reasoning": false
+          },
+          "pricing": {
+            "input_per_million": 0.6,
+            "output_per_million": 12,
+            "cache_read_per_million": null,
+            "cache_write_per_million": null
+          }
+        }
+      }
+    },
+    {
+      "model": "openai/gpt-image-1",
+      "display_name": "GPT Image 1",
+      "availability_status": "available",
+      "access_required": false,
+      "vendors": {
+        "openai": {
+          "context_window": null,
+          "max_output_tokens": null,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text", "image"],
+            "output": ["image"],
+            "supports_tool_calling": false,
+            "supports_reasoning": false
+          },
+          "pricing": {
+            "input_per_million": 5,
+            "output_per_million": 40,
+            "cache_read_per_million": 1.25,
+            "cache_write_per_million": null
+          }
+        }
+      }
+    },
+    {
+      "model": "google/veo-3",
+      "display_name": "Veo 3",
+      "availability_status": "available",
+      "access_required": false,
+      "vendors": {
+        "google": {
+          "context_window": null,
+          "max_output_tokens": null,
+          "availability_status": "available",
+          "capabilities": {
+            "input": ["text", "image"],
+            "output": ["video"],
+            "supports_tool_calling": false,
+            "supports_reasoning": false
+          },
+          "pricing": {
+            "input_per_million": null,
+            "output_per_million": null,
+            "cache_read_per_million": null,
+            "cache_write_per_million": null
+          }
+        }
+      }
+    },
+    {
+      "model": "mistral/mistral-large-2407",
+      "display_name": "Mistral Large 24.07",
+      "availability_status": "deprecated",
+      "access_required": false,
+      "vendors": {
+        "mistral": {
+          "context_window": 128000,
+          "max_output_tokens": 8192,
+          "availability_status": "deprecated",
+          "capabilities": {
+            "input": ["text"],
+            "output": ["text"],
+            "supports_tool_calling": true,
+            "supports_reasoning": false
+          },
+          "pricing": {
+            "input_per_million": 2,
+            "output_per_million": 6,
+            "cache_read_per_million": null,
+            "cache_write_per_million": null
+          }
+        }
+      }
+    }
+  ],
+  "has_more": true,
+  "next_cursor": "eyJhZnRlciI6Im1pc3RyYWwvbWlzdHJhbC1sYXJnZS0yNDA3In0"
+}

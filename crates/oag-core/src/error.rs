@@ -192,25 +192,53 @@ pub enum Error {
     #[error("upstream sent no response within {after:?}")]
     UpstreamTimeout { after: Duration },
 
-    /// A System One request reached a route that holds no Jev credential.
+    /// The credential could not be made into one a request can carry: the
+    /// exchange that turns what is stored into what is sent failed. Today
+    /// that is a Vertex service account whose key Google's token endpoint
+    /// would not trade for an access token, or a token endpoint that could
+    /// not be reached.
+    ///
+    /// Not [`Error::Internal`]: nothing in the gateway is broken, so the
+    /// client is told the upstream is unavailable (503), not that the gateway
+    /// failed (500). `lasting` says whether the credential itself is at fault
+    /// (a key that cannot be read, or one Google refused) or only the way to
+    /// it, and so how long the credential sits out: see
+    /// [`Error::disposition`]. `reason` holds no secret: whoever builds this
+    /// keeps the key, the assertion and any token out of it.
+    #[error("the upstream is unavailable: {reason}")]
+    UpstreamUnavailable { reason: String, lasting: bool },
+
+    /// A System One request reached a route that holds no credential for the
+    /// System One provider it names: Jev, unless its model names a System One
+    /// endpoint.
     ///
     /// Deliberately not [`Error::NoCredential`], which is also what `lease`
-    /// says of a route whose Jev keys all exist and are cooling down. Here
-    /// there is nothing to wait for and no fallback to name — no chat model
-    /// answers a System One question — so the refusal says what is missing and
-    /// how to add it, rather than answering with a guess.
+    /// says of a route whose keys for that provider all exist and are cooling
+    /// down. Here there is nothing to wait for and no fallback to name — no
+    /// chat model answers a System One question — so the refusal says what is
+    /// missing and how to add it, rather than answering with a guess.
     #[error(
-        "System One is not configured on this route: route '{route}' holds no Jev \
-         credential. Add one with `oag admin account add --name <name> --provider jev \
-         --secret <key> --route {route}`"
+        "System One is not configured on this route: route '{route}' holds no {} \
+         credential. Add one with `oag admin account add --name <name> --provider {provider} \
+         --secret <key> --route {route}`",
+        holder(*.provider)
     )]
-    SystemOneNotConfigured { route: String },
+    SystemOneNotConfigured { route: String, provider: Provider },
 
     #[error("serialisation: {0}")]
     Serde(#[from] serde_json::Error),
 
     #[error("{0}")]
     Internal(String),
+}
+
+/// Whose credential a System One route lacks, as a sentence names it: Jev by
+/// the product's name, an endpoint by its own.
+fn holder(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Jev => "Jev",
+        other => other.as_str(),
+    }
 }
 
 /// The qualifiers a model id may carry, as a client writes them.
@@ -302,10 +330,19 @@ impl Error {
             },
             // A provider that accepts and then says nothing is behaving like
             // a 5xx that never arrived: try another credential, and give this
-            // one the same short cooldown a 503 would earn.
-            Self::UpstreamTimeout { .. } => Disposition::FailoverAccount {
-                cooldown: Duration::from_secs(30),
-            },
+            // one the same short cooldown a 503 would earn. So is a token
+            // endpoint that did not answer for a credential.
+            Self::UpstreamTimeout { .. } | Self::UpstreamUnavailable { lasting: false, .. } => {
+                Disposition::FailoverAccount {
+                    cooldown: Duration::from_secs(30),
+                }
+            }
+            // A credential that cannot be made ready to send because it is
+            // itself at fault, a key Google refuses, sits out as long as a 401
+            // earns.
+            Self::UpstreamUnavailable { lasting: true, .. } => {
+                Disposition::FailoverAccount { cooldown: COOLDOWN }
+            }
             // A reserved-out provider is out for as long as its window lasts,
             // so the only thing that can still serve this request is a rung
             // naming a different one — the same reasoning as an empty pool.
@@ -414,8 +451,13 @@ pub fn every_variant() -> Vec<Error> {
         Error::UpstreamTimeout {
             after: Duration::from_secs(90),
         },
+        Error::UpstreamUnavailable {
+            reason: "the Google token endpoint answered 503 Service Unavailable".to_owned(),
+            lasting: false,
+        },
         Error::SystemOneNotConfigured {
             route: "default".to_owned(),
+            provider: Provider::Jev,
         },
         // `unwrap_err` on a value that is unconditionally an `Err`: the clippy
         // lint is about Results that might be `Ok`, and "not json" is not an i32
@@ -448,6 +490,7 @@ pub fn every_variant() -> Vec<Error> {
             | Error::Upstream { .. }
             | Error::StreamIdle(_)
             | Error::UpstreamTimeout { .. }
+            | Error::UpstreamUnavailable { .. }
             | Error::SystemOneNotConfigured { .. }
             | Error::Serde(_)
             | Error::Internal(_) => {}
@@ -474,6 +517,33 @@ mod tests {
         }
     }
 
+    /// A credential that cannot be made ready sits out ten minutes when it is
+    /// at fault, and thirty seconds when only the way to its token endpoint
+    /// is: the cooldowns a 401 and a 5xx earn.
+    #[test]
+    fn an_unavailable_upstream_cools_its_credential_down_for_as_long_as_it_says() {
+        let unavailable = |lasting| Error::UpstreamUnavailable {
+            reason: "the Google token endpoint answered 400 Bad Request (invalid_grant)".to_owned(),
+            lasting,
+        };
+        assert_eq!(
+            unavailable(true).disposition(),
+            upstream(401).disposition(),
+            "a refused key"
+        );
+        assert_eq!(
+            unavailable(false).disposition(),
+            upstream(503).disposition(),
+            "an unreachable token endpoint"
+        );
+        assert_eq!(
+            unavailable(true).disposition(),
+            Disposition::FailoverAccount {
+                cooldown: Duration::from_mins(10)
+            }
+        );
+    }
+
     /// The match inside `every_variant` proves no variant is missing from its
     /// code; this proves the list it returns is that list — each variant once,
     /// the newest included — without a round trip through the catalogue test
@@ -488,6 +558,39 @@ mod tests {
             all.iter()
                 .any(|e| matches!(e, Error::SystemOneNotConfigured { .. })),
             "the newest variant is in the list its catalogue is rendered from"
+        );
+    }
+
+    /// Jev's refusal reads as it always has; an endpoint's names the endpoint,
+    /// in the sentence and in the command that fixes it.
+    #[test]
+    fn a_system_one_route_without_a_key_names_whose_key_it_lacks() {
+        let jev = Error::SystemOneNotConfigured {
+            route: "r".to_owned(),
+            provider: Provider::Jev,
+        }
+        .to_string();
+        assert_eq!(
+            jev,
+            "System One is not configured on this route: route 'r' holds no Jev credential. \
+             Add one with `oag admin account add --name <name> --provider jev --secret <key> \
+             --route r`"
+        );
+        let endpoint = crate::provider::Endpoint::new(
+            "t7-err-decisions",
+            crate::provider::Dialect::SystemOne,
+            crate::provider::Platform::Plain,
+        )
+        .unwrap();
+        let hosted = Error::SystemOneNotConfigured {
+            route: "r".to_owned(),
+            provider: Provider::Custom(endpoint),
+        }
+        .to_string();
+        assert!(
+            hosted.contains("holds no t7-err-decisions credential")
+                && hosted.contains("--provider t7-err-decisions "),
+            "{hosted}"
         );
     }
 
