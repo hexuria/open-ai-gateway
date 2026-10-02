@@ -30,5 +30,11 @@ typesafe-sdk.workspace = true
 axum.workspace = true
 wiremock.workspace = true
 
+[features]
+# Exposes `eventstream::encode`, which frames an AWS event-stream message for a
+# stand-in Bedrock in another crate's tests. Behind a feature so it is not in a
+# release build: nothing at runtime sends Bedrock's framing.
+test-fixtures = []
+
 [lints]
 workspace = true

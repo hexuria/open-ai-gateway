@@ -342,6 +342,13 @@ pub enum Dialect {
     /// Not a conversation, so the canonical form cannot carry it: nothing
     /// translates into or out of it, and only a Jev upstream answers it.
     SystemOne,
+    /// `POST /model/{modelId}/converse` — AWS Bedrock's one shape for every
+    /// model it serves: Llama, Mistral, Nova, and Claude as well.
+    ///
+    /// Upstream only. No inbound route accepts it and no client speaks it, so
+    /// `oag-proto` holds only the half an upstream needs, and only an endpoint
+    /// on the `aws` platform speaks it.
+    BedrockConverse,
 }
 
 impl Dialect {
@@ -358,6 +365,7 @@ impl Dialect {
             Self::OpenAIResponses => "OpenAI Responses",
             Self::GeminiGenerateContent => "Gemini generateContent",
             Self::SystemOne => "System One",
+            Self::BedrockConverse => "Bedrock Converse",
         }
     }
 
@@ -386,6 +394,7 @@ impl Dialect {
             Self::AnthropicMessages => Some("anthropic"),
             Self::GeminiGenerateContent => Some("gemini"),
             Self::SystemOne => Some("system_one"),
+            Self::BedrockConverse => Some("bedrock_converse"),
             // Chat Completions is the OpenAI dialect an endpoint speaks; no
             // adapter sends a Responses request to anything but a Codex seat.
             Self::OpenAIResponses => None,
@@ -393,22 +402,16 @@ impl Dialect {
     }
 
     /// The dialect an `endpoint.dialect` value names.
-    ///
-    /// `bedrock_converse` is refused with its own message: the schema admits
-    /// it, and this build has no codec for it yet, so a row that names it is
-    /// one this build cannot serve rather than one that is misspelt.
     pub fn from_endpoint_column(column: &str) -> Result<Self, String> {
         match column {
             "openai" => Ok(Self::OpenAIChatCompletions),
             "anthropic" => Ok(Self::AnthropicMessages),
             "gemini" => Ok(Self::GeminiGenerateContent),
             "system_one" => Ok(Self::SystemOne),
-            "bedrock_converse" => Err(
-                "dialect `bedrock_converse` is not served by this build: it has no Converse codec"
-                    .to_owned(),
-            ),
+            "bedrock_converse" => Ok(Self::BedrockConverse),
             other => Err(format!(
-                "unknown dialect `{other}`: use openai, anthropic, gemini or system_one"
+                "unknown dialect `{other}`: use openai, anthropic, gemini, system_one or \
+                 bedrock_converse"
             )),
         }
     }
@@ -561,7 +564,10 @@ impl Platform {
                     | Dialect::GeminiGenerateContent
                     | Dialect::SystemOne
             ) | (Self::Azure, Dialect::OpenAIChatCompletions)
-                | (Self::Aws, Dialect::AnthropicMessages)
+                | (
+                    Self::Aws,
+                    Dialect::AnthropicMessages | Dialect::BedrockConverse
+                )
                 | (
                     Self::Gcp,
                     Dialect::GeminiGenerateContent | Dialect::AnthropicMessages
@@ -998,8 +1004,8 @@ mod tests {
     }
 
     /// The endpoints the parse tests share: name, dialect, platform, and the
-    /// credential kinds that platform takes. One on each platform, and a
-    /// System One host.
+    /// credential kinds that platform takes. One on each platform, a second
+    /// aws one speaking Converse, and a System One host.
     const ENDPOINTS: &[(&str, Dialect, Platform, &[CredentialKind])] = &[
         (
             "t1-groq",
@@ -1016,6 +1022,12 @@ mod tests {
         (
             "t1-bedrock-eu",
             Dialect::AnthropicMessages,
+            Platform::Aws,
+            &[CredentialKind::Bedrock],
+        ),
+        (
+            "t9-converse",
+            Dialect::BedrockConverse,
             Platform::Aws,
             &[CredentialKind::Bedrock],
         ),
@@ -1369,6 +1381,7 @@ mod tests {
             (Dialect::AnthropicMessages, "anthropic"),
             (Dialect::GeminiGenerateContent, "gemini"),
             (Dialect::SystemOne, "system_one"),
+            (Dialect::BedrockConverse, "bedrock_converse"),
         ] {
             assert_eq!(dialect.endpoint_column(), Some(column));
             assert_eq!(Dialect::from_endpoint_column(column), Ok(dialect));
@@ -1378,21 +1391,34 @@ mod tests {
             None,
             "no endpoint speaks Responses"
         );
-        // In the schema, and not in this build: refused as such, not as a typo.
-        let converse = Dialect::from_endpoint_column("bedrock_converse").unwrap_err();
-        assert!(converse.contains("not served by this build"), "{converse}");
         // serde's spelling is not the column's.
-        for bad in ["open_a_i_chat_completions", "OpenAI", "responses", ""] {
+        for bad in [
+            "open_a_i_chat_completions",
+            "OpenAI",
+            "responses",
+            "converse",
+            "",
+        ] {
             let err = Dialect::from_endpoint_column(bad).unwrap_err();
             assert!(err.contains("unknown dialect"), "{bad:?}: {err}");
+            assert!(err.ends_with("system_one or bedrock_converse"), "{err}");
         }
+    }
+
+    #[test]
+    fn converse_is_a_chat_dialect_named_as_aws_names_it() {
+        // A conversation, so its models join the catalog chat requests route
+        // over, unlike System One's.
+        assert!(Dialect::BedrockConverse.is_chat());
+        assert_eq!(Dialect::BedrockConverse.as_str(), "Bedrock Converse");
+        assert_eq!(Dialect::BedrockConverse.to_string(), "Bedrock Converse");
     }
 
     #[test]
     fn the_platform_matrix_admits_exactly_its_pairs() {
         use Dialect::{
-            AnthropicMessages, GeminiGenerateContent, OpenAIChatCompletions, OpenAIResponses,
-            SystemOne,
+            AnthropicMessages, BedrockConverse, GeminiGenerateContent, OpenAIChatCompletions,
+            OpenAIResponses, SystemOne,
         };
         let served = [
             (Platform::Plain, OpenAIChatCompletions),
@@ -1401,6 +1427,7 @@ mod tests {
             (Platform::Plain, SystemOne),
             (Platform::Azure, OpenAIChatCompletions),
             (Platform::Aws, AnthropicMessages),
+            (Platform::Aws, BedrockConverse),
             (Platform::Gcp, GeminiGenerateContent),
             (Platform::Gcp, AnthropicMessages),
         ];
@@ -1416,6 +1443,7 @@ mod tests {
                 OpenAIResponses,
                 GeminiGenerateContent,
                 SystemOne,
+                BedrockConverse,
             ] {
                 assert_eq!(
                     platform.speaks(dialect),

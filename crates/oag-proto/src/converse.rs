@@ -6,8 +6,8 @@
 //! stream event → canonical events — with no request parser and no renderer
 //! for a Converse client behind it.
 //!
-//! Not wired to anything yet. PR 9b adds `Dialect::BedrockConverse`, points
-//! this module's `DIALECT` at it, and builds the adapter that calls it.
+//! `oag_upstream::converse::ConverseAdapter` calls it, for an endpoint on the
+//! `aws` platform that speaks `bedrock_converse`.
 //!
 //! Where the dialect departs from the hub, each a place translation can lose
 //! something:
@@ -44,13 +44,7 @@ use oag_router::Usage;
 use serde_json::{Value, json};
 
 /// The dialect a refusal names.
-///
-/// A PLACEHOLDER until PR 9b. [`Error::UnsupportedField`] has to name a
-/// dialect, and `Dialect::BedrockConverse` does not exist yet: adding it
-/// belongs to the PR that wires this module in, which is also the first one
-/// through which any request can reach a refusal here. Anthropic Messages
-/// because it is what the Bedrock provider speaks today. 9b replaces this line.
-const DIALECT: Dialect = Dialect::AnthropicMessages;
+const DIALECT: Dialect = Dialect::BedrockConverse;
 
 fn refused(field: &'static str) -> Error {
     Error::UnsupportedField {
@@ -366,8 +360,8 @@ pub fn parse_response(body: &Value) -> Vec<StreamEvent> {
 /// stream: the event's type as the one key, its payload as the value —
 /// `{"contentBlockDelta": {…}}`. On the wire the type is the `:event-type`
 /// header of an AWS event-stream message rather than part of its payload, so
-/// whoever decodes the framing (`oag_upstream::eventstream`) wraps each
-/// payload in it. Doing that is 9b's.
+/// whoever decodes the framing wraps each payload in it:
+/// `oag_upstream::eventstream::converse_event`.
 ///
 /// An empty result is normal: a text block's `contentBlockStop`, and
 /// `messageStop`, which is held until the usage arrives.
@@ -734,10 +728,15 @@ mod tests {
                 err,
                 Error::UnsupportedField {
                     field: "tool_choice",
-                    ..
+                    dialect: Dialect::BedrockConverse,
                 }
             ),
             "{err}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("Bedrock Converse cannot express"),
+            "the client is told which dialect refused it: {err}"
         );
 
         // With no tools there is nothing to forbid, so `none` already holds.
@@ -967,10 +966,10 @@ mod tests {
             r.thinking_budget = Some(8192);
             r.thinking_effort = Some(Effort::High);
             r.client_session = Some("session".to_owned());
-            // Written in the dialect `DIALECT` stands in for today, so a
-            // `merge_into` here would take it.
+            // Written as if in this very dialect, so a `merge_into` here
+            // would take it: no client writes Converse, and nothing should.
             r.passthrough = Some(Passthrough {
-                dialect: Dialect::AnthropicMessages,
+                dialect: Dialect::BedrockConverse,
                 body: json!({ "top_k": 5 }),
             });
         });

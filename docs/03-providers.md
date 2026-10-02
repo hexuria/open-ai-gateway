@@ -234,8 +234,9 @@ gateway:
 
 An endpoint is an upstream you register instead of one built in. It has a name,
 which is also its models' prefix (`groq/llama-…`); a dialect (`openai`,
-`anthropic`, `gemini` or `system_one`); a platform (`plain`, `azure`, `aws` or
-`gcp`); and its settings, all in the `endpoint` table (migration 0020). Its keys
+`anthropic`, `gemini`, `system_one` or `bedrock_converse`); a platform
+(`plain`, `azure`, `aws` or `gcp`); and its settings, all in the `endpoint`
+table (migration 0020). Its keys
 are ordinary sealed credentials filed under its name
 (`oag admin account add --provider groq`, which files the one kind the
 endpoint's platform takes), and its models are catalog rows whose provider is
@@ -250,8 +251,9 @@ before it files a key under an endpoint's name:
 
 - the name is 1 to 32 of `a-z`, `0-9`, `_` and `-`, and is not a built-in
   provider's name or alias, `oag` or `codex`;
-- the platform serves the dialect: `plain` all four, `azure` `openai`, `aws`
-  `anthropic`, `gcp` `gemini` and `anthropic`;
+- the platform serves the dialect: `plain` `openai`, `anthropic`, `gemini` and
+  `system_one`; `azure` `openai`; `aws` `anthropic` and `bedrock_converse`;
+  `gcp` `gemini` and `anthropic`;
 - the auth style is how the platform takes a key: any of them on `plain`,
   `api_key_header` on `azure`, `bearer` on `gcp` (a minted token) and `none` on
   `aws` (the request is signed instead);
@@ -262,7 +264,10 @@ before it files a key under an endpoint's name:
   own network;
 - a region (required on `aws` and `gcp`) and a project (required on `gcp`) are
   1 to 63 of `a-z`, `0-9` and `-`, because a platform puts them in a hostname or
-  a path;
+  a path; and an `aws` region is shaped like one, two letters, then words, then
+  one digit (`us-east-1`, `us-gov-west-1`), because it is also the scope every
+  request is signed for, and AWS answers a signature for a region that does not
+  exist as it answers a bad key;
 - a path (migration 0021) is set only on a `system_one` endpoint, and is `/`
   and then at most 127 of letters, digits, `/`, `.`, `_` and `-`, in segments
   that are neither empty, `.` nor `..` (the schema checks the characters, the
@@ -274,17 +279,92 @@ before it files a key under an endpoint's name:
 
 A row that breaks one is skipped, and the rest are served as before. Its keys
 and models serve nothing, a warning naming it is logged on every refresh, and
-`oag_endpoint_invalid_total{reason}` counts it. In this release only `plain`
-endpoints are served: one speaking `openai`, `anthropic` or `gemini` by the chat
-routes, and a `system_one` one by the System One route
-([System One hosts](#system-one-hosts)). An `azure`, `aws` or `gcp` endpoint is
-a valid row skipped with reason `unsupported` until its adapter lands.
+`oag_endpoint_invalid_total{reason}` counts it. In this release `plain` and
+`aws` endpoints are served: a `plain` one speaking `openai`, `anthropic` or
+`gemini` by the chat routes, and a `system_one` one by the System One route
+([System One hosts](#system-one-hosts)); an `aws` one by the chat routes too
+([Bedrock endpoints](#bedrock-endpoints)). An `azure` or `gcp` endpoint is a
+valid row skipped with reason `unsupported` until its adapter lands.
 
 A request already sent when its endpoint's settings change is not moved: it was
 built for the old base URL and headers and is answered from there, and the next
 request gets the new settings. A request in flight when its endpoint is removed
 can fail once its answer arrives, so remove an endpoint's keys, and let their
 requests finish, before the endpoint itself.
+
+### Bedrock endpoints
+
+The built-in `bedrock` provider is Claude in one region:
+`gateway.bedrock_region`, at `provider_base_urls.bedrock` when that is set. An
+endpoint on the `aws` platform is Bedrock again, in a region of its own, so a
+gateway can hold as many as it has regions to reach — and beyond Claude. The
+built-in is unchanged by any of them, and none of them reads its settings.
+
+| Dialect | Models | Bedrock API |
+|---|---|---|
+| `anthropic` | Claude | `InvokeModel`: `POST /model/{id}/invoke`, `/invoke-with-response-stream`, in Anthropic's body as the built-in sends it |
+| `bedrock_converse` | Llama, Mistral, Nova, and every other model `Converse` serves (Claude too) | `Converse`: `POST /model/{id}/converse`, `/converse-stream` |
+
+- **Region**, required, and the endpoint's own: it names the host,
+  `https://bedrock-runtime.{region}.amazonaws.com`, and the scope every request
+  is signed for. Each endpoint signs for its region, never for
+  `gateway.bedrock_region`.
+- **Base URL**, optional: set it for a VPC interface endpoint, a proxy, or a
+  stand-in. The request goes there and the signed `host` follows it; the
+  signature is still scoped to the region.
+- **Auth** is `none`. No header carries a key: each request is signed with
+  `SigV4` instead, from a credential of kind `bedrock` stored packed as
+  `access_key:secret[:session_token]`, the shape the built-in takes. A session
+  token is signed, not merely attached.
+- **Model ids.** A catalog row's upstream name is Bedrock's model id, or an
+  inference profile's (`us.meta.llama3-1-70b-instruct-v1:0`). It goes in the
+  path, colon and all, and is signed as it is sent.
+- **Extra headers** are sent on every request, outside the signature, which
+  covers `host`, `x-amz-date`, `x-amz-content-sha256` and the session token.
+
+```sh
+oag admin endpoint add --name bedrock-eu --platform aws --dialect bedrock_converse \
+  --region eu-west-3
+oag admin endpoint add --name claude-tokyo --platform aws --dialect anthropic \
+  --region ap-northeast-1
+# One key each, filed under the endpoint's name.
+oag admin account add --name bedrock-eu-1 --provider bedrock-eu \
+  --secret '<access key id>:<secret access key>' --route default
+```
+
+Until `oag admin endpoint add` takes `--dialect bedrock_converse`, the first row
+is one statement:
+
+```sql
+INSERT INTO endpoint (name, dialect, platform, auth, region)
+VALUES ('bedrock-eu', 'bedrock_converse', 'aws', 'none', 'eu-west-3');
+```
+
+Then a catalog row per model, whose provider is the endpoint's name and whose
+upstream name is Bedrock's model id: `bedrock-eu/llama-3.1-70b` for
+`meta.llama3-1-70b-instruct-v1:0`, priced from Bedrock's price list for that
+region.
+
+**What Converse can carry.** Any client dialect reaches it through the
+canonical form, and its answer goes back the same way; see
+`oag_proto::converse` for the mapping. Three things a client can ask for have no
+spelling in Converse and are refused with a 400 rather than dropped: a JSON
+answer without a schema (`response_format: json_object`), forbidding tool calls
+while tools are defined (`tool_choice: none`), and `previous_response_id`. A
+thinking budget and cache breakpoints are dropped, because Converse takes each
+only from some model families and a wrong guess is a 400, and so is reasoning
+replayed from an earlier turn, which only the model that wrote it can take
+back. Tool names are held to the OpenAI pattern, as on Chat Completions, and a
+client's own names come back on the calls the model makes.
+
+**Streams.** `ConverseStream` sends AWS event-stream messages whose payload is
+the event itself, named by a header (see [Framing](#framing)). It announces the
+stop before the usage, so the stop is held until the usage arrives, and a client
+is shown the bill on the frame that ends the answer. An exception inside the
+stream (`throttlingException`, `modelStreamErrorException`, …) reaches the
+client as an error frame in its own dialect, naming the exception, and the
+ledger records it; a 429 before the stream starts moves to the endpoint's next
+key, as any provider's does.
 
 ## Which dialect reaches which upstream
 
@@ -303,6 +383,7 @@ conversation, so nothing translates into or out of it.
 | OpenAI Chat Completions | `/v1/chat/completions` | yes |
 | OpenAI Responses | `/v1/responses` | yes |
 | Gemini | `/v1beta/models/{model}:generateContent` | yes |
+| Bedrock Converse | none: upstream only | no — rendered only as a request to an `aws` endpoint, whose answers are read back into the client's dialect |
 | System One | `/jev/v1/systemone` | no — passed through to a System One upstream (Jev, or a System One host), and only to one |
 
 `Provider::OpenAI`'s registered adapter still speaks Chat Completions, so an
@@ -477,12 +558,21 @@ says which one it speaks, and the default is SSE because all but one do:
 | Framing | Providers |
 |---|---|
 | `Sse` | Anthropic, OpenAI (Chat Completions and Codex), Gemini, Kimi, DeepSeek, Zhipu, xAI |
-| `AwsEventStream` | Bedrock |
+| `AwsEventStream` | Bedrock, and `aws` endpoints speaking `anthropic` |
+| `AwsConverseStream` | `aws` endpoints speaking `bedrock_converse` |
 
 Bedrock streams length-prefixed binary messages whose payload carries the
 provider's own event, base64-encoded. A reader that splits on blank lines finds
 nothing in one — and the failure is silent: an empty response and zero recorded
 usage, with no error anywhere. `eventstream.rs` decodes it.
+
+`ConverseStream` sends the same messages with nothing wrapped: the payload is
+the event's JSON as it is, and which event it is is said only by the message's
+`:event-type` header (`contentBlockDelta`, `messageStop`, `metadata`, …).
+`eventstream::converse_event` puts the name back around the payload, and an
+exception message, named by `:exception-type`, becomes an error in Converse's
+own terms. Read as `AwsEventStream`, a Converse stream finds no `bytes` envelope
+in any message, and says nothing at all.
 
 This also means **a binary-framed upstream can never be passed through**, even
 when the dialects match. Bedrock's dialect *is* Anthropic, so dialect alone
@@ -529,6 +619,7 @@ nothing changes, and `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` apply as before.
 | Anthropic | The canonical dialect. |
 | Gemini | Model and mode in the URL path; its own auth header; a genuinely different body shape. |
 | Bedrock | Anthropic's body, but the model is in the path, `anthropic_version` replaces the version header, and every request is SigV4-signed. |
+| Bedrock Converse (`aws` endpoints) | Converse's own body and stream, on the Bedrock adapter's host, region and signing. |
 
 `sigv4.rs` is hand-rolled — a few dozen lines against the AWS SDK's several
 hundred transitive crates and a second HTTP stack, none of which this gateway

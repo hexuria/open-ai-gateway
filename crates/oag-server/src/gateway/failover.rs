@@ -127,16 +127,18 @@ pub(crate) fn adapter_for(
 
 /// Function names as an OpenAI-shaped upstream must see them.
 ///
-/// Canonical keeps the client's names. Only Chat Completions and Responses
-/// rewrite, because those are the dialects whose wire pattern luna enforces
-/// with a 400. Other dialects keep identity, so same-dialect passthrough is
-/// undisturbed.
-fn openai_function_names(
+/// Canonical keeps the client's names. Only Chat Completions, Responses and
+/// Bedrock Converse rewrite, because those are the dialects that hold a name
+/// to the OpenAI function-name pattern and refuse one outside it with a 400.
+/// Converse's codec sanitises the same way, so this map is the one that puts
+/// the client's names back. Other dialects keep identity, so same-dialect
+/// passthrough is undisturbed.
+pub(super) fn openai_function_names(
     canonical: &oag_proto::CanonicalRequest,
     upstream: Dialect,
 ) -> FunctionNameMap {
     match upstream {
-        Dialect::OpenAIChatCompletions | Dialect::OpenAIResponses => {
+        Dialect::OpenAIChatCompletions | Dialect::OpenAIResponses | Dialect::BedrockConverse => {
             let names = FunctionNameMap::from_request(canonical);
             if names.rewrites() {
                 for (original, wire) in names.rewritten() {
