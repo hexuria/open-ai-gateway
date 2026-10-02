@@ -1905,6 +1905,8 @@ fn endpoint_add_parses_every_setting() {
         ("system-one", DialectArg::SystemOne),
         ("anthropic", DialectArg::Anthropic),
         ("gemini", DialectArg::Gemini),
+        ("bedrock_converse", DialectArg::BedrockConverse),
+        ("bedrock-converse", DialectArg::BedrockConverse),
     ] {
         match parse(&[
             "endpoint",
@@ -1933,6 +1935,7 @@ fn endpoint_add_parses_every_setting() {
         DialectArg::Anthropic,
         DialectArg::Gemini,
         DialectArg::SystemOne,
+        DialectArg::BedrockConverse,
     ] {
         let parsed = oag_core::provider::Dialect::from_endpoint_column(dialect.column())
             .unwrap_or_else(|e| panic!("{dialect:?}: {e}"));
@@ -1955,20 +1958,7 @@ fn endpoint_add_parses_every_setting() {
     ] {
         assert_eq!(platform.platform().as_str(), spelt);
     }
-    // No build serves Converse yet, and the platform is not optional.
-    assert!(
-        parse(&[
-            "endpoint",
-            "add",
-            "--name",
-            "e",
-            "--dialect",
-            "bedrock_converse",
-            "--platform",
-            "aws",
-        ])
-        .is_err()
-    );
+    // The platform is not optional.
     assert!(parse(&["endpoint", "add", "--name", "e", "--dialect", "openai"]).is_err());
 }
 

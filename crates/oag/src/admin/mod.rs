@@ -143,6 +143,10 @@ pub enum DialectArg {
     /// System One questions, as Jev answers them.
     #[value(name = "system_one", alias = "system-one")]
     SystemOne,
+    /// Bedrock's Converse API, on the aws platform: Llama, Mistral, Nova and
+    /// every other model Converse serves.
+    #[value(name = "bedrock_converse", alias = "bedrock-converse")]
+    BedrockConverse,
 }
 
 impl DialectArg {
@@ -152,6 +156,7 @@ impl DialectArg {
             Self::Anthropic => "anthropic",
             Self::Gemini => "gemini",
             Self::SystemOne => "system_one",
+            Self::BedrockConverse => "bedrock_converse",
         }
     }
 }

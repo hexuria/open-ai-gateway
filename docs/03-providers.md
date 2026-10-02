@@ -501,14 +501,6 @@ oag admin account add --name bedrock-eu-1 --provider bedrock-eu \
   --secret '<access key id>:<secret access key>' --route default
 ```
 
-Until `oag admin endpoint add` takes `--dialect bedrock_converse`, the first row
-is one statement:
-
-```sql
-INSERT INTO endpoint (name, dialect, platform, auth, region)
-VALUES ('bedrock-eu', 'bedrock_converse', 'aws', 'none', 'eu-west-3');
-```
-
 Then a catalog row per model, whose provider is the endpoint's name and whose
 upstream name is Bedrock's model id: `bedrock-eu/llama-3.1-70b` for
 `meta.llama3-1-70b-instruct-v1:0`, priced from Bedrock's price list for that
