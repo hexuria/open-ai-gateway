@@ -193,9 +193,9 @@ async fn gemini_for_an_openai_client(
     let claims = claims(&grant["assertion"]);
     assert_eq!(claims["iss"], GEM_ACCOUNT);
     assert_eq!(
-        claims["aud"],
-        format!("{}/token", google.uri()),
-        "addressed to the configured token URL, not the key's token_uri"
+        claims["aud"], "https://oauth2.googleapis.com/token",
+        "addressed to Google's token endpoint, as Google requires, though it was posted to \
+         the configured stand-in and not to the key's token_uri"
     );
 
     let sent = only_request(&mock).await;

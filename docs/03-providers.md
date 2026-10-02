@@ -718,7 +718,9 @@ page to say.
 **The token.** A credential's key signs a JWT (RS256, scope
 `https://www.googleapis.com/auth/cloud-platform`, valid for an hour), which the
 gateway trades at `gateway.gcp_token_url`, Google's
-`https://oauth2.googleapis.com/token` unless it is set, for an access token. The
+`https://oauth2.googleapis.com/token` unless it is set, for an access token:
+https, or http only to this machine's loopback, and the assertion is addressed
+to Google's token endpoint whichever URL it is posted to. The
 token is kept until five minutes before it expires, in one cache per gateway
 process that every `gcp` endpoint shares and that outlives every reload. So a
 credential is minted for at most once at a time, and about once an hour, on

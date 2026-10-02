@@ -165,7 +165,7 @@ async fn a_mint_posts_a_jwt_bearer_grant_signed_by_the_key() {
         json!({
             "iss": EMAIL,
             "scope": "https://www.googleapis.com/auth/cloud-platform",
-            "aud": token_url(&server),
+            "aud": "https://oauth2.googleapis.com/token",
             "iat": T0,
             "exp": T0 + 3600,
         })
@@ -492,7 +492,7 @@ async fn an_answer_that_is_not_a_bearer_token_is_refused_without_quoting_it() {
 }
 
 /// The key's own `token_uri` is where whoever wrote the file wants the grant
-/// to go. It goes to the configured endpoint, addressed to it.
+/// to go. It goes to the configured endpoint, addressed to Google's.
 #[tokio::test]
 async fn the_keys_own_token_uri_is_never_used() {
     let theirs = token_endpoint(granted("ya29.theirs"), 0).await;
@@ -505,7 +505,10 @@ async fn the_keys_own_token_uri_is_never_used() {
         .await
         .expect("a token");
     assert_eq!(token, "ya29.ours");
-    assert_eq!(claims(&grants(&ours).await[0])["aud"], token_url(&ours));
+    assert_eq!(
+        claims(&grants(&ours).await[0])["aud"],
+        "https://oauth2.googleapis.com/token"
+    );
     theirs.verify().await;
     ours.verify().await;
 }
@@ -578,7 +581,10 @@ async fn a_mint_goes_through_the_accounts_proxy() {
         CLOSED,
         "the proxy is asked for the token URL itself"
     );
-    assert_eq!(claims(&grants(&proxy).await[0])["aud"], CLOSED);
+    assert_eq!(
+        claims(&grants(&proxy).await[0])["aud"],
+        "https://oauth2.googleapis.com/token"
+    );
     proxy.verify().await;
 }
 
@@ -640,5 +646,50 @@ fn a_key_is_checked_as_the_mint_reads_it_and_names_its_account() {
         let err = check_key(&sa_json).expect_err(case);
         assert!(matches!(err, Error::Config(_)), "{case}: {err:?}");
         assert_quotes_nothing(&err.to_string(), &["AIzaSy-not-a-service-account"]);
+    }
+}
+
+/// Google's documentation fixes an access token request's audience: "When
+/// making an access token request this value is always
+/// `https://oauth2.googleapis.com/token`". Wherever the grant is posted (a
+/// stand-in here, an egress proxy or a private name for the endpoint in a
+/// deployment), the assertion is addressed to Google's token endpoint, or
+/// Google refuses it.
+#[tokio::test]
+async fn the_assertion_is_addressed_to_google_wherever_it_is_posted() {
+    let server = token_endpoint(granted("ya29.addressed"), 1).await;
+    cache(&server)
+        .token(AccountId::new(), &key_json().to_string(), None)
+        .await
+        .expect("a token");
+    assert_eq!(
+        claims(&grants(&server).await[0])["aud"],
+        "https://oauth2.googleapis.com/token"
+    );
+    server.verify().await;
+}
+
+/// A signed assertion is as good as the key for the hour it is valid, so it
+/// crosses no network in the clear: the token URL is https, or http only to
+/// this machine's own loopback, where a stand-in or a local proxy listens.
+#[test]
+fn a_token_url_off_loopback_must_be_https() {
+    for bad in [
+        "http://oauth2.googleapis.com/token",
+        "http://token-proxy.internal/token",
+        "http://10.0.0.7/token",
+    ] {
+        let err = GcpTokenCache::new(bad).expect_err(bad);
+        assert!(matches!(err, Error::Config(_)), "{bad:?}: {err:?}");
+        assert!(err.to_string().contains("Google token URL"), "{err}");
+    }
+    for good in [
+        DEFAULT_TOKEN_URL,
+        "https://token-proxy.internal/token",
+        "http://127.0.0.1:9/token",
+        "http://[::1]:9/token",
+        "http://localhost:9/token",
+    ] {
+        GcpTokenCache::new(good).expect(good);
     }
 }

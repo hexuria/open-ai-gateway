@@ -65,6 +65,15 @@ const SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 /// The JWT-bearer grant (RFC 7523 §2.1).
 const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
+/// Who every assertion is addressed to, its `aud`, wherever it is posted.
+///
+/// Google's documentation fixes it: "When making an access token request
+/// this value is always `https://oauth2.googleapis.com/token`"
+/// (<https://developers.google.com/identity/protocols/oauth2/service-account>).
+/// The token URL can be another, a stand-in or a proxy, and an assertion
+/// addressed to that is one Google refuses.
+const AUDIENCE: &str = "https://oauth2.googleapis.com/token";
+
 /// How long a signed assertion is valid. Google refuses anything longer.
 const ASSERTION_LIFETIME_SECS: i64 = 3600;
 
@@ -143,8 +152,9 @@ impl ServiceAccountKey {
         })
     }
 
-    /// The signed JWT that is traded for an access token at `audience`.
-    fn sign_assertion(&self, audience: &str, now: i64) -> Result<String> {
+    /// The signed JWT that is traded for an access token, addressed to
+    /// [`AUDIENCE`].
+    fn sign_assertion(&self, now: i64) -> Result<String> {
         let key_pair = self.key_pair()?;
 
         let header = serde_json::json!({
@@ -155,7 +165,7 @@ impl ServiceAccountKey {
         let claims = serde_json::json!({
             "iss": &self.client_email,
             "scope": SCOPE,
-            "aud": audience,
+            "aud": AUDIENCE,
             "iat": now,
             "exp": now + ASSERTION_LIFETIME_SECS,
         });
@@ -297,24 +307,27 @@ impl GcpTokenCache {
     /// A cache that mints at `token_url`, which is [`DEFAULT_TOKEN_URL`]
     /// unless `gateway.gcp_token_url` says otherwise.
     ///
-    /// Refused unless `token_url` is an http or https URL, so a mistyped one
-    /// stops the gateway at startup instead of failing every Vertex request.
+    /// Refused unless `token_url` is an https URL, or an http one to this
+    /// machine's own loopback (a stand-in, a local proxy), so a mistyped one
+    /// stops the gateway at startup instead of failing every Vertex request,
+    /// and no signed assertion crosses a network in the clear: one is as good
+    /// as the key for the hour it is valid.
     ///
     /// Redirects are not followed. A token endpoint that answers 3xx has
     /// failed the mint, because following the redirect would post the signed
     /// assertion to a host nobody configured.
     pub fn new(token_url: impl Into<String>) -> Result<Self> {
         let token_url = token_url.into();
-        let scheme = reqwest::Url::parse(&token_url)
-            .map(|url| url.scheme().to_owned())
-            .map_err(|e| {
-                Error::Config(format!(
-                    "the Google token URL {token_url:?} is not a URL: {e}"
-                ))
-            })?;
-        if !matches!(scheme.as_str(), "http" | "https") {
+        let url = reqwest::Url::parse(&token_url).map_err(|e| {
+            Error::Config(format!(
+                "the Google token URL {token_url:?} is not a URL: {e}"
+            ))
+        })?;
+        if !oag_core::endpoint::is_https_or_loopback(&url) {
             return Err(Error::Config(format!(
-                "the Google token URL {token_url:?} is not an http or https URL"
+                "the Google token URL {token_url:?} is neither https nor http to this \
+                 machine's loopback: a signed assertion is as good as the key for an hour, \
+                 and is not sent anywhere in the clear"
             )));
         }
         Ok(Self {
@@ -364,7 +377,7 @@ impl GcpTokenCache {
         }
 
         let key = ServiceAccountKey::from_json(sa_json)?;
-        let assertion = key.sign_assertion(&self.token_url, now)?;
+        let assertion = key.sign_assertion(now)?;
         let (access_token, expires_in) = self.exchange(&assertion, proxy).await?;
         // Counted from before the request went out, so the recorded expiry is
         // never later than the real one.
