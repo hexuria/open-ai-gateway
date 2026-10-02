@@ -140,6 +140,9 @@ must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
+# New in 1.99 (pedantic): wants `assert_eq!(x, [] as [T; 0])` for
+# `assert!(x.is_empty())`, which reads worse and drops the message.
+assert_is_empty = "allow"
 
 [profile.release]
 lto = "thin"

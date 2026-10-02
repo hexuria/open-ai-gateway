@@ -1006,7 +1006,7 @@ pub(crate) fn fastrand_u64() -> u64 {
     // state and both storing the same successor — the exact same draw, on the
     // exact code path whose only job is to make two replicas differ.
     let mut next = 0u64;
-    let _ = STATE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |mut x| {
+    let _ = STATE.try_update(Ordering::Relaxed, Ordering::Relaxed, |mut x| {
         if x == 0 {
             x = process_seed();
         }
