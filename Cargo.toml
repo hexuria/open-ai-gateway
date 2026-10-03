@@ -94,7 +94,7 @@ hex = "0.4"
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.10"
-base64 = "0.22"
+base64 = "0.23"
 # RS256 for the JWT a Google service account signs to get an access token
 # (`oag-upstream/src/gcp_token.rs`). Already in the tree as rustls' crypto
 # provider; named here at the version the lockfile holds, so no crate is added.
