@@ -1,6 +1,7 @@
 //! An endpoint's catalog sync and model discovery, as the store sees them: the
-//! sync's one-transaction write, the ladder check that keeps a stale row, and
-//! the keys the usage poller asks.
+//! sync's one-transaction write, the ladder check that keeps a stale row, the
+//! keys the usage poller asks, and the reasoning-effort levels a sync and
+//! `catalog sync-efforts` store (migration 0023).
 //!
 //! Gated on Postgres like every test here that needs a row. Every name is
 //! fresh, and every test removes what it wrote before it asserts.
@@ -58,6 +59,8 @@ fn model(provider: &str, upstream: &str, input: i64, label: Option<&str>) -> Mod
         supports_reasoning: false,
         supports_prompt_cache: false,
         display_label: label.map(str::to_owned),
+        reasoning_efforts: None,
+        reasoning_effort: None,
     }
 }
 
@@ -123,6 +126,7 @@ async fn a_sync_writes_overrides_rewrites_its_own_and_fills_only_a_missing_label
             model(&e, "b", 2, None),
         ],
         &[],
+        &[],
     )
     .await;
     let after_first = provider_models(&db, &e).await;
@@ -138,6 +142,7 @@ async fn a_sync_writes_overrides_rewrites_its_own_and_fills_only_a_missing_label
             model(&e, "zai/a", 9, Some("A (e)")),
             model(&e, "b", 2, Some("B (e)")),
         ],
+        &[],
         &[],
     )
     .await;
@@ -191,7 +196,7 @@ async fn an_id_another_providers_row_holds_is_left_as_it_was() {
     theirs.provider = "anthropic".to_owned();
     upsert_model(&db, &theirs, false).await.expect("a row");
 
-    let synced = sync_endpoint_models(&db, &e, &[model(&e, "x", 1, None)], &[]).await;
+    let synced = sync_endpoint_models(&db, &e, &[model(&e, "x", 1, None)], &[], &[]).await;
     let seen = provider_models(&db, &e).await;
     let held: (String, Decimal) =
         sqlx::query_as("SELECT provider, input_per_mtok FROM model_catalog WHERE id = $1")
@@ -243,6 +248,7 @@ async fn a_stale_row_a_ladder_names_is_kept_and_the_rest_are_removed() {
             model(&e, "s", 1, None),
         ],
         &[],
+        &[],
     )
     .await
     .expect("seed");
@@ -270,6 +276,7 @@ async fn a_stale_row_a_ladder_names_is_kept_and_the_rest_are_removed() {
         &e,
         &[model(&e, "s", 1, None)],
         &[kept.clone(), gone.clone()],
+        &[],
     )
     .await;
     let left: Vec<String> = provider_models(&db, &e)
@@ -322,6 +329,7 @@ async fn a_sync_removes_only_the_rows_its_own_syncs_wrote() {
         &e,
         &[model(&e, "synced", 1, None), model(&e, "restated", 1, None)],
         &[],
+        &[],
     )
     .await
     .expect("seed");
@@ -343,6 +351,7 @@ async fn a_sync_removes_only_the_rows_its_own_syncs_wrote() {
         &e,
         &[],
         &[synced.clone(), restated.clone(), theirs.clone()],
+        &[],
     )
     .await;
     let left: Vec<String> = provider_models(&db, &e)
@@ -370,9 +379,15 @@ async fn a_sync_removes_only_the_rows_its_own_syncs_wrote() {
 #[tokio::test]
 async fn a_sync_refuses_a_row_of_another_provider() {
     let db = Db::connect("postgres://oag:oag@127.0.0.1:1/oag", 1).expect("lazy pool");
-    let err = sync_endpoint_models(&db, "t6-mine", &[model("t6-theirs", "m", 1, None)], &[])
-        .await
-        .expect_err("refused before any statement");
+    let err = sync_endpoint_models(
+        &db,
+        "t6-mine",
+        &[model("t6-theirs", "m", 1, None)],
+        &[],
+        &[],
+    )
+    .await
+    .expect_err("refused before any statement");
     assert!(err.to_string().contains("t6-theirs/m"), "{err}");
 }
 
@@ -468,5 +483,269 @@ async fn the_sweep_reads_only_discovering_endpoints_keys_and_forgets_the_rest() 
         quiet_after,
         (None, None),
         "forgotten: never asked, as far as the listing can tell"
+    );
+}
+
+fn levels(values: &[&str], default: &str) -> Option<oag_router::ReasoningEfforts> {
+    oag_router::ReasoningEfforts::new(values.iter().copied(), default)
+}
+
+/// A row's two effort columns, as stored.
+async fn stored_levels(db: &Db, id: &str) -> (Option<Vec<String>>, Option<String>) {
+    sqlx::query_as("SELECT reasoning_efforts, reasoning_effort FROM model_catalog WHERE id = $1")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .expect("the row")
+}
+
+fn owned(values: &[&str]) -> Vec<String> {
+    values.iter().map(|v| (*v).to_owned()).collect()
+}
+
+/// Levels are stored lowest first, read back with the row by both of the
+/// catalog's reads, reported only when they change, and cleared by `None`; an
+/// id the catalog no longer holds is passed over.
+#[tokio::test]
+async fn a_rows_levels_are_stored_read_back_and_cleared() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let e = fresh("t7-levels");
+    endpoint(&db, &e, false).await;
+    let (a, b) = (format!("{e}/a"), format!("{e}/b"));
+    for m in [model(&e, "a", 1, None), model(&e, "b", 1, None)] {
+        upsert_model(&db, &m, false).await.expect("a row");
+    }
+    let ladder = levels(&["xhigh", "high", "medium", "low"], "high");
+
+    let first = set_model_efforts(
+        &db,
+        &[
+            (a.clone(), ladder.clone()),
+            (b.clone(), None),
+            (format!("{e}/gone"), ladder.clone()),
+        ],
+    )
+    .await;
+    let stored = stored_levels(&db, &a).await;
+    let read = catalog(&db)
+        .await
+        .map(|rows| rows.into_iter().find(|m| m.id == a));
+    let via_provider = provider_models(&db, &e).await;
+    let again = set_model_efforts(&db, &[(a.clone(), ladder.clone())]).await;
+    let cleared = set_model_efforts(&db, &[(a.clone(), None)]).await;
+    let after = stored_levels(&db, &a).await;
+    remove(&db, &[&e]).await;
+
+    assert_eq!(
+        first.expect("stored"),
+        std::slice::from_ref(&a),
+        "b had none and still has none, and gone is no row"
+    );
+    assert_eq!(
+        stored,
+        (
+            Some(owned(&["low", "medium", "high", "xhigh"])),
+            Some("high".to_owned())
+        )
+    );
+    // What the gateway's catalog load reads; `rows::tests` has it from there
+    // to the router.
+    let read = read.expect("read").expect("the row");
+    assert_eq!((read.reasoning_efforts, read.reasoning_effort), stored);
+    assert_eq!(
+        by_id(&via_provider.expect("rows"), &a)
+            .model
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
+    );
+    assert!(
+        again.expect("unchanged").is_empty(),
+        "nothing changed, so nothing is reported"
+    );
+    assert_eq!(cleared.expect("cleared"), [a]);
+    assert_eq!(after, (None, None));
+}
+
+/// A seed, an operator's `catalog add`, a price sync and an endpoint sync that
+/// read no levels each rewrite a row and none of them names its levels, so
+/// none of them changes them.
+#[tokio::test]
+async fn the_catalogs_other_writers_leave_a_rows_levels_as_they_were() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let e = fresh("t7-keep");
+    endpoint(&db, &e, false).await;
+    let (seeded, synced) = (format!("{e}/seeded"), format!("{e}/synced"));
+    let ladder = levels(&["low", "high"], "low");
+    let kept = (Some(owned(&["low", "high"])), Some("low".to_owned()));
+
+    upsert_model(&db, &model(&e, "seeded", 1, None), false)
+        .await
+        .expect("seeded");
+    set_model_efforts(&db, &[(seeded.clone(), ladder.clone())])
+        .await
+        .expect("levels");
+    upsert_model(&db, &model(&e, "seeded", 2, None), false)
+        .await
+        .expect("seeded again");
+    let reseeded = stored_levels(&db, &seeded).await;
+    update_model_prices(&db, &seeded, Decimal::from(3), Decimal::from(12), None)
+        .await
+        .expect("repriced");
+    let repriced = stored_levels(&db, &seeded).await;
+    override_model(&db, &model(&e, "seeded", 4, None))
+        .await
+        .expect("stated");
+    let stated = stored_levels(&db, &seeded).await;
+    let price: Decimal =
+        sqlx::query_scalar("SELECT input_per_mtok FROM model_catalog WHERE id = $1")
+            .bind(&seeded)
+            .fetch_one(db.pool())
+            .await
+            .expect("the row");
+
+    let first = sync_endpoint_models(
+        &db,
+        &e,
+        &[model(&e, "synced", 1, None)],
+        &[],
+        &[(synced.clone(), ladder.clone())],
+    )
+    .await;
+    let without = sync_endpoint_models(&db, &e, &[model(&e, "synced", 2, None)], &[], &[]).await;
+    let after_sync = stored_levels(&db, &synced).await;
+    remove(&db, &[&e]).await;
+
+    assert_eq!(reseeded, kept, "a re-seed");
+    assert_eq!(repriced, kept, "a price sync");
+    assert_eq!(stated, kept, "an operator's restatement");
+    assert_eq!(price, Decimal::from(4), "each of them did write the row");
+    assert_eq!(
+        first.expect("synced").efforts,
+        std::slice::from_ref(&synced)
+    );
+    let without = without.expect("synced");
+    assert_eq!(without.written, std::slice::from_ref(&synced));
+    assert!(without.efforts.is_empty());
+    assert_eq!(after_sync, kept, "a sync that read no levels");
+}
+
+/// A sync stores levels on its own provider's rows alone: an id another
+/// provider's row holds keeps its levels, as it keeps everything else.
+#[tokio::test]
+async fn a_sync_stores_levels_on_its_own_rows_alone() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let e = fresh("t7-own");
+    endpoint(&db, &e, false).await;
+    let (mine, held) = (format!("{e}/m"), format!("{e}/x"));
+    let mut theirs = model(&e, "x", 5, None);
+    theirs.provider = "anthropic".to_owned();
+    upsert_model(&db, &theirs, false).await.expect("a row");
+    let ladder = levels(&["max", "high", "low"], "max");
+
+    let done = sync_endpoint_models(
+        &db,
+        &e,
+        &[model(&e, "m", 1, None), model(&e, "x", 1, None)],
+        &[],
+        &[(mine.clone(), ladder.clone()), (held.clone(), ladder)],
+    )
+    .await;
+    let (mine_levels, held_levels) = (
+        stored_levels(&db, &mine).await,
+        stored_levels(&db, &held).await,
+    );
+    sqlx::query("DELETE FROM model_catalog WHERE id = $1")
+        .bind(&held)
+        .execute(db.pool())
+        .await
+        .expect("clean up");
+    remove(&db, &[&e]).await;
+
+    let done = done.expect("synced");
+    assert_eq!(done.held, std::slice::from_ref(&held));
+    assert_eq!(done.efforts, [mine]);
+    assert_eq!(
+        mine_levels,
+        (Some(owned(&["low", "high", "max"])), Some("max".to_owned()))
+    );
+    assert_eq!(held_levels, (None, None), "another provider's row");
+}
+
+/// Migration 0023's CHECK: levels and a default together or neither, the
+/// default one of the levels, and no level missing from the list.
+#[tokio::test]
+async fn the_schema_refuses_half_a_pair_and_a_default_off_the_list() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let e = fresh("t7-check");
+    endpoint(&db, &e, false).await;
+    let id = format!("{e}/m");
+    upsert_model(&db, &model(&e, "m", 1, None), false)
+        .await
+        .expect("a row");
+    let write = |levels: Option<Vec<Option<&'static str>>>, default: Option<&'static str>| {
+        let (db, id) = (db.clone(), id.clone());
+        async move {
+            sqlx::query(
+                "UPDATE model_catalog SET reasoning_efforts = $2, reasoning_effort = $3 \
+                 WHERE id = $1",
+            )
+            .bind(&id)
+            .bind(levels)
+            .bind(default)
+            .execute(db.pool())
+            .await
+            .map_err(|e| {
+                e.as_database_error()
+                    .and_then(|d| d.code().map(std::borrow::Cow::into_owned))
+            })
+        }
+    };
+    let mut outcomes = Vec::new();
+    for (levels, default) in [
+        (Some(vec![Some("low"), Some("high")]), Some("high")),
+        (None, None),
+        (Some(vec![Some("low"), Some("high")]), None),
+        (None, Some("high")),
+        (Some(vec![Some("low"), Some("high")]), Some("medium")),
+        (Some(vec![]), Some("high")),
+        (Some(vec![]), None),
+        (Some(vec![Some("high"), None]), Some("high")),
+        (Some(vec![Some("low"), None]), Some("high")),
+    ] {
+        outcomes.push(write(levels, default).await.map(|_| ()));
+    }
+    remove(&db, &[&e]).await;
+
+    let refused = Err(Some("23514".to_owned()));
+    assert_eq!(
+        outcomes,
+        [
+            Ok(()),
+            Ok(()),
+            refused.clone(),
+            refused.clone(),
+            refused.clone(),
+            refused.clone(),
+            refused.clone(),
+            refused.clone(),
+            refused,
+        ]
     );
 }

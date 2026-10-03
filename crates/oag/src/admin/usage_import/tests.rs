@@ -77,6 +77,8 @@ fn model_row(
         supports_reasoning: true,
         supports_prompt_cache: true,
         display_label: None,
+        reasoning_efforts: None,
+        reasoning_effort: None,
     }
 }
 
@@ -97,6 +99,8 @@ fn catalog() -> Prices {
             supports_reasoning: true,
             supports_prompt_cache: true,
             display_label: None,
+            reasoning_efforts: None,
+            reasoning_effort: None,
         }],
         "anthropic",
     )
@@ -1145,6 +1149,8 @@ fn grok_catalog() -> Prices {
             supports_reasoning: true,
             supports_prompt_cache: true,
             display_label: None,
+            reasoning_efforts: None,
+            reasoning_effort: None,
         }],
         "xai",
     )

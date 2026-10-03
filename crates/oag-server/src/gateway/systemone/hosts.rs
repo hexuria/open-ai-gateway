@@ -25,6 +25,7 @@ fn row(id: &str, provider: Provider, upstream: &str, input: i64) -> ModelSpec {
         max_output_tokens: 0,
         capabilities: Capabilities::default(),
         display_label: None,
+        reasoning_efforts: None,
     }
 }
 

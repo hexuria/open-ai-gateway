@@ -18,7 +18,7 @@ use oag_store::Db;
 /// below counts the files rather than trusting this line, because the number
 /// that matters is the one on disk and a constant is exactly the thing that
 /// gets forgotten.
-const EXPECTED_MIGRATIONS: usize = 22;
+const EXPECTED_MIGRATIONS: usize = 23;
 
 pub async fn run(db: &Db, config: &Config, route: &str) -> Result<()> {
     conclude(problems(db, config, route).await?)

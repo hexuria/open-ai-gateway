@@ -80,7 +80,75 @@ fn any_row(endpoint: &str, upstream: &str) -> ModelRow {
         supports_reasoning: false,
         supports_prompt_cache: false,
         display_label: None,
+        reasoning_efforts: None,
+        reasoning_effort: None,
     }
+}
+
+fn efforts(levels: &[&str], default: &str) -> oag_router::ReasoningEfforts {
+    oag_router::ReasoningEfforts::new(levels.iter().copied(), default).expect("valid levels")
+}
+
+/// Levels are planned for every row a sync writes or finds unchanged: the
+/// override table's, else OpenRouter's, else none. Not for one it removes, keeps
+/// for a ladder, or finds another provider holding.
+#[test]
+fn a_syncs_levels_cover_the_rows_it_manages_and_no_other() {
+    let report = SyncReport {
+        endpoint: "merge".to_owned(),
+        added: vec!["merge/zai/glm-5.3-flash".to_owned()],
+        updated: vec!["merge/acme/unlisted".to_owned()],
+        unchanged: vec!["merge/openai/gpt-5.5".to_owned()],
+        removed: vec!["merge/old/a".to_owned()],
+        kept_on_ladder: vec!["merge/old/b".to_owned()],
+        held: vec!["merge/zai/held".to_owned()],
+        ..SyncReport::default()
+    };
+    let overrides = Overrides::parse(
+        r#"{"merge/zai/glm-5.3-flash": {"efforts": ["low", "high", "max"], "default": "max",
+                                       "source": "the vendor's documentation"}}"#,
+    )
+    .expect("parses");
+    let listed = |levels: &[&str], default: &str| efforts(levels, default);
+    let snapshot = Snapshot::new([
+        (
+            "z-ai/glm-5.3-flash".to_owned(),
+            listed(&["high", "low"], "low"),
+        ),
+        (
+            "openai/gpt-5.5".to_owned(),
+            listed(&["xhigh", "high", "medium", "low", "none"], "medium"),
+        ),
+        ("old/a".to_owned(), listed(&["low"], "low")),
+        ("old/b".to_owned(), listed(&["low"], "low")),
+        ("zai/held".to_owned(), listed(&["low"], "low")),
+    ]);
+    let (levels, tally) = levels_for(&report, &overrides, &snapshot);
+    assert_eq!(
+        levels,
+        [
+            (
+                "merge/zai/glm-5.3-flash".to_owned(),
+                Some(efforts(&["low", "high", "max"], "max"))
+            ),
+            ("merge/acme/unlisted".to_owned(), None),
+            (
+                "merge/openai/gpt-5.5".to_owned(),
+                Some(efforts(
+                    &["none", "low", "medium", "high", "xhigh"],
+                    "medium"
+                ))
+            ),
+        ]
+    );
+    assert_eq!(
+        tally,
+        Tally {
+            overridden: 1,
+            listed: 1,
+            unknown: 1
+        }
+    );
 }
 
 #[test]
@@ -440,6 +508,7 @@ fn the_write_has_the_last_word_on_what_was_written_and_removed() {
             written: vec!["e/a".to_owned(), "e/d".to_owned()],
             held: vec!["e/b".to_owned(), "e/c".to_owned()],
             removed: vec!["e/x".to_owned()],
+            efforts: Vec::new(),
         },
         vec!["e/x".to_owned(), "e/y".to_owned()],
     );
@@ -562,6 +631,44 @@ impl Merge {
 
     async fn sync(&self, options: SyncOptions) -> Result<SyncReport> {
         super::sync(&self.db, &self.kek, &self.endpoint, &options).await
+    }
+
+    /// An OpenRouter list at `/api/v1/models`, stating levels, highest first,
+    /// for two of the fixture's three chat models: none for DeepSeek's.
+    async fn openrouter(&self) -> MockGuard {
+        Mock::given(method("GET"))
+            .and(path("/api/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [
+                {"id": "z-ai/glm-5.3-flash",
+                 "reasoning": {"supported_efforts": ["max", "high", "low"],
+                               "default_effort": "max"}},
+                {"id": "anthropic/claude-sonnet-4.5",
+                 "reasoning": {"supported_efforts": ["high", "medium", "low"],
+                               "default_effort": "medium"}},
+                {"id": "deepseek/deepseek-v3.2", "reasoning": null}
+            ]})))
+            .mount_as_scoped(&self.server)
+            .await
+    }
+
+    fn openrouter_url(&self) -> String {
+        format!("{}/api/v1/models", self.server.uri())
+    }
+
+    /// Each of the endpoint's rows' stored levels, in id order.
+    async fn levels(&self) -> Vec<(String, Option<Vec<String>>, Option<String>)> {
+        repo::provider_models(&self.db, &self.endpoint)
+            .await
+            .expect("rows")
+            .into_iter()
+            .map(|r| {
+                (
+                    r.model.id,
+                    r.model.reasoning_efforts,
+                    r.model.reasoning_effort,
+                )
+            })
+            .collect()
     }
 
     fn id(&self, upstream: &str) -> String {
@@ -1087,6 +1194,90 @@ async fn an_endpoint_that_takes_a_key_and_has_none_is_refused_before_anything_is
                 .expect("recording")
                 .is_empty()
         );
+    })
+    .await;
+}
+
+fn owned(values: &[&str]) -> Vec<String> {
+    values.iter().map(|v| (*v).to_owned()).collect()
+}
+
+/// A sync stores the levels OpenRouter's list states for each row it writes,
+/// lowest first, and none for a row it lists none for. A dry run reports where
+/// they would come from and stores nothing, and a sync that reads no levels
+/// keeps the ones stored, on the rows it finds unchanged too.
+#[tokio::test]
+async fn a_sync_stores_each_rows_levels_and_one_that_reads_none_keeps_them() {
+    with_merge("/v1/openai", |m| async move {
+        let _served = m.serve(page(PAGE_1), page(PAGE_2)).await;
+        let _listed = m.openrouter().await;
+        let reading = |dry_run| SyncOptions {
+            efforts: Some(m.openrouter_url()),
+            dry_run,
+            ..SyncOptions::default()
+        };
+        let tally = Some(Tally {
+            overridden: 0,
+            listed: 2,
+            unknown: 1,
+        });
+
+        let dry = m.sync(reading(true)).await.expect("a dry run");
+        assert_eq!(dry.efforts, tally);
+        assert!(m.levels().await.is_empty(), "a dry run writes nothing");
+
+        let first = m.sync(reading(false)).await.expect("synced");
+        assert_eq!(first.efforts, tally);
+        let stored = vec![
+            (
+                m.id(SONNET),
+                Some(owned(&["low", "medium", "high"])),
+                Some("medium".to_owned()),
+            ),
+            (m.id(DEEPSEEK), None, None),
+            (
+                m.id(GLM),
+                Some(owned(&["low", "high", "max"])),
+                Some("max".to_owned()),
+            ),
+        ];
+        assert_eq!(m.levels().await, stored);
+
+        let without = m.sync(SyncOptions::default()).await.expect("synced");
+        assert_eq!(without.efforts, None);
+        assert_eq!(without.unchanged, [m.id(GLM), m.id(SONNET), m.id(DEEPSEEK)]);
+        assert_eq!(m.levels().await, stored, "kept");
+    })
+    .await;
+}
+
+/// A list of levels that cannot be read stops the sync before it writes, and
+/// says how to sync without one.
+#[tokio::test]
+async fn a_level_list_that_cannot_be_read_stops_the_sync_before_it_writes() {
+    with_merge("/v1/openai", |m| async move {
+        let _served = m.serve(page(PAGE_1), page(PAGE_2)).await;
+        // Nothing is served at the list's path, which the stand-in answers 404.
+        let err = m
+            .sync(SyncOptions {
+                efforts: Some(m.openrouter_url()),
+                ..SyncOptions::default()
+            })
+            .await
+            .expect_err("no list");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("configuration: reading reasoning-effort levels: "),
+            "{message}"
+        );
+        assert!(message.contains("returned 404"), "{message}");
+        assert!(
+            message.ends_with(
+                "run the sync again with --no-efforts to keep each row's levels as they are"
+            ),
+            "{message}"
+        );
+        assert!(m.rows().await.is_empty(), "nothing was written");
     })
     .await;
 }

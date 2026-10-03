@@ -1,8 +1,10 @@
 //! An endpoint's priced model list, end to end: a stand-in Merge Gateway on a
 //! mock server, `endpoint_sync::sync` writing its catalog rows, and a real
-//! gateway on real ports serving them without a restart: listing them, sending
-//! each request with the model's own multi-slash name, pricing it by the vendor
-//! the sync chose, and narrowing the listing once discovery is turned on.
+//! gateway on real ports serving them without a restart: listing them, with
+//! the reasoning-effort levels the sync stored from the committed override
+//! table and a stand-in OpenRouter list, sending each request with the model's
+//! own multi-slash name, pricing it by the vendor the sync chose, and
+//! narrowing the listing once discovery is turned on.
 //!
 //! Gated like every test that needs the store: skipped unless
 //! `OAG_TEST_DATABASE_URL` and `OAG_TEST_REDIS_URL` are set. It makes a
@@ -13,6 +15,7 @@
 
 use futures_util::FutureExt as _;
 use oag_core::credential::SecretMaterial;
+use oag_router::efforts::{Overrides, Tally};
 use oag_server::AppState;
 use oag_server::endpoint_sync::{SyncOptions, sync};
 use oag_store::{Cache, Db, EndpointUpdate, EndpointUpdated, NewEndpoint, repo};
@@ -30,10 +33,12 @@ const PAGE_2: &str = include_str!("../../oag-upstream/tests/fixtures/merge-model
 /// The fixture's first page's `next_cursor`.
 const CURSOR: &str = "eyJhZnRlciI6Im1pc3RyYWwvbWlzdHJhbC1sYXJnZS0yNDA3In0";
 
-const ENDPOINT: &str = "mergemock";
-const GLM: &str = "mergemock/zai/glm-5.3-flash";
-const SONNET: &str = "mergemock/anthropic/claude-sonnet-4.5";
-const DEEPSEEK: &str = "mergemock/deepseek/deepseek-v3.2";
+/// The name the committed override table knows Merge by, so GLM's row is one
+/// it names. This test has a database of its own, so the name is free.
+const ENDPOINT: &str = "merge";
+const GLM: &str = "merge/zai/glm-5.3-flash";
+const SONNET: &str = "merge/anthropic/claude-sonnet-4.5";
+const DEEPSEEK: &str = "merge/deepseek/deepseek-v3.2";
 const KEY: &str = "t6-merge-key";
 
 /// How long a change may take to show. The refresh and the poller run every
@@ -110,11 +115,29 @@ async fn scenario(db_url: String, redis_url: String) {
     .await
     .expect("the endpoint");
     let key = gw.account(ENDPOINT, KEY).await;
-    let report = sync(&gw.db, &gw.state.kek, ENDPOINT, &SyncOptions::default())
-        .await
-        .expect("the sync");
+    let openrouter = openrouter().await;
+    let report = sync(
+        &gw.db,
+        &gw.state.kek,
+        ENDPOINT,
+        &SyncOptions {
+            efforts: Some(format!("{}/api/v1/models", openrouter.uri())),
+            ..SyncOptions::default()
+        },
+    )
+    .await
+    .expect("the sync");
     assert_eq!(report.added, [GLM, SONNET, DEEPSEEK]);
     assert_eq!(report.url, format!("{}/v1/models?limit=500", merge.uri()));
+    assert_eq!(
+        report.efforts,
+        Some(Tally {
+            overridden: 1,
+            listed: 1,
+            unknown: 1
+        })
+    );
+    openrouter.verify().await;
     sqlx::query("UPDATE route SET tiers = $1::jsonb WHERE id = $2")
         .bind(json!([{"name": "cheap", "models": [GLM]}]))
         .bind(gw.route)
@@ -136,10 +159,110 @@ async fn scenario(db_url: String, redis_url: String) {
         "what the sync skipped is not served: {listed:?}"
     );
 
+    effort_levels_are_listed_as_opencodex_lists_them(&gw).await;
     chat_by_the_models_full_name(&gw, &merge).await;
     gemini_path_with_slashes_in_the_model(&gw, &merge).await;
     rung_pin(&gw, &merge).await;
     discovery_narrows_the_listing(&gw, &base, key).await;
+}
+
+/// A stand-in for OpenRouter's public model list at `/api/v1/models`, read
+/// once: levels for GLM and Sonnet, highest first, and none for DeepSeek.
+async fn openrouter() -> MockServer {
+    let openrouter = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"data": [
+            // Not what the committed override states for Merge's GLM, which
+            // wins.
+            {"id": "z-ai/glm-5.3-flash",
+             "reasoning": {"supported_efforts": ["high", "low"], "default_effort": "low"}},
+            {"id": "anthropic/claude-sonnet-4.5",
+             "reasoning": {"supported_efforts": ["max", "xhigh", "high", "medium", "low"],
+                           "default_effort": "high"}},
+            {"id": "deepseek/deepseek-v3.2", "reasoning": null}
+        ]})))
+        .expect(1)
+        .mount(&openrouter)
+        .await;
+    openrouter
+}
+
+/// The levels the sync stored, listed as opencodex lists them: the committed
+/// override's for GLM over OpenRouter's, OpenRouter's for Sonnet lowest first,
+/// none at all for DeepSeek, and GLM's for `oag/cheap`, whose rung names GLM
+/// alone.
+async fn effort_levels_are_listed_as_opencodex_lists_them(gw: &Gateway) {
+    let models = gw.models().await;
+    let row = |id: &str| {
+        models
+            .iter()
+            .find(|m| m["id"] == id)
+            .unwrap_or_else(|| panic!("{id} is listed: {models:?}"))
+            .clone()
+    };
+    let overridden = Overrides::committed()
+        .expect("the committed table")
+        .get(GLM)
+        .cloned()
+        .flatten()
+        .expect(
+            "the committed table names Merge's GLM, which this test drives an override through",
+        );
+
+    let glm = row(GLM);
+    assert_eq!(glm["supports_reasoning_effort"], true);
+    assert_eq!(glm["reasoning_effort"], overridden.default_level().value);
+    assert_eq!(
+        glm["capabilities"]["reasoning_effort"],
+        json!(overridden.values())
+    );
+    assert_ne!(
+        glm["capabilities"]["reasoning_effort"],
+        json!(["low", "high"]),
+        "OpenRouter's, which the override beats"
+    );
+
+    let sonnet = row(SONNET);
+    assert_eq!(sonnet["supports_reasoning_effort"], true);
+    assert_eq!(sonnet["reasoning_effort"], "high");
+    assert_eq!(
+        sonnet["reasoning_efforts"],
+        json!([
+            {"value": "low", "label": "Low Effort"},
+            {"value": "medium", "label": "Medium Effort"},
+            {"value": "high", "label": "High Effort", "default": true},
+            {"value": "xhigh", "label": "Xhigh Effort"},
+            {"value": "max", "label": "Max Effort"},
+        ])
+    );
+    assert_eq!(
+        sonnet["capabilities"]["reasoning_effort"],
+        json!(["low", "medium", "high", "xhigh", "max"])
+    );
+
+    let deepseek = row(DEEPSEEK);
+    for field in [
+        "supports_reasoning_effort",
+        "reasoning_effort",
+        "reasoning_efforts",
+    ] {
+        assert!(deepseek.get(field).is_none(), "{field}: {deepseek}");
+    }
+    assert!(
+        deepseek["capabilities"].get("reasoning_effort").is_none(),
+        "{deepseek}"
+    );
+
+    let cheap = row("oag/cheap");
+    for field in [
+        "supports_reasoning_effort",
+        "reasoning_effort",
+        "reasoning_efforts",
+        "capabilities",
+    ] {
+        assert_eq!(cheap[field], glm[field], "{field}");
+    }
 }
 
 /// The catalog id is the endpoint's name, a slash, and the model's own name,
@@ -417,7 +540,8 @@ gateway:
             .expect("the gateway answers")
     }
 
-    async fn model_ids(&self) -> Vec<String> {
+    /// `/v1/models`' rows, as served.
+    async fn models(&self) -> Vec<Value> {
         let res = self
             .client
             .get(format!("{}/v1/models", self.public))
@@ -426,9 +550,12 @@ gateway:
             .await
             .expect("the gateway answers");
         let body = ok_json(res, "/v1/models").await;
-        body["data"]
-            .as_array()
-            .expect("a data list")
+        body["data"].as_array().expect("a data list").clone()
+    }
+
+    async fn model_ids(&self) -> Vec<String> {
+        self.models()
+            .await
             .iter()
             .filter_map(|m| m["id"].as_str().map(str::to_owned))
             .collect()

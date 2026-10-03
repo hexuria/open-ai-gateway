@@ -1,0 +1,27 @@
+{
+  "openai/gpt-5.5": {
+    "efforts": ["low", "medium", "high", "xhigh"],
+    "default": "medium",
+    "source": "The Codex backend's own model catalog (supported_reasoning_levels, default_reasoning_level), read by the ChatGPT seat that serves this row; pinned in opencodex's src/codex/data/upstream-models.json. OpenRouter's API listing adds none, which that catalog does not offer."
+  },
+  "openai/gpt-5.6-luna": {
+    "efforts": ["low", "medium", "high", "xhigh", "max"],
+    "default": "medium",
+    "source": "The Codex backend's own model catalog (supported_reasoning_levels, default_reasoning_level), read by the ChatGPT seat that serves this row; pinned in opencodex's src/codex/data/upstream-models.json and served by opencodex's /v1/models. OpenRouter's API listing adds none."
+  },
+  "openai/gpt-5.6-terra": {
+    "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "default": "medium",
+    "source": "The Codex backend's own model catalog (supported_reasoning_levels, default_reasoning_level), read by the ChatGPT seat that serves this row; pinned in opencodex's src/codex/data/upstream-models.json and served by opencodex's /v1/models. OpenRouter's API listing has none and no ultra."
+  },
+  "xai/grok-4.6": {
+    "efforts": ["low", "medium", "high", "xhigh"],
+    "default": "high",
+    "source": "xAI's reasoning guide (docs.x.ai/developers/model-capabilities/text/reasoning): grok-4.6 takes low, medium, high and xhigh, high by default, as opencodex's xAI registry records. OpenRouter lists the same."
+  },
+  "merge/zai/glm-5.3-flash": {
+    "efforts": ["low", "high", "max"],
+    "default": "max",
+    "source": "Z.ai's GLM-5.3 documentation (docs.z.ai/devpack/latest-model): GLM-5.3 and its Flash fold every effort into low, high and max, max by default, as opencodex's Z.ai registry records. OpenRouter lists the same."
+  }
+}

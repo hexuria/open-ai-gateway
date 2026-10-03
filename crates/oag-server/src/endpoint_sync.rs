@@ -11,13 +11,19 @@
 //! own name for the model and may hold slashes of its own (Merge's
 //! `zai/glm-5.3-flash`): the endpoint's name is everything before the first
 //! slash of the catalog id, and the request carries everything after it.
+//!
+//! It also stores each row's reasoning-effort levels, from the committed
+//! override table and OpenRouter's public model list, which it reads before
+//! anything is written: see [`oag_router::efforts`].
 
 use oag_core::credential::SecretMaterial;
 use oag_core::provider::{AuthStyle, Platform};
 use oag_core::{Error, Kek, Result};
-use oag_store::{Db, EndpointSync, ModelRow, StoredModelRow, repo};
+use oag_router::efforts::{self, Overrides, Snapshot, Tally};
+use oag_store::{Db, EndpointSync, ModelEfforts, ModelRow, StoredModelRow, repo};
 use oag_upstream::custom::EndpointSpec;
 use oag_upstream::listing::{self, ListedModel, Offer, PriceChoice, Skip};
+use oag_upstream::openrouter;
 use std::collections::{HashMap, HashSet};
 
 /// An endpoint, ready to have its list read.
@@ -120,6 +126,10 @@ pub struct SyncOptions {
     /// of the rows earlier syncs wrote, which is refused otherwise: see
     /// [`sync`].
     pub allow_shrink: bool,
+    /// Where to read reasoning-effort levels: OpenRouter's model list
+    /// ([`openrouter::MODELS_URL`]), read before anything is written. `None`
+    /// reads none, and every row keeps the levels it has.
+    pub efforts: Option<String>,
 }
 
 /// What a sync found, and did or, on a dry run, would do. Every list is of
@@ -147,6 +157,9 @@ pub struct SyncReport {
     pub skipped: Vec<(String, Skip)>,
     /// Left out by `--include` or `--exclude`: neither written nor removed.
     pub filtered: Vec<String>,
+    /// Where the levels of the rows this run manages came from, written or
+    /// not; `None` when no levels were read.
+    pub efforts: Option<Tally>,
 }
 
 /// Write an endpoint's priced model list into the catalog.
@@ -172,6 +185,11 @@ pub struct SyncReport {
 /// meant: a list that shrinks that far is more often one read in part, or
 /// changed in shape, than an endpoint withdrawing its models.
 ///
+/// With [`SyncOptions::efforts`], every row the run writes or finds unchanged
+/// also stores its reasoning-effort levels: the committed override table's
+/// entry for it, else OpenRouter's, else none. That list is read before
+/// anything is written, so one that cannot be read stops the sync.
+///
 /// Everything is written in one transaction. The gateway serves the rows from
 /// its next catalog refresh; nothing has to restart.
 pub async fn sync(db: &Db, kek: &Kek, endpoint: &str, options: &SyncOptions) -> Result<SyncReport> {
@@ -183,6 +201,10 @@ pub async fn sync(db: &Db, kek: &Kek, endpoint: &str, options: &SyncOptions) -> 
         reader.proxy.as_deref(),
     )
     .await?;
+    let sources = match options.efforts.as_deref() {
+        Some(url) => Some(effort_sources(url).await?),
+        None => None,
+    };
     let existing = repo::provider_models(db, &reader.name).await?;
     let laddered = repo::laddered_models(db).await?;
     let Plan {
@@ -216,13 +238,48 @@ pub async fn sync(db: &Db, kek: &Kek, endpoint: &str, options: &SyncOptions) -> 
     report.url = listed.url;
     report.pages = listed.pages;
     report.account = reader.account;
+    let mut levels = Vec::new();
+    if let Some((overrides, snapshot)) = &sources {
+        let (planned, tally) = levels_for(&report, overrides, snapshot);
+        levels = planned;
+        report.efforts = Some(tally);
+    }
     if options.dry_run {
         return Ok(report);
     }
 
-    let done = repo::sync_endpoint_models(db, &reader.name, &writes, &remove).await?;
+    let done = repo::sync_endpoint_models(db, &reader.name, &writes, &remove, &levels).await?;
     settle(&mut report, done, remove);
     Ok(report)
+}
+
+/// The override table, and the levels OpenRouter's list at `url` states.
+async fn effort_sources(url: &str) -> Result<(Overrides, Snapshot)> {
+    let overrides = Overrides::committed()?;
+    let snapshot = openrouter::reasoning_efforts(url).await.map_err(|e| {
+        Error::Config(format!(
+            "reading reasoning-effort levels: {e}. Nothing was written; run the sync again with \
+             --no-efforts to keep each row's levels as they are"
+        ))
+    })?;
+    Ok((overrides, snapshot))
+}
+
+/// The levels each row a sync manages is to store, and where they came from:
+/// every row it writes or finds unchanged. A row it removes needs none, and an
+/// id another provider holds is not its to change.
+fn levels_for(
+    report: &SyncReport,
+    overrides: &Overrides,
+    snapshot: &Snapshot,
+) -> (Vec<ModelEfforts>, Tally) {
+    let managed = report
+        .added
+        .iter()
+        .chain(&report.updated)
+        .chain(&report.unchanged)
+        .map(|id| (id.as_str(), report.endpoint.as_str()));
+    efforts::plan(managed, overrides, snapshot)
 }
 
 /// The plan's report, corrected by what the write found: the rows as they
@@ -386,6 +443,10 @@ fn catalog_row(endpoint: &str, label: &str, offer: &Offer) -> ModelRow {
         // A cache read is only billed where the list prices one.
         supports_prompt_cache: offer.price.cache_read.is_some(),
         display_label: Some(format!("{shown} ({label})")),
+        // Not the list's to say: the levels are stored apart, from the
+        // override table and OpenRouter's list (`levels_for`).
+        reasoning_efforts: None,
+        reasoning_effort: None,
     }
 }
 

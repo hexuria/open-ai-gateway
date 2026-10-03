@@ -310,6 +310,55 @@ If the tool appends its own `/v1`, both spellings are served, so it does not
 matter which half of the path you put where — as long as you do not end up with
 `/v1/v1`.
 
+## Reasoning effort
+
+`/v1/models` says which `reasoning_effort` levels each model takes, in the
+field names, order and words opencodex's own `/v1/models` uses, so a picker's
+effort slider shows only the stops a model has:
+
+```json
+{
+  "id": "merge/zai/glm-5.3-flash",
+  "object": "model",
+  "created": 0,
+  "owned_by": "merge",
+  "supports_reasoning_effort": true,
+  "reasoning_effort": "max",
+  "reasoning_efforts": [
+    {"value": "low", "label": "Low Effort"},
+    {"value": "high", "label": "High Effort"},
+    {"value": "max", "label": "Max Effort", "default": true}
+  ],
+  "capabilities": {
+    "context_length": 131072,
+    "max_output_tokens": 32768,
+    "supports_tool_use": true,
+    "supports_reasoning": false,
+    "supports_vision": false,
+    "reasoning_effort": ["low", "high", "max"]
+  },
+  "type": "model",
+  "display_name": "GLM 5.3 Flash (Merge)",
+  "created_at": "1970-01-01T00:00:00Z",
+  "oag": {"...": "unchanged"}
+}
+```
+
+Levels run lowest first (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`, `ultra`), each labelled as opencodex labels it, and only the default
+carries `"default": true`; `reasoning_effort` names it. A model whose levels are
+not known carries none of `supports_reasoning_effort`, `reasoning_effort`,
+`reasoning_efforts` and `capabilities.reasoning_effort`: no slider rather than
+a guessed one. `capabilities` otherwise mirrors the catalog's window, output
+limit (each left off when the catalog does not know it) and tool, reasoning and
+vision flags. A virtual name (`oag/cheap`, `oag/auto`) carries the description
+only when every rung it can be decided onto names one and the same model, and
+then it is that model's. The `oag` object is as it was.
+
+The levels are stored with each catalog row, not looked up per request; where
+they come from is in
+[03-providers.md](03-providers.md#reasoning-effort-levels).
+
 ## Why did I get a different model than I asked for?
 
 Because the route is in **managed** mode, which is the point of the product and

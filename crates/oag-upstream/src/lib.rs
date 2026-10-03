@@ -16,6 +16,7 @@ pub mod jev;
 pub mod listing;
 pub mod openai;
 pub mod openai_oauth;
+pub mod openrouter;
 pub mod pricing;
 pub mod sigv4;
 pub mod transport;

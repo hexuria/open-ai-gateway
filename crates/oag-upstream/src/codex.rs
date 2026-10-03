@@ -445,6 +445,7 @@ mod tests {
             max_output_tokens: 16_384,
             capabilities: Capabilities::default(),
             display_label: None,
+            reasoning_efforts: None,
         }
     }
 

@@ -251,6 +251,13 @@ pub struct ModelRow {
     /// What an operator named this model. `None` means nobody has, and the
     /// label is derived — see [`ModelRow::derived_label`].
     pub display_label: Option<String>,
+    /// The reasoning-effort levels the model takes, lowest first, and the one
+    /// it uses when a request names none (migration 0023): both `None` when
+    /// they are not known. Read with the row; written only by
+    /// [`crate::repo::set_model_efforts`] and an endpoint's sync, and no other
+    /// write names them, so a seed or `catalog add` leaves them as they were.
+    pub reasoning_efforts: Option<Vec<String>>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl ModelRow {
@@ -294,7 +301,19 @@ impl ModelRow {
                 prompt_cache: self.supports_prompt_cache,
             },
             display_label: self.display_label.clone(),
+            reasoning_efforts: self.efforts(),
         })
+    }
+
+    /// The stored levels, or `None` when the row holds none or a pair the
+    /// router cannot use. Migration 0023's CHECK keeps the second from being
+    /// written; read leniently anyway, so one row never costs the catalog.
+    fn efforts(&self) -> Option<oag_router::ReasoningEfforts> {
+        let levels = self.reasoning_efforts.as_ref()?;
+        oag_router::ReasoningEfforts::new(
+            levels.iter().map(String::as_str),
+            self.reasoning_effort.as_deref()?,
+        )
     }
 }
 
@@ -437,9 +456,59 @@ pub struct UsageWrite {
 
 #[cfg(test)]
 mod tests {
-    use super::EndpointRow;
+    use super::{EndpointRow, ModelRow};
     use oag_core::endpoint::Reason;
     use oag_core::provider::{AuthStyle, Dialect, Platform};
+    use rust_decimal::Decimal;
+
+    fn model(levels: Option<&[&str]>, default: Option<&str>) -> ModelRow {
+        ModelRow {
+            id: "xai/grok-4.6".to_owned(),
+            provider: "xai".to_owned(),
+            upstream_name: "grok-4.6".to_owned(),
+            input_per_mtok: Decimal::TWO,
+            output_per_mtok: Decimal::TEN,
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: None,
+            context_window: 500_000,
+            max_output_tokens: 32_000,
+            supports_vision: true,
+            supports_tools: true,
+            supports_reasoning: true,
+            supports_prompt_cache: false,
+            display_label: None,
+            reasoning_efforts: levels.map(|l| l.iter().map(|s| (*s).to_owned()).collect()),
+            reasoning_effort: default.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_rows_stored_levels_reach_the_router_lowest_first() {
+        let spec = model(Some(&["low", "medium", "high", "xhigh"]), Some("high"))
+            .to_spec()
+            .expect("a known provider");
+        let efforts = spec.reasoning_efforts.expect("levels");
+        assert_eq!(efforts.values(), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(efforts.default_level().value, "high");
+    }
+
+    #[test]
+    fn a_row_without_a_usable_pair_has_no_levels_and_still_loads() {
+        for (levels, default) in [
+            (None, None),
+            (Some(&["low", "high"][..]), None),
+            (None, Some("high")),
+            // What migration 0023's CHECK refuses, read leniently anyway.
+            (Some(&["low", "high"][..]), Some("medium")),
+            (Some(&["low", "turbo"][..]), Some("low")),
+        ] {
+            let spec = model(levels, default)
+                .to_spec()
+                .expect("the row still loads");
+            assert_eq!(spec.reasoning_efforts, None, "{levels:?} {default:?}");
+            assert_eq!(spec.id.as_str(), "xai/grok-4.6");
+        }
+    }
 
     /// A Vertex row: the platform that uses every optional column but the API
     /// version, which is given anyway.

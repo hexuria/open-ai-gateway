@@ -1,7 +1,7 @@
 //! Putting it together: mode, ladder, classifier, floor, and budget produce a
 //! model. Plus the rules for when to try again one rung up.
 
-use crate::catalog::{Catalog, ModelSpec, Requirements};
+use crate::catalog::{Catalog, ModelId, ModelSpec, Requirements};
 use crate::classify::{Classifier, RequestSignal};
 use crate::ladder::TierLadder;
 use oag_core::Provider;
@@ -710,6 +710,34 @@ impl RoutingPolicy {
             .collect()
     }
 
+    /// The one model a virtual name is decided onto, when it can be decided
+    /// onto only one: `/v1/models` describes that name as the model.
+    ///
+    /// `oag/<rung>` (`Some`) is decided onto its rung's models; `oag/auto`
+    /// (`None`) onto those of every rung it may be classified onto under this
+    /// pressure, which are the rungs [`Self::virtual_names`] advertises. A
+    /// climb past them after a failed answer is a retry, not what the name
+    /// pins. `None` when the name reaches no model, or more than one.
+    #[must_use]
+    pub fn pinned_model(
+        &self,
+        rung: Option<&TierName>,
+        pressure: BudgetPressure,
+    ) -> Option<&ModelId> {
+        let rungs = match rung {
+            Some(name) => vec![name.clone()],
+            None => self.virtual_names(pressure),
+        };
+        let mut models = self
+            .ladder
+            .rungs()
+            .iter()
+            .filter(|r| rungs.contains(&r.name))
+            .flat_map(|r| r.models.iter());
+        let first = models.next()?;
+        models.all(|m| m == first).then_some(first)
+    }
+
     /// Models this caller may actually name, and whether naming one is honoured.
     ///
     /// `providers` is the set the route holds usable credentials for: a model
@@ -830,6 +858,7 @@ mod tests {
                 prompt_cache: true,
             },
             display_label: None,
+            reasoning_efforts: None,
         }
     }
 
@@ -2114,6 +2143,84 @@ mod tests {
             "a floor is an entitlement; Constrained cannot hide it"
         );
         assert!(policy().virtual_names(BudgetPressure::Exhausted).is_empty());
+    }
+
+    fn pinned(
+        policy: &RoutingPolicy,
+        rung: Option<&str>,
+        pressure: BudgetPressure,
+    ) -> Option<String> {
+        policy
+            .pinned_model(rung.map(TierName::new).as_ref(), pressure)
+            .map(|id| id.as_str().to_owned())
+    }
+
+    #[test]
+    fn a_rung_name_pins_its_rungs_one_model_and_auto_pins_only_a_one_model_ladder() {
+        let policy = policy();
+        let normal = BudgetPressure::Normal;
+        assert_eq!(
+            pinned(&policy, Some("cheap"), normal).as_deref(),
+            Some("kimi/k2")
+        );
+        assert_eq!(
+            pinned(&policy, Some("frontier"), normal).as_deref(),
+            Some("anthropic/opus")
+        );
+        assert_eq!(
+            pinned(&policy, Some("premium"), normal),
+            None,
+            "no such rung"
+        );
+        assert_eq!(
+            pinned(&policy, None, normal),
+            None,
+            "auto may be classified onto three models"
+        );
+        assert_eq!(
+            pinned(&policy, None, BudgetPressure::Constrained).as_deref(),
+            Some("kimi/k2"),
+            "constrained, auto is only ever decided onto the cheapest rung"
+        );
+        let floored = policy.with_floor(Some(Tier::new(TierName::new("frontier"), 2)));
+        assert_eq!(
+            pinned(&floored, None, normal).as_deref(),
+            Some("anthropic/opus"),
+            "floored at the top, auto reaches one rung"
+        );
+    }
+
+    #[test]
+    fn a_rung_of_two_models_pins_neither_and_one_model_named_twice_pins_it() {
+        let rung = |name: &str, models: &[&str]| Rung {
+            name: TierName::new(name),
+            models: models.iter().map(|m| ModelId::new(*m)).collect(),
+        };
+        let mixed = RoutingPolicy::new(
+            TierLadder::new(vec![rung("cheap", &["kimi/k2", "anthropic/haiku"])])
+                .expect("non-empty"),
+            Box::new(HeuristicClassifier::default()),
+        );
+        assert_eq!(pinned(&mixed, Some("cheap"), BudgetPressure::Normal), None);
+        assert_eq!(pinned(&mixed, None, BudgetPressure::Normal), None);
+
+        let one = RoutingPolicy::new(
+            TierLadder::new(vec![
+                rung("cheap", &["kimi/k2", "kimi/k2"]),
+                rung("frontier", &["kimi/k2"]),
+            ])
+            .expect("non-empty"),
+            Box::new(HeuristicClassifier::default()),
+        );
+        assert_eq!(
+            pinned(&one, None, BudgetPressure::Normal).as_deref(),
+            Some("kimi/k2")
+        );
+        let empty = RoutingPolicy::new(
+            TierLadder::new(vec![rung("cheap", &[])]).expect("non-empty"),
+            Box::new(HeuristicClassifier::default()),
+        );
+        assert_eq!(pinned(&empty, Some("cheap"), BudgetPressure::Normal), None);
     }
 
     #[test]

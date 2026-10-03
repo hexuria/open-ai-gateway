@@ -2851,6 +2851,8 @@ fn seed_model(id: &str, input: Decimal) -> ModelRow {
         supports_reasoning: false,
         supports_prompt_cache: false,
         display_label: None,
+        reasoning_efforts: None,
+        reasoning_effort: None,
     }
 }
 

@@ -124,6 +124,14 @@ pub struct ModelSpec {
     /// field existed must still load.
     #[serde(default)]
     pub display_label: Option<String>,
+    /// The reasoning-effort levels the model takes and its default, when they
+    /// are known: see [`crate::efforts`]. `/v1/models` publishes them; nothing
+    /// routes on them.
+    ///
+    /// Not serialised: the catalog row is their record, and nothing reads a
+    /// serialised spec back.
+    #[serde(skip)]
+    pub reasoning_efforts: Option<crate::efforts::ReasoningEfforts>,
 }
 
 /// What a human should read for a model, as opposed to what the router needs.
@@ -373,6 +381,7 @@ mod tests {
                 prompt_cache: true,
             },
             display_label: None,
+            reasoning_efforts: None,
         }
     }
 

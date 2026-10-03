@@ -401,6 +401,8 @@ mod tests {
             supports_reasoning: false,
             supports_prompt_cache: cache_read.is_some(),
             display_label: None,
+            reasoning_efforts: None,
+            reasoning_effort: None,
         }
     }
 

@@ -725,6 +725,7 @@ fn a_model_is_on_the_ladder_by_its_own_id_or_the_catalogs() {
         max_output_tokens: 8_192,
         capabilities: oag_router::Capabilities::default(),
         display_label: None,
+        reasoning_efforts: None,
     };
     let ladder = |ids: &[&str]| {
         TierLadder::new(vec![oag_router::ladder::Rung {
@@ -1266,6 +1267,7 @@ fn suppression_catalog() -> oag_router::Catalog {
             prompt_cache: true,
         },
         display_label: None,
+        reasoning_efforts: None,
     };
     oag_router::Catalog::from_entries([
         model("anthropic/haiku", rust_decimal::Decimal::ONE),
@@ -1324,6 +1326,7 @@ fn decision_for(provider: oag_core::Provider) -> RoutingDecision {
             max_output_tokens: 100,
             capabilities: Capabilities::default(),
             display_label: None,
+            reasoning_efforts: None,
         },
         tier: Some(oag_core::Tier::new("cheap", 0)),
         reason: oag_router::SelectionReason::Classified,

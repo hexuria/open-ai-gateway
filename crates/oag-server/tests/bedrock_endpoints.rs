@@ -682,6 +682,8 @@ gateway:
             supports_reasoning: false,
             supports_prompt_cache: false,
             display_label: None,
+            reasoning_efforts: None,
+            reasoning_effort: None,
         };
         repo::upsert_model(&self.db, &row, false)
             .await

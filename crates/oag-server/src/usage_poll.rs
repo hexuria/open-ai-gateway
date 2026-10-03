@@ -377,6 +377,8 @@ fn row_from(insert: &CatalogInsert) -> ModelRow {
         supports_reasoning: insert.supports_reasoning,
         supports_prompt_cache: insert.supports_prompt_cache,
         display_label: None,
+        reasoning_efforts: None,
+        reasoning_effort: None,
     }
 }
 

@@ -1393,6 +1393,7 @@ mod tests {
             max_output_tokens: 8_192,
             capabilities: oag_router::Capabilities::default(),
             display_label: None,
+            reasoning_efforts: None,
         }
     }
 
@@ -1480,6 +1481,8 @@ mod tests {
                 supports_reasoning: false,
                 supports_prompt_cache: false,
                 display_label: None,
+                reasoning_efforts: None,
+                reasoning_effort: None,
             };
             oag_store::repo::upsert_model(&db, &row, false)
                 .await
@@ -1569,6 +1572,8 @@ mod tests {
             supports_reasoning: false,
             supports_prompt_cache: false,
             display_label: None,
+            reasoning_efforts: None,
+            reasoning_effort: None,
         };
         oag_store::repo::upsert_model(&db, &row, false)
             .await

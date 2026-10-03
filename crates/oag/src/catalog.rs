@@ -111,6 +111,8 @@ pub fn builtin() -> Vec<ModelRow> {
         supports_reasoning: false,
         supports_prompt_cache: false,
         display_label: None,
+        reasoning_efforts: None,
+        reasoning_effort: None,
     });
 
     MODELS
@@ -137,6 +139,9 @@ pub fn builtin() -> Vec<ModelRow> {
                 // Nothing built in is named by hand: a starter row shows the
                 // derived label until an operator decides otherwise.
                 display_label: None,
+                // A seed never writes them; `catalog sync-efforts` does.
+                reasoning_efforts: None,
+                reasoning_effort: None,
             })
         })
         .chain(system_one)
@@ -293,6 +298,8 @@ fn from_litellm_str(raw: &str, origin: &str) -> Result<Vec<ModelRow>> {
             // LiteLLM has no opinion about what to call a model in a picker,
             // and a seed must never write over what an operator called it.
             display_label: None,
+            reasoning_efforts: None,
+            reasoning_effort: None,
         });
     }
 
@@ -386,6 +393,8 @@ pub fn plan_price_sync(
                 // an INSERT: a model the catalog already knows takes the
                 // `Reprice` arm above, which names no columns but the prices.
                 display_label: None,
+                reasoning_efforts: None,
+                reasoning_effort: None,
             })
         })
         .collect()
