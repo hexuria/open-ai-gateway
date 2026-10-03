@@ -41,7 +41,7 @@ when the body was truncated and no longer parses.
 | `authentication_error` | 401 | no key, unknown key, revoked key | re-auth; do not retry |
 | `budget_exhausted` | 402 | a key, route or principal cap is spent | stop; surface which scope from the message |
 | `invalid_request` | 400 | the body is not valid JSON for this dialect | fix the request |
-| `no_viable_model` | 400 | nothing on the route's ladder can serve it; on `/jev/v1/systemone`, a model no System One provider this gateway serves answers to | fix the model, or the operator fixes the ladder |
+| `no_viable_model` | 400 | the model cannot be routed. Off the route's ladder, the message gives the ladder's fix; on it, the message names what is in the way instead: no credential for its provider on the route, none this caller may use (a seat with no owner, or someone else's), every usable one cooling down or disabled (and when the first is back), or no catalog row. On `/jev/v1/systemone`, a model no System One provider this gateway serves answers to | fix the model, or the operator fixes what the message names |
 | `invalid_model_qualifier` | 400 | `@something` is not a qualifier, or that provider cannot be reached that way | drop or correct the qualifier |
 | `unsupported_field` | 400 | a field the chosen upstream's dialect cannot express | drop the field, or pin to a provider that has it |
 | `not_found` | 404 | an action this gateway does not serve | — |

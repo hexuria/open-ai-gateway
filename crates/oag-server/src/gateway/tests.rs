@@ -3,10 +3,10 @@ use super::failover::{
     MAX_RETRY_AFTER, Outcome, Step, TRANSPORT_COOLDOWN, backoff, collect_failed, egress_for,
     may_try_another, openai_function_names, step_for, transport_failure, upstream_retry_after,
 };
-use super::plan::parse_ladder;
+use super::plan::{laddered, parse_ladder};
 use super::respond::{
-    client_got_nothing, json_response, no_viable_message, render_collected, stream_response,
-    truncate,
+    Blocked, Laddered, client_got_nothing, json_response, no_viable_message, render_collected,
+    stream_response, truncate,
 };
 use super::*;
 use crate::breakers::Breakers;
@@ -489,7 +489,7 @@ fn no_viable_model_names_the_route_and_the_fix() {
         models: vec![oag_router::ModelId::new("anthropic/claude-haiku-4.5")],
     }])
     .expect("ladder");
-    let msg = no_viable_message("default", "xai/grok-4.3", &ladder);
+    let msg = no_viable_message("default", "xai/grok-4.3", &ladder, None);
     assert!(msg.contains("route 'default'"), "{msg}");
     assert!(msg.contains("no xai models"), "{msg}");
     assert!(
@@ -509,7 +509,7 @@ fn a_chat_request_for_a_system_one_model_is_sent_to_system_one() {
         models: vec![oag_router::ModelId::new("anthropic/claude-haiku-4.5")],
     }])
     .expect("ladder");
-    let msg = no_viable_message("default", "jev/jev-latest", &ladder);
+    let msg = no_viable_message("default", "jev/jev-latest", &ladder, None);
     assert!(
         msg.contains("'jev/jev-latest' is a System One model"),
         "{msg}"
@@ -517,8 +517,489 @@ fn a_chat_request_for_a_system_one_model_is_sent_to_system_one() {
     assert!(msg.contains("POST /jev/v1/systemone"), "{msg}");
     assert!(!msg.contains("route tiers"), "{msg}");
     // The alias names the same provider, and gets the same answer.
-    let alias = no_viable_message("default", "typesafe/jev-latest", &ladder);
+    let alias = no_viable_message("default", "typesafe/jev-latest", &ladder, None);
     assert!(alias.contains("System One"), "{alias}");
+}
+
+/// The default route's ladder on 2026-09-30: one rung, one xAI model.
+fn grok_ladder() -> TierLadder {
+    TierLadder::new(vec![oag_router::ladder::Rung {
+        name: TierName::from("cheap"),
+        models: vec![oag_router::ModelId::new("xai/grok-4.6")],
+    }])
+    .expect("ladder")
+}
+
+/// `xai/grok-4.6` on that ladder, with the catalog not holding it, and what
+/// the credentials put in the way.
+fn grok_blocked(blocked: Option<Blocked>) -> Laddered {
+    Laddered::Uncatalogued {
+        provider: "xai".to_owned(),
+        blocked,
+    }
+}
+
+fn grok_refusal(blocked: Option<Blocked>) -> String {
+    no_viable_message(
+        "default",
+        "xai/grok-4.6",
+        &grok_ladder(),
+        Some(&grok_blocked(blocked)),
+    )
+}
+
+/// (a) A model the ladder does not name is still the ladder's to fix, word
+/// for word as before, whether or not its provider is on the ladder — and a
+/// virtual name, which names no model, is told the ladder's first.
+#[test]
+fn a_model_off_the_ladder_is_still_the_ladders_to_fix() {
+    assert_eq!(
+        no_viable_message("default", "xai/grok-4.3", &grok_ladder(), None),
+        "route 'default' has no model on its ladder that can serve 'xai/grok-4.3'; set one \
+         with: oag admin route tiers --route default cheap=xai/grok-4.3"
+    );
+    assert_eq!(
+        no_viable_message("default", "oag/auto", &grok_ladder(), None),
+        "route 'default' has no model on its ladder that can serve this request; add one \
+         with: oag admin route tiers --route default cheap=xai/grok-4.6"
+    );
+    assert_eq!(
+        laddered("xai/grok-4.3", &grok_ladder(), &oag_router::Catalog::new()),
+        None,
+        "and nothing is asked about credentials for a model off the ladder"
+    );
+}
+
+/// (b) On the ladder, and the route holds nothing for its provider.
+#[test]
+fn a_laddered_model_with_no_credential_for_its_provider_says_to_add_one() {
+    assert_eq!(
+        grok_refusal(Some(Blocked::NoCredential)),
+        "'xai/grok-4.6' is on the ladder of route 'default', but the route holds no xai \
+         credential; add one with: oag admin account add --name <name> --provider xai \
+         --secret <key> --route default"
+    );
+}
+
+/// (c) On the ladder, and every credential is one this caller may not use.
+/// The real case of 2026-09-30 is the first: a seat with no owner. Neither
+/// names whose a credential is, so neither can name an email.
+#[test]
+fn a_laddered_model_whose_credentials_are_not_the_callers_says_whose_they_are_not() {
+    let ownerless = grok_refusal(Some(Blocked::NotTheirs { ownerless: true }));
+    assert_eq!(
+        ownerless,
+        "'xai/grok-4.6' is on the ladder of route 'default', but no xai credential there may \
+         serve you: a subscription seat with no owner serves no one. Bind the seat to the one \
+         person it belongs to with: oag admin account set-owner <seat> --owner-email <owner>; \
+         or add a pay-per-use API key the whole route shares with: oag admin account add \
+         --name <name> --provider xai --secret <key> --route default"
+    );
+    let theirs = grok_refusal(Some(Blocked::NotTheirs { ownerless: false }));
+    assert_eq!(
+        theirs,
+        "'xai/grok-4.6' is on the ladder of route 'default', but no xai credential there may \
+         serve you: each belongs to someone else, and a personal credential serves only its \
+         owner. Add a pay-per-use API key the whole route shares with: oag admin account add \
+         --name <name> --provider xai --secret <key> --route default; or, if one of them is \
+         yours, bind it to you with: oag admin account set-owner <name> --owner-email <your \
+         email>"
+    );
+    for msg in [ownerless, theirs] {
+        assert!(!msg.contains('@'), "an email has no place here: {msg}");
+        assert!(
+            !msg.contains("route tiers"),
+            "not the ladder's to fix: {msg}"
+        );
+    }
+}
+
+/// (d) On the ladder, and every credential the caller may use is cooling down
+/// or disabled: when the first is back, rounded up to the second so a retry
+/// on it is not early, or how to put one back when none will come back alone.
+#[test]
+fn a_laddered_model_whose_credentials_are_all_cooling_says_when_the_first_is_back() {
+    use time::macros::datetime;
+    let back = |at| grok_refusal(Some(Blocked::NoneLive { back_at: Some(at) }));
+    assert_eq!(
+        back(datetime!(2026-10-03 12:05:00.25 UTC)),
+        "'xai/grok-4.6' is on the ladder of route 'default', but every xai credential there \
+         that may serve you is cooling down or disabled; the first is back at \
+         2026-10-03T12:05:01Z"
+    );
+    assert!(
+        back(datetime!(2026-10-03 12:05:00 UTC)).ends_with("back at 2026-10-03T12:05:00Z"),
+        "a whole second is not rounded past"
+    );
+    assert!(
+        back(datetime!(2026-10-03 20:05:00 +08:00)).ends_with("back at 2026-10-03T12:05:00Z"),
+        "and is said in UTC"
+    );
+    assert_eq!(
+        grok_refusal(Some(Blocked::NoneLive { back_at: None })),
+        "'xai/grok-4.6' is on the ladder of route 'default', but every xai credential there \
+         that may serve you is disabled; put one back with: oag admin account enable <name>"
+    );
+}
+
+/// On the ladder, and nothing about the credentials is in the way: what is
+/// left is the catalog. A model the catalog holds was not what failed — a
+/// floor tier or managed routing sent the request to rungs that could not
+/// take it — and a provider nobody serves has no credentials to ask about.
+#[test]
+fn a_laddered_model_the_credentials_do_not_explain_names_the_catalog_or_the_rungs() {
+    assert_eq!(
+        grok_refusal(None),
+        "'xai/grok-4.6' is on the ladder of route 'default', but the catalog has no such \
+         model, so it cannot be priced or routed; add it with: oag admin catalog add --id \
+         xai/grok-4.6 --upstream <model> --input-per-mtok <usd> --output-per-mtok <usd> \
+         --context <tokens> --max-output <tokens>"
+    );
+    assert_eq!(
+        no_viable_message(
+            "default",
+            "xai/grok-4.6",
+            &grok_ladder(),
+            Some(&Laddered::Catalogued)
+        ),
+        "'xai/grok-4.6' is on the ladder of route 'default', but no rung this request may use \
+         holds a catalogued model that can take it, by context window, vision, tools or \
+         reasoning; see the ladder with: oag admin route show --route default"
+    );
+    let unserved = Laddered::Unserved {
+        provider: "mockanth".to_owned(),
+    };
+    assert_eq!(
+        no_viable_message("t4", "mockanth/m-anth", &grok_ladder(), Some(&unserved)),
+        "'mockanth/m-anth' is on the ladder of route 't4', but this gateway serves no provider \
+         named 'mockanth', so nothing can serve it; `oag admin doctor` says why"
+    );
+}
+
+/// The order the credentials are read in: none at all, then none the caller
+/// may use, then none live. Each answer is the first that holds.
+#[test]
+fn what_the_credentials_put_in_the_way_is_the_first_that_holds() {
+    use time::macros::datetime;
+    let at = datetime!(2026-10-03 12:05:00 UTC);
+    let standing = |total, usable, ownerless_seats, live| oag_store::ProviderStanding {
+        total,
+        usable,
+        ownerless_seats,
+        live,
+        back_at: Some(at),
+    };
+    assert_eq!(
+        Blocked::of(&standing(0, 0, 0, 0)),
+        Some(Blocked::NoCredential)
+    );
+    assert_eq!(
+        Blocked::of(&standing(2, 0, 1, 0)),
+        Some(Blocked::NotTheirs { ownerless: true })
+    );
+    assert_eq!(
+        Blocked::of(&standing(2, 0, 0, 0)),
+        Some(Blocked::NotTheirs { ownerless: false })
+    );
+    assert_eq!(
+        Blocked::of(&standing(2, 1, 1, 0)),
+        Some(Blocked::NoneLive { back_at: Some(at) })
+    );
+    assert_eq!(Blocked::of(&standing(2, 1, 1, 1)), None);
+}
+
+/// Which requests count as naming a model on the ladder, and whose model it is.
+#[test]
+fn a_model_is_on_the_ladder_by_its_own_id_or_the_catalogs() {
+    let spec = |id: &str, provider, upstream: &str| oag_router::ModelSpec {
+        id: oag_router::ModelId::new(id),
+        provider,
+        upstream_name: upstream.to_owned(),
+        pricing: oag_router::Pricing {
+            input_per_mtok: rust_decimal::Decimal::ONE,
+            output_per_mtok: rust_decimal::Decimal::ONE,
+            cache_read_per_mtok: None,
+            cache_write_per_mtok: None,
+        },
+        context_window: 131_072,
+        max_output_tokens: 8_192,
+        capabilities: oag_router::Capabilities::default(),
+        display_label: None,
+    };
+    let ladder = |ids: &[&str]| {
+        TierLadder::new(vec![oag_router::ladder::Rung {
+            name: TierName::from("cheap"),
+            models: ids.iter().copied().map(oag_router::ModelId::new).collect(),
+        }])
+        .expect("ladder")
+    };
+    let empty = oag_router::Catalog::new();
+    let mut grok = oag_router::Catalog::new();
+    grok.insert(spec("xai/grok-4.6", oag_core::Provider::XAI, "grok-4.6"));
+    let uncatalogued = |provider: &str| {
+        Some(Laddered::Uncatalogued {
+            provider: provider.to_owned(),
+            blocked: None,
+        })
+    };
+    let unserved = |provider: &str| {
+        Some(Laddered::Unserved {
+            provider: provider.to_owned(),
+        })
+    };
+
+    // The real case: on the ladder, and the catalog never learned it.
+    assert_eq!(
+        laddered(" xai/grok-4.6 ", &grok_ladder(), &empty),
+        uncatalogued("xai")
+    );
+    // A name the catalog resolves to a laddered id, whatever it was spelled.
+    assert_eq!(
+        laddered("grok-4.6", &grok_ladder(), &grok),
+        Some(Laddered::Catalogued)
+    );
+    assert_eq!(
+        laddered("xai/grok-4.6", &grok_ladder(), &grok),
+        Some(Laddered::Catalogued)
+    );
+    // Catalogued, and not on this ladder.
+    assert_eq!(
+        laddered("grok-4.6", &ladder(&["xai/grok-4.3"]), &grok),
+        None
+    );
+    // The provider by its own name, which is what a credential is filed
+    // under, not by the alias the ladder spelled it with.
+    assert_eq!(
+        laddered("grok/grok-5", &ladder(&["grok/grok-5"]), &empty),
+        uncatalogued("xai")
+    );
+    // Nobody serves it, or not as chat: nothing to ask the credentials about.
+    assert_eq!(
+        laddered("nope/m", &ladder(&["nope/m"]), &empty),
+        unserved("nope")
+    );
+    assert_eq!(
+        laddered("jev/jev-latest", &ladder(&["jev/jev-latest"]), &empty),
+        unserved("jev")
+    );
+    // An id that names no provider cannot be asked about one.
+    assert_eq!(laddered("kimi-k2", &ladder(&["kimi-k2"]), &empty), None);
+    // And a laddered System One model is still sent to System One.
+    let jev = no_viable_message(
+        "default",
+        "jev/jev-latest",
+        &ladder(&["jev/jev-latest"]),
+        unserved("jev").as_ref(),
+    );
+    assert!(jev.contains("POST /jev/v1/systemone"), "{jev}");
+}
+
+/// The refusals a model on the ladder gets, as the gateway serves them: the
+/// whole request path, a real key, and the route's credentials in Postgres.
+/// One step per case, (a) to (d), on a ladder naming `xai/grok-4.6` that the
+/// catalog does not hold — the state the default route was in on 2026-09-30,
+/// when its only xAI credential was a seat with no owner and the refusal told
+/// the operator to put on the ladder the model that was already there.
+///
+/// Against Postgres and Redis, because what is in the way is rows; skipped
+/// without them.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_model_on_the_ladder_is_refused_for_what_is_in_its_way() {
+    use tower::ServiceExt as _;
+    let Some(state) = crate::testing::live_state().await else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL / OAG_TEST_REDIS_URL unset");
+        return;
+    };
+    let pool = state.db.pool();
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let route = format!("ladder-{tag}");
+    let email = format!("caller-{tag}@example.invalid");
+    let caller = oag_store::repo::upsert_principal(&state.db, &email, "member", None)
+        .await
+        .expect("caller");
+    let someone = oag_store::repo::upsert_principal(
+        &state.db,
+        &format!("someone-{tag}@example.invalid"),
+        "member",
+        None,
+    )
+    .await
+    .expect("someone else");
+    let route_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO route (id, name, tiers) VALUES (gen_random_uuid(), $1, \
+         '[{\"name\": \"cheap\", \"models\": [\"xai/grok-4.6\"]}]'::jsonb) RETURNING id",
+    )
+    .bind(&route)
+    .fetch_one(pool)
+    .await
+    .expect("route");
+    let key = oag_store::repo::mint_key(&state.db, &email, &route, "cli", None)
+        .await
+        .expect("mint")
+        .expect("the caller and the route exist")
+        .key;
+
+    let refusal = async |model: &str| {
+        let res = crate::public_router(Arc::clone(&state))
+            .oneshot(
+                axum::http::Request::post("/v1/chat/completions")
+                    .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = res.status();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), 1 << 16)
+                .await
+                .expect("body"),
+        )
+        .expect("a JSON refusal");
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["type"], "no_viable_model", "{body}");
+        let message = body["error"]["message"]
+            .as_str()
+            .expect("a message")
+            .to_owned();
+        eprintln!("{model}: {message}");
+        message
+    };
+    let head = format!("'xai/grok-4.6' is on the ladder of route '{route}', but");
+    let add_key = format!(
+        "oag admin account add --name <name> --provider xai --secret <key> --route {route}"
+    );
+
+    // (a) Off the ladder: the ladder's to fix, as it always was.
+    assert_eq!(
+        refusal("xai/grok-4.3").await,
+        format!(
+            "route '{route}' has no model on its ladder that can serve 'xai/grok-4.3'; set one \
+             with: oag admin route tiers --route {route} cheap=xai/grok-4.3"
+        )
+    );
+
+    // (b) On the ladder, and nothing for xAI on the route.
+    assert_eq!(
+        refusal("xai/grok-4.6").await,
+        format!("{head} the route holds no xai credential; add one with: {add_key}")
+    );
+
+    // (c) The real case: the only xAI credential is a seat with no owner. The
+    // schema no longer lets anything make one, so the trigger is off for the
+    // one insert and back on before anyone else can see it was.
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("ALTER TABLE account DISABLE TRIGGER account_seat_has_one_owner")
+        .execute(&mut *tx)
+        .await
+        .expect("disable");
+    let seat: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce) \
+         VALUES (gen_random_uuid(), $1, 'xai', 'oauth', '\\x00', '\\x00') RETURNING id",
+    )
+    .bind(format!("grok-seat-{tag}"))
+    .fetch_one(&mut *tx)
+    .await
+    .expect("a legacy owner-less seat");
+    sqlx::query("ALTER TABLE account ENABLE TRIGGER account_seat_has_one_owner")
+        .execute(&mut *tx)
+        .await
+        .expect("enable");
+    sqlx::query("INSERT INTO account_route (account_id, route_id) VALUES ($1, $2)")
+        .bind(seat)
+        .bind(route_id)
+        .execute(&mut *tx)
+        .await
+        .expect("attach");
+    tx.commit().await.expect("commit");
+    assert_eq!(
+        refusal("xai/grok-4.6").await,
+        format!(
+            "{head} no xai credential there may serve you: a subscription seat with no owner \
+             serves no one. Bind the seat to the one person it belongs to with: oag admin \
+             account set-owner <seat> --owner-email <owner>; or add a pay-per-use API key the \
+             whole route shares with: {add_key}"
+        )
+    );
+
+    // (c) again, once the seat has an owner who is not the caller. Whose it
+    // is stays out of the answer.
+    sqlx::query("UPDATE account SET owner_principal_id = $2 WHERE id = $1")
+        .bind(seat)
+        .bind(someone)
+        .execute(pool)
+        .await
+        .expect("bind the seat to someone else");
+    let theirs = refusal("xai/grok-4.6").await;
+    assert_eq!(
+        theirs,
+        format!(
+            "{head} no xai credential there may serve you: each belongs to someone else, and a \
+             personal credential serves only its owner. Add a pay-per-use API key the whole \
+             route shares with: {add_key}; or, if one of them is yours, bind it to you with: \
+             oag admin account set-owner <name> --owner-email <your email>"
+        )
+    );
+    assert!(!theirs.contains("someone-"), "{theirs}");
+
+    // (d) The caller's own key, cooling down: when it is back.
+    let back = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("zero is a nanosecond")
+        + time::Duration::minutes(10);
+    let own: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO account (id, name, provider, kind, credentials_sealed, credentials_nonce, \
+         owner_principal_id, cooldown_until) VALUES (gen_random_uuid(), $1, 'xai', 'api_key', \
+         '\\x00', '\\x00', $2, $3) RETURNING id",
+    )
+    .bind(format!("own-key-{tag}"))
+    .bind(caller)
+    .bind(back)
+    .fetch_one(pool)
+    .await
+    .expect("the caller's key");
+    sqlx::query("INSERT INTO account_route (account_id, route_id) VALUES ($1, $2)")
+        .bind(own)
+        .bind(route_id)
+        .execute(pool)
+        .await
+        .expect("attach");
+    let when = back
+        .format(time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second]Z"
+        ))
+        .expect("formats");
+    assert_eq!(
+        refusal("xai/grok-4.6").await,
+        format!(
+            "{head} every xai credential there that may serve you is cooling down or disabled; \
+             the first is back at {when}"
+        )
+    );
+
+    // Back now, and still refused: what is left in the way is the catalog,
+    // and the refusal says so rather than blaming a credential that is fine.
+    sqlx::query("UPDATE account SET cooldown_until = NULL WHERE id = $1")
+        .bind(own)
+        .execute(pool)
+        .await
+        .expect("cooled");
+    assert_eq!(
+        refusal("xai/grok-4.6").await,
+        format!(
+            "{head} the catalog has no such model, so it cannot be priced or routed; add it \
+             with: oag admin catalog add --id xai/grok-4.6 --upstream <model> --input-per-mtok \
+             <usd> --output-per-mtok <usd> --context <tokens> --max-output <tokens>"
+        )
+    );
 }
 
 #[test]
