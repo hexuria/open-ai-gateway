@@ -23,6 +23,6 @@ pub use repo::{
 };
 pub use rows::Spend;
 pub use rows::{
-    AccountRow, AuthContext, ChannelStatusRow, EndpointRow, ModelRow, RouteRow, ServiceRow,
-    StoredModelRow, UsageWrite,
+    AccountRow, AuthContext, ChannelStatusRow, EndpointRow, ModelRow, ProviderStanding, RouteRow,
+    ServiceRow, StoredModelRow, UsageWrite,
 };

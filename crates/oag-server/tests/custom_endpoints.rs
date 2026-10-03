@@ -406,10 +406,13 @@ async fn refused_by_the_compliance_guard(gw: &Gateway, anth: &MockServer) {
     let body: Value = res.json().await.expect("a JSON refusal");
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["error"]["type"], "no_viable_model", "{body}");
+    // The model is still on the ladder, so the refusal names what is in its
+    // way, the endpoint nobody serves, and not the ladder.
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("can serve 'mockanth/m-anth'")),
+        body["error"]["message"].as_str().is_some_and(|m| {
+            m.starts_with("'mockanth/m-anth' is on the ladder of route")
+                && m.contains("serves no provider named 'mockanth'")
+        }),
         "{body}"
     );
     assert_eq!(

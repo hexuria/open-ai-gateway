@@ -13,6 +13,7 @@ use oag_proto::FunctionNameMap;
 use oag_router::{RoutingDecision, TierLadder};
 use std::sync::Arc;
 use std::time::Instant;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
 /// Render a collected answer as one body in the client's dialect.
@@ -519,9 +520,72 @@ pub(crate) fn error_response(e: &Error) -> Response {
     response
 }
 
-/// Operator-facing `no_viable_model`: which route, and the command that
-/// puts a serving model on its ladder.
-pub(super) fn no_viable_message(route: &str, requested: &str, ladder: &TierLadder) -> String {
+/// What stands between a model on the ladder and the caller, read from the
+/// route's credentials for the model's provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Blocked {
+    /// The route holds no credential for the provider.
+    NoCredential,
+    /// It holds some, and none this caller may use: each is a subscription
+    /// seat with no owner, which serves no one, or someone else's. `ownerless`
+    /// when a seat with no owner is among them.
+    NotTheirs { ownerless: bool },
+    /// Every one this caller may use is cooling down or disabled. `back_at`
+    /// is when the first one in rotation is back, if any is.
+    NoneLive { back_at: Option<OffsetDateTime> },
+}
+
+impl Blocked {
+    /// What the credentials put in the way, or `None` when they do not.
+    pub(super) fn of(standing: &oag_store::ProviderStanding) -> Option<Self> {
+        if standing.total == 0 {
+            Some(Self::NoCredential)
+        } else if standing.usable == 0 {
+            Some(Self::NotTheirs {
+                ownerless: standing.ownerless_seats > 0,
+            })
+        } else if standing.live == 0 {
+            Some(Self::NoneLive {
+                back_at: standing.back_at,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+/// A requested model the route's ladder names, and why it was not routed as
+/// far as routing and the route's credentials can say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Laddered {
+    /// Its id names a provider this gateway does not serve as chat.
+    Unserved { provider: String },
+    /// The catalog holds it. So it was not the model that failed but the
+    /// rungs this request may use, which a floor tier or managed routing
+    /// chose: its own provider's credentials are not in question.
+    Catalogued,
+    /// The catalog does not hold it, and `blocked` is what the provider's
+    /// credentials put in the way, if they were asked and do.
+    Uncatalogued {
+        provider: String,
+        blocked: Option<Blocked>,
+    },
+}
+
+/// Operator-facing `no_viable_model`: which route, what is in the way, and
+/// the command that clears it.
+///
+/// A model the ladder does not name is the ladder's to fix, and the message
+/// says so. One it does name is not: telling its operator to put it on the
+/// ladder sent them to change the one thing that was already right, while the
+/// route's only credential for it was a seat that serves no one. `laddered`
+/// says what is in the way instead.
+pub(super) fn no_viable_message(
+    route: &str,
+    requested: &str,
+    ladder: &TierLadder,
+    laddered: Option<&Laddered>,
+) -> String {
     let requested = requested.trim();
     let on_ladder: Vec<&str> = ladder
         .rungs()
@@ -550,6 +614,10 @@ pub(super) fn no_viable_message(route: &str, requested: &str, ladder: &TierLadde
         );
     }
 
+    if let Some(found) = laddered {
+        return laddered_message(route, requested, found);
+    }
+
     if let Some(provider) = provider {
         if !ladder_providers.contains(&provider) {
             return format!(
@@ -563,5 +631,91 @@ pub(super) fn no_viable_message(route: &str, requested: &str, ladder: &TierLadde
     let example = on_ladder.first().copied().unwrap_or("provider/model");
     format!(
         "route '{route}' has no model on its ladder that can serve this request; add one with: oag admin route tiers --route {route} cheap={example}"
+    )
+}
+
+/// [`no_viable_message`] for a model the ladder names, checked in the order
+/// the causes have to be cleared: a provider nobody serves, the credentials,
+/// then the catalog.
+///
+/// The credentials come before the catalog because they are often why the
+/// catalog lacks the model: an xAI model reaches it from a credential's own
+/// list, and a seat with no owner is never asked. Whose credentials they are
+/// is not said: a caller learns that someone else holds the route's seat,
+/// never who.
+fn laddered_message(route: &str, model: &str, found: &Laddered) -> String {
+    let head = format!("'{model}' is on the ladder of route '{route}'");
+    let (provider, blocked) = match found {
+        Laddered::Unserved { provider } => {
+            return format!(
+                "{head}, but this gateway serves no provider named '{provider}', so nothing \
+                 can serve it; `oag admin doctor` says why"
+            );
+        }
+        Laddered::Catalogued => {
+            return format!(
+                "{head}, but no rung this request may use holds a catalogued model that can \
+                 take it, by context window, vision, tools or reasoning; see the ladder with: \
+                 oag admin route show --route {route}"
+            );
+        }
+        Laddered::Uncatalogued { provider, blocked } => (provider, blocked),
+    };
+    let add_key = format!(
+        "oag admin account add --name <name> --provider {provider} --secret <key> --route {route}"
+    );
+    match blocked {
+        Some(Blocked::NoCredential) => {
+            format!("{head}, but the route holds no {provider} credential; add one with: {add_key}")
+        }
+        Some(Blocked::NotTheirs { ownerless: true }) => format!(
+            "{head}, but no {provider} credential there may serve you: a subscription seat \
+             with no owner serves no one. Bind the seat to the one person it belongs to with: \
+             oag admin account set-owner <seat> --owner-email <owner>; or add a pay-per-use API \
+             key the whole route shares with: {add_key}"
+        ),
+        Some(Blocked::NotTheirs { ownerless: false }) => format!(
+            "{head}, but no {provider} credential there may serve you: each belongs to someone \
+             else, and a personal credential serves only its owner. Add a pay-per-use API key \
+             the whole route shares with: {add_key}; or, if one of them is yours, bind it to you \
+             with: oag admin account set-owner <name> --owner-email <your email>"
+        ),
+        Some(Blocked::NoneLive { back_at: Some(at) }) => format!(
+            "{head}, but every {provider} credential there that may serve you is cooling down or \
+             disabled; the first is back at {}",
+            utc_second(*at)
+        ),
+        Some(Blocked::NoneLive { back_at: None }) => format!(
+            "{head}, but every {provider} credential there that may serve you is disabled; put \
+             one back with: oag admin account enable <name>"
+        ),
+        None => format!(
+            "{head}, but the catalog has no such model, so it cannot be priced or routed; add it \
+             with: oag admin catalog add --id {model} --upstream <model> --input-per-mtok <usd> \
+             --output-per-mtok <usd> --context <tokens> --max-output <tokens>"
+        ),
+    }
+}
+
+/// A moment as a message gives it: UTC, to the second, and never before it.
+///
+/// Rounded up rather than truncated, because "back at" is a promise: a caller
+/// that retries on the second named must not find the credential still
+/// cooling for the fraction that was dropped.
+fn utc_second(at: OffsetDateTime) -> String {
+    let at = at.to_offset(time::UtcOffset::UTC);
+    let at = if at.nanosecond() > 0 {
+        at + time::Duration::SECOND
+    } else {
+        at
+    };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
     )
 }
