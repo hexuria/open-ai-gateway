@@ -487,6 +487,14 @@ pub(super) async fn try_credential(
         Ok(a) => a,
         Err(e) => return Outcome::Fatal(e),
     };
+    // An `ultra` goes on as itself only to a model whose catalog row lists it,
+    // through a dialect that can say it; anywhere else as `max`, or the row's
+    // highest level where it lists no `max`. Here because this is where the
+    // routed model and the dialect it will be rendered in are first both
+    // known, and per attempt because an escalation changes the model.
+    let canonical =
+        canonical.for_model(decision.model.reasoning_efforts.as_ref(), adapter.dialect());
+    let canonical = canonical.as_ref();
     let names = openai_function_names(canonical, adapter.dialect());
     note_dropped_vendor_fields(canonical, adapter.dialect(), request_id);
     // Refreshes first if the token is close to expiry. A credential that is

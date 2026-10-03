@@ -1230,6 +1230,24 @@ mod tests {
         );
     }
 
+    /// `ultra` is no exception: Converse has no base field for any level (see
+    /// `render_request`), so none is written, rather than a knob some model
+    /// refuses.
+    #[test]
+    fn an_ultra_level_is_left_out_like_any_other() {
+        let req = request(|r| {
+            r.messages = vec![turn(Role::User, vec![text("hi")])];
+            r.thinking_effort = Some(Effort::Ultra);
+        });
+        assert_eq!(
+            render_request(&req).expect("renders"),
+            json!({
+                "messages": [{ "role": "user", "content": [{ "text": "hi" }] }],
+                "inferenceConfig": { "maxTokens": 1024 },
+            })
+        );
+    }
+
     /// Structured output, as the guide's Converse example spells it.
     /// <https://docs.aws.amazon.com/bedrock/latest/userguide/structured-output.html>
     #[test]

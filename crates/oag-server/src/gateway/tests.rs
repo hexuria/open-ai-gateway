@@ -2100,6 +2100,181 @@ async fn a_stream_is_relayed_by_the_adapter_that_sent_it_after_its_endpoint_is_r
     upstream.verify().await;
 }
 
+/// A model's catalog row, as #142 stores it.
+fn efforts(levels: &[&str]) -> oag_router::ReasoningEfforts {
+    oag_router::ReasoningEfforts::new(levels.iter().copied(), "medium").expect("valid levels")
+}
+
+/// `gpt-5.6-terra`'s row in the override table, which lists `ultra`.
+const TERRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+/// `gpt-5.5`'s, which stops at `xhigh`.
+const GPT_5_5: &[&str] = &["low", "medium", "high", "xhigh"];
+
+/// A Chat Completions client's request for `ultra`.
+fn asking_for_ultra(model: &str) -> oag_proto::CanonicalRequest {
+    oag_proto::openai::parse_request(&serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "ultra",
+    }))
+    .expect("parses")
+}
+
+/// Settle one attempt, failing on anything but an answer.
+fn answered(outcome: Outcome) {
+    match outcome {
+        Outcome::Ok(_) => {}
+        Outcome::Switch(e) | Outcome::Lost(e, _) | Outcome::Escalate(e) | Outcome::Fatal(e) => {
+            panic!("the stand-in's answer was not handed on: {e}")
+        }
+        Outcome::Raced => panic!("raced"),
+    }
+}
+
+/// The one body a stand-in received.
+async fn received_body(upstream: &wiremock::MockServer) -> serde_json::Value {
+    let received = upstream.received_requests().await.expect("recording");
+    assert_eq!(received.len(), 1, "one request");
+    serde_json::from_slice(&received[0].body).expect("a JSON body")
+}
+
+/// What a chat request asking for `ultra` carries as `reasoning_effort` to a
+/// Chat Completions upstream, for a model whose catalog row lists `levels`.
+async fn ultra_sent_through_chat(
+    name: &str,
+    levels: Option<oag_router::ReasoningEfforts>,
+) -> serde_json::Value {
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let (state, upstream, provider, lease) = removable_endpoint(
+        name,
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ultra",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "thought hard"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+        })),
+        &slots,
+    )
+    .await;
+    let mut decision = decision_for(provider);
+    decision.model.reasoning_efforts = levels;
+    let canonical = asking_for_ultra(&format!("{name}/m"));
+    answered(
+        super::failover::try_credential(
+            &state,
+            &decision,
+            &canonical,
+            &lease,
+            RequestId::new(),
+            0,
+            uuid::Uuid::nil(),
+        )
+        .await,
+    );
+    upstream.verify().await;
+    received_body(&upstream).await["reasoning_effort"].clone()
+}
+
+/// The level `/v1/models` advertises reaches the upstream: as itself to a
+/// model whose catalog row lists it, and as the row's top to one whose row
+/// does not. Before, `ultra` was read as no level, and every model was sent
+/// its own default.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_request_s_ultra_goes_upstream_as_itself_only_where_the_row_lists_it() {
+    assert_eq!(
+        ultra_sent_through_chat("t-ultra-lists", Some(efforts(TERRA))).await,
+        "ultra"
+    );
+    assert_eq!(
+        ultra_sent_through_chat("t-ultra-stops", Some(efforts(GPT_5_5))).await,
+        "xhigh",
+        "the row's highest level"
+    );
+    assert_eq!(
+        ultra_sent_through_chat("t-ultra-unknown", None).await,
+        "max",
+        "a model whose levels are not known is not sent a level only one backend lists"
+    );
+}
+
+/// What a chat request asking for `ultra` carries as `reasoning.effort` to a
+/// Codex seat — the Responses backend that serves `gpt-5.6-terra` — for a
+/// model whose catalog row lists `levels`.
+async fn ultra_sent_to_a_codex_seat(levels: oag_router::ReasoningEfforts) -> serde_json::Value {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(ResponseTemplate::new(200).insert_header("content-type", "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let state = crate::testing::state(&format!(
+        "gateway:\n  codex:\n    base_url: \"{}\"\n",
+        upstream.uri()
+    ));
+
+    let slots = Arc::new(select::testing::CountingSlots::default());
+    let mut lease = select::testing::lease(&slots);
+    let sealed = state
+        .kek
+        .seal_json(&oag_core::credential::SecretMaterial {
+            access_token: "t-ultra-seat-token".to_owned(),
+            refresh_token: None,
+            expires_at: None,
+            version: 0,
+            client_id: None,
+            account_id: None,
+        })
+        .expect("seals");
+    // A ChatGPT seat: an OpenAI OAuth credential, which `adapter_for` serves
+    // with the Codex adapter.
+    "openai".clone_into(&mut lease.account.provider);
+    "oauth".clone_into(&mut lease.account.kind);
+    lease.account.credentials_sealed = sealed.ciphertext;
+    lease.account.credentials_nonce = sealed.nonce;
+
+    let mut decision = decision_for(oag_core::Provider::OpenAI);
+    decision.model.reasoning_efforts = Some(levels);
+    // Streamed, so the attempt hands the response on unread: what matters
+    // here is what was sent.
+    let mut canonical = asking_for_ultra("openai/m");
+    canonical.stream = true;
+    answered(
+        super::failover::try_credential(
+            &state,
+            &decision,
+            &canonical,
+            &lease,
+            RequestId::new(),
+            0,
+            uuid::Uuid::nil(),
+        )
+        .await,
+    );
+    upstream.verify().await;
+    received_body(&upstream).await["reasoning"]["effort"].clone()
+}
+
+/// The same through the dialect that serves `gpt-5.6-terra` here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_seat_is_sent_ultra_only_for_a_model_that_lists_it() {
+    assert_eq!(ultra_sent_to_a_codex_seat(efforts(TERRA)).await, "ultra");
+    assert_eq!(
+        ultra_sent_to_a_codex_seat(efforts(&["low", "medium", "high", "xhigh", "max"])).await,
+        "max",
+        "gpt-5.6-luna's row stops at max"
+    );
+}
+
 #[test]
 fn an_empty_ladder_is_rejected_rather_than_serving_nothing() {
     assert!(parse_ladder(&serde_json::json!([])).is_err());

@@ -93,6 +93,9 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     // This was pinned to "medium" regardless, which meant a client could not
     // ask a Codex seat to think harder or cheaper — the dial existed on the
     // wire and nothing downstream could reach it.
+    //
+    // An `ultra` is written as itself: the gateway has already mapped one the
+    // model's catalog row does not list (`CanonicalRequest::for_model`).
     if let Some(effort) = req
         .thinking_effort
         .or_else(|| req.thinking_budget.map(Effort::from_budget))
@@ -2145,6 +2148,7 @@ mod effort_tests {
             Effort::High,
             Effort::XHigh,
             Effort::Max,
+            Effort::Ultra,
         ] {
             let body = render_request(&asking(Some(level), None), "gpt-5.6-luna").expect("renders");
             assert_eq!(body["reasoning"]["effort"], level.as_str());
@@ -2186,5 +2190,39 @@ mod effort_tests {
         .expect("parses");
         assert_eq!(parsed.thinking_effort, Some(Effort::High));
         assert_eq!(parsed.thinking_budget, Some(Effort::High.as_budget()));
+    }
+
+    /// `ultra`, which the Codex backend's catalog lists for `gpt-5.6-terra`
+    /// and `/v1/models` advertises. It used to parse as no level at all, so a
+    /// client that picked it was sent the upstream's default.
+    #[test]
+    fn ultra_is_read_and_sent_as_itself_or_as_the_model_s_top() {
+        let parsed = parse_request(&serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "input": [],
+            "reasoning": { "effort": "ultra" },
+        }))
+        .expect("parses");
+        assert_eq!(parsed.thinking_effort, Some(Effort::Ultra));
+        assert_eq!(parsed.thinking_budget, Some(Effort::Ultra.as_budget()));
+
+        // As itself to a model whose row lists it, which is what a Codex seat
+        // serving `gpt-5.6-terra` is sent.
+        let terra = oag_router::ReasoningEfforts::new(
+            ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "medium",
+        )
+        .expect("levels");
+        let sent = parsed.for_model(Some(&terra), DIALECT);
+        let body = render_request(&sent, "gpt-5.6-terra").expect("renders");
+        assert_eq!(body["reasoning"]["effort"], "ultra");
+
+        // `gpt-5.6-luna` stops at `max`.
+        let luna =
+            oag_router::ReasoningEfforts::new(["low", "medium", "high", "xhigh", "max"], "medium")
+                .expect("levels");
+        let sent = parsed.for_model(Some(&luna), DIALECT);
+        let body = render_request(&sent, "gpt-5.6-luna").expect("renders");
+        assert_eq!(body["reasoning"]["effort"], "max");
     }
 }

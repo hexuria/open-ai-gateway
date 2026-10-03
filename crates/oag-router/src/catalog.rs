@@ -126,7 +126,9 @@ pub struct ModelSpec {
     pub display_label: Option<String>,
     /// The reasoning-effort levels the model takes and its default, when they
     /// are known: see [`crate::efforts`]. `/v1/models` publishes them; nothing
-    /// routes on them.
+    /// routes on them. The request path reads them for one thing: what a
+    /// request's `ultra` is sent to this model as
+    /// (`oag_proto::canonical::Effort::for_model`).
     ///
     /// Not serialised: the catalog row is their record, and nothing reads a
     /// serialised spec back.

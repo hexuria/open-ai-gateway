@@ -263,6 +263,19 @@ const SUBTRACTED: &[&str] = &[
     "generationConfig.candidateCount",
 ];
 
+/// `thinkingLevel`'s words in this dialect, compared in lower case: the API's
+/// enum spells them `HIGH`, its examples `high`.
+///
+/// A level in one of them is left in the residue, so a Gemini upstream gets
+/// it as the client said it, as before. One in a word only another dialect
+/// has — `ultra`, and `none`, `xhigh`, `max` — a Gemini upstream refuses, so
+/// `parse_request` reads it as the canonical level instead and takes it out
+/// of the residue at [`THINKING_LEVEL`].
+const THINKING_LEVELS: [&str; 4] = ["minimal", "low", "medium", "high"];
+
+/// Where a level is, in the path notation [`Passthrough::capture`] takes.
+const THINKING_LEVEL: &str = "generationConfig.thinkingConfig.thinkingLevel";
+
 /// Gemini wire JSON → canonical.
 pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
     let system = field(field(body, "systemInstruction"), "parts")
@@ -308,6 +321,20 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
 
     let cfg = field(body, "generationConfig");
 
+    // A level in a word this dialect has none for (see `THINKING_LEVELS`):
+    // the canonical level, and not part of the residue. A Gemini upstream is
+    // then sent the budget for it rather than a word it refuses, and an
+    // upstream in another dialect the level.
+    let foreign_level = field(field(cfg, "thinkingConfig"), "thinkingLevel")
+        .as_str()
+        .map(str::to_ascii_lowercase)
+        .filter(|level| !THINKING_LEVELS.contains(&level.as_str()))
+        .and_then(|level| Effort::parse(&level));
+    let mut subtracted = SUBTRACTED.to_vec();
+    if foreign_level.is_some() {
+        subtracted.push(THINKING_LEVEL);
+    }
+
     Ok(CanonicalRequest {
         // Carried in the URL, not the body.
         model: String::new(),
@@ -324,7 +351,10 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         thinking_budget: thinking_budget(cfg),
         // This dialect speaks budgets. Carry the nearest level too, so a hop to
         // one that speaks levels does not silently drop the request to think.
-        thinking_effort: thinking_budget(cfg).map(Effort::from_budget),
+        // A budget wins over a level beside it, as the more precise of the two.
+        thinking_effort: thinking_budget(cfg)
+            .map(Effort::from_budget)
+            .or(foreign_level),
         client_session: None,
         tool_choice: parse_tool_choice(field(field(body, "toolConfig"), "functionCallingConfig")),
         response_format: parse_response_format(cfg),
@@ -341,7 +371,7 @@ pub fn parse_request(body: &Value) -> Result<CanonicalRequest> {
         // Whatever the client sent that none of the above reads. It reaches a
         // Gemini upstream unchanged and is dropped everywhere else; see
         // `Passthrough` and `SUBTRACTED`.
-        passthrough: Passthrough::capture(DIALECT, body, SUBTRACTED),
+        passthrough: Passthrough::capture(DIALECT, body, &subtracted),
     })
 }
 
@@ -879,6 +909,86 @@ mod tests {
         let back = parse_request(&body).expect("parses");
         assert_eq!(back.thinking_budget, Some(0));
         assert_eq!(back.thinking_effort, Some(Effort::Off));
+    }
+
+    /// A `thinkingLevel` of `ultra`, which `/v1/models` advertises and no
+    /// Gemini model takes. Left in the residue it reached a Gemini upstream
+    /// as a word it refuses, and every other upstream not at all. Now it is
+    /// the canonical level, in either spelling and any case, and a Gemini
+    /// upstream is sent its budget, `max`'s, in its place.
+    #[test]
+    fn an_ultra_level_is_read_and_sent_as_max_s_budget() {
+        for body in [
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {"thinkingConfig": {"thinkingLevel": "ultra"}},
+            }),
+            json!({
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generation_config": {"thinking_config": {"thinking_level": "ULTRA"}},
+            }),
+        ] {
+            let req = parse_request(&body).expect("parses");
+            assert_eq!(req.thinking_effort, Some(Effort::Ultra), "{body}");
+            assert_eq!(req.thinking_budget, None, "{body}");
+            assert_eq!(req.passthrough, None, "no word of it is forwarded: {body}");
+
+            let sent = render_request(&req).expect("renders");
+            assert_eq!(
+                sent["generationConfig"]["thinkingConfig"],
+                json!({"thinkingBudget": Effort::Max.as_budget()}),
+                "{sent}"
+            );
+        }
+    }
+
+    /// The rest of a thinking config the level was in is still the client's,
+    /// and lands beside the budget.
+    #[test]
+    fn an_ultra_level_leaves_the_rest_of_its_config_in_place() {
+        let req = parse_request(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": "ultra", "includeThoughts": true}},
+        }))
+        .expect("parses");
+        let sent = render_request(&req).expect("renders");
+        assert_eq!(
+            sent["generationConfig"]["thinkingConfig"],
+            json!({"thinkingBudget": Effort::Max.as_budget(), "includeThoughts": true}),
+            "{sent}"
+        );
+    }
+
+    /// One of this dialect's own levels is the client's, said in its own
+    /// dialect: it reaches a Gemini upstream as it was said, and no budget is
+    /// put beside it, as before.
+    #[test]
+    fn a_gemini_level_passes_through_as_it_was_said() {
+        let body = json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingLevel": "HIGH"}},
+        });
+        let req = parse_request(&body).expect("parses");
+        assert_eq!(req.thinking_effort, None);
+        let sent = render_request(&req).expect("renders");
+        assert_eq!(
+            sent["generationConfig"]["thinkingConfig"],
+            json!({"thinkingLevel": "HIGH"})
+        );
+    }
+
+    /// A budget beside a foreign level is the more precise of the two, and the
+    /// level still does not reach the upstream.
+    #[test]
+    fn a_budget_beside_an_ultra_level_wins() {
+        let req = parse_request(&json!({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"thinkingConfig": {"thinkingBudget": 2048, "thinkingLevel": "ultra"}},
+        }))
+        .expect("parses");
+        assert_eq!(req.thinking_budget, Some(2048));
+        assert_eq!(req.thinking_effort, Some(Effort::from_budget(2048)));
+        assert_eq!(req.passthrough, None, "nothing of it is left to forward");
     }
 
     /// P10. A tool result is addressed by the function's name, not by an id.

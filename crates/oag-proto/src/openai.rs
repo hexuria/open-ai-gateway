@@ -111,7 +111,9 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
 
     // The level, where the client gave one. A budget is rendered as the nearest
     // level rather than dropped, so an Anthropic client reaching an OpenAI
-    // upstream still asks for reasoning at all.
+    // upstream still asks for reasoning at all. An `ultra` is written as
+    // itself: the gateway has already mapped one the model's catalog row does
+    // not list (`CanonicalRequest::for_model`).
     if let Some(effort) = req
         .thinking_effort
         .or_else(|| req.thinking_budget.map(Effort::from_budget))
@@ -1654,6 +1656,39 @@ mod tests {
         assert!(back.get("tool_choice").is_none());
         assert!(back.get("response_format").is_none());
         assert!(back.get("stop").is_none());
+    }
+
+    /// `/v1/models` advertises `ultra` for the models whose catalog row lists
+    /// it, so a client picking it must not be refused or quietly sent the
+    /// upstream's default. It used to be read as no level at all.
+    #[test]
+    fn ultra_is_read_and_sent_as_itself_or_as_the_model_s_top() {
+        let c = parse_request(&json!({
+            "model": "gpt-5.6-terra",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "ultra",
+        }))
+        .expect("parses");
+        assert_eq!(c.thinking_effort, Some(Effort::Ultra));
+        assert_eq!(c.thinking_budget, None, "this dialect states a level");
+
+        // As itself to a model whose row lists it.
+        let terra = oag_router::ReasoningEfforts::new(
+            ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "medium",
+        )
+        .expect("levels");
+        let sent = c.for_model(Some(&terra), DIALECT);
+        let body = render_request(&sent, "gpt-5.6-terra").expect("renders");
+        assert_eq!(body["reasoning_effort"], "ultra");
+
+        // As the row's top to one whose row does not.
+        let gpt_5_5 =
+            oag_router::ReasoningEfforts::new(["low", "medium", "high", "xhigh"], "medium")
+                .expect("levels");
+        let sent = c.for_model(Some(&gpt_5_5), DIALECT);
+        let body = render_request(&sent, "gpt-5.5").expect("renders");
+        assert_eq!(body["reasoning_effort"], "xhigh");
     }
 
     // ── cross-dialect: an OpenAI client reaching an Anthropic upstream ────────
