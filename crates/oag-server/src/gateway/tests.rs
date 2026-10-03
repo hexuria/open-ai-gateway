@@ -725,6 +725,7 @@ fn a_model_is_on_the_ladder_by_its_own_id_or_the_catalogs() {
         max_output_tokens: 8_192,
         capabilities: oag_router::Capabilities::default(),
         display_label: None,
+        reasoning_efforts: None,
     };
     let ladder = |ids: &[&str]| {
         TierLadder::new(vec![oag_router::ladder::Rung {
