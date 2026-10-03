@@ -111,7 +111,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.99.0
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-audit,cargo-deny
       # Reads `.cargo/audit.toml`, where every ignore has to say why the
@@ -304,7 +304,7 @@ jobs:
           # a mutants run that fails is the common case on a branch being fixed.
           shared-key: mutants
           cache-on-failure: true
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-mutants
       - run: cargo run -p oag -- migrate
