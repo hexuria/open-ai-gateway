@@ -88,7 +88,10 @@ sha2 = "0.11"
 # anything else.
 hmac = "0.13"
 hex = "0.4"
-chacha20poly1305 = "0.10"
+# `zeroize`: the cipher wipes its copy of the KEK when dropped. 0.10 always
+# did; 0.11 does only with this feature, and a test in `oag-core/src/seal.rs`
+# does not compile without it. No `getrandom`: the nonce comes from `rand`.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.10"
 base64 = "0.22"

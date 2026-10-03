@@ -10,7 +10,7 @@
 //! Sealing them is this file.
 
 use base64::Engine as _;
-use chacha20poly1305::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
+use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -70,13 +70,15 @@ impl Kek {
     /// a birthday bound close enough to matter for a table that gets rewritten
     /// on every token refresh.
     pub fn seal(&self, plaintext: &[u8]) -> crate::Result<Sealed> {
-        let mut nonce_bytes = [0u8; 24];
-        OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let nonce_bytes: [u8; 24] = {
+            use rand::RngExt;
+            rand::rng().random()
+        };
+        let nonce = XNonce::from(nonce_bytes);
 
         let ciphertext = self
             .cipher()
-            .encrypt(nonce, plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|_| crate::Error::Internal("sealing credential failed".to_owned()))?;
 
         Ok(Sealed {
@@ -90,11 +92,16 @@ impl Kek {
     /// Fails on any tampering, because the tag is checked. The error message
     /// deliberately says nothing about which part failed.
     pub fn open(&self, sealed: &Sealed) -> crate::Result<Vec<u8>> {
-        let nonce_bytes: [u8; 24] = sealed.nonce.as_slice().try_into().map_err(|_| {
-            crate::Error::Internal("stored credential nonce is malformed".to_owned())
-        })?;
+        let malformed =
+            || crate::Error::Internal("stored credential nonce is malformed".to_owned());
+        let nonce_bytes: [u8; 24] = sealed
+            .nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| malformed())?;
+        let nonce = XNonce::try_from(&nonce_bytes[..]).map_err(|_| malformed())?;
         self.cipher()
-            .decrypt(XNonce::from_slice(&nonce_bytes), sealed.ciphertext.as_ref())
+            .decrypt(&nonce, sealed.ciphertext.as_ref())
             .map_err(|_| {
                 crate::Error::Internal(
                     "could not open sealed credential: wrong key, or the row was tampered with"
@@ -210,6 +217,16 @@ mod tests {
     #[test]
     fn debug_never_prints_the_key() {
         assert_eq!(format!("{:?}", kek()), "Kek(<redacted>)");
+    }
+
+    #[test]
+    fn the_cipher_wipes_its_copy_of_the_key_on_drop() {
+        // `cipher()` copies the KEK into every cipher it builds.
+        // chacha20poly1305 0.10 wiped that copy on drop unconditionally; 0.11
+        // does only with its `zeroize` feature, which the workspace manifest
+        // turns on. Without the feature this does not compile.
+        fn wipes_on_drop<T: ZeroizeOnDrop>() {}
+        wipes_on_drop::<XChaCha20Poly1305>();
     }
 
     // The golden vector. Every credential row in Postgres was sealed by an
