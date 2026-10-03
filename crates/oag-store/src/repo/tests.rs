@@ -2,7 +2,7 @@ use super::catalog::UPSERT_MODEL_SQL;
 use super::usage::{KEY_USAGE_SQL, PRINCIPAL_USAGE_SQL};
 use super::*;
 use crate::Db;
-use crate::rows::{ModelRow, ServiceRow, UsageWrite};
+use crate::rows::{ModelRow, ProviderStanding, ServiceRow, UsageWrite};
 use oag_core::{AccountId, Error};
 use rust_decimal::Decimal;
 use rust_decimal::dec;
@@ -3409,6 +3409,215 @@ async fn the_usage_sweep_holds_owned_enabled_seats() {
         .collect();
     assert!(swept.contains(&live), "an owned, enabled seat is polled");
     assert!(!swept.contains(&off), "a disabled seat is not");
+}
+
+/// A standing with nothing usable or live in it, and nothing coming back.
+fn standing(total: i64, usable: i64, ownerless_seats: i64) -> ProviderStanding {
+    ProviderStanding {
+        total,
+        usable,
+        ownerless_seats,
+        live: 0,
+        back_at: None,
+    }
+}
+
+/// (b) of a `no_viable_model` for a laddered model: the route holds nothing
+/// for the provider. Asked on a route that does hold another provider's key,
+/// which is counted when that provider is asked: zero is the answer for xai,
+/// not what the query returns for everything.
+#[tokio::test]
+async fn a_route_with_no_credential_for_a_provider_stands_at_zero() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let (principal, route, _) = seed(&db).await;
+
+    assert_eq!(
+        provider_standing(&db, route, "xai", principal)
+            .await
+            .expect("standing"),
+        standing(0, 0, 0)
+    );
+    assert_eq!(
+        provider_standing(&db, route, "anthropic", principal)
+            .await
+            .expect("standing"),
+        ProviderStanding {
+            live: 1,
+            ..standing(1, 1, 0)
+        },
+        "the seeded shared key is the caller's to use, and live"
+    );
+}
+
+/// (c): credentials this caller may not use are counted, and told apart. A
+/// seat with no owner serves no one; someone else's seat serves them; the
+/// caller's own seat and an owner-less API key, the shared pool, are usable.
+/// The owner-less seat is built inside a transaction that disables the
+/// trigger, because the schema no longer lets anything create one.
+#[tokio::test]
+async fn credentials_this_caller_may_not_use_are_counted_apart() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let (caller, route, _) = seed(&db).await;
+    let someone = another_principal(&db).await;
+
+    let mut tx = db.pool().begin().await.expect("begin");
+    sqlx::query("ALTER TABLE account DISABLE TRIGGER account_seat_has_one_owner")
+        .execute(&mut *tx)
+        .await
+        .expect("disable, inside the transaction only");
+    let add = |kind: &'static str, owner: Option<Uuid>| {
+        sqlx::query(
+            "WITH a AS (INSERT INTO account (id, name, provider, kind, credentials_sealed, \
+             credentials_nonce, owner_principal_id) VALUES (gen_random_uuid(), $1, 'xai', $2, \
+             '\\x00', '\\x00', $3) RETURNING id) \
+             INSERT INTO account_route (account_id, route_id) SELECT id, $4 FROM a",
+        )
+        .bind(format!("{kind}-{}", Uuid::new_v4()))
+        .bind(kind)
+        .bind(owner)
+        .bind(route)
+    };
+    let ask = async |tx: &mut sqlx::PgConnection| {
+        sqlx::query_as::<_, ProviderStanding>(super::routes::PROVIDER_STANDING_SQL)
+            .bind(route)
+            .bind("xai")
+            .bind(caller)
+            .fetch_one(tx)
+            .await
+            .expect("standing")
+    };
+
+    add("oauth", None)
+        .execute(&mut *tx)
+        .await
+        .expect("a legacy owner-less seat");
+    assert_eq!(
+        ask(&mut *tx).await,
+        standing(1, 0, 1),
+        "an owner-less seat is nobody's"
+    );
+
+    add("oauth", Some(someone))
+        .execute(&mut *tx)
+        .await
+        .expect("someone else's seat");
+    assert_eq!(
+        ask(&mut *tx).await,
+        standing(2, 0, 1),
+        "someone else's seat is theirs, and not an owner-less one"
+    );
+
+    add("oauth", Some(caller))
+        .execute(&mut *tx)
+        .await
+        .expect("the caller's seat");
+    add("api_key", None)
+        .execute(&mut *tx)
+        .await
+        .expect("a shared key");
+    assert_eq!(
+        ask(&mut *tx).await,
+        ProviderStanding {
+            live: 2,
+            ..standing(4, 2, 1)
+        },
+        "the caller's own seat and the shared pool are the caller's"
+    );
+    tx.rollback().await.expect("rollback");
+}
+
+/// (d): everything the caller may use is cooling down, rate limited or out of
+/// rotation, and the first one back is the earliest end among those in
+/// rotation. A disabled credential is not back when its cooldown ends, and
+/// someone else's is not the caller's to wait for, so neither sets the time.
+#[tokio::test]
+async fn the_first_usable_credential_back_is_the_one_named() {
+    let Some(db) = test_db() else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    db.migrate().await.expect("migrate");
+    let (caller, route, _) = seed(&db).await;
+    let someone = another_principal(&db).await;
+    // Whole seconds, so what Postgres keeps is exactly what was written.
+    let now = OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .expect("zero is a nanosecond");
+    let mins = |n: i64| now + time::Duration::minutes(n);
+    let at = |id: Uuid, cooling: Option<OffsetDateTime>, limited: Option<OffsetDateTime>| {
+        let db = db.clone();
+        async move {
+            sqlx::query(
+                "UPDATE account SET cooldown_until = $2, rate_limited_until = $3 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(cooling)
+            .bind(limited)
+            .execute(db.pool())
+            .await
+            .expect("cool");
+        }
+    };
+
+    let cooling = seat_on(&db, route, "xai", "api_key", None).await;
+    let limited = seat_on(&db, route, "xai", "oauth", Some(caller)).await;
+    let disabled = seat_on(&db, route, "xai", "api_key", Some(caller)).await;
+    let theirs = seat_on(&db, route, "xai", "api_key", Some(someone)).await;
+    // The later of the two ends is when a credential is back.
+    at(cooling, Some(mins(10)), Some(mins(3))).await;
+    at(limited, Some(mins(2)), Some(mins(5))).await;
+    at(disabled, Some(mins(1)), None).await;
+    set_schedulable(&db, AccountId::from_uuid(disabled), false)
+        .await
+        .expect("disable");
+    at(theirs, Some(mins(1)), None).await;
+
+    let got = provider_standing(&db, route, "xai", caller)
+        .await
+        .expect("standing");
+    assert_eq!(
+        got,
+        ProviderStanding {
+            back_at: Some(mins(5)),
+            ..standing(4, 3, 0)
+        },
+        "nothing usable is live, and the seat limited for five minutes is first back"
+    );
+
+    // A cooldown that has ended is no cooldown: the credential is live.
+    at(cooling, Some(mins(-1)), None).await;
+    let got = provider_standing(&db, route, "xai", caller)
+        .await
+        .expect("standing");
+    assert_eq!(
+        (got.live, got.back_at),
+        (1, Some(mins(5))),
+        "one live again, and the other still on its way back"
+    );
+
+    // Out of rotation, with nothing cooling: nothing is coming back by itself.
+    at(cooling, Some(mins(10)), None).await;
+    at(limited, None, None).await;
+    for id in [cooling, limited] {
+        set_schedulable(&db, AccountId::from_uuid(id), false)
+            .await
+            .expect("disable");
+    }
+    assert_eq!(
+        provider_standing(&db, route, "xai", caller)
+            .await
+            .expect("standing"),
+        standing(4, 3, 0),
+        "disabled is not back at the end of its cooldown"
+    );
 }
 
 /// A fresh endpoint name that fits 0020's pattern.

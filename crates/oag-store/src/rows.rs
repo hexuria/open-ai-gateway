@@ -207,6 +207,28 @@ pub struct ChannelStatusRow {
     pub usage_reserve_pct: Option<i16>,
 }
 
+/// What a route holds for one provider, counted from where one caller stands.
+///
+/// Why a model on the route's ladder could not be routed, as far as the
+/// credentials can say: the route has none for its provider, or none this
+/// caller may use, or none that can take a request now. Counts and a time,
+/// never a name or an owner: whose credentials they are stays in the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromRow)]
+pub struct ProviderStanding {
+    /// Every credential the route holds for the provider, whoever's it is.
+    pub total: i64,
+    /// Those this caller may draw on: its own, and the shared pool.
+    pub usable: i64,
+    /// Subscription seats with no owner, which serve no one.
+    pub ownerless_seats: i64,
+    /// Usable ones that could take a request now: in rotation, not cooling
+    /// down, not rate limited.
+    pub live: i64,
+    /// When the first usable one in rotation that is cooling down or rate
+    /// limited is back. `None` when none is.
+    pub back_at: Option<OffsetDateTime>,
+}
+
 /// One catalog entry.
 // The capability flags mirror the catalog columns one-for-one; folding them
 // into an enum here would just mean unfolding them again on every query.

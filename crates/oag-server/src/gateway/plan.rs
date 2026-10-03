@@ -1,6 +1,6 @@
 //! Planning a request: which policy, budget, ladder and models it gets.
 
-use super::respond::no_viable_message;
+use super::respond::{Blocked, Laddered, no_viable_message};
 use crate::AppState;
 use axum::http::{HeaderMap, header};
 use oag_core::tier::RoutingMode;
@@ -262,10 +262,12 @@ pub(super) async fn plan_request(
     ) {
         Ok(d) => d,
         Err(Error::NoViableModel(_)) => {
+            let laddered = explain(state, auth, &canonical.model, policy.ladder(), &catalog).await;
             return Err(Error::NoViableModel(no_viable_message(
                 &route.name,
                 &canonical.model,
                 policy.ladder(),
+                laddered.as_ref(),
             )));
         }
         Err(e) => return Err(e),
@@ -280,6 +282,90 @@ pub(super) async fn plan_request(
         channel,
         served,
     })
+}
+
+/// The requested model, when the route's ladder names it, as routing alone can
+/// see it: whether its provider is served, and whether the catalog holds it.
+///
+/// Named by the id the request used or, where the catalog knows the name, by
+/// the catalog's id for it. `None` for a model the ladder does not name, which
+/// is the ladder's to explain, and for one whose id names no provider.
+pub(super) fn laddered(
+    requested: &str,
+    ladder: &TierLadder,
+    catalog: &oag_router::Catalog,
+) -> Option<Laddered> {
+    let requested = requested.trim();
+    let names = |id: &str| {
+        ladder
+            .rungs()
+            .iter()
+            .any(|rung| rung.models.iter().any(|m| m.as_str() == id))
+    };
+    let spec = catalog.resolve(requested);
+    if !names(requested) && !spec.is_some_and(|spec| names(spec.id.as_str())) {
+        return None;
+    }
+    if spec.is_some() {
+        return Some(Laddered::Catalogued);
+    }
+    let (prefix, _) = requested.split_once('/')?;
+    Some(match prefix.parse::<oag_core::Provider>() {
+        // By its own name, which is what a credential is filed under, rather
+        // than the alias the ladder may have spelled it with.
+        Ok(p) if p.native_dialect().is_chat() => Laddered::Uncatalogued {
+            provider: p.as_str().to_owned(),
+            blocked: None,
+        },
+        _ => Laddered::Unserved {
+            provider: prefix.to_owned(),
+        },
+    })
+}
+
+/// [`laddered`], and what the route's credentials for the model's provider
+/// are to this caller when the catalog does not hold the model.
+///
+/// The one read a refusal adds, made only for a request that has already
+/// failed: nothing on the way to a served answer pays for it. A read that
+/// fails leaves the credentials unsaid, and the refusal says what routing
+/// alone can.
+async fn explain(
+    state: &Arc<AppState>,
+    auth: &oag_store::AuthContext,
+    requested: &str,
+    ladder: &TierLadder,
+    catalog: &oag_router::Catalog,
+) -> Option<Laddered> {
+    let mut found = laddered(requested, ladder, catalog)?;
+    if let Laddered::Uncatalogued { provider, blocked } = &mut found {
+        match oag_store::repo::provider_standing(
+            &state.db,
+            auth.route_id,
+            provider,
+            auth.principal_id,
+        )
+        .await
+        {
+            Ok(standing) => {
+                // The counts go to the log, for the operator: the refusal says
+                // what is in the way, and this says how much of the pool is.
+                tracing::info!(
+                    %provider,
+                    principal_id = %auth.principal_id,
+                    route_id = %auth.route_id,
+                    ?standing,
+                    "a model on the ladder could not be routed"
+                );
+                *blocked = Blocked::of(&standing);
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not read the route's credentials to explain a refusal"
+            ),
+        }
+    }
+    Some(found)
 }
 
 /// The inbound key, from any header a client might use.

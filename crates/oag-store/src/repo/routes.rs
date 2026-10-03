@@ -1,7 +1,7 @@
 //! Routes and the channels (accounts) each one can use.
 
 use crate::Db;
-use crate::rows::{AccountRow, ChannelStatusRow, RouteRow};
+use crate::rows::{AccountRow, ChannelStatusRow, ProviderStanding, RouteRow};
 use oag_core::{Error, Result};
 use uuid::Uuid;
 
@@ -52,7 +52,7 @@ pub(super) const CANDIDATES_SQL: &str = r"
 /// is the organisation's shared pool; an owner-less seat is a personal plan
 /// serving whoever asked, which is the sharing its terms forbid, so it matches
 /// no one until `account set-owner` binds it. The same predicate is in
-/// [`route_channels`] and [`route_channel_status`].
+/// [`route_channels`], [`route_channel_status`] and [`provider_standing`].
 pub async fn candidates(
     db: &Db,
     route_id: Uuid,
@@ -66,6 +66,54 @@ pub async fn candidates(
         .fetch_all(db.pool())
         .await
         .map_err(|e| Error::Internal(format!("loading candidates: {e}")))
+}
+
+/// [`provider_standing`]'s statement, a constant so a test can run it inside a
+/// transaction that holds a row the schema no longer admits: the owner-less
+/// seat, which is the case it most needs to tell apart.
+pub(super) const PROVIDER_STANDING_SQL: &str = r"
+        WITH held AS (
+            SELECT COALESCE(a.owner_principal_id = $3
+                            OR (a.owner_principal_id IS NULL AND a.kind <> 'oauth'),
+                            false) AS usable,
+                   (a.owner_principal_id IS NULL AND a.kind = 'oauth') AS ownerless_seat,
+                   a.schedulable,
+                   GREATEST(a.cooldown_until, a.rate_limited_until) AS busy_until
+            FROM account a
+            JOIN account_route ar ON ar.account_id = a.id
+            WHERE ar.route_id = $1
+              AND a.provider = $2
+        )
+        SELECT count(*) AS total,
+               count(*) FILTER (WHERE usable) AS usable,
+               count(*) FILTER (WHERE ownerless_seat) AS ownerless_seats,
+               count(*) FILTER (WHERE usable AND schedulable
+                                  AND (busy_until IS NULL OR busy_until <= now())) AS live,
+               min(busy_until) FILTER (WHERE usable AND schedulable AND busy_until > now())
+                   AS back_at
+        FROM held
+        ";
+
+/// Where one caller stands with a route's credentials for one provider.
+///
+/// For the refusal of a model on the route's ladder, and only that: it is read
+/// on the way out of a request that has already failed, never on one being
+/// served. "May use" is [`candidates`]' owner predicate, so it is exactly what
+/// selection would have offered this caller; the rest are counted without
+/// saying whose they are.
+pub async fn provider_standing(
+    db: &Db,
+    route_id: Uuid,
+    provider: &str,
+    principal_id: Uuid,
+) -> Result<ProviderStanding> {
+    sqlx::query_as::<_, ProviderStanding>(PROVIDER_STANDING_SQL)
+        .bind(route_id)
+        .bind(provider)
+        .bind(principal_id)
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| Error::Internal(format!("loading credential standing: {e}")))
 }
 
 /// Providers this route holds usable credentials for, and by which credential
