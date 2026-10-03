@@ -9,6 +9,7 @@
 use clap::{Subcommand, ValueEnum};
 use oag_core::config::Config;
 use oag_core::{Kek, Result};
+use oag_router::efforts::Tally;
 use oag_server::endpoint_sync::{self, ModelsReport, SyncOptions, SyncReport};
 use oag_store::Db;
 use oag_upstream::listing::PriceChoice;
@@ -31,6 +32,11 @@ pub enum EndpointCatalogCommand {
     /// add` never is. A run that would remove more than half of the rows
     /// earlier syncs wrote is refused without --allow-shrink. The running
     /// gateway serves the rows from its next catalog refresh.
+    ///
+    /// Each row the list offers also stores its reasoning-effort levels, which
+    /// `/v1/models` publishes: the committed override table's entry for it,
+    /// else what OpenRouter's public model list states, read first and with
+    /// no key; else none. --no-efforts reads neither.
     Sync {
         #[arg(value_name = "NAME")]
         name: String,
@@ -64,6 +70,11 @@ pub enum EndpointCatalogCommand {
         /// this: a list that shrinks that far is more often one read in part.
         #[arg(long)]
         allow_shrink: bool,
+        /// Read no reasoning-effort levels, which needs no network beyond
+        /// the endpoint: every row keeps the levels it has, and a new row has
+        /// none until `oag admin catalog sync-efforts`.
+        #[arg(long)]
+        no_efforts: bool,
     },
     /// Show the models an endpoint's list names, as discovery reads it, beside
     /// the catalog. Writes nothing.
@@ -111,6 +122,7 @@ pub(super) async fn run(
             price,
             listing_url,
             allow_shrink,
+            no_efforts,
         } => {
             let options = SyncOptions {
                 account,
@@ -120,6 +132,7 @@ pub(super) async fn run(
                 price: price.into(),
                 dry_run,
                 allow_shrink,
+                efforts: efforts_url(no_efforts),
             };
             let report = endpoint_sync::sync(db, kek, &name, &options).await?;
             sync_lines(&report, config.gateway.catalog_refresh_interval)
@@ -132,6 +145,12 @@ pub(super) async fn run(
         println!("{line}");
     }
     Ok(())
+}
+
+/// Where a sync reads reasoning-effort levels: OpenRouter's list, unless
+/// `--no-efforts`.
+pub(super) fn efforts_url(no_efforts: bool) -> Option<String> {
+    (!no_efforts).then(|| oag_upstream::openrouter::MODELS_URL.to_owned())
 }
 
 /// How many ids a count shows before it says how many more there are.
@@ -215,6 +234,12 @@ pub(super) fn sync_lines(report: &SyncReport, refresh: Duration) -> Vec<String> 
         ));
     }
     lines.push(count("filtered out", &report.filtered, false));
+    lines.push(match report.efforts {
+        Some(tally) => efforts_line(tally),
+        None => {
+            "  efforts        not read (--no-efforts): each row keeps the levels it had".to_owned()
+        }
+    });
     lines.push(if report.dry_run {
         "Dry run: nothing was written. Run it again without --dry-run to write it.".to_owned()
     } else if refresh.is_zero() {
@@ -229,6 +254,20 @@ pub(super) fn sync_lines(report: &SyncReport, refresh: Duration) -> Vec<String> 
         )
     });
     lines
+}
+
+/// Where the rows' reasoning-effort levels came from, in the summary's
+/// columns: the count is the rows a source named, an override that says the
+/// model takes no level among them.
+pub(super) fn efforts_line(tally: Tally) -> String {
+    format!(
+        "  {:<14} {:>4}  {} from the override table, {} from OpenRouter; {} without known levels",
+        "efforts",
+        tally.overridden + tally.listed,
+        tally.overridden,
+        tally.listed,
+        tally.unknown
+    )
 }
 
 /// What `endpoint models` prints.
@@ -310,6 +349,7 @@ mod tests {
             price,
             listing_url,
             allow_shrink,
+            no_efforts,
         } = parse(&["endpoint", "sync", "merge"]).expect("parses")
         else {
             panic!("expected sync");
@@ -317,6 +357,7 @@ mod tests {
         assert_eq!(name, "merge");
         assert_eq!((account, dry_run, listing_url), (None, false, None));
         assert!(!allow_shrink, "a shrinking list is refused unless asked");
+        assert!(!no_efforts, "levels are read unless asked not to");
         assert!(include.is_empty() && exclude.is_empty());
         assert_eq!(price, Price::Cheapest);
         assert_eq!(PriceChoice::from(price), PriceChoice::Cheapest);
@@ -329,6 +370,7 @@ mod tests {
             price,
             listing_url,
             allow_shrink,
+            no_efforts,
             ..
         } = parse(&[
             "endpoint",
@@ -348,6 +390,7 @@ mod tests {
             "--listing-url",
             "https://api-gateway.merge.dev/v1/models",
             "--allow-shrink",
+            "--no-efforts",
         ])
         .expect("parses")
         else {
@@ -356,6 +399,7 @@ mod tests {
         assert_eq!(account.as_deref(), Some("merge-key"));
         assert!(dry_run);
         assert!(allow_shrink);
+        assert!(no_efforts);
         assert_eq!(include, ["zai/*", "anthropic/*"]);
         assert_eq!(exclude, ["*-preview"]);
         assert_eq!(PriceChoice::from(price), PriceChoice::First);
@@ -372,6 +416,15 @@ mod tests {
             parse(&["endpoint", "sync", "merge", "--price", "dearest"]).is_err(),
             "cheapest or first"
         );
+    }
+
+    #[test]
+    fn levels_are_read_from_openrouter_unless_no_efforts_says_not_to() {
+        assert_eq!(
+            efforts_url(false).as_deref(),
+            Some("https://openrouter.ai/api/v1/models")
+        );
+        assert_eq!(efforts_url(true), None);
     }
 
     #[test]
@@ -410,6 +463,11 @@ mod tests {
                 ("google/veo-3".to_owned(), Skip::NotChat("video".to_owned())),
             ],
             filtered: Vec::new(),
+            efforts: Some(Tally {
+                overridden: 1,
+                listed: 6,
+                unknown: 2,
+            }),
         }
     }
 
@@ -433,6 +491,8 @@ mod tests {
             "    not a chat model: 2 (openai/gpt-image-1, google/veo-3)",
             "    deprecated or unavailable: 1 (mistral/large)",
             "  filtered out      0",
+            "  efforts           7  1 from the override table, 6 from OpenRouter; 2 without \
+             known levels",
         ] {
             assert!(
                 lines.iter().any(|l| l == expected),
@@ -454,6 +514,16 @@ mod tests {
 
         let off = sync_lines(&report(false), Duration::ZERO).join("\n");
         assert!(off.contains("catalog_refresh_interval: 0"), "{off}");
+
+        let mut unread = report(false);
+        unread.efforts = None;
+        let unread = sync_lines(&unread, Duration::from_mins(1));
+        assert!(
+            unread.iter().any(|l| l
+                == "  efforts        not read (--no-efforts): each row keeps the levels it had"),
+            "{unread:?}"
+        );
+        assert!(!unread.iter().any(|l| l.contains("from OpenRouter")));
     }
 
     #[test]

@@ -330,6 +330,7 @@ mod tests {
             max_output_tokens: 64_000,
             capabilities: Capabilities::default(),
             display_label: None,
+            reasoning_efforts: None,
         }
     }
 

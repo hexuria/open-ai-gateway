@@ -614,6 +614,18 @@ pub enum CatalogCommand {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Store every catalog row's reasoning-effort levels, which `/v1/models`
+    /// publishes so a client shows only the effort levels a model takes.
+    ///
+    /// A row named in the override table committed with this build
+    /// (`crates/oag-router/reasoning-efforts.json`) takes its entry. Any other
+    /// takes what OpenRouter's public model list states for the model, read
+    /// with no key: a built-in's row by its id (`xai/grok-4.6`), an endpoint's
+    /// by its id less the endpoint (`merge/zai/glm-5.3-flash` is
+    /// `zai/glm-5.3-flash`). A row neither names has none, and `/v1/models`
+    /// publishes none for it. Only the two effort columns are written; the
+    /// running gateway serves them from its next catalog refresh.
+    SyncEfforts,
     /// List catalog entries.
     List {
         #[arg(long)]

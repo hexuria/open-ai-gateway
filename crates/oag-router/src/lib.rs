@@ -14,12 +14,14 @@
 pub mod catalog;
 pub mod classify;
 pub mod cost;
+pub mod efforts;
 pub mod ladder;
 pub mod policy;
 
 pub use catalog::{Capabilities, Catalog, ModelId, ModelSpec, Pricing, derive_label};
 pub use classify::{Classifier, HeuristicClassifier, RequestSignal};
 pub use cost::{Usage, counterfactual};
+pub use efforts::ReasoningEfforts;
 pub use ladder::TierLadder;
 pub use policy::{
     BudgetPressure, BudgetState, Budgets, Entitlement, QualityGate, RoutingDecision, RoutingPolicy,

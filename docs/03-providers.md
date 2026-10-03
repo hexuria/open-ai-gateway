@@ -425,6 +425,7 @@ list prices its models:
 oag admin endpoint sync merge --dry-run     # what would change; writes nothing
 oag admin endpoint sync merge               # write it
 oag admin endpoint sync merge --include 'anthropic/*' --exclude '*-preview' --price first
+oag admin endpoint sync merge --no-efforts  # offline: read no reasoning-effort levels
 ```
 
 - **Where it looks.** At `--listing-url` if given: on the base URL's own origin,
@@ -473,7 +474,9 @@ oag admin endpoint sync merge --include 'anthropic/*' --exclude '*-preview' --pr
   model", and so is one that no longer names more than half of the rows earlier
   syncs wrote: that is more often a list read in part, or changed in shape,
   than an endpoint withdrawing its models. `--allow-shrink` removes them anyway.
-  The whole sync is one transaction.
+  Each row the list offers also stores its reasoning-effort levels: see
+  [Reasoning-effort levels](#reasoning-effort-levels). The whole sync is one
+  transaction.
 - **What it prints.** Added, updated, unchanged, removed and kept counts,
   skipped entries by reason, and what the filters left out. The running gateway
   serves the rows from its next catalog refresh
@@ -494,6 +497,46 @@ URL, never the origin's: a served set read from some other service's list would
 hide the endpoint's models. It never writes a catalog row, because it has no
 prices. `oag admin endpoint models <name>` prints what it would record, beside
 the catalog, and writes nothing.
+
+### Reasoning-effort levels
+
+`/v1/models` says which `reasoning_effort` levels each model takes, and its
+default, so a client's effort slider shows only the stops the model has (the
+shape is in [08-clients.md](08-clients.md#reasoning-effort)). Merge's list says
+nothing about them, so they come from two other places, both read when the
+catalog is written and never per request, and are stored with the row
+(`model_catalog.reasoning_efforts`, lowest first, and `reasoning_effort`, the
+default; migration 0023):
+
+1. **The override table**, `crates/oag-router/reasoning-efforts.json`,
+   committed, for the rows this deployment serves most. Each entry names a
+   catalog id, its levels, its default and where they come from; an empty list
+   says the model takes no level. It wins over OpenRouter.
+2. **OpenRouter's public model list**, `https://openrouter.ai/api/v1/models`,
+   read with no key: `reasoning.supported_efforts` (highest first, and stored
+   lowest first) and `reasoning.default_effort`. A built-in's row matches by its
+   id (`xai/grok-4.6` is OpenRouter's `x-ai/grok-4.6`), an endpoint's by its id
+   less the endpoint (`merge/zai/glm-5.3-flash` is `z-ai/glm-5.3-flash`). The
+   vendors spelt more than one way (`x-ai`, `z-ai`/`zhipu`,
+   `moonshotai`/`kimi`, `google`/`gemini`, `mistralai`, `meta-llama`) are
+   matched as one; the model's own name must match exactly.
+
+A row neither names has no levels, and `/v1/models` publishes none for it.
+Nothing is guessed: a list naming a level outside `none`, `minimal`, `low`,
+`medium`, `high`, `xhigh`, `max` and `ultra`, or a default it does not hold, is
+not used. The table is applied when a row is written, so the row holds what the
+listing serves; editing the table changes nothing until one of these runs:
+
+- **`oag admin endpoint sync <name>`** stores the levels of every row it writes
+  or finds unchanged, in the sync's transaction, reading OpenRouter's list
+  before anything is written: a list it cannot read stops the sync.
+  `--no-efforts` reads none, and every row keeps the levels it has (a new one
+  has none until the next run that reads them).
+- **`oag admin catalog sync-efforts`** does the same for every catalog row,
+  built-in or endpoint, and writes nothing else.
+
+`catalog seed`, `catalog add` and `catalog sync-prices` leave a row's levels
+where they were. The gateway serves them from its next catalog refresh.
 
 ### Bedrock endpoints
 

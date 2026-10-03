@@ -148,6 +148,8 @@ fn a_filtered_listing_reports_what_the_catalog_holds_not_what_survived() {
         supports_reasoning: false,
         supports_prompt_cache: false,
         display_label: None,
+        reasoning_efforts: None,
+        reasoning_effort: None,
     };
     let catalog = vec![
         model("anthropic/claude-opus-5", "anthropic"),
@@ -2284,5 +2286,134 @@ fn a_catalog_price_is_rounded_as_it_will_be_stored_before_it_is_judged() {
         row.cache_write_per_mtok,
         Some(Decimal::ZERO),
         "a negative that rounds to nothing is a zero"
+    );
+}
+
+#[test]
+fn catalog_sync_efforts_takes_no_arguments() {
+    assert!(matches!(
+        parse(&["catalog", "sync-efforts"]).expect("parses"),
+        AdminCommand::Catalog(CatalogCommand::SyncEfforts)
+    ));
+    assert!(parse(&["catalog", "sync-efforts", "--provider", "xai"]).is_err());
+}
+
+#[test]
+fn the_sync_efforts_summary_says_where_each_rows_levels_came_from() {
+    let tally = oag_router::efforts::Tally {
+        overridden: 5,
+        listed: 40,
+        unknown: 295,
+    };
+    assert_eq!(
+        super::catalog::sync_efforts_lines(
+            "https://openrouter.ai/api/v1/models",
+            192,
+            340,
+            tally,
+            12
+        ),
+        [
+            "reasoning efforts: the list at https://openrouter.ai/api/v1/models states levels \
+             for 192 models",
+            "  340 catalog rows: 5 from the override table, 40 from OpenRouter, 295 without \
+             known levels; 12 changed",
+            "  a running gateway serves them from its next catalog refresh; a row without \
+             levels publishes none",
+        ]
+    );
+}
+
+/// `catalog sync-efforts` reads OpenRouter's list, stores each row's levels
+/// from it, and says what it read. Gated on Postgres; the list is the recorded
+/// one, served by a stand-in, and the rows are an endpoint's of this test's own.
+#[tokio::test]
+async fn sync_efforts_stores_the_levels_openrouter_states_on_each_row() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    const LISTED: &str =
+        include_str!("../../../oag-upstream/tests/fixtures/openrouter-models.json");
+
+    let Ok(url) = std::env::var("OAG_TEST_DATABASE_URL") else {
+        eprintln!("skipped: OAG_TEST_DATABASE_URL unset");
+        return;
+    };
+    let db = Db::connect(&url, 2).expect("connect");
+    db.migrate().await.expect("migrate");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(LISTED, "application/json"))
+        .mount(&server)
+        .await;
+    let e = format!("t7-cli-{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let row = |model: &str| oag_store::ModelRow {
+        id: format!("{e}/{model}"),
+        provider: e.clone(),
+        upstream_name: model.to_owned(),
+        input_per_mtok: Decimal::ONE,
+        output_per_mtok: Decimal::TWO,
+        cache_read_per_mtok: None,
+        cache_write_per_mtok: None,
+        context_window: 128_000,
+        max_output_tokens: 8_192,
+        supports_vision: false,
+        supports_tools: true,
+        supports_reasoning: true,
+        supports_prompt_cache: false,
+        display_label: None,
+        reasoning_efforts: None,
+        reasoning_effort: None,
+    };
+    // OpenRouter lists levels for the first, `reasoning: {"mandatory": false}`
+    // for the second, and does not list the third.
+    let models = [
+        "xai/grok-4.6",
+        "anthropic/claude-sonnet-4.5",
+        "mystery/model",
+    ];
+    for model in models {
+        repo::override_model(&db, &row(model)).await.expect("a row");
+    }
+
+    let listed = format!("{}/api/v1/models", server.uri());
+    let lines = super::catalog::sync_efforts(&db, &listed).await;
+    let mut stored = Vec::new();
+    for model in models {
+        let pair: (Option<Vec<String>>, Option<String>) = sqlx::query_as(
+            "SELECT reasoning_efforts, reasoning_effort FROM model_catalog WHERE id = $1",
+        )
+        .bind(format!("{e}/{model}"))
+        .fetch_one(db.pool())
+        .await
+        .expect("the row");
+        stored.push(pair);
+    }
+    sqlx::query("DELETE FROM model_catalog WHERE provider = $1")
+        .bind(&e)
+        .execute(db.pool())
+        .await
+        .expect("clean up");
+
+    let lines = lines.expect("synced");
+    assert_eq!(
+        lines[0],
+        format!("reasoning efforts: the list at {listed} states levels for 6 models")
+    );
+    assert!(lines[1].contains(" from OpenRouter, "), "{lines:?}");
+    assert_eq!(
+        stored,
+        [
+            (
+                Some(
+                    ["low", "medium", "high", "xhigh"]
+                        .map(str::to_owned)
+                        .to_vec()
+                ),
+                Some("high".to_owned())
+            ),
+            (None, None),
+            (None, None),
+        ]
     );
 }

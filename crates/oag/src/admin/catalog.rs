@@ -3,6 +3,7 @@
 use super::accounts::{parse_provider, price_account, register_endpoints};
 use super::{CatalogAddArgs, CatalogCommand};
 use oag_core::{Kek, Provider, Result, credential::SecretMaterial};
+use oag_router::efforts::{self, Overrides, Tally};
 use oag_store::{Db, ModelRow, repo};
 use rust_decimal::{Decimal, RoundingStrategy};
 
@@ -13,10 +14,59 @@ pub(super) async fn catalog_cmd(db: &Db, kek: &Kek, cmd: CatalogCommand) -> Resu
         CatalogCommand::SyncPrices { provider, account } => {
             sync_prices(db, kek, &provider, account.as_deref()).await
         }
+        CatalogCommand::SyncEfforts => {
+            for line in sync_efforts(db, oag_upstream::openrouter::MODELS_URL).await? {
+                println!("{line}");
+            }
+            Ok(())
+        }
         CatalogCommand::List { provider, limit } => {
             list_catalog(db, provider.as_deref(), limit).await
         }
     }
+}
+
+/// `catalog sync-efforts`: every catalog row's reasoning-effort levels, from
+/// the committed override table and OpenRouter's list at `url`, and what it
+/// did. The list is read before anything is written.
+pub(super) async fn sync_efforts(db: &Db, url: &str) -> Result<Vec<String>> {
+    let overrides = Overrides::committed()?;
+    let snapshot = oag_upstream::openrouter::reasoning_efforts(url).await?;
+    let rows = repo::catalog(db).await?;
+    let (levels, tally) = efforts::plan(
+        rows.iter().map(|m| (m.id.as_str(), m.provider.as_str())),
+        &overrides,
+        &snapshot,
+    );
+    let changed = repo::set_model_efforts(db, &levels).await?;
+    Ok(sync_efforts_lines(
+        url,
+        snapshot.len(),
+        rows.len(),
+        tally,
+        changed.len(),
+    ))
+}
+
+/// What `catalog sync-efforts` prints.
+pub(super) fn sync_efforts_lines(
+    url: &str,
+    listed: usize,
+    rows: usize,
+    tally: Tally,
+    changed: usize,
+) -> Vec<String> {
+    vec![
+        format!("reasoning efforts: the list at {url} states levels for {listed} models"),
+        format!(
+            "  {rows} catalog rows: {} from the override table, {} from OpenRouter, {} without \
+             known levels; {changed} changed",
+            tally.overridden, tally.listed, tally.unknown
+        ),
+        "  a running gateway serves them from its next catalog refresh; a row without levels \
+         publishes none"
+            .to_owned(),
+    ]
 }
 
 /// What to say when a catalog listing has nothing to show.
@@ -281,6 +331,10 @@ pub(super) fn model_row(args: &CatalogAddArgs, provider: Provider) -> Result<Mod
         supports_reasoning: args.reasoning,
         supports_prompt_cache: args.prompt_cache,
         display_label,
+        // Not the operator's to state here, and `override_model` does not
+        // write them: the row keeps whatever levels it had.
+        reasoning_efforts: None,
+        reasoning_effort: None,
     })
 }
 

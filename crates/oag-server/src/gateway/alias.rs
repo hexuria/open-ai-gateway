@@ -236,6 +236,7 @@ mod tests {
                 prompt_cache: true,
             },
             display_label: None,
+            reasoning_efforts: None,
         }
     }
 

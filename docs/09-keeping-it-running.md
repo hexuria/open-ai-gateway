@@ -125,6 +125,11 @@ An advertised model is not a servable one, and the reverse.
   first. With the endpoint's `discover_models` set, the same poller records
   what each of its keys serves, which narrows `/v1/models` to those models.
   See [03-providers.md](03-providers.md#an-endpoints-models).
+- **Reasoning-effort levels.** A sync also stores each of its rows' levels,
+  from the committed override table and OpenRouter's public list (`--no-efforts`
+  offline). `oag admin catalog sync-efforts` refreshes them for every row, after
+  a `catalog seed` or an edit to the table. See
+  [03-providers.md](03-providers.md#reasoning-effort-levels).
 - **Advertised but unservable.** A Codex seat listed `gpt-5.5` in
   `served_models`; a request for it returns 404.
 - **`served_models` is not a gate.** It feeds the savings baseline, not

@@ -677,6 +677,7 @@ async fn a_priced_jev_model_costs_what_its_catalog_row_says_and_claims_no_saving
             max_output_tokens: 0,
             capabilities: Capabilities::default(),
             display_label: None,
+            reasoning_efforts: None,
         }])
         .await;
 
@@ -1191,6 +1192,7 @@ async fn a_chat_request_can_never_reach_a_jev_key() {
                         max_output_tokens: 32_000,
                         capabilities: Capabilities::default(),
                         display_label: None,
+                        reasoning_efforts: None,
                     },
                 ]),
         )
@@ -1271,6 +1273,7 @@ fn an_answer_is_priced_by_its_catalog_row_or_left_unpriced() {
         max_output_tokens: 0,
         capabilities: Capabilities::default(),
         display_label: None,
+        reasoning_efforts: None,
     };
     let catalog = Catalog::from_entries([priced_row.clone()]);
     assert_eq!(

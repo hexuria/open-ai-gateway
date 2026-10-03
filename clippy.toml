@@ -10,6 +10,7 @@ doc-valid-idents = [
     "SigV4",
     "XChaCha",
     "LiteLLM",
+    "OpenRouter",
     "BoringSSL",
     "JSON",
     "..",

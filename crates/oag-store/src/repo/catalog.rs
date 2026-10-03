@@ -14,7 +14,8 @@ pub async fn catalog(db: &Db) -> Result<Vec<ModelRow>> {
         SELECT id, provider, upstream_name, input_per_mtok, output_per_mtok,
                cache_read_per_mtok, cache_write_per_mtok, context_window,
                max_output_tokens, supports_vision, supports_tools,
-               supports_reasoning, supports_prompt_cache, display_label
+               supports_reasoning, supports_prompt_cache, display_label,
+               reasoning_efforts, reasoning_effort
         FROM model_catalog
         ",
     )
@@ -386,8 +387,8 @@ pub async fn provider_models(db: &Db, provider: &str) -> Result<Vec<StoredModelR
         SELECT id, provider, upstream_name, input_per_mtok, output_per_mtok,
                cache_read_per_mtok, cache_write_per_mtok, context_window,
                max_output_tokens, supports_vision, supports_tools,
-               supports_reasoning, supports_prompt_cache, display_label, is_override,
-               synced_by
+               supports_reasoning, supports_prompt_cache, display_label,
+               reasoning_efforts, reasoning_effort, is_override, synced_by
         FROM model_catalog
         WHERE provider = $1 OR left(id, char_length($1) + 1) = $1 || '/'
         ORDER BY id
@@ -497,22 +498,81 @@ pub struct EndpointSync {
     /// Removed: every id in `stale` that no ladder named. The rest a ladder
     /// names, and they stay.
     pub removed: Vec<String>,
+    /// The rows whose reasoning-effort levels changed.
+    pub efforts: Vec<String>,
 }
 
-/// Write one endpoint's synced rows and remove its stale ones, in one
-/// transaction, so a catalog refresh sees the endpoint's rows as they were or
-/// as the sync left them and never half of each.
+/// A catalog row's reasoning-effort levels, by id: `None` for none known.
+pub type ModelEfforts = (String, Option<oag_router::ReasoningEfforts>);
+
+/// Store the levels of the row with id `$1`, `$2` and `$3`, if `$4` is NULL
+/// or its provider, and say so only when they changed.
+const SET_EFFORTS_SQL: &str = concat!(
+    "UPDATE model_catalog SET reasoning_efforts = $2, reasoning_effort = $3, ",
+    "updated_at = now() WHERE id = $1 AND ($4::text IS NULL OR provider = $4) ",
+    "AND (reasoning_efforts IS DISTINCT FROM $2 OR reasoning_effort IS DISTINCT FROM $3) ",
+    "RETURNING id"
+);
+
+/// Store each row's levels (migration 0023), `None` clearing them, on the
+/// rows of `provider` alone when it is given, and say which rows changed. A
+/// row no longer in the catalog is skipped.
+async fn write_efforts(
+    conn: &mut sqlx::PgConnection,
+    provider: Option<&str>,
+    efforts: &[ModelEfforts],
+) -> Result<Vec<String>> {
+    let mut changed = Vec::new();
+    for (id, levels) in efforts {
+        let values = levels.as_ref().map(oag_router::ReasoningEfforts::values);
+        let default = levels.as_ref().map(|l| l.default_level().value);
+        let written: Option<String> = sqlx::query_scalar(SET_EFFORTS_SQL)
+            .bind(id)
+            .bind(values)
+            .bind(default)
+            .bind(provider)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("storing {id}'s reasoning efforts: {e}")))?;
+        changed.extend(written);
+    }
+    Ok(changed)
+}
+
+/// Store the reasoning-effort levels of every row named, `None` clearing a
+/// row's, in one transaction, and say which rows changed: what `oag admin
+/// catalog sync-efforts` writes. Only the two effort columns are touched.
+pub async fn set_model_efforts(db: &Db, efforts: &[ModelEfforts]) -> Result<Vec<String>> {
+    let mut tx = db
+        .pool()
+        .begin()
+        .await
+        .map_err(|e| Error::Internal(format!("starting to store reasoning efforts: {e}")))?;
+    let changed = write_efforts(&mut tx, None, efforts).await?;
+    tx.commit()
+        .await
+        .map_err(|e| Error::Internal(format!("committing reasoning efforts: {e}")))?;
+    Ok(changed)
+}
+
+/// Write one endpoint's synced rows, their reasoning-effort levels, and remove
+/// its stale ones, in one transaction, so a catalog refresh sees the
+/// endpoint's rows as they were or as the sync left them and never half of
+/// each.
 ///
-/// Every row must be `provider`'s, and is marked as its sync's. A stale row is
-/// removed only if an earlier sync of `provider` wrote it and no ladder names
-/// it, decided in the statement that removes it: a ladder written, or a row
-/// stated by an operator, between the caller's look and this one still keeps
-/// its model.
+/// Every row must be `provider`'s, and is marked as its sync's. `efforts` is
+/// stored on `provider`'s rows alone, written or not: an id another
+/// provider's row holds keeps its levels as it keeps everything else. Empty
+/// leaves every row's levels as they were. A stale row is removed only if an
+/// earlier sync of `provider` wrote it and no ladder names it, decided in the
+/// statement that removes it: a ladder written, or a row stated by an
+/// operator, between the caller's look and this one still keeps its model.
 pub async fn sync_endpoint_models(
     db: &Db,
     provider: &str,
     rows: &[ModelRow],
     stale: &[String],
+    efforts: &[ModelEfforts],
 ) -> Result<EndpointSync> {
     if let Some(stray) = rows.iter().find(|m| m.provider != provider) {
         return Err(Error::Internal(format!(
@@ -550,6 +610,7 @@ pub async fn sync_endpoint_models(
             None => done.held.push(m.id.clone()),
         }
     }
+    done.efforts = write_efforts(&mut tx, Some(provider), efforts).await?;
     done.removed = sqlx::query_scalar(DELETE_STALE_SQL)
         .bind(provider)
         .bind(stale)

@@ -26,7 +26,7 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use oag_core::credential::CredentialKind;
 use oag_core::{Provider, TierName, tier::RoutingMode};
-use oag_router::{BudgetPressure, Entitlement};
+use oag_router::{BudgetPressure, Entitlement, ModelSpec};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -95,7 +95,10 @@ pub async fn list(
     let mut data: Vec<Value> = Vec::new();
     if advertise(pressure, concrete.len()) {
         for rung in virtual_rungs(&policy, pressure, state.config.gateway.advertise_auto) {
-            push(&mut data, virtual_entry(rung.as_ref()), aliases);
+            let pinned = policy
+                .pinned_model(rung.as_ref(), pressure)
+                .and_then(|id| catalog.get(id));
+            push(&mut data, virtual_entry(rung.as_ref(), pinned), aliases);
         }
         for e in &concrete {
             for entry in concrete_entries(e, &channels) {
@@ -384,7 +387,9 @@ fn concrete_entries(e: &Entitlement, channels: &Channels) -> Vec<Value> {
 /// A superset of the OpenAI and Anthropic shapes, because both dialects are
 /// served from the same base URL and the caller's SDK is not knowable from the
 /// request — `extract_key` accepts all three header spellings from any client,
-/// so auth headers carry no dialect signal.
+/// so auth headers carry no dialect signal. And opencodex's description of the
+/// model (see [`describe`]), so a client built against opencodex's listing
+/// reads its effort levels here.
 fn concrete_entry(e: &Entitlement, channel: Option<CredentialKind>) -> Value {
     let canonical = e.spec.id.as_str();
     let id = channel
@@ -401,6 +406,7 @@ fn concrete_entry(e: &Entitlement, channel: Option<CredentialKind>) -> Value {
         &id,
         e.spec.provider.as_str(),
         &display,
+        Some(e.spec),
         json!({
             "tier": e.tier.as_ref().map(TierName::as_str),
             "provider": e.spec.provider.as_str(),
@@ -428,16 +434,23 @@ fn concrete_entry(e: &Entitlement, channel: Option<CredentialKind>) -> Value {
 
 /// One virtual name. `None` is `oag/auto`.
 ///
-/// Must emit the identical field set to `concrete_entry`: virtual entries sort
-/// first, so a thin one fails SDK validation on element 0 and breaks
-/// `models.list()` for every model, not just this one.
-fn virtual_entry(rung: Option<&TierName>) -> Value {
+/// Must emit the identical required field set to `concrete_entry`: virtual
+/// entries sort first, so a thin one fails SDK validation on element 0 and
+/// breaks `models.list()` for every model, not just this one.
+///
+/// opencodex's description is optional, and a virtual name carries it only
+/// when it is decided onto one model alone (`pinned`, from
+/// [`oag_router::RoutingPolicy::pinned_model`]): then it describes that model,
+/// effort levels and all. A name that may reach several models has no one set
+/// of levels to offer, and offers none.
+fn virtual_entry(rung: Option<&TierName>, pinned: Option<&ModelSpec>) -> Value {
     let name = rung.map_or("auto", TierName::as_str);
     let id = format!("oag/{name}");
     entry(
         &id,
         "oag",
         &oag_router::derive_label("OAG", name),
+        pinned,
         json!({
             "tier": rung.map(TierName::as_str),
             "provider": "oag",
@@ -453,18 +466,28 @@ fn virtual_entry(rung: Option<&TierName>) -> Value {
     )
 }
 
-fn entry(id: &str, owned_by: &str, display_name: &str, oag: Value) -> Value {
+fn entry(
+    id: &str,
+    owned_by: &str,
+    display_name: &str,
+    model: Option<&ModelSpec>,
+    oag: Value,
+) -> Value {
     let mut entry = json!({
         // OpenAI's shape.
         "id": id,
         "object": "model",
         "created": 0,
         "owned_by": owned_by,
-        // Anthropic's shape, for the same object.
-        "type": "model",
-        "display_name": display_name,
-        "created_at": "1970-01-01T00:00:00Z",
     });
+    // opencodex's, which follows `owned_by` there and so here.
+    if let Some(spec) = model {
+        describe(&mut entry, spec);
+    }
+    // Anthropic's shape, for the same object.
+    entry["type"] = json!("model");
+    entry["display_name"] = json!(display_name);
+    entry["created_at"] = json!("1970-01-01T00:00:00Z");
     // Ours. No pricing: that is the organisation's cost data, and it stays on
     // the admin listener where it already lives.
     entry["oag"] = oag;
@@ -472,6 +495,64 @@ fn entry(id: &str, owned_by: &str, display_name: &str, oag: Value) -> Value {
     // cannot disagree about the field's existence — the twin overwrites it.
     entry["oag"]["alias_of"] = Value::Null;
     entry
+}
+
+/// What opencodex's `/v1/models` says of a model, in its field names, its
+/// order and its words, so a client that reads opencodex's listing reads this
+/// one: a picker's effort slider shows only the stops the model has.
+///
+/// The levels come from the catalog row (see [`oag_router::efforts`]). When
+/// they are not known, all four of `supports_reasoning_effort`,
+/// `reasoning_effort`, `reasoning_efforts` and `capabilities.reasoning_effort`
+/// are left off, as opencodex leaves them off: no slider rather than a guessed
+/// one. `capabilities` otherwise mirrors the catalog's flags, a window or an
+/// output limit the catalog does not know (zero) left off as opencodex leaves
+/// an unknown one off.
+fn describe(entry: &mut Value, spec: &ModelSpec) {
+    let mut capabilities = serde_json::Map::new();
+    if spec.context_window > 0 {
+        capabilities.insert("context_length".to_owned(), json!(spec.context_window));
+    }
+    if spec.max_output_tokens > 0 {
+        capabilities.insert(
+            "max_output_tokens".to_owned(),
+            json!(spec.max_output_tokens),
+        );
+    }
+    capabilities.insert(
+        "supports_tool_use".to_owned(),
+        json!(spec.capabilities.tools),
+    );
+    capabilities.insert(
+        "supports_reasoning".to_owned(),
+        json!(spec.capabilities.reasoning),
+    );
+    capabilities.insert(
+        "supports_vision".to_owned(),
+        json!(spec.capabilities.vision),
+    );
+    if let Some(efforts) = &spec.reasoning_efforts {
+        let default = efforts.default_level();
+        entry["supports_reasoning_effort"] = json!(true);
+        entry["reasoning_effort"] = json!(default.value);
+        entry["reasoning_efforts"] = efforts
+            .levels()
+            .iter()
+            .map(|level| effort_option(*level, *level == default))
+            .collect();
+        capabilities.insert("reasoning_effort".to_owned(), json!(efforts.values()));
+    }
+    entry["capabilities"] = Value::Object(capabilities);
+}
+
+/// One stop on the slider. Only the default says `default`, as opencodex has
+/// it: the others leave the key off rather than saying `false`.
+fn effort_option(level: oag_router::efforts::Level, default: bool) -> Value {
+    let mut option = json!({ "value": level.value, "label": level.label });
+    if default {
+        option["default"] = json!(true);
+    }
+    option
 }
 
 /// Whether this entitlement belongs on the picker for the credentials we hold.
@@ -638,7 +719,25 @@ mod tests {
                 prompt_cache: true,
             },
             display_label: None,
+            reasoning_efforts: None,
         }
+    }
+
+    /// The fields only opencodex's description adds, which a model carries
+    /// and a virtual name reaching several models does not.
+    const DESCRIBED: [&str; 4] = [
+        "supports_reasoning_effort",
+        "reasoning_effort",
+        "reasoning_efforts",
+        "capabilities",
+    ];
+
+    /// A row's keys, sorted, less opencodex's optional description.
+    fn required_keys_of(v: &Value) -> Vec<String> {
+        keys_of(v)
+            .into_iter()
+            .filter(|k| !DESCRIBED.contains(&k.as_str()))
+            .collect()
     }
 
     /// A route holding every kind named, for one provider, none of them yet
@@ -685,11 +784,14 @@ mod tests {
             },
             None,
         );
-        let virtual_auto = virtual_entry(None);
-        let virtual_rung = virtual_entry(Some(&TierName::new("cheap")));
+        let virtual_auto = virtual_entry(None, None);
+        let virtual_rung = virtual_entry(Some(&TierName::new("cheap")), None);
 
-        assert_eq!(keys_of(&concrete), keys_of(&virtual_auto));
-        assert_eq!(keys_of(&concrete), keys_of(&virtual_rung));
+        // Every field but opencodex's description, which is optional to any
+        // reader and which a name reaching several models has no one value
+        // for: see `a_virtual_name_describes_a_model_only_when_it_pins_one`.
+        assert_eq!(required_keys_of(&concrete), keys_of(&virtual_auto));
+        assert_eq!(required_keys_of(&concrete), keys_of(&virtual_rung));
         assert_eq!(keys_of(&concrete["oag"]), keys_of(&virtual_auto["oag"]));
 
         // Both dialects' required fields, on the same object, because the
@@ -710,14 +812,14 @@ mod tests {
 
     #[test]
     fn virtual_names_are_prefixed_and_auto_is_the_unpinned_one() {
-        assert_eq!(virtual_entry(None)["id"], "oag/auto");
-        assert_eq!(virtual_entry(None)["oag"]["tier"], Value::Null);
+        assert_eq!(virtual_entry(None, None)["id"], "oag/auto");
+        assert_eq!(virtual_entry(None, None)["oag"]["tier"], Value::Null);
         assert_eq!(
-            virtual_entry(Some(&TierName::new("cheap")))["id"],
+            virtual_entry(Some(&TierName::new("cheap")), None)["id"],
             "oag/cheap"
         );
         assert_eq!(
-            virtual_entry(Some(&TierName::new("cheap")))["oag"]["tier"],
+            virtual_entry(Some(&TierName::new("cheap")), None)["oag"]["tier"],
             "cheap"
         );
     }
@@ -1081,10 +1183,10 @@ mod tests {
             ..spec.clone()
         };
         let mut out = Vec::new();
-        push(&mut out, virtual_entry(None), aliases);
+        push(&mut out, virtual_entry(None, None), aliases);
         push(
             &mut out,
-            virtual_entry(Some(&TierName::new("cheap"))),
+            virtual_entry(Some(&TierName::new("cheap")), None),
             aliases,
         );
         for spec in [&spec, &grok] {
@@ -1181,7 +1283,7 @@ mod tests {
             .find(|m| m["id"] == "anthropic/xai/grok-4.6")
             .expect("aliased");
         assert_eq!(twin["display_name"], "xAI: grok-4.6");
-        assert_eq!(virtual_entry(None)["display_name"], "OAG: auto");
+        assert_eq!(virtual_entry(None, None)["display_name"], "OAG: auto");
     }
 
     #[test]
@@ -1390,6 +1492,202 @@ mod tests {
         // in a Claude Code picker that says otherwise.
         assert_eq!(grok().label(), "xAI: grok-4.6");
         assert_eq!(spec().label(), "Anthropic: claude-opus-5");
+    }
+
+    /// `xai/grok-4.6` with the levels OpenRouter lists for it, highest first.
+    fn grok_with_levels() -> ModelSpec {
+        ModelSpec {
+            reasoning_efforts: oag_router::ReasoningEfforts::new(
+                ["xhigh", "high", "medium", "low"],
+                "high",
+            ),
+            ..grok()
+        }
+    }
+
+    fn keys_in_order(v: &Value) -> Vec<&str> {
+        v.as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn a_model_with_known_levels_is_described_as_opencodex_describes_one() {
+        let spec = grok_with_levels();
+        let row = concrete_entry(&entitled(&spec), None);
+
+        assert_eq!(row["supports_reasoning_effort"], true);
+        assert_eq!(row["reasoning_effort"], "high", "the model's default");
+        assert_eq!(
+            row["reasoning_efforts"],
+            json!([
+                {"value": "low", "label": "Low Effort"},
+                {"value": "medium", "label": "Medium Effort"},
+                {"value": "high", "label": "High Effort", "default": true},
+                {"value": "xhigh", "label": "Xhigh Effort"},
+            ]),
+            "lowest first, labelled, and only the default says so"
+        );
+        assert_eq!(
+            row["capabilities"],
+            json!({
+                "context_length": 200_000,
+                "max_output_tokens": 64_000,
+                "supports_tool_use": true,
+                "supports_reasoning": true,
+                "supports_vision": true,
+                "reasoning_effort": ["low", "medium", "high", "xhigh"],
+            })
+        );
+        // opencodex's order, which a reader of its listing may lean on: its
+        // fields follow `owned_by`, then this listing's own.
+        assert_eq!(
+            keys_in_order(&row),
+            [
+                "id",
+                "object",
+                "created",
+                "owned_by",
+                "supports_reasoning_effort",
+                "reasoning_effort",
+                "reasoning_efforts",
+                "capabilities",
+                "type",
+                "display_name",
+                "created_at",
+                "oag",
+            ]
+        );
+        assert_eq!(
+            keys_in_order(&row["capabilities"]),
+            [
+                "context_length",
+                "max_output_tokens",
+                "supports_tool_use",
+                "supports_reasoning",
+                "supports_vision",
+                "reasoning_effort",
+            ]
+        );
+        assert_eq!(
+            keys_in_order(&row["reasoning_efforts"][2]),
+            ["value", "label", "default"]
+        );
+        // And the `oag` object is what it was.
+        assert_eq!(
+            keys_of(&row["oag"]),
+            keys_of(&concrete_entry(&entitled(&grok()), None)["oag"])
+        );
+    }
+
+    #[test]
+    fn a_model_whose_levels_are_not_known_carries_none_of_the_four_fields() {
+        let row = concrete_entry(&entitled(&grok()), None);
+        for field in [
+            "supports_reasoning_effort",
+            "reasoning_effort",
+            "reasoning_efforts",
+        ] {
+            assert!(row.get(field).is_none(), "{field} on {row}");
+        }
+        assert_eq!(
+            row["capabilities"],
+            json!({
+                "context_length": 200_000,
+                "max_output_tokens": 64_000,
+                "supports_tool_use": true,
+                "supports_reasoning": true,
+                "supports_vision": true,
+            }),
+            "no `reasoning_effort` in it either"
+        );
+    }
+
+    #[test]
+    fn a_window_or_output_limit_the_catalog_does_not_know_is_left_off() {
+        let unknown = ModelSpec {
+            context_window: 0,
+            max_output_tokens: 0,
+            capabilities: Capabilities {
+                vision: false,
+                tools: false,
+                reasoning: false,
+                prompt_cache: false,
+            },
+            ..grok()
+        };
+        assert_eq!(
+            concrete_entry(&entitled(&unknown), None)["capabilities"],
+            json!({
+                "supports_tool_use": false,
+                "supports_reasoning": false,
+                "supports_vision": false,
+            })
+        );
+        let one_token = ModelSpec {
+            context_window: 1,
+            max_output_tokens: 1,
+            ..unknown
+        };
+        let capabilities = &concrete_entry(&entitled(&one_token), None)["capabilities"];
+        assert_eq!(capabilities["context_length"], 1);
+        assert_eq!(capabilities["max_output_tokens"], 1);
+    }
+
+    #[test]
+    fn every_spelling_of_a_model_carries_its_levels() {
+        // The `@sub` twin and Claude Code's alias are the same model, and a
+        // picker reading either must show the same slider.
+        let spec = grok_with_levels();
+        let both = channels(
+            Provider::XAI,
+            &[CredentialKind::ApiKey, CredentialKind::OAuth],
+        );
+        let mut out = Vec::new();
+        for entry in concrete_entries(&entitled(&spec), &both) {
+            push(&mut out, entry, true);
+        }
+        assert_eq!(out.len(), 6, "{out:?}");
+        for row in &out {
+            assert_eq!(row["reasoning_effort"], "high", "{}", row["id"]);
+            assert_eq!(row["reasoning_efforts"], out[0]["reasoning_efforts"]);
+            assert_eq!(row["capabilities"], out[0]["capabilities"]);
+        }
+    }
+
+    #[test]
+    fn a_virtual_name_describes_a_model_only_when_it_pins_one() {
+        let cheap = TierName::new("cheap");
+        // Reaching several models, it has no one set of levels to offer.
+        for row in [virtual_entry(None, None), virtual_entry(Some(&cheap), None)] {
+            for field in DESCRIBED {
+                assert!(row.get(field).is_none(), "{field} on {row}");
+            }
+        }
+        // Pinned to one model with levels, it offers that model's.
+        let spec = grok_with_levels();
+        let pinned = virtual_entry(Some(&cheap), Some(&spec));
+        let model = concrete_entry(&entitled(&spec), None);
+        assert_eq!(pinned["id"], "oag/cheap");
+        for field in DESCRIBED {
+            assert_eq!(pinned[field], model[field], "{field}");
+        }
+        assert_eq!(pinned["reasoning_effort"], "high");
+        // Still a virtual name to this listing's own readers.
+        assert_eq!(pinned["oag"]["virtual"], true);
+        assert_eq!(pinned["oag"]["capabilities"], Value::Null);
+        assert_eq!(keys_of(&pinned), keys_of(&model));
+        // Pinned to one model whose levels are not known: its capabilities,
+        // and none of the four.
+        let unknown = grok();
+        let pinned = virtual_entry(Some(&cheap), Some(&unknown));
+        assert!(pinned.get("reasoning_efforts").is_none());
+        assert_eq!(
+            pinned["capabilities"],
+            concrete_entry(&entitled(&unknown), None)["capabilities"]
+        );
     }
 
     /// A listing whose route lookup fails refuses. An empty 200 would tell a
