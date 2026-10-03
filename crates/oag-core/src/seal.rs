@@ -211,4 +211,99 @@ mod tests {
     fn debug_never_prints_the_key() {
         assert_eq!(format!("{:?}", kek()), "Kek(<redacted>)");
     }
+
+    // The golden vector. Every credential row in Postgres was sealed by an
+    // earlier build, and a dependency bump must not strand one. These bytes
+    // were produced once, by this file on chacha20poly1305 0.10.1, and are
+    // never regenerated: if they stop matching, the stored format changed.
+
+    /// Not a real key: a repeated pattern, 32 bytes.
+    const GOLDEN_KEK: [u8; 32] = *b"KEK-KEK-KEK-KEK-KEK-KEK-KEK-KEK-";
+    /// Not a random nonce: a repeated pattern, 24 bytes.
+    const GOLDEN_NONCE: [u8; 24] = *b"NONCE-NONCE-NONCE-NONCE-";
+
+    const GOLDEN_SHORT: &[u8] = b"FAKE-CREDENTIAL";
+    const GOLDEN_SHORT_SEALED: &[u8] = &[
+        0x4c, 0xe4, 0xf4, 0xaa, 0xae, 0xf0, 0x58, 0x63, 0xbb, 0xfe, 0xba, 0xc3, 0x09, 0xb8, 0x9a,
+        0x71, 0x49, 0x7e, 0x66, 0x90, 0xfc, 0x20, 0x17, 0xee, 0x8a, 0x99, 0x5f, 0xb6, 0x5b, 0x28,
+        0x7b,
+    ];
+
+    /// A serialised [`SecretMaterial`], every field set, every value fake.
+    const GOLDEN_MATERIAL: &str = r#"{"access_token":"FAKE-ACCESS-TOKEN","refresh_token":"FAKE-REFRESH-TOKEN","expires_at":1800000000,"version":3,"client_id":"fake-client-id","account_id":"fake-account-id"}"#;
+    const GOLDEN_MATERIAL_SEALED: &[u8] = &[
+        0x71, 0x87, 0xde, 0x8c, 0xe0, 0xd6, 0x79, 0x55, 0xa0, 0xcf, 0x9b, 0xfc, 0x25, 0x97, 0xf4,
+        0x39, 0xd8, 0xdc, 0x3d, 0x19, 0xe2, 0x91, 0x46, 0xc6, 0xa8, 0xfe, 0x54, 0xb1, 0x30, 0xa8,
+        0xea, 0x69, 0xae, 0x7f, 0x06, 0x85, 0xf2, 0x90, 0xf9, 0xbb, 0xf9, 0xd2, 0x93, 0xf8, 0x07,
+        0xf9, 0x2d, 0xc7, 0x60, 0xf1, 0x1e, 0xaa, 0x91, 0x43, 0x28, 0xb8, 0x7e, 0xec, 0x05, 0x3f,
+        0x3c, 0xf2, 0x7a, 0x8e, 0x94, 0x46, 0x57, 0xb4, 0x3b, 0x9a, 0xa2, 0xd8, 0xb0, 0x5c, 0x0c,
+        0x55, 0x42, 0x39, 0x19, 0x53, 0x2f, 0x01, 0x43, 0x0d, 0x27, 0xa0, 0xa4, 0x5b, 0xfb, 0xf1,
+        0x6e, 0x88, 0x74, 0xb4, 0xc2, 0xde, 0xfd, 0x89, 0xf6, 0xb0, 0xf1, 0x04, 0x99, 0xa7, 0xcf,
+        0x40, 0x5a, 0x19, 0x18, 0xc1, 0x67, 0xe8, 0xc0, 0x9f, 0xdf, 0x23, 0x26, 0x0b, 0x45, 0x2a,
+        0x04, 0x88, 0xe7, 0x30, 0x62, 0xa7, 0x79, 0x23, 0x2b, 0xa8, 0xd8, 0x8f, 0x4a, 0x1b, 0xd1,
+        0x8a, 0xe6, 0xed, 0x90, 0x0c, 0xce, 0xc3, 0x53, 0x10, 0xfd, 0x86, 0x77, 0x36, 0xf5, 0xee,
+        0xc5, 0x8a, 0x42, 0xf3, 0xd7, 0x46, 0xd0, 0x7a, 0x61, 0xef, 0xee, 0x0c, 0x3b, 0x5a, 0x43,
+        0xeb, 0x88, 0x7b, 0x3e, 0x45, 0xb7, 0x17, 0x52, 0x3a, 0xb6, 0xc3, 0x05, 0x7c, 0xff, 0xde,
+        0x09, 0x66, 0x02, 0x5c, 0xf0,
+    ];
+
+    /// What [`Kek::seal`] does, under a nonce the caller picks so the output
+    /// is fixed. Test-only: a repeated nonce is what `seal` exists to prevent.
+    fn seal_with_nonce(k: &Kek, plaintext: &[u8], nonce: [u8; 24]) -> Sealed {
+        let ciphertext = k
+            .cipher()
+            .encrypt(&XNonce::from(nonce), plaintext)
+            .expect("seals");
+        Sealed {
+            ciphertext,
+            nonce: nonce.to_vec(),
+        }
+    }
+
+    #[test]
+    fn rows_sealed_by_an_earlier_build_open_and_reseal_byte_for_byte() {
+        let k = Kek(GOLDEN_KEK);
+        for (name, plaintext, ciphertext) in [
+            ("short", GOLDEN_SHORT, GOLDEN_SHORT_SEALED),
+            (
+                "material",
+                GOLDEN_MATERIAL.as_bytes(),
+                GOLDEN_MATERIAL_SEALED,
+            ),
+        ] {
+            let stored = Sealed {
+                ciphertext: ciphertext.to_vec(),
+                nonce: GOLDEN_NONCE.to_vec(),
+            };
+            // Reading: a row the earlier build wrote opens to its plaintext.
+            assert_eq!(
+                k.open(&stored).expect("a stored row opens"),
+                plaintext,
+                "{name}: the stored row opened to different bytes"
+            );
+            // Writing: this build seals what the earlier build did.
+            assert_eq!(
+                seal_with_nonce(&k, plaintext, GOLDEN_NONCE),
+                stored,
+                "{name}: the same key, nonce and plaintext sealed to different bytes"
+            );
+        }
+
+        // And through the call production makes to read a credential row.
+        let material: SecretMaterial = k
+            .open_json(&Sealed {
+                ciphertext: GOLDEN_MATERIAL_SEALED.to_vec(),
+                nonce: GOLDEN_NONCE.to_vec(),
+            })
+            .expect("a stored credential opens");
+        assert_eq!(material.access_token, "FAKE-ACCESS-TOKEN");
+        assert_eq!(
+            material.refresh_token.as_deref(),
+            Some("FAKE-REFRESH-TOKEN")
+        );
+        assert_eq!(material.expires_at, Some(1_800_000_000));
+        assert_eq!(material.version, 3);
+        assert_eq!(material.client_id.as_deref(), Some("fake-client-id"));
+        assert_eq!(material.account_id.as_deref(), Some("fake-account-id"));
+    }
 }
