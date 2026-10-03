@@ -359,6 +359,45 @@ The levels are stored with each catalog row, not looked up per request; where
 they come from is in
 [03-providers.md](03-providers.md#reasoning-effort-levels).
 
+### What the upstream is sent
+
+A level is read from whichever shape the client speaks — Chat Completions'
+`reasoning_effort`, Responses' `reasoning.effort`, Anthropic's
+`output_config.effort` (with `thinking: {"type": "adaptive"}`) or
+`thinking.budget_tokens`, Gemini's `thinkingBudget` — and sent in the
+upstream's own form. Every level goes as asked except `ultra`.
+
+`ultra` comes from the Codex backend's own model catalog, which lists it for a
+few models (`openai/gpt-5.6-terra` here); OpenRouter's list, the other source
+of a row's levels, has none. So it is sent as itself only where both the
+model and the wire have it: the routed model's catalog row lists `ultra`, and
+the upstream speaks Chat Completions or Responses, whose effort field is a
+word. Anywhere else it is mapped as opencodex maps it: to `max` where the row
+lists `max`, else to the highest level the row lists, and to `max` for a model
+whose levels are not known. Then it is written as that level always is:
+
+| Upstream (field) | Row lists `ultra` | Row lists `max` | Row stops lower, at `xhigh` say | Levels not known |
+|---|---|---|---|---|
+| Chat Completions (`reasoning_effort`) | `ultra` | `max` | `xhigh` | `max` |
+| Responses, Codex seats included (`reasoning.effort`) | `ultra` | `max` | `xhigh` | `max` |
+| Anthropic 4.6 and later (`output_config.effort`) | `max`¹ | `max` | `xhigh` | `max` |
+| Anthropic 4.5 and earlier (`thinking.budget_tokens`) | 65536¹ ² | 65536² | 32768² | 65536² |
+| Gemini (`thinkingBudget`) | 65536¹ | 65536 | 32768 | 65536 |
+| Bedrock Converse | nothing: Converse takes no level at all | | | |
+
+¹ Or the row's highest level below `ultra`, where it lists no `max`.
+² Below `max_tokens`, as every budget is.
+
+A Gemini client's `thinkingLevel` in one of Gemini's own words (`minimal`,
+`low`, `medium`, `high`) still reaches a Gemini upstream as it was said. One
+in a word Gemini has no level for — `ultra`, `max`, `xhigh`, `none` — would be
+refused there, so it is read as the request's level instead, sent to a Gemini
+upstream as the budget above, and to any other as the level.
+
+Which level a request was sent is decided per attempt, so a request escalated
+to another model is sent what that model's row allows. `/v1/models` is not
+changed by any of this: it still lists `ultra` exactly where the row does.
+
 ## Why did I get a different model than I asked for?
 
 Because the route is in **managed** mode, which is the point of the product and

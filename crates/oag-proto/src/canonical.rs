@@ -1,8 +1,9 @@
 //! The hub representation.
 
 use oag_core::provider::Dialect;
-use oag_router::RequestSignal;
+use oag_router::{ReasoningEfforts, RequestSignal};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -188,6 +189,12 @@ impl ResponseFormat {
 /// this enum stopped at `High` and folded `xhigh` and `max` into it, which
 /// silently capped a client asking for the most reasoning available at the
 /// middle of the range — the opposite of what it asked for.
+///
+/// And a seventh above them, `Ultra`, which the Codex backend's own model
+/// catalog lists for some models and `/v1/models` therefore advertises.
+/// OpenRouter's list, the other source of a model's levels, has none, so it
+/// is sent as itself only where the model's own levels list it: see
+/// [`Effort::for_model`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effort {
@@ -198,6 +205,8 @@ pub enum Effort {
     High,
     XHigh,
     Max,
+    /// The Codex catalog's "Maximum reasoning with automatic task delegation".
+    Ultra,
 }
 
 impl Effort {
@@ -211,6 +220,7 @@ impl Effort {
             Self::High => "high",
             Self::XHigh => "xhigh",
             Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 
@@ -230,6 +240,7 @@ impl Effort {
             "high" => Some(Self::High),
             "xhigh" => Some(Self::XHigh),
             "max" => Some(Self::Max),
+            "ultra" => Some(Self::Ultra),
             _ => None,
         }
     }
@@ -240,6 +251,10 @@ impl Effort {
     /// and a number of tokens, and any figure here is this gateway's opinion
     /// rather than the vendor's. The ordering is the only part that carries
     /// meaning, and it is what a downstream classifier reads.
+    ///
+    /// `Ultra` is `Max`'s budget. What it adds over `max` is the Codex
+    /// client's delegating the work to sub-agents, not more tokens of thinking,
+    /// so a dialect that speaks budgets has nothing more to ask for.
     #[must_use]
     pub const fn as_budget(self) -> u32 {
         match self {
@@ -248,7 +263,7 @@ impl Effort {
             Self::Medium => 8192,
             Self::High => 16384,
             Self::XHigh => 32768,
-            Self::Max => 65536,
+            Self::Max | Self::Ultra => 65536,
         }
     }
 
@@ -272,6 +287,50 @@ impl Effort {
         } else {
             Self::Low
         }
+    }
+
+    /// The level to send in place of this one, to a model whose catalog row
+    /// lists `levels`, through an upstream speaking `dialect`.
+    ///
+    /// Every level but `Ultra` is sent as asked. `Ultra` is sent as itself only
+    /// where both allow it: the row lists `ultra`, and the dialect states
+    /// effort as a word the upstream checks against the model's own list —
+    /// Chat Completions' `reasoning_effort` and Responses' `reasoning.effort`.
+    /// Anthropic's `output_config.effort` has no `ultra`, and Gemini and
+    /// Converse take no word at all.
+    ///
+    /// Anywhere else it is mapped as opencodex maps it (`mapReasoningEffort`,
+    /// and the Codex client's own `resolve_reasoning_effort`): `max` where the
+    /// row lists `max`, else the highest level the row lists, and `max` for a
+    /// model whose levels are not known. A model nobody has said takes `ultra`
+    /// is not sent it.
+    #[must_use]
+    pub fn for_model(self, levels: Option<&ReasoningEfforts>, dialect: Dialect) -> Self {
+        if self != Self::Ultra {
+            return self;
+        }
+        let Some(levels) = levels else {
+            return Self::Max;
+        };
+        let listed = || {
+            levels
+                .levels()
+                .iter()
+                .filter_map(|level| Self::parse(level.value))
+        };
+        if matches!(
+            dialect,
+            Dialect::OpenAIChatCompletions | Dialect::OpenAIResponses
+        ) && listed().any(|level| level == Self::Ultra)
+        {
+            return Self::Ultra;
+        }
+        // `max` is above every level but `ultra`, so the highest of the rest
+        // is `max` wherever the row lists it.
+        listed()
+            .filter(|level| *level != Self::Ultra)
+            .max()
+            .unwrap_or(Self::Max)
     }
 }
 
@@ -535,6 +594,34 @@ impl CanonicalRequest {
         }
         let effort = self.thinking_effort.filter(|e| !matches!(e, Effort::Off))?;
         Some((effort.as_budget(), effort))
+    }
+
+    /// This request as it is to reach one model, through an upstream speaking
+    /// `dialect`: its `ultra`, if it asked for one, sent as
+    /// [`Effort::for_model`] says. `levels` are the model's catalog row's.
+    ///
+    /// A nominal budget derived from the same word goes with it — Responses
+    /// parses `reasoning.effort` into both — so a dialect that renders the
+    /// budget asks for the level that was sent, not the one that was mapped
+    /// away. A budget of any other size was the client's own, and stays.
+    ///
+    /// Borrowed unless an `ultra` has to be mapped, so no other request is
+    /// copied.
+    #[must_use]
+    pub fn for_model(&self, levels: Option<&ReasoningEfforts>, dialect: Dialect) -> Cow<'_, Self> {
+        let Some(asked) = self.thinking_effort else {
+            return Cow::Borrowed(self);
+        };
+        let sent = asked.for_model(levels, dialect);
+        if sent == asked {
+            return Cow::Borrowed(self);
+        }
+        let mut req = self.clone();
+        req.thinking_effort = Some(sent);
+        if req.thinking_budget == Some(asked.as_budget()) {
+            req.thinking_budget = Some(sent.as_budget());
+        }
+        Cow::Owned(req)
     }
 
     /// Rough prompt size.
@@ -1010,5 +1097,185 @@ mod count_tests {
             ..blank()
         };
         assert!(count_input_tokens(&many) > count_input_tokens(&one) * 5);
+    }
+}
+
+#[cfg(test)]
+mod ultra_tests {
+    use super::*;
+
+    /// A model's catalog row: its levels, lowest first, as #142 stores them.
+    fn row(levels: &[&str]) -> ReasoningEfforts {
+        ReasoningEfforts::new(levels.iter().copied(), levels[0]).expect("valid levels")
+    }
+
+    /// The rows the override table holds: `gpt-5.6-terra` lists `ultra`,
+    /// `gpt-5.6-luna` stops at `max`, `gpt-5.5` at `xhigh`.
+    fn terra() -> ReasoningEfforts {
+        row(&["low", "medium", "high", "xhigh", "max", "ultra"])
+    }
+
+    fn luna() -> ReasoningEfforts {
+        row(&["low", "medium", "high", "xhigh", "max"])
+    }
+
+    fn gpt_5_5() -> ReasoningEfforts {
+        row(&["low", "medium", "high", "xhigh"])
+    }
+
+    fn asking(effort: Option<Effort>, budget: Option<u32>) -> CanonicalRequest {
+        CanonicalRequest {
+            model: "m".to_owned(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 1024,
+            stream: false,
+            temperature: None,
+            thinking_budget: budget,
+            thinking_effort: effort,
+            client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
+            passthrough: None,
+        }
+    }
+
+    #[test]
+    fn ultra_is_a_level_above_max_that_budgets_as_max() {
+        assert_eq!(Effort::parse("ultra"), Some(Effort::Ultra));
+        assert_eq!(Effort::Ultra.as_str(), "ultra");
+        assert!(Effort::Ultra > Effort::Max, "the top of the ladder");
+        assert_eq!(
+            serde_json::to_value(Effort::Ultra).expect("serialises"),
+            serde_json::json!("ultra")
+        );
+        // A dialect that speaks budgets has nothing more to ask for than max,
+        // and a budget cannot say `ultra` back: it reads as max.
+        assert_eq!(Effort::Ultra.as_budget(), Effort::Max.as_budget());
+        assert_eq!(Effort::from_budget(Effort::Ultra.as_budget()), Effort::Max);
+        // And it is an ask to think, which is what routes a request.
+        assert!(
+            asking(Some(Effort::Ultra), None)
+                .signal()
+                .thinking_requested
+        );
+    }
+
+    #[test]
+    fn ultra_goes_as_itself_only_where_the_row_lists_it_and_the_dialect_says_it() {
+        use Dialect::{
+            AnthropicMessages, BedrockConverse, GeminiGenerateContent, OpenAIChatCompletions,
+            OpenAIResponses,
+        };
+        let ultra =
+            |levels: Option<&ReasoningEfforts>, dialect| Effort::Ultra.for_model(levels, dialect);
+
+        // As itself: a row that lists it, through a dialect with a word for it.
+        assert_eq!(ultra(Some(&terra()), OpenAIChatCompletions), Effort::Ultra);
+        assert_eq!(ultra(Some(&terra()), OpenAIResponses), Effort::Ultra);
+
+        // A row without it: `max` where the row has it, else its highest.
+        assert_eq!(ultra(Some(&luna()), OpenAIResponses), Effort::Max);
+        assert_eq!(
+            ultra(Some(&gpt_5_5()), OpenAIChatCompletions),
+            Effort::XHigh
+        );
+        assert_eq!(
+            ultra(Some(&row(&["low", "high"])), OpenAIResponses),
+            Effort::High
+        );
+
+        // A model whose levels are not known is not assumed to take it.
+        assert_eq!(ultra(None, OpenAIChatCompletions), Effort::Max);
+        assert_eq!(ultra(None, AnthropicMessages), Effort::Max);
+
+        // A dialect with no word for it maps it, whatever the row says.
+        for dialect in [AnthropicMessages, GeminiGenerateContent, BedrockConverse] {
+            assert_eq!(ultra(Some(&terra()), dialect), Effort::Max, "{dialect:?}");
+        }
+        // To the row's top below `ultra`, which is not always `max`: the
+        // Codex client's own test ladder.
+        assert_eq!(
+            ultra(Some(&row(&["low", "xhigh", "ultra"])), AnthropicMessages),
+            Effort::XHigh
+        );
+        // A row with nothing else to offer: `max`, as opencodex does.
+        assert_eq!(
+            ultra(Some(&row(&["ultra"])), AnthropicMessages),
+            Effort::Max
+        );
+        assert_eq!(
+            ultra(Some(&row(&["ultra"])), OpenAIResponses),
+            Effort::Ultra
+        );
+    }
+
+    #[test]
+    fn every_other_level_is_sent_as_asked() {
+        for level in [
+            Effort::Off,
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+            Effort::XHigh,
+            Effort::Max,
+        ] {
+            for levels in [None, Some(gpt_5_5()), Some(row(&["low"]))] {
+                assert_eq!(
+                    level.for_model(levels.as_ref(), Dialect::OpenAIChatCompletions),
+                    level,
+                    "{level:?} {levels:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_is_copied_only_when_its_ultra_is_mapped() {
+        let chat = Dialect::OpenAIChatCompletions;
+
+        // Nothing to map: the request itself, not a copy of it.
+        for req in [
+            asking(None, None),
+            asking(None, Some(2048)),
+            asking(Some(Effort::High), None),
+            asking(Some(Effort::Ultra), None),
+        ] {
+            assert!(
+                matches!(req.for_model(Some(&terra()), chat), Cow::Borrowed(_)),
+                "{:?}",
+                req.thinking_effort
+            );
+        }
+
+        let asked = asking(Some(Effort::Ultra), None);
+        let mapped = asked.for_model(Some(&gpt_5_5()), chat);
+        assert!(matches!(mapped, Cow::Owned(_)));
+        assert_eq!(mapped.thinking_effort, Some(Effort::XHigh));
+        assert_eq!(mapped.thinking_budget, None, "no budget is invented");
+    }
+
+    #[test]
+    fn a_budget_derived_from_the_word_follows_it_and_the_client_s_own_stays() {
+        // Responses parses `reasoning.effort` into a level and its nominal
+        // budget. A budget dialect renders the budget, so left behind it would
+        // still ask for max where the row tops out lower.
+        let responses = asking(Some(Effort::Ultra), Some(Effort::Ultra.as_budget()));
+        let sent = responses.for_model(Some(&row(&["low", "high"])), Dialect::AnthropicMessages);
+        assert_eq!(sent.thinking_effort, Some(Effort::High));
+        assert_eq!(sent.thinking_budget, Some(Effort::High.as_budget()));
+        assert_eq!(
+            sent.thinking_request(),
+            Some((Effort::High.as_budget(), Effort::High)),
+            "what the Anthropic and Gemini renderers read"
+        );
+
+        let own = asking(Some(Effort::Ultra), Some(2048));
+        let sent = own.for_model(Some(&row(&["low", "high"])), Dialect::AnthropicMessages);
+        assert_eq!(sent.thinking_effort, Some(Effort::High));
+        assert_eq!(sent.thinking_budget, Some(2048), "the client's own number");
     }
 }

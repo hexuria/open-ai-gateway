@@ -143,6 +143,16 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
         Some(ThinkingMode::Adaptive) => {
             if let Some((_, effort)) = req.thinking_request() {
                 body["thinking"] = json!({ "type": "adaptive" });
+                // `ultra` is no level of this vendor's at any generation, and
+                // `max` is its top. The gateway maps it before rendering
+                // (`CanonicalRequest::for_model`), to the model's own top where
+                // its levels are known; this keeps the codec from writing a
+                // word the upstream refuses whoever calls it.
+                let effort = if effort == Effort::Ultra {
+                    Effort::Max
+                } else {
+                    effort
+                };
                 body["output_config"] = json!({ "effort": effort.as_str() });
             }
         }
@@ -1238,6 +1248,59 @@ mod tests {
             assert_eq!(body["thinking"], json!(null), "{model}: {body}");
             assert_eq!(body["output_config"], json!(null), "{model}: {body}");
         }
+    }
+
+    /// `ultra` on the way in: read as itself, where it used to fall through
+    /// to `adaptive`'s default and come out as `medium`.
+    #[test]
+    fn ultra_is_read_from_the_adaptive_form() {
+        let req = parse_request(&json!({
+            "model": "claude-opus-5",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "ultra"},
+        }))
+        .expect("parses");
+        assert_eq!(req.thinking_effort, Some(Effort::Ultra));
+    }
+
+    /// `ultra` on the way out: this vendor has no such level, so it is sent as
+    /// `max`, its top, in whichever form the model takes.
+    #[test]
+    fn ultra_is_sent_as_max_in_either_form() {
+        let mut req = CanonicalRequest {
+            model: "m".to_owned(),
+            system: vec![],
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 100_000,
+            stream: false,
+            temperature: None,
+            thinking_budget: None,
+            thinking_effort: Some(Effort::Ultra),
+            client_session: None,
+            tool_choice: None,
+            response_format: None,
+            stop: Vec::new(),
+            previous_response_id: None,
+            passthrough: None,
+        };
+        let body = render_request(&req, "claude-opus-5").expect("renders");
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert_eq!(body["output_config"]["effort"], json!("max"), "{body}");
+
+        let body = render_request(&req, "claude-sonnet-4-5").expect("renders");
+        assert_eq!(
+            body["thinking"],
+            json!({"type": "enabled", "budget_tokens": Effort::Max.as_budget()}),
+            "{body}"
+        );
+
+        // And still clamped below the ceiling, as every budget is.
+        req.max_tokens = 8192;
+        let body = render_request(&req, "claude-sonnet-4-5").expect("renders");
+        assert_eq!(body["thinking"]["budget_tokens"], json!(8191));
     }
 
     #[test]
