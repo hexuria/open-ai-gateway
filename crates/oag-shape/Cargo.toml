@@ -1,0 +1,22 @@
+[package]
+name = "oag-shape"
+description = "Integer shape features of a request (fences, diff hunks, dominant script, homoglyphs, JSON keys, structured-output markers). Counts only: no routing tier lives here (oag-router owns that)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# PUA engine, pinned by git rev (no PUA tag yet). Only the text normalizer is used.
+pua-text = { git = "https://github.com/hexuria/pua", rev = "e1635f12908deda99308f03222c4265043e0e749" }
+serde.workspace = true
+serde_json.workspace = true
+unicode-security = "0.1.2"
+unicode-script = "0.5"
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std", "bit-set"] }
+unicode-normalization = { version = "0.1", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true

@@ -9,6 +9,7 @@ members = [
     "crates/oag-store",
     "crates/oag-server",
     "crates/oag",
+    "crates/oag-shape",
 ]
 
 [workspace.package]
