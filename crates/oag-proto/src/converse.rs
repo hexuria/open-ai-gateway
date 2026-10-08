@@ -330,6 +330,22 @@ impl ToolUseIds {
     /// Every id `req`'s history uses that Converse would refuse, respelled.
     #[must_use]
     pub fn from_request(req: &CanonicalRequest) -> Self {
+        Self::from_request_by(req, tool_use_id_byte)
+    }
+
+    /// The same for Anthropic, which holds `tool_use.id` to `^[a-zA-Z0-9_-]+$`: no `.` and no
+    /// `:`, both of which other upstreams put in their ids. A conversation that moved to
+    /// Anthropic from one of them failed its first turn there with a 400 (8 Oct 2026).
+    #[must_use]
+    pub fn for_anthropic(req: &CanonicalRequest) -> Self {
+        Self::from_request_by(req, |b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')
+        })
+    }
+
+    /// Every id `req`'s history uses whose bytes are not all `ok`, respelled with only bytes that
+    /// are.
+    fn from_request_by(req: &CanonicalRequest, ok: fn(u8) -> bool) -> Self {
         let mut ids: Vec<&str> = Vec::new();
         let mut seen = HashSet::new();
         for block in req.messages.iter().flat_map(|m| &m.content) {
@@ -343,14 +359,15 @@ impl ToolUseIds {
             }
         }
         // The ones already legal claim their spellings first.
+        let legal = |id: &str| (1..=TOOL_USE_ID_MAX).contains(&id.len()) && id.bytes().all(ok);
         let mut taken: HashSet<String> = ids
             .iter()
-            .filter(|id| is_tool_use_id(id))
+            .filter(|id| legal(id))
             .map(|id| (*id).to_owned())
             .collect();
         let mut map = Self::default();
-        for id in ids.into_iter().filter(|id| !is_tool_use_id(id)) {
-            let wire = respell_tool_use_id(id, &taken);
+        for id in ids.into_iter().filter(|id| !legal(id)) {
+            let wire = respell_tool_use_id(id, &taken, ok);
             taken.insert(wire.clone());
             map.from_wire.insert(wire.clone(), id.to_owned());
             map.to_wire.insert(id.to_owned(), wire);
@@ -374,11 +391,7 @@ impl ToolUseIds {
 /// The longest `toolUseId` Converse takes.
 const TOOL_USE_ID_MAX: usize = 64;
 
-/// Whether Converse takes `id` as a `toolUseId`: `[a-zA-Z0-9_.:-]{1,64}`.
-fn is_tool_use_id(id: &str) -> bool {
-    (1..=TOOL_USE_ID_MAX).contains(&id.len()) && id.bytes().all(tool_use_id_byte)
-}
-
+/// A byte Converse takes in a `toolUseId`: `[a-zA-Z0-9_.:-]`, up to 64 of them.
 fn tool_use_id_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-')
 }
@@ -402,16 +415,10 @@ fn tool_use_id_byte(b: u8) -> bool {
 /// collision or a history built to make one, `id` goes as the client sent
 /// it, for Converse to refuse: a turn refused says what is wrong, where a
 /// spelling two ids shared could pair a call with another's result.
-fn respell_tool_use_id(id: &str, taken: &HashSet<String>) -> String {
+fn respell_tool_use_id(id: &str, taken: &HashSet<String>, ok: fn(u8) -> bool) -> String {
     let plain: String = id
         .bytes()
-        .map(|b| {
-            if tool_use_id_byte(b) {
-                char::from(b)
-            } else {
-                '_'
-            }
-        })
+        .map(|b| if ok(b) { char::from(b) } else { '_' })
         .collect();
     if (1..=TOOL_USE_ID_MAX).contains(&plain.len()) && !taken.contains(&plain) {
         return plain;

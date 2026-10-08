@@ -106,11 +106,17 @@ fn anthropic_budget(req: &CanonicalRequest) -> Option<u32> {
 
 /// Canonical → Anthropic wire JSON.
 pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Value> {
+    // Ids other upstreams issued, respelled the way Anthropic takes them (see `ToolUseIds`).
+    let ids = crate::converse::ToolUseIds::for_anthropic(req);
     let mut body = json!({
         "model": upstream_model,
         "max_tokens": req.max_tokens,
         "stream": req.stream,
-        "messages": req.messages.iter().map(render_message).collect::<Vec<_>>(),
+        "messages": req
+            .messages
+            .iter()
+            .map(|m| render_message(m, &ids))
+            .collect::<Vec<_>>(),
     });
 
     if !req.system.is_empty() {
@@ -198,7 +204,7 @@ pub fn render_request(req: &CanonicalRequest, upstream_model: &str) -> Result<Va
     Ok(body)
 }
 
-fn render_message(m: &Message) -> Value {
+fn render_message(m: &Message, ids: &crate::converse::ToolUseIds) -> Value {
     json!({
         "role": match m.role {
             // Anthropic has no `system` or `tool` message role: system is a
@@ -206,11 +212,20 @@ fn render_message(m: &Message) -> Value {
             Role::Assistant => "assistant",
             _ => "user",
         },
-        "content": m.content.iter().map(render_block).collect::<Vec<_>>(),
+        "content": m
+            .content
+            .iter()
+            .map(|b| render_block_with(b, ids))
+            .collect::<Vec<_>>(),
     })
 }
 
 fn render_block(b: &ContentBlock) -> Value {
+    render_block_with(b, &crate::converse::ToolUseIds::default())
+}
+
+/// A block, with every tool-call id spelled as Anthropic takes it (`ids`).
+fn render_block_with(b: &ContentBlock, ids: &crate::converse::ToolUseIds) -> Value {
     match b {
         ContentBlock::Text {
             text,
@@ -227,7 +242,7 @@ fn render_block(b: &ContentBlock) -> Value {
             "source": { "type": "base64", "media_type": media_type, "data": data },
         }),
         ContentBlock::ToolUse { id, name, input } => {
-            json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+            json!({ "type": "tool_use", "id": ids.wire(id), "name": name, "input": input })
         }
         ContentBlock::ToolResult {
             tool_use_id,
@@ -240,12 +255,12 @@ fn render_block(b: &ContentBlock) -> Value {
             let content = match content {
                 ToolResultContent::Text(text) => json!(text),
                 ToolResultContent::Blocks(blocks) => {
-                    Value::Array(blocks.iter().map(render_block).collect())
+                    Value::Array(blocks.iter().map(|b| render_block_with(b, ids)).collect())
                 }
             };
             json!({
                 "type": "tool_result",
-                "tool_use_id": tool_use_id,
+                "tool_use_id": ids.wire(tool_use_id),
                 "content": content,
                 "is_error": is_error,
             })
@@ -1047,6 +1062,54 @@ fn parse_stop_reason(raw: &str) -> StopReason {
 mod tests {
     use super::*;
     use crate::canonical::extract_cache_blocks;
+
+    /// A conversation begun on another upstream carries its tool-call ids, and Anthropic holds
+    /// `tool_use.id` to `^[a-zA-Z0-9_-]+$`: one `call.ab:12` in the history failed the whole
+    /// turn with a 400 when a chat moved to Anthropic (8 Oct 2026). Each such id is respelled the
+    /// same way in the call and in its result, so they still pair; a legal id goes as it is.
+    #[test]
+    fn tool_ids_from_another_upstream_are_respelled_for_anthropic_and_still_pair() {
+        let req = crate::openai::parse_request(&json!({
+            "model": "anthropic/claude-haiku-5-5",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call.ab:12", "type": "function",
+                     "function": {"name": "read_file", "arguments": "{}"}},
+                    {"id": "toolu_ok-1", "type": "function",
+                     "function": {"name": "read_file", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call.ab:12", "content": "one"},
+                {"role": "tool", "tool_call_id": "toolu_ok-1", "content": "two"}
+            ]
+        }))
+        .expect("parses");
+        let body = render_request(&req, "claude-haiku-5-5").expect("renders");
+        let blocks = |turn: usize| {
+            body["messages"][turn]["content"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let uses: Vec<String> = blocks(1)
+            .iter()
+            .map(|b| b["id"].as_str().unwrap().to_owned())
+            .collect();
+        let results: Vec<String> = blocks(2)
+            .iter()
+            .map(|b| b["tool_use_id"].as_str().unwrap().to_owned())
+            .collect();
+        let legal = |id: &str| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        };
+        assert!(uses.iter().all(|id| legal(id)), "{uses:?}");
+        assert_eq!(uses, results, "each call still pairs with its result");
+        assert_eq!(uses[1], "toolu_ok-1", "a legal id goes as it is");
+        assert_ne!(uses[0], "call.ab:12");
+    }
 
     /// H3. A client that asks for reasoning in levels still gets reasoning.
     /// The 4.6 form this renderer emits, read back by the parser that has to.
